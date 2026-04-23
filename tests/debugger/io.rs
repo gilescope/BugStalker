@@ -11,6 +11,12 @@ use std::mem;
 #[test]
 #[serial]
 fn test_read_register_write() {
+    // Program-counter register name is arch-specific.
+    #[cfg(target_arch = "x86_64")]
+    const PC_NAME: &str = "rip";
+    #[cfg(target_arch = "aarch64")]
+    const PC_NAME: &str = "pc";
+
     let process = prepare_debugee_process(HW_APP, &[]);
     let debugee_pid = process.pid();
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
@@ -22,9 +28,9 @@ fn test_read_register_write() {
 
     debugger.start_debugee().unwrap();
 
-    debugger.set_register_value("rip", 0x55555555BD20).unwrap();
+    debugger.set_register_value(PC_NAME, 0x55555555BD20).unwrap();
 
-    let val = debugger.get_register_value("rip");
+    let val = debugger.get_register_value(PC_NAME);
     assert_eq!(val.unwrap(), 0x55555555BD20);
 
     mem::drop(debugger);

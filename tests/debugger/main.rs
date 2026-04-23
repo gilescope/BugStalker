@@ -124,6 +124,14 @@ fn test_frame_cfa() {
     assert_no_proc!(debugee_pid);
 }
 
+// On x86_64 the CIE's return-address register is 16 (`rip`) and the
+// unwinder's `frame.return_addr` is the DWARF value for reg 16 at the
+// caller frame. Asserting that against `registers.value(reg16)` in the
+// current frame is meaningful. On aarch64 the CIE's RA register is 30
+// (`x30`/LR) and DWARF reg 32 (PC) is the current program counter — the
+// two are not the same quantity, so the assertion has no equivalent
+// without rewriting the test.
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[serial]
 fn test_registers() {

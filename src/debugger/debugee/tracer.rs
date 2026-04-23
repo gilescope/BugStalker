@@ -407,26 +407,37 @@ impl Tracer {
                             todo!()
                         }
                         code::TRAP_BRKPT | code::SI_KERNEL => {
-                            let current_pc = {
-                                let tracee = self.tracee_ctl.tracee_ensure(pid);
-                                tracee.set_pc(
-                                    tracee.pc()?.as_u64()
-                                        - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
-                                )?;
-                                tracee.pc()?
-                            };
-
+                            // Compute the trap's PC (after arch-specific rewind) and
+                            // match it against our installed breakpoints *before*
+                            // mutating tracee state, so unrelated debuggee traps
+                            // (e.g. __builtin_trap / BRK #1000 on aarch64, or a
+                            // user-level INT3 on x86) don't get misattributed.
+                            let trap_pc = RelocatedAddress::from(
+                                self.tracee_ctl.tracee_ensure(pid).pc()?.as_u64()
+                                    - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
+                            );
                             let mb_hit_brkpt = tcx
                                 .breakpoints
                                 .iter()
-                                .find(|brkpt| brkpt.addr == current_pc);
-                            debug_assert!(
-                                mb_hit_brkpt.is_some(),
-                                "the interrupt caught but the breakpoint was not found"
-                            );
+                                .find(|brkpt| brkpt.addr == trap_pc);
                             let Some(&brkpt) = mb_hit_brkpt else {
-                                return Ok(None);
+                                // A trap we didn't install — surface it as a
+                                // SIGTRAP signal-stop so the UI can report and
+                                // backtrace from it instead of panicking.
+                                self.tracee_ctl
+                                    .tracee_ensure_mut(pid)
+                                    .set_stop(StopType::SignalStop(signal));
+                                if !QUIET_SIGNALS.contains(&signal) {
+                                    self.group_stop_interrupt(tcx, pid)?;
+                                }
+                                return Ok(Some(StopReason::SignalStop(pid, signal)));
                             };
+                            // It's one of ours — apply the PC rewind now so the
+                            // rest of the handler sees the corrected PC.
+                            self.tracee_ctl
+                                .tracee_ensure(pid)
+                                .set_pc(trap_pc.as_u64())?;
+                            let current_pc = trap_pc;
 
                             let has_tmp_breakpoints = tcx
                                 .breakpoints
