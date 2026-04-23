@@ -78,7 +78,21 @@ impl Disassembler {
                 .filter(|brkpt| brkpt.addr >= fn_reloc_pc_start && brkpt.addr <= fn_reloc_pc_end)
                 .for_each(|brkpt| {
                     let byte_idx = usize::from(brkpt.addr) - usize::from(fn_reloc_pc_start);
-                    text[byte_idx] = brkpt.saved_data.get();
+                    // Restore the original instruction bytes that were
+                    // overwritten by the breakpoint opcode. The width is
+                    // arch-specific: 1 byte (INT3) on x86_64, 4 bytes
+                    // (BRK #0) on aarch64.
+                    let saved = brkpt.saved_data.get();
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        text[byte_idx] = saved as u8;
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let bytes = (saved as u32).to_le_bytes();
+                        let end = (byte_idx + bytes.len()).min(text.len());
+                        text[byte_idx..end].copy_from_slice(&bytes[..end - byte_idx]);
+                    }
                 });
 
             let instructions = self

@@ -580,6 +580,15 @@ impl Breakpoint {
     #[cfg(target_arch = "aarch64")]
     const BRK_MASK: u64 = 0xFFFF_FFFF;
 
+    /// Adjustment from the signalled PC back to the breakpoint address.
+    ///
+    /// x86_64 reports PC *after* the 1-byte `INT3` trap, so we rewind by 1.
+    /// aarch64 reports PC *at* the 4-byte `BRK #0`, so no rewind is needed.
+    #[cfg(target_arch = "x86_64")]
+    pub const PC_ADJUST: u64 = 1;
+    #[cfg(target_arch = "aarch64")]
+    pub const PC_ADJUST: u64 = 0;
+
     #[inline(always)]
     fn new_inner(
         addr: RelocatedAddress,

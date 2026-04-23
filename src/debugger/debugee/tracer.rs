@@ -409,7 +409,10 @@ impl Tracer {
                         code::TRAP_BRKPT | code::SI_KERNEL => {
                             let current_pc = {
                                 let tracee = self.tracee_ctl.tracee_ensure(pid);
-                                tracee.set_pc(tracee.pc()?.as_u64() - 1)?;
+                                tracee.set_pc(
+                                    tracee.pc()?.as_u64()
+                                        - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
+                                )?;
                                 tracee.pc()?
                             };
 

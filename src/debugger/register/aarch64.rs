@@ -366,12 +366,19 @@ pub mod debug_impl {
     }
 
     impl HardwareDebugState {
+        /// Returns an empty state so the no-watchpoint code path works
+        /// transparently. The actual hardware-watchpoint plumbing lives
+        /// behind `WatchpointRegistry::add`, which calls this + fails
+        /// only once an aarch64 installer is requested (see `add_inner`
+        /// in src/debugger/watchpoint.rs, which still returns
+        /// `WatchpointUnsupported` at the install call site).
         pub fn current(_pid: Pid) -> Result<Self, Error> {
-            Err(Error::WatchpointUnsupported)
+            Ok(Self::default())
         }
 
+        /// Syncing a zero/empty state is a no-op; nothing to program.
         pub fn sync(&self, _pid: Pid) -> Result<(), Error> {
-            Err(Error::WatchpointUnsupported)
+            Ok(())
         }
     }
 }

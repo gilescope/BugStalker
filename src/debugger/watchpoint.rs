@@ -138,6 +138,13 @@ impl HardwareBreakpoint {
     }
 
     fn enable(&mut self, tracee_ctl: &TraceeCtl) -> Result<HardwareDebugState, Error> {
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = tracee_ctl;
+            return Err(Error::WatchpointUnsupported);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
         let mut state = HardwareDebugState::current(tracee_ctl.proc_pid())?;
 
         // trying to find free debug register
@@ -165,9 +172,17 @@ impl HardwareBreakpoint {
         self.register = Some(free_register);
 
         Ok(state)
+        }
     }
 
     fn disable(&mut self, tracee_ctl: &TraceeCtl) -> Result<HardwareDebugState, Error> {
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = tracee_ctl;
+            return Err(Error::WatchpointUnsupported);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
         let mut state = HardwareDebugState::current(tracee_ctl.proc_pid())?;
         let register = self.register.expect("should exist");
         state.dr7.set_dr(register, false, false);
@@ -178,12 +193,25 @@ impl HardwareBreakpoint {
         });
         self.register = None;
         Ok(state)
+        }
     }
 
     fn address_already_observed(
         tracee_ctl: &TraceeCtl,
         address: RelocatedAddress,
     ) -> Result<bool, Error> {
+        // On aarch64 we can't enumerate active hardware watchpoints (no
+        // implementation of NT_ARM_HW_WATCH yet), so report no conflicts.
+        // Since hw-watchpoint installation itself fails with
+        // `WatchpointUnsupported` on this arch, this answer is never
+        // relied on for correctness.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (tracee_ctl, address);
+            return Ok(false);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
         let state = HardwareDebugState::current(tracee_ctl.proc_pid())?;
         Ok(state
             .address_regs
@@ -196,6 +224,7 @@ impl HardwareBreakpoint {
                 );
                 enabled && *in_use_addr == address.as_usize()
             }))
+        }
     }
 }
 
