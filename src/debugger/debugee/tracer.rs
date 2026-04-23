@@ -490,7 +490,16 @@ impl Tracer {
                             self.group_stop_interrupt(tcx, pid)?;
 
                             let mut state = register::debug::HardwareDebugState::current(pid)?;
-                            let reg = state.dr6.detect_and_flush().expect("should exists");
+                            // x86 recovers the firing slot from DR6; aarch64
+                            // doesn't have a per-slot trap bit, so it needs
+                            // `si_addr` (the faulting byte) to match against
+                            // each slot's watched bytes. Both arches accept
+                            // the same `Option<usize>` and ignore it when not
+                            // needed.
+                            let si_addr = unsafe { info.si_addr() } as usize;
+                            let reg = state
+                                .detect_and_flush_hit(Some(si_addr))
+                                .expect("watchpoint fired but no slot matched");
                             state.sync(pid)?;
                             let hit_type = WatchpointHitType::DebugRegister(reg);
                             Ok(Some(StopReason::Watchpoint(pid, current_pc, hit_type)))
@@ -569,7 +578,8 @@ impl Tracer {
                 }
 
                 let mut state = register::debug::HardwareDebugState::current(pid)?;
-                let maybe_dr = state.dr6.detect_and_flush();
+                let si_addr = unsafe { info.si_addr() } as usize;
+                let maybe_dr = state.detect_and_flush_hit(Some(si_addr));
                 state.sync(pid)?;
                 if let Some(dr) = maybe_dr {
                     let hit_type = WatchpointHitType::DebugRegister(dr);

@@ -346,39 +346,241 @@ impl From<RegisterMap> for DwarfRegisterMap {
 }
 
 pub mod debug_impl {
-    //! Hardware watchpoints via aarch64's `NT_ARM_HW_WATCH`/`NT_ARM_HW_BREAK`
-    //! regsets are not yet implemented. For now this module exposes the same
-    //! `HardwareDebugState` shape the rest of the debugger expects and
-    //! returns `Err(WatchpointOOM)` at runtime, making hardware watchpoints
-    //! unavailable but keeping the debugger otherwise operational.
+    //! aarch64 data-watchpoint plumbing backed by `NT_ARM_HW_WATCH`
+    //! (`PTRACE_GETREGSET` / `PTRACE_SETREGSET` regset 0x403).
+    //!
+    //! The kernel view is an array of `{ addr: u64, ctrl: u32 }` pairs
+    //! — one pair per hardware slot (commonly 4). Each pair mirrors the
+    //! `DBGWVR<n>_EL1` (value) and `DBGWCR<n>_EL1` (control) registers:
+    //!
+    //! * `addr` is the 8-byte-aligned base address of the watched window.
+    //! * `ctrl` packs enable / privilege / load-store / byte-address-select
+    //!   flags — we only use the minimum subset needed for unprivileged
+    //!   data watchpoints; see `encode_ctrl` below.
+    //!
+    //! Hit attribution: the kernel delivers `SIGTRAP` with
+    //! `si_code == TRAP_HWBKPT` and `si_addr` set to the exact faulting
+    //! byte; we match that byte against each slot's watched range to
+    //! recover the slot index.
 
     use crate::debugger::Error;
-    use crate::debugger::register::debug::{DebugControlRegister, DebugStatusRegister};
+    use crate::debugger::error::Error::Ptrace;
+    use crate::debugger::register::debug::{
+        BreakCondition, BreakSize, DebugRegisterNumber,
+    };
+    use nix::errno::Errno;
+    use nix::libc::{self, c_void, iovec};
     use nix::unistd::Pid;
+    use std::mem::{MaybeUninit, size_of};
 
     pub type DebugAddressRegister = usize;
 
-    #[derive(PartialEq, Debug, Default)]
+    /// Linux `NT_ARM_HW_WATCH` regset id.
+    const NT_ARM_HW_WATCH: libc::c_uint = 0x403;
+    /// Number of watchpoint slots we expose (the kernel may offer up to
+    /// 16, but we cap at 4 to match `DebugRegisterNumber::DR0..DR3`
+    /// which is the cross-arch shape the watchpoint registry uses).
+    const SLOT_COUNT: usize = 4;
+
+    #[repr(C)]
+    #[derive(Default, Copy, Clone, PartialEq, Debug)]
+    struct DbgReg {
+        addr: u64,
+        ctrl: u32,
+        _pad: u32,
+    }
+
+    /// Mirror of `struct user_hwdebug_state` from `<asm/ptrace.h>`.
+    #[repr(C)]
+    #[derive(Copy, Clone, PartialEq, Debug)]
+    struct UserHwDebugState {
+        dbg_info: u32,
+        _pad: u32,
+        dbg_regs: [DbgReg; SLOT_COUNT],
+    }
+
+    impl Default for UserHwDebugState {
+        fn default() -> Self {
+            Self {
+                dbg_info: 0,
+                _pad: 0,
+                dbg_regs: [DbgReg::default(); SLOT_COUNT],
+            }
+        }
+    }
+
+    /// Build a WCR value for a user-mode data watchpoint:
+    ///   bit  0   : E  (enable)
+    ///   bits 1-2 : PAC = 0b10 (unprivileged / EL0)
+    ///   bits 3-4 : LSC = load (0b01) / store (0b10) / either (0b11)
+    ///   bits 5-12: BAS (byte-address-select; one bit per watched byte
+    ///              within the 8-byte window at `addr`)
+    fn encode_ctrl(cond: BreakCondition, bas: u8) -> u32 {
+        let lsc: u32 = match cond {
+            BreakCondition::DataWrites => 0b10,
+            BreakCondition::DataReadsWrites => 0b11,
+        };
+        1                       // E
+            | (0b10u32 << 1)    // PAC = EL0
+            | (lsc << 3)        // LSC
+            | ((bas as u32) << 5)
+    }
+
+    /// Translate (address, size) into the 8-byte-aligned window the
+    /// hardware watches plus the BAS mask selecting bytes in that
+    /// window. Sizes 1/2/4/8 are supported and must be naturally
+    /// aligned, matching the `BreakSize` enum's guarantees.
+    fn compute_bas(addr: usize, size: BreakSize) -> (u64, u8) {
+        let window = (addr as u64) & !7;
+        let offset = addr & 7;
+        let width = match size {
+            BreakSize::Bytes1 => 1,
+            BreakSize::Bytes2 => 2,
+            BreakSize::Bytes4 => 4,
+            BreakSize::Bytes8 => 8,
+        };
+        let mask: u8 = ((1u16 << width) - 1) as u8;
+        (window, mask << offset)
+    }
+
+    /// Inverse of `compute_bas` — recover the base address and size
+    /// class of a slot from its (addr, bas) pair. Used when the
+    /// watchpoint registry asks which slots are in use without having
+    /// kept its own record.
+    fn decode_bas(window: u64, bas: u8) -> (usize, BreakSize) {
+        if bas == 0 {
+            return (window as usize, BreakSize::Bytes1);
+        }
+        let offset = bas.trailing_zeros() as usize;
+        let size = match bas.count_ones() {
+            1 => BreakSize::Bytes1,
+            2 => BreakSize::Bytes2,
+            4 => BreakSize::Bytes4,
+            8 => BreakSize::Bytes8,
+            // Non-power-of-two BAS patterns are not produced by
+            // `compute_bas`. If we encounter one (foreign tooling set
+            // it), treat it as 1-byte at the low bit so the upper
+            // layers see a conservative answer.
+            _ => BreakSize::Bytes1,
+        };
+        (window as usize + offset, size)
+    }
+
+    /// Invoke `PTRACE_{GET,SET}REGSET(pid, NT_ARM_HW_WATCH, ...)`,
+    /// returning the current slot state or writing `self.raw` back.
+    fn ptrace_hw_watch(
+        request: libc::c_uint,
+        pid: Pid,
+        state: &mut UserHwDebugState,
+    ) -> Result<(), Error> {
+        let mut iov = iovec {
+            iov_base: state as *mut _ as *mut c_void,
+            iov_len: size_of::<UserHwDebugState>(),
+        };
+        let ret = unsafe {
+            libc::ptrace(
+                request,
+                pid.as_raw(),
+                NT_ARM_HW_WATCH as *mut c_void,
+                &mut iov as *mut _ as *mut c_void,
+            )
+        };
+        if ret < 0 {
+            return Err(Ptrace(Errno::last()));
+        }
+        Ok(())
+    }
+
+    #[derive(PartialEq, Debug)]
     pub struct HardwareDebugState {
-        pub address_regs: [DebugAddressRegister; 4],
-        pub dr6: DebugStatusRegister,
-        pub dr7: DebugControlRegister,
+        raw: UserHwDebugState,
+    }
+
+    impl Default for HardwareDebugState {
+        fn default() -> Self {
+            Self {
+                raw: UserHwDebugState::default(),
+            }
+        }
     }
 
     impl HardwareDebugState {
-        /// Returns an empty state so the no-watchpoint code path works
-        /// transparently. The actual hardware-watchpoint plumbing lives
-        /// behind `WatchpointRegistry::add`, which calls this + fails
-        /// only once an aarch64 installer is requested (see `add_inner`
-        /// in src/debugger/watchpoint.rs, which still returns
-        /// `WatchpointUnsupported` at the install call site).
-        pub fn current(_pid: Pid) -> Result<Self, Error> {
-            Ok(Self::default())
+        pub fn current(pid: Pid) -> Result<Self, Error> {
+            let mut raw = MaybeUninit::<UserHwDebugState>::zeroed();
+            // SAFETY: MaybeUninit::zeroed is a valid bit pattern for a
+            // struct of POD types; we hand the storage to the kernel
+            // which populates it before we `assume_init`.
+            unsafe {
+                ptrace_hw_watch(libc::PTRACE_GETREGSET, pid, raw.assume_init_mut())?;
+                Ok(Self {
+                    raw: raw.assume_init(),
+                })
+            }
         }
 
-        /// Syncing a zero/empty state is a no-op; nothing to program.
-        pub fn sync(&self, _pid: Pid) -> Result<(), Error> {
-            Ok(())
+        pub fn sync(&self, pid: Pid) -> Result<(), Error> {
+            let mut raw = self.raw;
+            ptrace_hw_watch(libc::PTRACE_SETREGSET, pid, &mut raw)
+        }
+
+        // --- Slot-oriented API (mirrored on x86_64) ---
+
+        pub fn slot_enabled(&self, slot: DebugRegisterNumber) -> bool {
+            (self.raw.dbg_regs[slot as usize].ctrl & 1) == 1
+        }
+
+        pub fn slot_addr(&self, slot: DebugRegisterNumber) -> usize {
+            let reg = &self.raw.dbg_regs[slot as usize];
+            let bas = ((reg.ctrl >> 5) & 0xff) as u8;
+            let (addr, _) = decode_bas(reg.addr, bas);
+            addr
+        }
+
+        pub fn install(
+            &mut self,
+            slot: DebugRegisterNumber,
+            addr: usize,
+            cond: BreakCondition,
+            size: BreakSize,
+        ) {
+            let (window, bas) = compute_bas(addr, size);
+            let reg = &mut self.raw.dbg_regs[slot as usize];
+            reg.addr = window;
+            reg.ctrl = encode_ctrl(cond, bas);
+        }
+
+        pub fn uninstall(&mut self, slot: DebugRegisterNumber) {
+            let reg = &mut self.raw.dbg_regs[slot as usize];
+            reg.addr = 0;
+            reg.ctrl = 0;
+        }
+
+        /// Identify which slot fired for this stop. Unlike x86 there's
+        /// no per-slot "trap occurred" bit; the kernel gives us
+        /// `si_addr` pointing at the triggering byte and we match it
+        /// against each enabled slot's BAS-selected byte set.
+        pub fn detect_and_flush_hit(
+            &mut self,
+            si_addr: Option<usize>,
+        ) -> Option<DebugRegisterNumber> {
+            let addr = si_addr?;
+            for idx in 0..SLOT_COUNT {
+                let dr = DebugRegisterNumber::from_repr(idx)?;
+                if !self.slot_enabled(dr) {
+                    continue;
+                }
+                let reg = &self.raw.dbg_regs[idx];
+                let window = reg.addr as usize;
+                let mut bas = ((reg.ctrl >> 5) & 0xff) as u8;
+                while bas != 0 {
+                    let b = bas.trailing_zeros() as usize;
+                    if addr == window + b {
+                        return Some(dr);
+                    }
+                    bas &= bas - 1;
+                }
+            }
+            None
         }
     }
 }

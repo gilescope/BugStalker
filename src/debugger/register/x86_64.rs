@@ -380,7 +380,10 @@ impl From<RegisterMap> for DwarfRegisterMap {
 pub mod debug_impl {
     use crate::debugger::Error;
     use crate::debugger::Error::Ptrace;
-    use crate::debugger::register::debug::{DebugControlRegister, DebugStatusRegister};
+    use crate::debugger::register::debug::{
+        BreakCondition, BreakSize, DebugControlRegister, DebugRegisterNumber,
+        DebugStatusRegister,
+    };
     use nix::sys;
     use nix::sys::ptrace::AddressType;
     use nix::unistd::Pid;
@@ -434,6 +437,41 @@ pub mod debug_impl {
             set_dr(pid, 6, self.dr6.bits())?;
             set_dr(pid, 7, self.dr7.bits())?;
             Ok(())
+        }
+
+        // --- Slot-oriented API (mirrored on aarch64) ---
+
+        pub fn slot_enabled(&self, slot: DebugRegisterNumber) -> bool {
+            self.dr7.dr_enabled(slot, false)
+        }
+
+        pub fn slot_addr(&self, slot: DebugRegisterNumber) -> usize {
+            self.address_regs[slot as usize]
+        }
+
+        pub fn install(
+            &mut self,
+            slot: DebugRegisterNumber,
+            addr: usize,
+            cond: BreakCondition,
+            size: BreakSize,
+        ) {
+            self.address_regs[slot as usize] = addr;
+            self.dr7.configure_bp(slot, cond, size);
+            self.dr7.set_dr(slot, false, true);
+        }
+
+        pub fn uninstall(&mut self, slot: DebugRegisterNumber) {
+            self.dr7.set_dr(slot, false, false);
+        }
+
+        /// Identify which slot fired. x86 records the per-slot trap
+        /// flags in DR6, so we don't need `si_addr` — it's ignored.
+        pub fn detect_and_flush_hit(
+            &mut self,
+            _si_addr: Option<usize>,
+        ) -> Option<DebugRegisterNumber> {
+            self.dr6.detect_and_flush()
         }
     }
 }

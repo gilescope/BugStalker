@@ -138,13 +138,6 @@ impl HardwareBreakpoint {
     }
 
     fn enable(&mut self, tracee_ctl: &TraceeCtl) -> Result<HardwareDebugState, Error> {
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = tracee_ctl;
-            return Err(Error::WatchpointUnsupported);
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
         let mut state = HardwareDebugState::current(tracee_ctl.proc_pid())?;
 
         // trying to find free debug register
@@ -155,15 +148,15 @@ impl HardwareBreakpoint {
             DebugRegisterNumber::DR3,
         ]
         .into_iter()
-        .find(|&dr_num| !state.dr7.dr_enabled(dr_num, false))
+        .find(|&dr_num| !state.slot_enabled(dr_num))
         .ok_or(Error::WatchpointLimitReached)?;
 
-        // set hardware breakpoint
-        state.address_regs[free_register as usize] = self.address.as_usize();
-        state
-            .dr7
-            .configure_bp(free_register, self.condition, self.size);
-        state.dr7.set_dr(free_register, false, true);
+        state.install(
+            free_register,
+            self.address.as_usize(),
+            self.condition,
+            self.size,
+        );
         tracee_ctl.tracee_iter().for_each(|t| {
             if let Err(e) = state.sync(t.pid) {
                 error!("set hardware breakpoint for thread {}: {e}", t.pid)
@@ -172,20 +165,12 @@ impl HardwareBreakpoint {
         self.register = Some(free_register);
 
         Ok(state)
-        }
     }
 
     fn disable(&mut self, tracee_ctl: &TraceeCtl) -> Result<HardwareDebugState, Error> {
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = tracee_ctl;
-            return Err(Error::WatchpointUnsupported);
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
         let mut state = HardwareDebugState::current(tracee_ctl.proc_pid())?;
         let register = self.register.expect("should exist");
-        state.dr7.set_dr(register, false, false);
+        state.uninstall(register);
         tracee_ctl.tracee_iter().for_each(|t| {
             if let Err(e) = state.sync(t.pid) {
                 error!("remove hardware breakpoint for thread {}: {e}", t.pid)
@@ -193,38 +178,21 @@ impl HardwareBreakpoint {
         });
         self.register = None;
         Ok(state)
-        }
     }
 
     fn address_already_observed(
         tracee_ctl: &TraceeCtl,
         address: RelocatedAddress,
     ) -> Result<bool, Error> {
-        // On aarch64 we can't enumerate active hardware watchpoints (no
-        // implementation of NT_ARM_HW_WATCH yet), so report no conflicts.
-        // Since hw-watchpoint installation itself fails with
-        // `WatchpointUnsupported` on this arch, this answer is never
-        // relied on for correctness.
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (tracee_ctl, address);
-            return Ok(false);
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
         let state = HardwareDebugState::current(tracee_ctl.proc_pid())?;
-        Ok(state
-            .address_regs
-            .iter()
-            .enumerate()
-            .any(|(dr, in_use_addr)| {
-                let enabled = state.dr7.dr_enabled(
-                    DebugRegisterNumber::from_repr(dr).expect("infallible"),
-                    false,
-                );
-                enabled && *in_use_addr == address.as_usize()
-            }))
-        }
+        Ok([
+            DebugRegisterNumber::DR0,
+            DebugRegisterNumber::DR1,
+            DebugRegisterNumber::DR2,
+            DebugRegisterNumber::DR3,
+        ]
+        .into_iter()
+        .any(|dr| state.slot_enabled(dr) && state.slot_addr(dr) == address.as_usize()))
     }
 }
 
