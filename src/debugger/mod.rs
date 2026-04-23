@@ -10,6 +10,7 @@ pub mod process;
 pub mod register;
 pub mod rust;
 mod step;
+pub(crate) mod thread_db_compat;
 mod utils;
 pub mod variable;
 mod watchpoint;

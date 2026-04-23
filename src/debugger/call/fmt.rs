@@ -2,7 +2,7 @@ use crate::{
     debugger::{
         Debugger, Error, TypeDeclaration,
         address::RelocatedAddress,
-        call::{CallArgs, CallContext, CallError, CallHelper, RegType},
+        call::CallError,
         context::gcx,
         debugee::dwarf::unit::DieAddr,
         variable::{execute::QueryResult, render::RenderValue, value::Value},
@@ -10,8 +10,11 @@ use crate::{
     version::RustVersion,
     version_switch,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::debugger::call::{CallArgs, CallContext, CallHelper, RegType};
 use indexmap::IndexMap;
 use itertools::Itertools;
+#[cfg(target_arch = "x86_64")]
 use log::debug;
 
 #[derive(Debug, thiserror::Error)]
@@ -399,7 +402,15 @@ fn make_formatter_bytes_1_81_1_85(string_header_ptr: usize, vtable_ptr: usize) -
     formatter_to_bytes::<FORMATTER_SZ, _>(&formatter).to_vec()
 }
 
+/// Inferior-call execution is x86_64-only for now; on other architectures
+/// `call_debug_fmt` returns `FmtCallError::UnsupportedType`.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn call_debug_fmt(_dbg: &Debugger, _var: &QueryResult) -> Result<String, Error> {
+    Err(FmtCallError::UnsupportedType.into())
+}
+
 /// Call a core::fmt::Debug::fmt function for a variable and return formatted string.
+#[cfg(target_arch = "x86_64")]
 pub fn call_debug_fmt(dbg: &Debugger, var: &QueryResult) -> Result<String, Error> {
     if !var.value().formattable() {
         return Err(FmtCallError::UnsupportedType.into());

@@ -112,7 +112,7 @@ fn test_frame_cfa() {
 
     let sp = RegisterMap::current(debugee_pid)
         .unwrap()
-        .value(Register::Rsp);
+        .value(Register::SP);
 
     debugger.continue_debugee().unwrap();
     let frame_info = debugger.frame_info().unwrap();
@@ -145,7 +145,7 @@ fn test_registers() {
     let pc = debugger.ecx().location().pc;
     let frame = debugger.frame_info().unwrap();
     let registers = debugger.current_thread_registers_at_pc(pc).unwrap();
-    let ip_register = Register::Rip
+    let ip_register = Register::PC
         .dwarf_register()
         .expect("instruction pointer register must map to dwarf register");
     assert_eq!(

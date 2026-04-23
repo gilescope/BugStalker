@@ -113,7 +113,7 @@ pub fn return_addr(debugee: &Debugee, pid: Pid) -> Result<Option<RelocatedAddres
     unwinder.return_address(pid)
 }
 
-/// UnwindContext (or ucx) contains information for unwinding single frame.  
+/// UnwindContext (or ucx) contains information for unwinding single frame.
 pub struct UnwindContext<'a> {
     registers: DwarfRegisterMap,
     location: Location,
@@ -247,7 +247,7 @@ impl<'a> UnwindContext<'a> {
         ecx: &ExplorationContext,
     ) -> Result<Option<Self>, Error> {
         let mut next_frame_registers: DwarfRegisterMap = previous_ucx.registers;
-        let sp_register = Register::Rsp
+        let sp_register = Register::SP
             .dwarf_register()
             .expect("stack pointer register must map to dwarf register");
         next_frame_registers.update(sp_register, previous_ucx.cfa.into());

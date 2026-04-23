@@ -52,7 +52,6 @@ clap = { version = "4.5", features = ["derive", "env"] }
 uuid = { version = "1.19.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
 os_pipe = "1.2.3"
 proc-maps = "0.3.2"
-thread_db = "0.1.4"
 smallvec = "1.15.1"
 rand = "0.8.5"
 ctrlc = "3.5.1"
@@ -85,6 +84,12 @@ home = "0.5.12"
 which = "6.0.3"
 string-interner = "0.19.0"
 libc = "0.2"
+
+# thread_db wraps glibc's libthread_db, which only supports x86_64
+# (and i686). On other arches we compile an in-tree stub that always reports
+# "not supported"; see src/debugger/thread_db_compat.rs.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+thread_db = "0.1.4"
 
 [dev-dependencies]
 serial_test = "3.2.0"

@@ -553,7 +553,7 @@ pub struct Breakpoint {
     number: u32,
     /// Place information, None if brkpt is a temporary or entry point
     place: Option<PlaceDescriptorOwned>,
-    pub saved_data: Cell<u8>,
+    pub saved_data: Cell<u64>,
     enabled: Cell<bool>,
     r#type: BrkptType,
     pub debug_info_file: PathBuf,
@@ -566,7 +566,19 @@ impl Breakpoint {
 }
 
 impl Breakpoint {
-    const INT3: u64 = 0xCC_u64;
+    /// Software-breakpoint opcode.
+    ///
+    /// x86_64: `INT3` = `0xCC` (1 byte).
+    /// aarch64: `BRK #0` = `0xD4200000` (4 bytes, little-endian).
+    #[cfg(target_arch = "x86_64")]
+    const BRK_OPCODE: u64 = 0xCC;
+    #[cfg(target_arch = "x86_64")]
+    const BRK_MASK: u64 = 0xff;
+
+    #[cfg(target_arch = "aarch64")]
+    const BRK_OPCODE: u64 = 0xD420_0000;
+    #[cfg(target_arch = "aarch64")]
+    const BRK_MASK: u64 = 0xFFFF_FFFF;
 
     #[inline(always)]
     fn new_inner(
@@ -767,9 +779,9 @@ impl Breakpoint {
 
     pub fn enable(&self) -> Result<(), Error> {
         let addr = self.addr.as_usize() as *mut c_void;
-        let data = sys::ptrace::read(self.pid, addr).map_err(Error::Ptrace)?;
-        self.saved_data.set((data & 0xff) as u8);
-        let data_with_pb = (data & !0xff) as u64 | Self::INT3;
+        let data = sys::ptrace::read(self.pid, addr).map_err(Error::Ptrace)? as u64;
+        self.saved_data.set(data & Self::BRK_MASK);
+        let data_with_pb = (data & !Self::BRK_MASK) | Self::BRK_OPCODE;
         unsafe {
             sys::ptrace::write(self.pid, addr, data_with_pb as *mut c_void)
                 .map_err(Error::Ptrace)?;
@@ -782,7 +794,7 @@ impl Breakpoint {
     pub fn disable(&self) -> Result<(), Error> {
         let addr = self.addr.as_usize() as *mut c_void;
         let data = sys::ptrace::read(self.pid, addr).map_err(Error::Ptrace)? as u64;
-        let restored: u64 = (data & !0xff) | self.saved_data.get() as u64;
+        let restored: u64 = (data & !Self::BRK_MASK) | self.saved_data.get();
         unsafe {
             sys::ptrace::write(self.pid, addr, restored as *mut c_void).map_err(Error::Ptrace)?;
         }

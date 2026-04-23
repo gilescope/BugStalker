@@ -28,6 +28,7 @@ use crate::debugger::error::Error::{
 };
 use crate::debugger::process::{Child, Installed};
 use crate::debugger::register::DwarfRegisterMap;
+use crate::debugger::thread_db_compat as thread_db;
 use crate::debugger::unwind::FrameSpan;
 use crate::debugger::{ExplorationContext, PlaceDescriptor};
 use crate::{muted_error, print_warns, weak_error};

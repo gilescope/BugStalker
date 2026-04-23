@@ -85,6 +85,8 @@ pub enum Error {
     WatchpointWrongSize,
     #[error("watchpoint limit is reached (maximum 4 watchpoints), try to remove unused")]
     WatchpointLimitReached,
+    #[error("hardware watchpoints are not supported on this architecture")]
+    WatchpointUnsupported,
     #[error("memory location observed by another watchpoint")]
     AddressAlreadyObserved,
     #[error("unknown expression scope")]
@@ -130,7 +132,7 @@ pub enum Error {
     #[error("libthread_db not enabled")]
     NoThreadDB,
     #[error("libthread_db: {0}")]
-    ThreadDB(#[from] thread_db::ThreadDbError),
+    ThreadDB(#[from] crate::debugger::thread_db_compat::ThreadDbError),
 
     // --------------------------------- linker errors ---------------------------------------------
     #[error(transparent)]
@@ -231,6 +233,7 @@ impl Error {
             Error::WatchpointUndefinedSize => false,
             Error::WatchpointWrongSize => false,
             Error::WatchpointLimitReached => false,
+            Error::WatchpointUnsupported => false,
             Error::WatchSubjectNotFound => false,
             Error::AddressAlreadyObserved => false,
             Error::UnknownScope => false,

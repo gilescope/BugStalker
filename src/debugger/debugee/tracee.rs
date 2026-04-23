@@ -4,7 +4,7 @@ use crate::debugger::debugee::tracee::TraceeStatus::{Running, Stopped};
 use crate::debugger::debugee::{Debugee, Location};
 use crate::debugger::error::Error;
 use crate::debugger::error::Error::{MultipleErrors, NoThreadDB, Ptrace, ThreadDB, Waitpid};
-use crate::debugger::register::{Register, RegisterMap};
+use crate::debugger::register::RegisterMap;
 use log::{debug, warn};
 use nix::errno::Errno;
 use nix::sys;
@@ -15,7 +15,8 @@ use ouroboros::self_referencing;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use thread_db;
+
+use crate::debugger::thread_db_compat as thread_db;
 
 #[self_referencing]
 struct ThreadDBProcess {
@@ -109,14 +110,13 @@ impl Tracee {
 
     /// Get current program counter value.
     pub fn pc(&self) -> Result<RelocatedAddress, Error> {
-        RegisterMap::current(self.pid)
-            .map(|reg_map| RelocatedAddress::from(reg_map.value(Register::Rip)))
+        RegisterMap::current(self.pid).map(|reg_map| RelocatedAddress::from(reg_map.pc()))
     }
 
     /// Set new program counter value.
     pub fn set_pc(&self, value: u64) -> Result<(), Error> {
         let mut map = RegisterMap::current(self.pid)?;
-        map.update(Register::Rip, value);
+        map.set_pc(value);
         map.persist(self.pid)
     }
 

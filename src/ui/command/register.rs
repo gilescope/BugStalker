@@ -30,7 +30,8 @@ impl<'a> Handler<'a> {
     pub fn handle(self, cmd: &Command) -> command::CommandResult<ExecutionResult> {
         match cmd {
             Command::Info => {
-                let registers_to_dump = &[
+                #[cfg(target_arch = "x86_64")]
+                let registers_to_dump: &[Reg] = &[
                     Reg::Rax,
                     Reg::Rbx,
                     Reg::Rcx,
@@ -58,6 +59,44 @@ impl<'a> Handler<'a> {
                     Reg::Ss,
                     Reg::Ds,
                     Reg::Es,
+                ];
+
+                #[cfg(target_arch = "aarch64")]
+                let registers_to_dump: &[Reg] = &[
+                    Reg::X0,
+                    Reg::X1,
+                    Reg::X2,
+                    Reg::X3,
+                    Reg::X4,
+                    Reg::X5,
+                    Reg::X6,
+                    Reg::X7,
+                    Reg::X8,
+                    Reg::X9,
+                    Reg::X10,
+                    Reg::X11,
+                    Reg::X12,
+                    Reg::X13,
+                    Reg::X14,
+                    Reg::X15,
+                    Reg::X16,
+                    Reg::X17,
+                    Reg::X18,
+                    Reg::X19,
+                    Reg::X20,
+                    Reg::X21,
+                    Reg::X22,
+                    Reg::X23,
+                    Reg::X24,
+                    Reg::X25,
+                    Reg::X26,
+                    Reg::X27,
+                    Reg::X28,
+                    Reg::X29,
+                    Reg::X30,
+                    Reg::Sp,
+                    Reg::Pc,
+                    Reg::Pstate,
                 ];
 
                 let register_map = RegisterMap::current(self.dbg.ecx().pid_on_focus())
