@@ -5,7 +5,30 @@ All notable changes to this project will be documented in this file.
 # [?.?.?] Unreleased
 
 ### Added
+
+- debugger: experimental Linux/aarch64 support. Software breakpoints
+  (`BRK #0`), general-purpose register read/write via `PTRACE_GETREGSET` +
+  `NT_PRSTATUS`, and DWARF unwinding are functional. Hardware watchpoints,
+  inferior function calls, and `libthread_db`-backed TLS inspection are
+  stubbed and return clear errors.
+- register: `RegisterMap::pc()` / `set_pc()` / `sp()` / `set_sp()`
+  architecture-agnostic accessors, and `Register::PC` / `Register::SP`
+  aliases.
+- build: `Earthfile` with `+check`, `+build`, `+build-rel`, `+clippy`,
+  `+fmt-check`, `+test`, `+all` targets. Select the target platform with
+  `--BS_PLATFORM=linux/arm64` (default) or `--BS_PLATFORM=linux/amd64`.
+- error: new `Error::WatchpointUnsupported` variant (returned on
+  architectures where hardware watchpoints are not yet wired up).
+
 ### Changed
+
+- `thread_db` is now an x86_64-only dependency; a thin in-tree shim
+  (`debugger::thread_db_compat`) provides stubs on other architectures
+  so the debugger degrades gracefully rather than failing to build.
+- `src/debugger/register.rs` split into `src/debugger/register/{mod,
+  x86_64,aarch64,debug}.rs`. Public surface under `debugger::register::*`
+  and `debugger::register::debug::*` is preserved.
+
 ### Fixed
 ### Deprecated
 ### Breaking changes
@@ -65,7 +88,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- console: fixed `watch +w` command 
+- console: fixed `watch +w` command
 - fix: now `BsUnit::find_exact_place_by_pc` deterministically return always first suitable place
 
 ---
@@ -114,7 +137,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- debugger: panic when vecdeque have infinite capacity (bug in debug info) 
+- debugger: panic when vecdeque have infinite capacity (bug in debug info)
 
 ### Deprecated
 ### Breaking changes
@@ -163,7 +186,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - debugger: added support for rustc 1.88
-- debugger: new `DataCast` DQE op  
+- debugger: new `DataCast` DQE op
 
 ---
 
@@ -234,7 +257,7 @@ All notable changes to this project will be documented in this file.
 - debugger: added support for rustc 1.85
 
 ### Changed
-- use rust edition 2024 
+- use rust edition 2024
 
 ---
 
@@ -244,7 +267,7 @@ All notable changes to this project will be documented in this file.
 - debugger: added support for rustc 1.84
 
 ### Fixed
-- update github actions 
+- update github actions
 
 ---
 

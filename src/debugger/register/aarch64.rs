@@ -202,18 +202,22 @@ impl RegisterMap {
         }
     }
 
+    /// Architecture-agnostic program counter accessor (aarch64: `pc`).
     pub fn pc(&self) -> u64 {
         self.pc
     }
 
+    /// Architecture-agnostic program counter setter (aarch64: `pc`).
     pub fn set_pc(&mut self, value: u64) {
         self.pc = value;
     }
 
+    /// Architecture-agnostic stack pointer accessor (aarch64: `sp`).
     pub fn sp(&self) -> u64 {
         self.sp
     }
 
+    /// Architecture-agnostic stack pointer setter (aarch64: `sp`).
     pub fn set_sp(&mut self, value: u64) {
         self.sp = value;
     }

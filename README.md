@@ -5,7 +5,7 @@
     <br>
 </p>
 
-> Modern debugger for Linux x86-64. Written in Rust for Rust programs.
+> Modern debugger for Linux x86-64 (aarch64 experimental). Written in Rust for Rust programs.
 
 <h4 align="center">
   <a href="https://godzie44.github.io/BugStalker/docs/overview">Documentation</a> |
@@ -88,4 +88,3 @@ Any contributions are very welcome.
 ## Copyright
 
 © 2026 Derevtsov Konstantin. Distributed under the MIT License.
-

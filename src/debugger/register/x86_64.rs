@@ -225,20 +225,22 @@ impl RegisterMap {
         Ok(regs.into())
     }
 
-    /// Architecture-agnostic program counter accessor.
+    /// Architecture-agnostic program counter accessor (x86_64: `rip`).
     pub fn pc(&self) -> u64 {
         self.rip
     }
 
+    /// Architecture-agnostic program counter setter (x86_64: `rip`).
     pub fn set_pc(&mut self, value: u64) {
         self.rip = value;
     }
 
-    /// Architecture-agnostic stack pointer accessor.
+    /// Architecture-agnostic stack pointer accessor (x86_64: `rsp`).
     pub fn sp(&self) -> u64 {
         self.rsp
     }
 
+    /// Architecture-agnostic stack pointer setter (x86_64: `rsp`).
     pub fn set_sp(&mut self, value: u64) {
         self.rsp = value;
     }

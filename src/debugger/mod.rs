@@ -1101,7 +1101,8 @@ impl Debugger {
     ///
     /// # Arguments
     ///
-    /// * `register_name`: x86-64 register name (ex: `rip`)
+    /// * `register_name`: target-architecture register name
+    ///   (e.g. `rip` on x86_64, `pc` on aarch64)
     pub fn get_register_value(&self, register_name: &str) -> Result<u64, Error> {
         disable_when_not_stared!(self);
 
@@ -1139,8 +1140,9 @@ impl Debugger {
     ///
     /// # Arguments
     ///
-    /// * `register_name`: x86-64 register name (ex: `rip`)
-    /// * `val`: 8 bite value
+    /// * `register_name`: target-architecture register name
+    ///   (e.g. `rip` on x86_64, `pc` on aarch64)
+    /// * `val`: 8-byte value
     pub fn set_register_value(&self, register_name: &str, val: u64) -> Result<(), Error> {
         disable_when_not_stared!(self);
 

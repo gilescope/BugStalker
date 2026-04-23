@@ -32,7 +32,7 @@ mod stub {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 f,
-                "libthread_db is not available on this architecture (x86_64 only)"
+                "libthread_db is not available on this architecture (upstream `thread_db` crate supports x86_64/i686 only)"
             )
         }
     }
