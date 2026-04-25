@@ -126,3 +126,20 @@ all:
     BUILD +check
     BUILD +clippy
     BUILD +fmt-check
+
+# Repeat a single test N times (default 20). Useful for hunting flakes.
+flake-hunt:
+    ARG TEST=test_debug_trait_repr_vars
+    ARG N=20
+    FROM +build-examples
+    RUN mkdir -p examples/target && \
+        mv examples/_built/debug examples/target/debug
+    RUN --privileged \
+        --mount=type=cache,target=/usr/local/cargo/registry \
+        cargo build --tests --features int_test --test debugger
+    RUN --privileged \
+        for i in $(seq 1 $N); do \
+            echo "[flake-hunt] iteration $i/$N"; \
+            ./target/debug/deps/debugger-* --test-threads=1 --exact $TEST \
+                || { echo "[flake-hunt] FAILED at iteration $i"; exit 1; }; \
+        done

@@ -28,8 +28,22 @@ All notable changes to this project will be documented in this file.
 - `src/debugger/register.rs` split into `src/debugger/register/{mod,
   x86_64,aarch64,debug}.rs`. Public surface under `debugger::register::*`
   and `debugger::register::debug::*` is preserved.
+- doc: new `doc/ROADMAP.md` describing the larger-than-one-PR efforts
+  the codebase is moving towards (Linux/aarch64 port progress, planned
+  time-travel record-and-replay support, eventual native macOS port).
 
 ### Fixed
+
+- call: align the debuggee's RSP to 16 bytes before the inferior `CALL`
+  instruction in `CallHelper::call_fn`, as System V AMD64 requires.
+  Previously the trampoline kept whatever RSP the debuggee was stopped
+  at; depending on which line the breakpoint landed on, RSP was often
+  only 8-aligned, which caused alignment-sensitive callees (anything
+  using `movaps`/`movdqa` on stack locals — `Vec::reserve`,
+  `String::push_str`, …) to take an intermittent `#GP` partway through
+  `Debug::fmt`. Manifested as a flaky
+  `tests/debugger/variables.rs::test_debug_trait_repr_vars` regardless
+  of architecture.
 ### Deprecated
 ### Breaking changes
 

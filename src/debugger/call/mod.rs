@@ -5,7 +5,7 @@ pub use cache::CallCache;
 use super::{
     Debugger, Error, debugee::dwarf::DebugInformation, utils::PopIf, variable::dqe::Literal,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use super::{
     TypeDeclaration,
     address::RelocatedAddress,
@@ -19,16 +19,16 @@ use crate::{
     },
     weak_error,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::{
     debugger::{context::gcx, read_memory_by_pid, utils},
     disable_when_not_stared,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use log::debug;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use nix::sys::{self, signal::Signal, wait::WaitStatus};
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use std::rc::Rc;
 
 #[derive(Debug, thiserror::Error)]
@@ -55,14 +55,8 @@ pub enum CallError {
     Jmp,
 }
 
-// Everything below this point is tightly coupled to the System V AMD64 ABI
-// (argument registers, syscall numbers, INT3 shellcode). It's gated to
-// `target_arch = "x86_64"`; the aarch64 port will grow its own calling
-// convention machinery later. The aarch64 stub impl lives at the bottom
-// of this file.
-
 /// Use general registers or floating point registers.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[derive(Clone, Copy)]
 enum RegType {
     General,
@@ -71,11 +65,11 @@ enum RegType {
 }
 
 /// Function call arguments.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[derive(Default)]
-struct CallArgs(Box<[(u64, RegType)]>);
+pub(super) struct CallArgs(Box<[(u64, RegType)]>);
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn liter_to_arg_bin_repr(
     no: usize,
     lit: &Literal,
@@ -207,7 +201,27 @@ fn get_reg_for_no(no: usize, reg_type: RegType) -> Register {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn get_reg_for_no(no: usize, reg_type: RegType) -> Register {
+    match (no, reg_type) {
+        (0, RegType::General) => Register::X0,
+        (1, RegType::General) => Register::X1,
+        (2, RegType::General) => Register::X2,
+        (3, RegType::General) => Register::X3,
+        (4, RegType::General) => Register::X4,
+        (5, RegType::General) => Register::X5,
+        (6, RegType::General) => Register::X6,
+        (7, RegType::General) => Register::X7,
+        _ => unreachable!("unsupported arg no or unknown register"),
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
+const MAX_REGISTER_ARGS: usize = 6;
+#[cfg(target_arch = "aarch64")]
+const MAX_REGISTER_ARGS: usize = 8;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl CallArgs {
     fn new(literals: &[Literal], fn_params: &[Rc<ComplexType>]) -> Result<Self, CallError> {
         if literals.len() != fn_params.len() {
@@ -217,7 +231,7 @@ impl CallArgs {
             ));
         }
 
-        if literals.len() > 6 {
+        if literals.len() > MAX_REGISTER_ARGS {
             return Err(CallError::TooManyArguments);
         }
 
@@ -232,10 +246,7 @@ impl CallArgs {
 
     /// Fill registers with arguments.
     fn prepare_registers(self, reg_map: &mut RegisterMap) {
-        debug_assert!(
-            self.0.len() < 7,
-            "only 6 6-byte arguments allowed at this moment"
-        );
+        debug_assert!(self.0.len() <= MAX_REGISTER_ARGS);
         for (idx, (val, reg_type)) in self.0.iter().enumerate() {
             reg_map.update(get_reg_for_no(idx, *reg_type), *val);
         }
@@ -243,7 +254,7 @@ impl CallArgs {
 }
 
 /// Call context (or ccx). Program state before a call.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 struct CallContext<'a> {
     dbg: &'a Debugger,
     pid: nix::unistd::Pid,
@@ -252,7 +263,7 @@ struct CallContext<'a> {
     text: usize,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl<'a> CallContext<'a> {
     fn new(dbg: &'a Debugger) -> Result<Self, Error> {
         let pid = dbg.ecx().pid_on_focus();
@@ -290,7 +301,6 @@ impl<'a> CallContext<'a> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 struct CallHelper;
 
 #[cfg(target_arch = "x86_64")]
@@ -309,6 +319,24 @@ impl CallHelper {
         args.prepare_registers(&mut regs);
         regs.update(Register::Rax, fn_addr);
         regs.update(Register::Rip, rip);
+        // System V AMD64 ABI: at the point of `CALL`, RSP must be 16-byte
+        // aligned so that on entry to the callee `RSP + 8` is aligned
+        // (the callee's prologue compensates for the pushed return
+        // address). The debuggee's RSP at the stop point is whatever
+        // its compiler arranged for *that* instruction — typically
+        // 16-aligned at function-call sites but commonly only 8-aligned
+        // mid-function. If we leave it as-is, callees that use
+        // alignment-sensitive instructions (movaps/movdqa on SSE
+        // locals, e.g. inside Vec::reserve/realloc) take a #GP at a
+        // load that happens to land on an odd 8-byte slot — which made
+        // `test_debug_trait_repr_vars` flake whenever the breakpoint
+        // line happened to leave RSP & 0xf == 8.
+        //
+        // Round RSP down to 16 bytes (we're allocating into unused
+        // scratch below the live frame; ccx.regs is restored after the
+        // call so the alignment shim is invisible to the debuggee).
+        let aligned_sp = regs.value(Register::Rsp) & !0xfu64;
+        regs.update(Register::Rsp, aligned_sp);
         regs.persist(ccx.pid)?;
 
         debug!(target: "debugger", "call a function, wait until breakpoint are hit");
@@ -418,6 +446,126 @@ impl CallHelper {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+impl CallHelper {
+    fn call_fn(ccx: &CallContext, pc: u64, fn_addr: u64, args: CallArgs) -> Result<(), Error> {
+        const BLR_X8_BRK0: usize = 0xD420_0000usize << 32 | 0xD63F_0100usize;
+
+        debug!(target: "debugger", "add call instructions");
+        ccx.dbg.write_memory(pc as usize, BLR_X8_BRK0)?;
+
+        debug!(target: "debugger", "prepare function arguments");
+        let mut regs: RegisterMap = ccx.regs.clone();
+        args.prepare_registers(&mut regs);
+        regs.update(Register::X8, fn_addr);
+        regs.update(Register::Pc, pc);
+        regs.persist(ccx.pid)?;
+
+        debug!(target: "debugger", "call a function, wait until breakpoint are hit");
+        sys::ptrace::cont(ccx.pid, None).map_err(Error::Ptrace)?;
+        let res = nix::sys::wait::waitpid(ccx.pid, None).map_err(Error::Waitpid)?;
+        debug_assert!(res == WaitStatus::Stopped(ccx.pid, Signal::SIGTRAP));
+
+        Ok(())
+    }
+
+    fn jump(ccx: &CallContext, dest_ptr: u64) -> Result<(), Error> {
+        debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
+
+        let mut regs = ccx.regs.clone();
+        regs.update(Register::X8, dest_ptr);
+        regs.persist(ccx.pid)?;
+
+        const BR_X8: usize = 0xD61F_0100;
+        const BR_X8_MASK: usize = 0xFFFF_FFFF_0000_0000;
+
+        let new_text = (ccx.text & BR_X8_MASK) | BR_X8;
+
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_text)?;
+
+        sys::ptrace::step(ccx.pid, None).map_err(Error::Ptrace)?;
+        let res = nix::sys::wait::waitpid(ccx.pid, None).map_err(Error::Waitpid)?;
+        debug_assert!(matches!(res, WaitStatus::Stopped(_, _)));
+
+        if RegisterMap::current(ccx.pid)?.value(Register::Pc) != dest_ptr {
+            return Err(CallError::Jmp.into());
+        }
+
+        Ok(())
+    }
+
+    fn mmap(ccx: &CallContext) -> Result<u64, Error> {
+        debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
+
+        let mut regs = ccx.regs.clone();
+        const MMAP: u64 = 222;
+        const PROT: u64 =
+            (nix::libc::PROT_READ | nix::libc::PROT_EXEC | nix::libc::PROT_WRITE) as u64;
+        const FLAGS: u64 = (nix::libc::MAP_PRIVATE | nix::libc::MAP_ANONYMOUS) as u64;
+        regs.update(Register::X8, MMAP);
+        regs.update(Register::X0, 0);
+        let page_size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as u64 };
+        regs.update(Register::X1, page_size);
+        regs.update(Register::X2, PROT);
+        regs.update(Register::X3, FLAGS);
+        regs.update(Register::X4, -1i32 as u64);
+        regs.update(Register::X5, 0);
+
+        regs.persist(ccx.pid)?;
+
+        const SVC_0: usize = 0xD400_0001;
+        const SVC_0_MASK: usize = 0xFFFF_FFFF_0000_0000;
+
+        let new_instructions = (ccx.text & SVC_0_MASK) | SVC_0;
+
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_instructions)?;
+
+        sys::ptrace::step(ccx.pid, None).map_err(Error::Ptrace)?;
+        let res = nix::sys::wait::waitpid(ccx.pid, None).map_err(Error::Waitpid)?;
+        debug_assert!(matches!(res, WaitStatus::Stopped(_, _)));
+
+        let regs = RegisterMap::current(ccx.pid)?;
+        let alloc_ptr: u64 = regs.value(Register::X0);
+        if alloc_ptr as i64 == -1 {
+            return Err(CallError::Mmap.into());
+        }
+
+        debug_assert!(utils::region_exist(ccx.pid, alloc_ptr)?);
+
+        Ok(alloc_ptr)
+    }
+
+    fn munmap(ccx: &CallContext, addr: u64) -> Result<(), Error> {
+        const SVC_0: usize = 0xD400_0001;
+        const SVC_0_MASK: usize = 0xFFFF_FFFF_0000_0000;
+
+        let new_text = (ccx.text & SVC_0_MASK) | SVC_0;
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_text)?;
+
+        let mut regs = ccx.regs.clone();
+        const MUNMAP: u64 = 215;
+        regs.update(Register::X8, MUNMAP);
+        regs.update(Register::X0, addr);
+        let page_size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as u64 };
+        regs.update(Register::X1, page_size);
+        regs.persist(ccx.pid)?;
+
+        sys::ptrace::step(ccx.pid, None).map_err(Error::Ptrace)?;
+        let res = nix::sys::wait::waitpid(ccx.pid, None).map_err(Error::Waitpid)?;
+        debug_assert!(matches!(res, WaitStatus::Stopped(_, _)));
+
+        let regs: RegisterMap = RegisterMap::current(ccx.pid)?;
+        if regs.value(Register::X0) != 0 {
+            return Err(CallError::Munmap.into());
+        }
+        debug_assert!(utils::region_non_exist(ccx.pid, addr)?);
+
+        ccx.dbg.write_memory(ccx.pc.as_usize(), ccx.text)?;
+
+        Ok(())
+    }
+}
+
 impl Debugger {
     pub(crate) fn search_fn_to_call(
         &self,
@@ -464,7 +612,7 @@ impl Debugger {
             .ok_or(CallError::FunctionNotFoundOrTooMany)
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn with_disabled_brkpts<F>(&self, f: F) -> Result<(), Error>
     where
         F: FnOnce(&Self) -> Result<(), Error>,
@@ -486,7 +634,7 @@ impl Debugger {
         cb_result
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(super) fn call_fn_raw(&self, fn_addr: RelocatedAddress, args: CallArgs) -> Result<(), Error> {
         let call_context = CallContext::new(self)?;
 
@@ -510,7 +658,7 @@ impl Debugger {
         })
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn call_fn(&self, linkage_name: &str, arguments: &[Literal]) -> Result<(), Error> {
         debug!(target: "debugger", "find function address and prepare arguments");
 
@@ -526,16 +674,10 @@ impl Debugger {
     ///
     /// * `fn_name`: function to call.
     /// * `arguments`: list of literals.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn call(&mut self, fn_name: &str, arguments: &[Literal]) -> Result<(), Error> {
         disable_when_not_stared!(self);
 
         self.with_disabled_brkpts(|dbg| dbg.call_fn(fn_name, arguments))
-    }
-
-    /// Inferior function calls are not yet implemented on this architecture.
-    #[cfg(not(target_arch = "x86_64"))]
-    pub fn call(&mut self, _fn_name: &str, _arguments: &[Literal]) -> Result<(), Error> {
-        Err(Error::Call(CallError::FunctionNotFoundOrTooMany))
     }
 }
