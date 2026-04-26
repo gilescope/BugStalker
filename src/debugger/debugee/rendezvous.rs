@@ -32,11 +32,18 @@ pub struct Rendezvous {
     #[cfg(target_os = "linux")]
     inner: ffi::r_debug,
     /// Snapshot of dyld's loaded-image list, captured at
-    /// `Rendezvous::new` time. Refreshing on shared-library
-    /// load/unload is a follow-up — wire
-    /// `_dyld_register_func_for_add_image` later.
+    /// `Rendezvous::new` time. The image array is refreshed by
+    /// re-walking `dyld_all_image_infos.infoArray` whenever the
+    /// dyld notification BP fires (see `notification_addr`).
     #[cfg(not(target_os = "linux"))]
     images: Vec<crate::debugger::darwin_mach::ImageInfo>,
+    /// Address of dyld's image-add/remove notification function in
+    /// the debuggee. The macOS analogue of `r_debug.r_brk` — a
+    /// software BP installed here fires on every `dlopen` /
+    /// `dlclose`. Captured at `Rendezvous::new` time; zero if
+    /// dyld hasn't published it yet (transient, just after exec).
+    #[cfg(not(target_os = "linux"))]
+    notification_addr: u64,
 }
 
 impl Rendezvous {
@@ -127,9 +134,15 @@ impl Rendezvous {
         if images.is_empty() {
             return Err(RendezvousError::NotFound);
         }
+        // Best-effort: dyld may not have populated `notification`
+        // yet — that's fine, callers retry once the inferior has
+        // taken at least one stop.
+        let notification_addr =
+            darwin_mach::dyld_notification_addr(task).unwrap_or(0);
         Ok(Self {
             pid: proc_pid,
             images,
+            notification_addr,
         })
     }
 
@@ -162,17 +175,24 @@ impl Rendezvous {
             .collect())
     }
 
-    /// Darwin: dyld doesn't publish an exact `r_brk` equivalent —
-    /// the conventional way to learn about image load/unload is
-    /// `_dyld_register_func_for_add_image` (in-process callbacks).
-    /// For the POC we hand back the address of the first image's
-    /// `mach_header` so the caller's "set a BP here" code installs
-    /// a no-op (the BP will sit at module-start memory which is
-    /// already executable, but won't fire on dyld changes). Module
-    /// load/unload tracking lands as a later follow-up.
+    /// Darwin: dyld publishes a `notification` function in
+    /// `dyld_all_image_infos`; it's called on every image
+    /// load/unload with the mode + count + info-array pointer.
+    /// Installing a software BP here gives us the macOS analogue
+    /// of `r_brk` — same shape, same use ("re-walk images on
+    /// every fire") that the linux side already implements. If
+    /// dyld hasn't filled the field in yet (transient, just after
+    /// exec), we fall back to the main image's load address so
+    /// the caller's "set a BP here" code lands somewhere benign;
+    /// the next `Rendezvous::new` call after dyld is up will
+    /// resolve to the real notification address.
     #[cfg(not(target_os = "linux"))]
     pub fn r_brk(&self) -> RelocatedAddress {
-        self.link_map_main()
+        if self.notification_addr != 0 {
+            RelocatedAddress::from(self.notification_addr as usize)
+        } else {
+            self.link_map_main()
+        }
     }
 }
 

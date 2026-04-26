@@ -331,8 +331,15 @@ struct dyld_all_image_infos_v1 {
     version: u32,
     info_array_count: u32,
     info_array: u64, // *const dyld_image_info in the debuggee
-                     // (further fields ignored — they're version-dependent
-                     //  and we only need infoArray + count for now)
+    /// Function pointer dyld calls on every image add/remove. The
+    /// linux equivalent is the `r_brk` field of the `r_debug`
+    /// rendezvous struct: install a software BP at this address
+    /// and dyld will trap into us each time an image enters or
+    /// leaves the process.
+    notification: u64,
+    // Further fields (`processDetachedFromSharedRegion`,
+    // `libSystemInitialized`, `dyldImageLoadAddress`, …) follow but
+    // we don't read them yet.
 }
 
 #[repr(C)]
@@ -666,6 +673,24 @@ impl Drop for ExceptionPort {
             }
         }
     }
+}
+
+/// Address of dyld's image-load/unload notification function in the
+/// debuggee. Install a software breakpoint here and dyld will stop
+/// the inferior every time it enters this routine to announce a
+/// `dlopen` / `dlclose` (mode is in `x0` / `rdi`, count in `x1` /
+/// `rsi`, info-array pointer in `x2` / `rdx`).
+///
+/// Returns `Ok(0)` if dyld hasn't yet populated the field — that
+/// happens transiently between exec and dyld's first run; callers
+/// should retry after the first stop.
+///
+/// This is the macOS analogue of the linux `r_debug.r_brk` pointer
+/// that `Rendezvous::r_brk` installs a BP at on the linux side.
+pub fn dyld_notification_addr(task: task_t) -> Result<u64, MachError> {
+    let infos_addr = task_dyld_all_image_infos_addr(task)?;
+    let header: dyld_all_image_infos_v1 = read_struct(task, infos_addr)?;
+    Ok(header.notification)
 }
 
 /// Walk the dyld image list and return one `ImageInfo` per loaded
