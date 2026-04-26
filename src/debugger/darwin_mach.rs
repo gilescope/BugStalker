@@ -134,20 +134,14 @@ fn check(kr: kern_return_t) -> Result<(), MachError> {
 /// pair when the caller has the `com.apple.security.cs.debugger`
 /// entitlement — but for a process that called `PT_TRACE_ME`
 /// (e.g. a child we forked + execve'd via `Child::install`) it's
-/// allowed unconditionally.
+/// allowed unconditionally. On failure, `MachError::Display`
+/// surfaces the kr name and the most likely cause (typically
+/// "missing cs.debugger entitlement on the caller").
 pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
     let mut task: mach_port_t = 0;
     // SAFETY: mach_task_self() is always valid; raw_task_for_pid
     // takes an out-port and writes to it iff KERN_SUCCESS.
     let kr = unsafe { raw_task_for_pid(mach_task_self(), pid.as_raw(), &mut task) };
-    if kr != KERN_SUCCESS {
-        eprintln!(
-            "[bs/darwin] task_for_pid({pid}) -> kr={kr:#x} \
-             (KERN_FAILURE=5; KERN_INVALID_ARGUMENT=4; KERN_NO_ACCESS=8 — \
-             likely missing com.apple.security.cs.debugger entitlement \
-             on `bs` itself, or a SIP-protected target)"
-        );
-    }
     check(kr)?;
     Ok(task)
 }
