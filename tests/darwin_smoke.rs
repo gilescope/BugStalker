@@ -161,3 +161,46 @@ fn debugger_runs_to_first_breakpoint() {
     // current ptrace+SIGTRAP shortcut delivers — Mach exception
     // ports land in a follow-up.
 }
+
+/// Allocate a Mach exception port and subscribe it to a freshly
+/// spawned debuggee. Doesn't yet try to *receive* exceptions —
+/// that's the next iteration. Verifying allocation + registration
+/// here means the foundation is in place when the receive loop
+/// lands.
+#[test]
+#[ignore = "needs codesigning; see file header"]
+fn exception_port_allocate_and_register() {
+    use bugstalker::debugger::darwin_mach::{self, ExceptionPort};
+
+    ensure_debuggee_present();
+
+    let (_reader, writer) = pipe().expect("pipe");
+    let runner = Child::new(
+        HELLO_WORLD,
+        Vec::<String>::new(),
+        None::<PathBuf>,
+        writer.try_clone().expect("clone writer"),
+        writer,
+    );
+    let installed = runner.install().expect("Child::install");
+    let pid = installed.pid();
+
+    let port = ExceptionPort::allocate().expect("ExceptionPort::allocate");
+    let task = darwin_mach::task_for_pid(pid).expect("task_for_pid");
+    port.register(task).expect("ExceptionPort::register");
+
+    // Drop the port (releases receive + send) and clean up the
+    // ptraced child the same way the spawn-and-read smoke does.
+    drop(port);
+    let _ = nix::sys::ptrace::cont(pid, Some(nix::sys::signal::SIGKILL));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            Ok(nix::sys::wait::WaitStatus::StillAlive) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => return,
+        }
+    }
+    panic!("debuggee {pid} didn't die within 5s of ptrace::cont(SIGKILL)");
+}

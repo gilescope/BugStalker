@@ -5,7 +5,7 @@ pub mod call;
 mod code;
 mod context;
 #[cfg(target_os = "macos")]
-mod darwin_mach;
+pub mod darwin_mach;
 mod debugee;
 mod error;
 pub mod process;

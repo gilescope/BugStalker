@@ -26,6 +26,15 @@ use mach2::structs::arm_thread_state64_t;
 use mach2::task::task_threads;
 use mach2::thread_act::{thread_get_state, thread_set_state};
 use mach2::thread_status::ARM_THREAD_STATE64;
+use mach2::exception_types::{
+    EXC_MASK_BAD_ACCESS, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE, EXCEPTION_DEFAULT,
+    MACH_EXCEPTION_CODES, exception_mask_t,
+};
+use mach2::mach_port::{mach_port_allocate, mach_port_insert_right};
+use mach2::message::MACH_MSG_TYPE_MAKE_SEND;
+use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_name_t};
+use mach2::task::task_set_exception_ports;
+use mach2::thread_status::THREAD_STATE_NONE;
 use mach2::traps::{mach_task_self, task_for_pid as raw_task_for_pid};
 use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_write};
 use mach2::vm_prot::{VM_PROT_COPY, VM_PROT_READ, VM_PROT_WRITE};
@@ -383,6 +392,109 @@ fn read_cstr(task: task_t, addr: u64, max_len: usize) -> Result<String, MachErro
     let bytes = vm_read_n(task, addr as usize, max_len)?;
     let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     Ok(String::from_utf8_lossy(&bytes[..len]).into_owned())
+}
+
+// --- Mach exception ports --------------------------------------------
+//
+// The `Tracer::resume` darwin path in this crate uses a ptrace+SIGTRAP
+// shortcut that works for single-thread debuggees but races with the
+// debuggee's natural progression after a breakpoint hit. The
+// LLDB-grade replacement is a Mach-native exception-port loop:
+//
+//   1. Allocate a Mach receive port (this struct's
+//      `ExceptionPort::allocate`).
+//   2. Insert a send right onto the same name so we can hand it to
+//      `task_set_exception_ports`.
+//   3. Subscribe to `EXC_MASK_BREAKPOINT | EXC_MASK_SOFTWARE |
+//      EXC_MASK_BAD_ACCESS` on the debuggee's task port — when any
+//      of those exceptions fires in the debuggee the kernel posts a
+//      `mach_exception_raise` message to our port instead of
+//      delivering a UNIX signal (this is how lldb captures
+//      breakpoints with multi-thread discipline).
+//   4. (Iteration 10) `mach_msg` to receive + decode the raised
+//      exception, translate it to `StopReason`, and reply with
+//      `KERN_SUCCESS` (continue) or a non-success kr (let the
+//      kernel deliver the exception to the next handler).
+//
+// This iteration lands the port allocation + registration only;
+// the receive loop and the Tracer wiring are the next chunk.
+
+/// Owned Mach exception port. Drop it and the kernel reaps the
+/// receive right (the send right we duplicated for the task is
+/// also released because both share the same name in this task's
+/// IPC space).
+pub struct ExceptionPort {
+    port: mach_port_name_t,
+}
+
+impl ExceptionPort {
+    /// Allocate a fresh receive port + send right in our own task,
+    /// suitable for handing to `task_set_exception_ports`.
+    pub fn allocate() -> Result<Self, MachError> {
+        let mut port: mach_port_name_t = MACH_PORT_NULL;
+        // SAFETY: mach_task_self() is always valid; mach_port_allocate
+        // writes to `port` iff KERN_SUCCESS.
+        let kr = unsafe {
+            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mut port)
+        };
+        check(kr)?;
+        // Add a send right onto the same name so we can hand it to
+        // task_set_exception_ports without dropping our own receive.
+        // SAFETY: port is the name we just allocated.
+        let kr = unsafe {
+            mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND)
+        };
+        check(kr)?;
+        Ok(Self { port })
+    }
+
+    /// Register this port for the standard debuggee-relevant
+    /// exception set on `task`. The 64-bit `MACH_EXCEPTION_CODES`
+    /// variant is requested so we get full-width fault addresses
+    /// from `EXC_BAD_ACCESS` etc.
+    pub fn register(&self, task: task_t) -> Result<(), MachError> {
+        // EXC_MASK_BREAKPOINT — software-bp BRK and userland traps
+        // EXC_MASK_SOFTWARE — debuggee's __builtin_trap and friends
+        // EXC_MASK_BAD_ACCESS — segfaults, so the debugger can stop
+        //                       at the fault rather than letting the
+        //                       process die silently
+        let mask: exception_mask_t =
+            EXC_MASK_BREAKPOINT | EXC_MASK_SOFTWARE | EXC_MASK_BAD_ACCESS;
+        let behavior: u32 = (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as u32;
+        // SAFETY: task and port are valid mach_port_t values.
+        let kr = unsafe {
+            task_set_exception_ports(
+                task,
+                mask,
+                self.port,
+                behavior as i32,
+                THREAD_STATE_NONE,
+            )
+        };
+        check(kr)?;
+        Ok(())
+    }
+
+    /// Underlying port name. Iteration 10 (the receive + decode
+    /// loop) will use this with `mach_msg`.
+    #[allow(dead_code)]
+    pub fn name(&self) -> mach_port_name_t {
+        self.port
+    }
+}
+
+impl Drop for ExceptionPort {
+    fn drop(&mut self) {
+        if self.port != MACH_PORT_NULL {
+            // SAFETY: we own `self.port`; destroying it releases
+            // both the receive and send rights we hold under that
+            // name in our task's IPC space.
+            unsafe {
+                let _ =
+                    mach2::mach_port::mach_port_destroy(mach_task_self(), self.port);
+            }
+        }
+    }
 }
 
 /// Walk the dyld image list and return one `ImageInfo` per loaded
