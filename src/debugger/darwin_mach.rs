@@ -19,8 +19,13 @@
 use crate::debugger::Error;
 use crate::debugger::Error::Ptrace;
 use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
-use mach2::mach_types::{task_t, vm_task_entry_t};
+use mach2::mach_types::{task_t, thread_act_array_t, thread_act_t, vm_task_entry_t};
+use mach2::message::mach_msg_type_number_t;
 use mach2::port::mach_port_t;
+use mach2::structs::arm_thread_state64_t;
+use mach2::task::task_threads;
+use mach2::thread_act::{thread_get_state, thread_set_state};
+use mach2::thread_status::ARM_THREAD_STATE64;
 use mach2::traps::{mach_task_self, task_for_pid as raw_task_for_pid};
 use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_write};
 use mach2::vm_prot::{VM_PROT_COPY, VM_PROT_READ, VM_PROT_WRITE};
@@ -131,4 +136,77 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
     };
     check(kr)?;
     Ok(())
+}
+
+/// Enumerate all Mach thread ports for a task. Used by the
+/// equivalent of `/proc/<pid>/task/` enumeration on linux —
+/// `Tracer` needs the per-thread ports to read registers / single
+/// step.
+///
+/// The returned array is owned by the task port; today we leak the
+/// out-of-line array on success because there's no good
+/// `vm_deallocate` wrapper in this module yet. TODO when the
+/// thread-list path actually fires more than once per session.
+pub fn task_threads_vec(task: task_t) -> Result<Vec<thread_act_t>, MachError> {
+    let mut threads: thread_act_array_t = std::ptr::null_mut();
+    let mut count: mach_msg_type_number_t = 0;
+    // SAFETY: kernel writes both out-pointers iff KERN_SUCCESS.
+    let kr = unsafe { task_threads(task, &mut threads, &mut count) };
+    check(kr)?;
+    // SAFETY: kernel guarantees the array is `count` `thread_act_t`-wide
+    // contiguous when it returns success.
+    let slice = unsafe { std::slice::from_raw_parts(threads, count as usize) };
+    Ok(slice.to_vec())
+}
+
+/// Read the aarch64 GP register set for a single Mach thread. Use
+/// `task_threads_vec` to get the thread port; for the typical
+/// "stopped at a breakpoint, only one thread" case the first
+/// element is fine.
+pub fn thread_get_arm_state64(thread: thread_act_t) -> Result<arm_thread_state64_t, MachError> {
+    let mut state = arm_thread_state64_t::default();
+    let mut count = arm_thread_state64_t::count();
+    // SAFETY: thread is a valid port; state is sized by `count`
+    // which we initialise to the matching value.
+    let kr = unsafe {
+        thread_get_state(
+            thread,
+            ARM_THREAD_STATE64,
+            &mut state as *mut _ as *mut u32,
+            &mut count,
+        )
+    };
+    check(kr)?;
+    Ok(state)
+}
+
+/// Mirror of `thread_get_arm_state64` for writes.
+pub fn thread_set_arm_state64(
+    thread: thread_act_t,
+    state: &arm_thread_state64_t,
+) -> Result<(), MachError> {
+    let count = arm_thread_state64_t::count();
+    // SAFETY: state lives across the call; the kernel copies and
+    // doesn't retain the pointer.
+    let kr = unsafe {
+        thread_set_state(
+            thread,
+            ARM_THREAD_STATE64,
+            state as *const _ as *mut u32,
+            count,
+        )
+    };
+    check(kr)?;
+    Ok(())
+}
+
+/// Convenience: pick the first thread of `task`. Most early-port
+/// codepaths assume single-thread debuggees; the multi-thread
+/// flow lands once the exception-port loop is in.
+pub fn first_thread_of(task: task_t) -> Result<thread_act_t, MachError> {
+    let threads = task_threads_vec(task)?;
+    threads
+        .first()
+        .copied()
+        .ok_or(MachError(mach2::kern_return::KERN_FAILURE))
 }

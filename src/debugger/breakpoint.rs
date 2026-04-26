@@ -803,15 +803,28 @@ impl Breakpoint {
         Ok(())
     }
 
-    /// Darwin path: the breakpoint opcode and PC-rewind constants
-    /// (`BRK_OPCODE`, `BRK_MASK`, `PC_ADJUST`) are arch-correct on
-    /// aarch64 already; what differs is how we *write* it. Linux
-    /// uses `PTRACE_POKEDATA`; darwin needs
-    /// `mach_vm_write` framed by `mach_vm_protect(VM_PROT_WRITE)` so
-    /// the read-only code page is temporarily writable. Stubbed.
+    /// Darwin path: same `BRK_OPCODE` / `BRK_MASK` / `PC_ADJUST`
+    /// the linux/aarch64 path uses; only the kernel call shape
+    /// changes — we route through `darwin_mach::vm_read_n` /
+    /// `vm_write_word` (which itself widens the page to RW with
+    /// `mach_vm_protect(VM_PROT_COPY|READ|WRITE)` first, so the
+    /// CoW'd text page becomes writable for the duration).
     #[cfg(not(target_os = "linux"))]
     pub fn enable(&self) -> Result<(), Error> {
-        unimplemented!("darwin: Breakpoint::enable via mach_vm_protect + mach_vm_write")
+        use crate::debugger::darwin_mach;
+        let task = darwin_mach::task_for_pid(self.pid)?;
+        let addr = self.addr.as_usize();
+        let bytes = darwin_mach::vm_read_n(task, addr, std::mem::size_of::<u64>())?;
+        let arr: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .expect("vm_read_n returns exactly 8 bytes");
+        let data = u64::from_ne_bytes(arr);
+        self.saved_data.set(data & Self::BRK_MASK);
+        let data_with_pb = (data & !Self::BRK_MASK) | Self::BRK_OPCODE;
+        darwin_mach::vm_write_word(task, addr, data_with_pb as usize)?;
+        self.enabled.set(true);
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -829,7 +842,19 @@ impl Breakpoint {
 
     #[cfg(not(target_os = "linux"))]
     pub fn disable(&self) -> Result<(), Error> {
-        unimplemented!("darwin: Breakpoint::disable via mach_vm_protect + mach_vm_write")
+        use crate::debugger::darwin_mach;
+        let task = darwin_mach::task_for_pid(self.pid)?;
+        let addr = self.addr.as_usize();
+        let bytes = darwin_mach::vm_read_n(task, addr, std::mem::size_of::<u64>())?;
+        let arr: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .expect("vm_read_n returns exactly 8 bytes");
+        let data = u64::from_ne_bytes(arr);
+        let restored: u64 = (data & !Self::BRK_MASK) | self.saved_data.get();
+        darwin_mach::vm_write_word(task, addr, restored as usize)?;
+        self.enabled.set(false);
+        Ok(())
     }
 }
 

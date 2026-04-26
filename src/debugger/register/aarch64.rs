@@ -236,12 +236,40 @@ impl RegisterMap {
     }
 
     /// Darwin path: read the GP register set via Mach
-    /// `thread_get_state(thread, ARM_THREAD_STATE64, …)`. Not yet
-    /// implemented — this is the first runtime hook the macOS port
-    /// needs to fill in.
+    /// `thread_get_state(thread, ARM_THREAD_STATE64, …)`.
+    ///
+    /// The mapping from the Mach `arm_thread_state64_t` layout
+    /// (`__x[29]`, `__fp`, `__lr`, `__sp`, `__pc`, `__cpsr`,
+    /// `__flags`) to the cross-arch `RegisterMap` (`regs[31]`,
+    /// `sp`, `pc`, `pstate`) is:
+    ///   * `regs[0..=28]` ← `__x[0..=28]`
+    ///   * `regs[29]`     ← `__fp` (= x29 / FP)
+    ///   * `regs[30]`     ← `__lr` (= x30 / LR)
+    ///   * `sp`           ← `__sp`
+    ///   * `pc`           ← `__pc`
+    ///   * `pstate`       ← `__cpsr`  (only the low 32 bits are
+    ///                                  meaningful; high bits zero)
+    ///
+    /// We pick the first thread of the task — the existing
+    /// caller (`Tracer` and friends) treats single-threaded
+    /// stops as the common case; multi-thread support arrives
+    /// with the exception-port loop.
     #[cfg(not(target_os = "linux"))]
-    pub fn current(_pid: Pid) -> Result<Self, Error> {
-        unimplemented!("darwin: RegisterMap::current via thread_get_state(ARM_THREAD_STATE64)")
+    pub fn current(pid: Pid) -> Result<Self, Error> {
+        use crate::debugger::darwin_mach;
+        let task = darwin_mach::task_for_pid(pid)?;
+        let thread = darwin_mach::first_thread_of(task)?;
+        let s = darwin_mach::thread_get_arm_state64(thread)?;
+        let mut regs = [0u64; 31];
+        regs[..29].copy_from_slice(&s.__x);
+        regs[29] = s.__fp;
+        regs[30] = s.__lr;
+        Ok(Self {
+            regs,
+            sp: s.__sp,
+            pc: s.__pc,
+            pstate: s.__cpsr as u64,
+        })
     }
 
     /// Architecture-agnostic program counter accessor (aarch64: `pc`).
@@ -350,11 +378,27 @@ impl RegisterMap {
     }
 
     /// Darwin path: write the GP register set via Mach
-    /// `thread_set_state(thread, ARM_THREAD_STATE64, …)`. Stubbed
-    /// alongside `current`.
+    /// `thread_set_state(thread, ARM_THREAD_STATE64, …)`. Inverse
+    /// of `current` above; same single-thread assumption.
     #[cfg(not(target_os = "linux"))]
-    pub fn persist(self, _pid: Pid) -> Result<(), Error> {
-        unimplemented!("darwin: RegisterMap::persist via thread_set_state(ARM_THREAD_STATE64)")
+    pub fn persist(self, pid: Pid) -> Result<(), Error> {
+        use crate::debugger::darwin_mach;
+        use mach2::structs::arm_thread_state64_t;
+        let task = darwin_mach::task_for_pid(pid)?;
+        let thread = darwin_mach::first_thread_of(task)?;
+        let mut x = [0u64; 29];
+        x.copy_from_slice(&self.regs[..29]);
+        let state = arm_thread_state64_t {
+            __x: x,
+            __fp: self.regs[29],
+            __lr: self.regs[30],
+            __sp: self.sp,
+            __pc: self.pc,
+            __cpsr: self.pstate as u32,
+            __pad: 0,
+        };
+        darwin_mach::thread_set_arm_state64(thread, &state)?;
+        Ok(())
     }
 }
 
