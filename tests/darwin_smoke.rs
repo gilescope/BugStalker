@@ -156,4 +156,8 @@ fn debugger_runs_to_first_breakpoint() {
     debugger.start_debugee().expect("start_debugee");
     // If we got here, the breakpoint at hello_world.rs:5 fired and
     // the tracer returned with the debuggee paused inside main.
+    // The next set of assertions (PC at stop, continue-to-exit)
+    // depends on a more disciplined Tracer event loop than the
+    // current ptrace+SIGTRAP shortcut delivers — Mach exception
+    // ports land in a follow-up.
 }
