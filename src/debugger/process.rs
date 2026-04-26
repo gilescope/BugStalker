@@ -306,20 +306,14 @@ impl<S: State> Child<S> {
             });
         }
 
-        match unsafe { fork() }.map_err(|e| Error::Attach(e))? {
+        match unsafe { fork() }.map_err(Error::Attach)? {
             ForkResult::Parent { child: pid } => {
                 // Two stops to expect from a PT_TRACE_ME'd child:
                 //   * SIGTRAP at the post-exec attach point, OR
                 //   * SIGSTOP if the child raise()s before exec.
                 // Either way we just need the child to be paused so
                 // the next phase can attach its Mach exception port.
-                eprintln!("[bs/darwin] fork ok, child pid={pid}; waitpid(WUNTRACED)…");
-                let status = waitpid(pid, Some(WaitPidFlag::WUNTRACED))
-                    .map_err(|e| {
-                        eprintln!("[bs/darwin] waitpid failed: {e:?}");
-                        Error::Attach(e)
-                    })?;
-                eprintln!("[bs/darwin] waitpid returned: {status:?}");
+                let status = waitpid(pid, Some(WaitPidFlag::WUNTRACED)).map_err(Error::Attach)?;
                 debug_assert!(matches!(
                     status,
                     WaitStatus::Stopped(_, signal)
