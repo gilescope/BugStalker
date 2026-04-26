@@ -237,6 +237,39 @@ fn exception_port_receive_times_out() {
     );
 }
 
+/// `thread_suspend` + `thread_resume` round-trip on a worker
+/// thread we control. Suspending the test's *own* main thread
+/// would deadlock the test (it'd never resume itself), so spawn
+/// a worker that publishes its Mach thread port through a channel
+/// and gets suspended from main. We resume immediately so the
+/// suspend count goes back to zero — Mach suspend counts are a
+/// 1:1 nesting count, not a boolean.
+///
+/// This proves the `task_resume` / `task_suspend` family wires
+/// up cleanly; the eventual `Tracer` cutover from ptrace+SIGTRAP
+/// will use them as the resume/pause primitives.
+#[test]
+fn thread_suspend_resume_roundtrip() {
+    use bugstalker::debugger::darwin_mach::{thread_resume, thread_suspend};
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<u32>();
+    std::thread::spawn(move || {
+        // SAFETY: mach_thread_self always succeeds.
+        let me = unsafe { mach2::mach_init::mach_thread_self() };
+        tx.send(me).expect("send port");
+        // Park forever; the test process exits after main returns
+        // and reaps us as a daemon.
+        loop {
+            std::thread::park();
+        }
+    });
+    let worker_port = rx.recv().expect("worker port");
+
+    thread_suspend(worker_port).expect("thread_suspend");
+    thread_resume(worker_port).expect("thread_resume — must rebalance the suspend count");
+}
+
 /// `dyld_image_list` walked against our own task port (no
 /// debuggee, no entitlement) returns at least one image — the
 /// test binary itself — and every entry has a non-zero

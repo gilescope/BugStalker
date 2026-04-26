@@ -235,6 +235,45 @@ pub fn task_threads_vec(task: task_t) -> Result<Vec<thread_act_t>, MachError> {
     Ok(slice.to_vec())
 }
 
+/// Suspend every thread of the task. Each call increments the
+/// task's suspend count; pair with `task_resume` 1:1. The Mach
+/// equivalent of sending `SIGSTOP`, except suspension is reflected
+/// at the kernel level rather than as a delivered signal —
+/// useful for the `Tracer::pause` path once we drop ptrace.
+pub fn task_suspend(task: task_t) -> Result<(), MachError> {
+    // SAFETY: task is a valid task port; task_suspend takes the
+    // port and returns a kr.
+    let kr = unsafe { mach2::task::task_suspend(task) };
+    check(kr)
+}
+
+/// Resume the task — decrement its suspend count by one. Mirror
+/// of `task_suspend`; if the count was 1, the task starts running
+/// again.
+pub fn task_resume(task: task_t) -> Result<(), MachError> {
+    // SAFETY: task is a valid task port; task_resume returns a kr.
+    let kr = unsafe { mach2::task::task_resume(task) };
+    check(kr)
+}
+
+/// Suspend a single thread. Thread suspend counts are independent
+/// of the task suspend count — a thread runs only when *both*
+/// counts are zero. Used by the future single-step path: suspend
+/// every thread except the one we're stepping, set MDSCR_EL1.SS,
+/// resume the chosen thread, wait for an EXC_BREAKPOINT.
+pub fn thread_suspend(thread: thread_act_t) -> Result<(), MachError> {
+    // SAFETY: thread is a valid thread port.
+    let kr = unsafe { mach2::thread_act::thread_suspend(thread) };
+    check(kr)
+}
+
+/// Resume a single thread — mirror of `thread_suspend`.
+pub fn thread_resume(thread: thread_act_t) -> Result<(), MachError> {
+    // SAFETY: thread is a valid thread port.
+    let kr = unsafe { mach2::thread_act::thread_resume(thread) };
+    check(kr)
+}
+
 /// Stable 64-bit identifier for a Mach thread.
 ///
 /// Mach thread *ports* (`thread_act_t`) are u32 IPC names — they're
