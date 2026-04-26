@@ -435,6 +435,36 @@ fn thread_suspend_resume_roundtrip() {
     thread_resume(worker_port).expect("thread_resume — must rebalance the suspend count");
 }
 
+/// `swap_in_temp_exception_port` + `restore_exception_ports`
+/// round-trip on our own task. The pattern that the upcoming
+/// Mach-native `CallHelper` will use for inferior calls — swap a
+/// temp port in, drive the trampoline, swap back — needs the
+/// snapshot-and-restore primitive to be reliable.
+///
+/// Safe against our own task: we register a freshly-allocated
+/// port for `EXC_MASK_BAD_INSTRUCTION` (a mask we don't actually
+/// trigger here), capture the existing chain, restore it, drop
+/// the port. No exceptions are ever raised.
+#[test]
+fn swap_and_restore_exception_ports_self() {
+    use bugstalker::debugger::darwin_mach::{
+        ExceptionPort, restore_exception_ports, swap_in_temp_exception_port,
+    };
+    use mach2::exception_types::{EXCEPTION_DEFAULT, EXC_MASK_BAD_INSTRUCTION, MACH_EXCEPTION_CODES};
+
+    let task = unsafe { mach2::traps::mach_task_self() };
+    let port = ExceptionPort::allocate().expect("allocate");
+    let chain = swap_in_temp_exception_port(
+        task,
+        EXC_MASK_BAD_INSTRUCTION,
+        port.name(),
+        (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as u32,
+    )
+    .expect("swap_in_temp_exception_port");
+
+    restore_exception_ports(task, &chain).expect("restore_exception_ports");
+}
+
 /// `MachError::describe` should decode the codes we actually
 /// hit in production to specific strings — not the generic
 /// "unknown" fallback. Catches typos in the match arms (e.g.

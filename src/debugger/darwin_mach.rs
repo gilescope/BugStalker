@@ -427,6 +427,100 @@ pub fn thread_set_arm_debug_state64(
     Ok(())
 }
 
+/// Snapshot of a task's exception-port chain. Captured by
+/// `swap_in_temp_exception_port` before installing a temporary
+/// port (the LLDB-style pattern for inferior function calls
+/// where the trampoline drives its own exception loop without
+/// disturbing the main `Tracer`'s port).
+///
+/// Pass to `restore_exception_ports` to put the chain back.
+/// `EXC_TYPES_COUNT = 14` is the maximum number of distinct
+/// exception types — see `<mach/arm/exception.h>`.
+pub struct ExceptionPortChain {
+    masks: [exception_mask_t; 14],
+    handlers: [mach_port_t; 14],
+    behaviors: [u32; 14],
+    flavors: [i32; 14],
+    count: u32,
+}
+
+/// Atomically replace the task's exception ports for `mask` with
+/// `new_port`, returning the prior chain so the caller can later
+/// restore it via `restore_exception_ports`.
+///
+/// `mach2::task::task_swap_exception_ports` is the kernel's
+/// atomic-swap primitive — strictly better than the
+/// get-then-set pair LLDB uses, since there's no window where
+/// an exception could be misrouted.
+pub fn swap_in_temp_exception_port(
+    task: task_t,
+    mask: exception_mask_t,
+    new_port: mach_port_t,
+    behavior: u32,
+) -> Result<ExceptionPortChain, MachError> {
+    let mut masks = [0 as exception_mask_t; 14];
+    let mut handlers = [0 as mach_port_t; 14];
+    let mut behaviors = [0u32; 14];
+    let mut flavors = [0i32; 14];
+    let mut count: u32 = 14;
+    // SAFETY: arrays sized for `count`; mach2's task_swap_exception_ports
+    // signature matches.
+    let kr = unsafe {
+        mach2::task::task_swap_exception_ports(
+            task,
+            mask,
+            new_port,
+            behavior as i32,
+            THREAD_STATE_NONE,
+            masks.as_mut_ptr(),
+            &mut count,
+            handlers.as_mut_ptr(),
+            behaviors.as_mut_ptr() as *mut i32,
+            flavors.as_mut_ptr(),
+        )
+    };
+    check(kr)?;
+    Ok(ExceptionPortChain {
+        masks,
+        handlers,
+        behaviors,
+        flavors,
+        count,
+    })
+}
+
+/// Reinstall the exception chain captured by
+/// `swap_in_temp_exception_port`. Each saved entry is pushed back
+/// via `task_set_exception_ports`. Errors on individual entries
+/// are logged and skipped — partial restore is better than no
+/// restore.
+pub fn restore_exception_ports(
+    task: task_t,
+    chain: &ExceptionPortChain,
+) -> Result<(), MachError> {
+    for i in 0..(chain.count as usize) {
+        // SAFETY: entries within `count` are valid as written
+        // by the kernel during the swap.
+        let kr = unsafe {
+            mach2::task::task_set_exception_ports(
+                task,
+                chain.masks[i],
+                chain.handlers[i],
+                chain.behaviors[i] as i32,
+                chain.flavors[i],
+            )
+        };
+        if kr != KERN_SUCCESS {
+            log::warn!(
+                target: "darwin_mach",
+                "restore_exception_ports: entry {} failed kr={:#x}",
+                i, kr
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Arm or disarm hardware single-step on a single Mach thread.
 ///
 /// Software single-step on aarch64 is two-bit cooperation between
