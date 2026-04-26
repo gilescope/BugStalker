@@ -270,6 +270,62 @@ host.
   `spawn_and_read_pc`, `exception_port_allocate_and_register`,
   `debugger_runs_to_first_breakpoint`.
 
+### Inferior calls — design notes
+
+The trampoline driver (`CallHelper::mmap` → `jump` → `call_fn` →
+`munmap`) on aarch64 still uses `ptrace::cont`/`step` + `waitpid`,
+which is incompatible with the pure-Mach Tracer cutover. A
+Mach-native rewrite needs:
+
+1. Allocate a temp `ExceptionPort`.
+2. `swap_in_temp_exception_port(EXC_MASK_BREAKPOINT, temp)` to
+   capture the current chain (the Tracer's port goes there) and
+   install ours. Atomic swap — already implemented in `31c37d4`.
+3. **Release the Tracer's parked thread.** When `CallHelper` is
+   invoked, the inferior's faulting thread is parked at the most
+   recent stop; the kernel is waiting for the Tracer's
+   `pending_reply` to advance it. We must take that reply, send
+   `KERN_SUCCESS`, then write trampoline code, set regs, and
+   block on the temp port for the next exception.
+4. For each trampoline step (mmap/jump/call/munmap):
+   * Write the trampoline instruction at PC.
+   * Set up registers (syscall args, x8/x16 = nr).
+   * For BRK-terminated trampolines (`call_fn`): just resume.
+      For single-instruction steps (`jump`, `mmap`, `munmap`):
+      `arm_set_single_step` + resume.
+   * Reply prior pending → kernel resumes thread → trampoline
+      executes → exception fires → temp port receives.
+   * Save new pending reply for the next step.
+5. After the last step's reply: `restore_exception_ports` to put
+   the Tracer's port back. Update `Tracer::darwin_state.pending_reply`
+   so it reflects the final exception state on our restored port
+   (or clear it; the next `Tracer::resume` call needs a coherent
+   starting state).
+
+**Architectural friction**: step 3 + step 5b need
+`&mut Tracer` access (or interior mutability via `Cell` /
+`RefCell`). The current code path is
+`Debugger::call (&mut)` → `with_disabled_brkpts (&self)` →
+`call_fn (&self)` → `call_fn_raw (&self)` → `CallHelper::* (&CallContext)`.
+Routing `&mut Tracer` through requires either:
+
+* propagating `&mut self` from `call_fn_raw` up through
+  `with_disabled_brkpts`, `call_fn`, and the closure shape — and
+  also through `call_debug_fmt` and the `Print Handler` chain
+  (cascades into `ui::command::print` and the TUI's
+  `tui::components::variables`); or
+* making `DarwinSupervision::pending_reply` a `Cell<Option<…>>`
+  and adding `Tracer::darwin_state(&self) -> Option<&_>` plus a
+  `pub(crate) fn debugee(&self) -> &Debugee` on `Debugger` so
+  `CallHelper` can reach the cell from `&CallContext.dbg`.
+
+The Cell approach is less invasive but needs a new public-ish
+surface on `Tracer` and `Debugger`. Either way, the refactor is
+~150–250 lines spread across 4–6 files. Until it lands,
+`vard`/`argd`/`fmt::call_debug_fmt`/`Debugger::call` return
+`CallError::Mmap` on darwin (clear failure rather than corrupt
+state).
+
 ### Phase 3 — parity with linux/aarch64
 
 * **Cut `Tracer` over from ptrace+SIGTRAP to Mach exception ports.**
