@@ -368,6 +368,60 @@ darwin work (each tracked below):
   dispatches but writes nothing into the inferior's String buffer.
 * `variables::test_debug_trait_repr_vars` — same.
 
+#### LinkerMapFn rendezvous — diagnosis
+
+The legacy GNU-style "set a SW BP at `dyld_all_image_infos.notification`
+and dyld will trap into us on every dlopen" protocol no longer works
+on macOS Sequoia / dyld 4. Confirmed empirically:
+
+* `dyld_all_image_infos.notification` *is* set: at runtime, the field
+  contains the bare 47-bit VA of `_lldb_image_notifier` (offset
+  `0x37938` inside dyld). For arm64 inferiors the stored value is
+  unsigned, not PAC-signed.
+* Installing a SW BP there *does* take effect — `vm_read_n` after
+  `vm_write_word` confirms the `BRK #0` is in the inferior's memory
+  view (read-back: `0xd4200000`).
+* But the BP never fires. dyld disasm shows the call path (`bl
+  __ZN5dyld423ExternallyViewableState20triggerNotificationsE...` →
+  `blraaz x9`) is gated on `RemoteNotificationResponder::active()` —
+  modern dyld funnels module-load notifications through Mach IPC to a
+  registered remote port (the dtrace/Instruments path), and skips the
+  legacy in-process callback when no remote responder is registered.
+* `mach_vm_msync(VM_SYNC_INVALIDATE)` and
+  `mach_vm_machine_attribute(MATTR_CACHE, MATTR_VAL_CACHE_SYNC)` after
+  the BP write don't change anything — this isn't an I-cache /
+  shared-cache CoW issue, dyld really doesn't run that code.
+
+Three viable Phase 3 fixes, in increasing effort:
+
+1. **Hardware instruction breakpoint at `_lldb_image_notifier`.**
+   Bypasses the SW-BP / I-cache / PAC concerns entirely since DBGBVR/
+   DBGBCR trap on instruction fetch regardless of memory contents.
+   Doesn't help here — dyld still doesn't *call* the function.
+2. **HW data watchpoint on `dyld_all_image_infos.infoArrayCount`.**
+   Modern dyld does still update that field on dlopen/dlclose, so a
+   write-watch fires in dyld code; we then refresh deferred BPs.
+   The infrastructure is already there (`HardwareDebugState`).
+3. **Mach IPC via `_dyld_process_info_notify`.** The "real" fix that
+   lldb / Instruments use. Allocate a Mach port, pass it to dyld via
+   `task_dyld_process_info_notify_get`, decode the per-load Mach
+   message format. Largest delta but the only path that scales to
+   multi-process / detached debugees.
+
+#### Debug::fmt empty buffer — diagnosis
+
+`call_debug_fmt` constructs a `String` header (24 bytes, empty Vec
+sentinel) and a `<String as core::fmt::Write>` vtable in inferior
+memory, then calls `<T as Debug>::fmt(&self, &mut formatter)`. The
+call returns success but the post-call read of the String header
+shows the same bytes as the initial empty Vec — write_str was never
+invoked. Likely vtable layout / Formatter struct offsets
+mismatch on darwin/aarch64 vs linux/aarch64; Mach-O lazy stubs are
+*not* in play (vtable holds resolved function addrs in the inferior's
+text segment, not symbol stubs). Needs side-by-side trace of the
+inferior's PC and register state during the call to pinpoint where
+the dispatch diverges.
+
 Recent darwin-specific fixes in this phase:
 
 * CU disambiguation when dsymutil's `low_pc/high_pc` engulfs other

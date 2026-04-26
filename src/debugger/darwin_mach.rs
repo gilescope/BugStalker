@@ -696,9 +696,19 @@ struct dyld_all_image_infos_v1 {
     /// and dyld will trap into us each time an image enters or
     /// leaves the process.
     notification: u64,
-    // Further fields (`processDetachedFromSharedRegion`,
-    // `libSystemInitialized`, `dyldImageLoadAddress`, …) follow but
-    // we don't read them yet.
+    /// `processDetachedFromSharedRegion` (bool) + `libSystemInitialized`
+    /// (bool) + 6 bytes of padding → 8 bytes. We only read this struct
+    /// to extract `notification` and `dyld_image_load_address`, so we
+    /// pack the two booleans + alignment into one u64 and never read
+    /// it back.
+    _flags_and_padding: u64,
+    /// Virtual address of dyld itself (the real `/usr/lib/dyld`,
+    /// not `libdyld.dylib`). Available when `version >= 2`. dyld
+    /// does NOT include itself in `infoArray`, so this is the only
+    /// way to find dyld's slid load address — needed to range-check
+    /// PCs that fall inside dyld pages (e.g. the `_lldb_image_notifier`
+    /// trap point that fires on every dlopen). 0 if `version < 2`.
+    dyld_image_load_address: u64,
 }
 
 #[repr(C)]
@@ -1050,7 +1060,30 @@ impl Drop for ExceptionPort {
 pub fn dyld_notification_addr(task: task_t) -> Result<u64, MachError> {
     let infos_addr = task_dyld_all_image_infos_addr(task)?;
     let header: dyld_all_image_infos_v1 = read_struct(task, infos_addr)?;
-    Ok(header.notification)
+    // Strip PAC bits if present. On arm64e, function pointers stored
+    // in `dyld_all_image_infos.notification` are normally PAC-signed
+    // (paciza). For arm64 inferiors the dyld stores the bare 47-bit
+    // VA, but masking is harmless either way. We use 47-bit VA because
+    // Apple Silicon uses 47-bit user VAs with PAC bits in [47..62].
+    const VA_MASK: u64 = (1u64 << 47) - 1;
+    Ok(header.notification & VA_MASK)
+}
+
+/// Slid virtual address of dyld itself (the real `/usr/lib/dyld`).
+/// Read from `dyld_all_image_infos.dyldImageLoadAddress` (available
+/// when `version >= 2` — every supported macOS does). Returns `Ok(0)`
+/// if dyld hasn't yet populated the field.
+///
+/// dyld does *not* list itself in `infoArray`, so callers that need
+/// to know whether a stopped PC is inside dyld pages have to ask
+/// here rather than walking the image list.
+pub fn dyld_self_load_addr(task: task_t) -> Result<u64, MachError> {
+    let infos_addr = task_dyld_all_image_infos_addr(task)?;
+    let header: dyld_all_image_infos_v1 = read_struct(task, infos_addr)?;
+    if header.version < 2 {
+        return Ok(0);
+    }
+    Ok(header.dyld_image_load_address)
 }
 
 /// Walk the dyld image list and return one `ImageInfo` per loaded
