@@ -179,11 +179,58 @@ impl Child<Installed> {
         })
     }
 
-    /// Darwin path: attach to an existing pid via `task_for_pid` +
-    /// Mach exception ports. Stubbed for the macOS port.
+    /// Darwin: attach to an already-running process by pid.
+    ///
+    /// `ptrace::attach` (BSD `PT_ATTACHEXC`) sends `SIGSTOP` and
+    /// grants the parent the right to call `task_for_pid` on the
+    /// target without the `com.apple.security.cs.debugger`
+    /// entitlement — same handshake the spawn path uses for newly
+    /// forked children. We pull the executable path / cwd / argv
+    /// out of `sysinfo` so the post-attach behaviour mirrors what
+    /// `Child::new` records for spawned processes.
+    ///
+    /// **Multi-thread limitation:** the linux side records every
+    /// tid (from `/proc/<pid>/task/`) so each thread ends up as a
+    /// separate `Tracee`. On darwin, threads are Mach `thread_act_t`
+    /// ports — u32 IPC names, not pids — and the cross-platform
+    /// `Tracee` API is keyed by `Pid`. Until the multi-thread
+    /// enumeration code grows a stable Mach-port → Pid mapping,
+    /// we record only the main pid; per-thread inspection still
+    /// works through `task_threads_vec` from the inside.
     #[cfg(not(target_os = "linux"))]
-    pub fn from_external(_pid: Pid, _stdout: PipeWriter, _stderr: PipeWriter) -> Result<Self, Error> {
-        unimplemented!("darwin: Child::from_external via task_for_pid + Mach exception ports")
+    pub fn from_external(pid: Pid, stdout: PipeWriter, stderr: PipeWriter) -> Result<Self, Error> {
+        use nix::sys::wait::{WaitPidFlag, waitpid};
+        use sysinfo::{RefreshKind, System};
+
+        let sys = System::new_with_specifics(
+            RefreshKind::everything().without_cpu().without_memory(),
+        );
+        let external = System::process(&sys, sysinfo::Pid::from_u32(pid.as_raw() as u32))
+            .ok_or(Error::AttachedProcessNotFound(pid))?;
+        let program = external
+            .exe()
+            .ok_or(Error::AttachedProcessNotFound(pid))?
+            .to_string_lossy()
+            .to_string();
+        let cwd = external.cwd().map(ToOwned::to_owned);
+        let args: Vec<String> = external.cmd().get(1..).unwrap_or(&[]).to_vec();
+
+        // BSD ptrace::attach delivers SIGSTOP and unlocks
+        // task_for_pid. Wait for the resulting stop before we
+        // hand the Child off to the engine.
+        nix::sys::ptrace::attach(pid).map_err(Error::Attach)?;
+        let _ = waitpid(pid, Some(WaitPidFlag::WUNTRACED)).map_err(Error::Attach)?;
+
+        Ok(Self {
+            stdout,
+            stderr,
+            program,
+            args,
+            cwd,
+            pid: Some(pid),
+            external_info: Some(ExternalInfo { threads: vec![pid] }),
+            _p: PhantomData,
+        })
     }
 }
 
