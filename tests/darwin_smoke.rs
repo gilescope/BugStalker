@@ -437,6 +437,44 @@ fn thread_suspend_resume_roundtrip() {
     thread_resume(worker_port).expect("thread_resume — must rebalance the suspend count");
 }
 
+/// `MachError::describe` should decode the codes we actually
+/// hit in production to specific strings — not the generic
+/// "unknown" fallback. Catches typos in the match arms (e.g.
+/// transposing a digit in 0x1000_0002 → 0x1000_0020 would
+/// silently demote MACH_SEND_INVALID_DEST to "unknown").
+#[test]
+fn mach_error_describe_known_codes() {
+    use bugstalker::debugger::darwin_mach::MachError;
+
+    let cases: &[(i32, &str)] = &[
+        (0, "KERN_SUCCESS"),
+        (1, "KERN_INVALID_ADDRESS"),
+        (2, "KERN_PROTECTION_FAILURE"),
+        (4, "KERN_INVALID_ARGUMENT"),
+        (5, "KERN_FAILURE"),
+        (8, "KERN_NO_ACCESS"),
+        (15, "KERN_INVALID_NAME"),
+        (17, "KERN_INVALID_RIGHT"),
+        (37, "KERN_TERMINATED"),
+        (0x10000002u32 as i32, "MACH_SEND_INVALID_DEST"),
+        (0x10004003u32 as i32, "MACH_RCV_TIMED_OUT"),
+    ];
+    for &(kr, expected_prefix) in cases {
+        let desc = MachError(kr).describe();
+        assert!(
+            desc.starts_with(expected_prefix),
+            "kr=0x{kr:08x}: expected describe() to start with {expected_prefix:?}, got {desc:?}"
+        );
+        assert!(
+            !desc.starts_with("unknown"),
+            "kr=0x{kr:08x}: should not fall through to 'unknown'"
+        );
+    }
+
+    // And a code we deliberately don't cover should fall through.
+    assert_eq!(MachError(0xDEAD_BEEFu32 as i32).describe(), "unknown kern_return_t");
+}
+
 /// `thread_get_arm_exception_state64` against a suspended worker.
 /// On a thread that hasn't taken a synchronous exception, FAR/ESR
 /// /exception are typically zero (or whatever the kernel left from
