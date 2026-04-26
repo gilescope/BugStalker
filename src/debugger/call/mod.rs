@@ -673,8 +673,19 @@ impl CallHelper {
     fn mmap(ccx: &CallContext) -> Result<u64, Error> {
         debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
 
+        // The page is used only as a data scratchpad (string header,
+        // vtable copy, Formatter struct, etc.) — no inferior code
+        // ever runs from it. PROT_EXEC was historically requested
+        // for parity with linux's behaviour, but darwin's W^X policy
+        // returns EACCES for any anonymous mapping that asks for
+        // both PROT_WRITE and PROT_EXEC without `MAP_JIT` (which in
+        // turn needs the `com.apple.security.cs.allow-jit`
+        // entitlement). Drop EXEC on darwin — we never need it here.
         let mut regs = ccx.regs.clone();
+        #[cfg(target_os = "linux")]
         const PROT: u64 = (libc::PROT_READ | libc::PROT_EXEC | libc::PROT_WRITE) as u64;
+        #[cfg(not(target_os = "linux"))]
+        const PROT: u64 = (libc::PROT_READ | libc::PROT_WRITE) as u64;
         const FLAGS: u64 = (libc::MAP_PRIVATE | libc::MAP_ANON) as u64;
         regs.update(syscall_abi::NR_REG, syscall_abi::NR_MMAP);
         regs.update(Register::X0, 0);
@@ -694,6 +705,14 @@ impl CallHelper {
         let regs = RegisterMap::current(ccx.pid)?;
         let alloc_ptr: u64 = regs.value(Register::X0);
         if syscall_abi::is_syscall_error(&regs, alloc_ptr) {
+            if std::env::var_os("BS_DARWIN_DEBUG").is_some() {
+                eprintln!(
+                    "[mmap] errno={} pstate=0x{:x} pc=0x{:x}",
+                    alloc_ptr,
+                    regs.value(Register::Pstate),
+                    regs.value(Register::Pc)
+                );
+            }
             return Err(CallError::Mmap.into());
         }
         Ok(alloc_ptr)
