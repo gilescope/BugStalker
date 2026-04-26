@@ -771,23 +771,26 @@ impl Tracer {
                         // Watchpoint check — darwin's analogue of
                         // linux's `siginfo.si_addr`/`TRAP_HWBKPT`
                         // path is the per-thread FAR_EL1 captured
-                        // in `ARM_EXCEPTION_STATE64`. Match against
-                        // the BAS-encoded byte set of every armed
-                        // slot; on a hit, surface as Watchpoint.
+                        // in `ARM_EXCEPTION_STATE64`. The kernel
+                        // sets FAR only on the thread that took
+                        // the abort, so iterate every thread and
+                        // pick the first whose FAR matches an
+                        // armed slot's BAS-encoded byte set.
                         if let Ok(task) = crate::debugger::darwin_mach::task_for_pid(stopped_pid)
-                            && let Ok(thread) = crate::debugger::darwin_mach::first_thread_of(task)
-                            && let Ok(exc) =
-                                crate::debugger::darwin_mach::thread_get_arm_exception_state64(
-                                    thread,
-                                )
+                            && let Ok(threads) =
+                                crate::debugger::darwin_mach::task_threads_vec(task)
                             && let Ok(mut state) =
                                 crate::debugger::register::debug::HardwareDebugState::current(
                                     stopped_pid,
                                 )
                         {
-                            if let Some(dr) =
+                            let hit = threads.iter().find_map(|&thread| {
+                                let exc = crate::debugger::darwin_mach::
+                                    thread_get_arm_exception_state64(thread)
+                                    .ok()?;
                                 state.detect_and_flush_hit(Some(exc.far as usize))
-                            {
+                            });
+                            if let Some(dr) = hit {
                                 let _ = state.sync(stopped_pid);
                                 let hit_type = WatchpointHitType::DebugRegister(dr);
                                 return Ok(StopReason::Watchpoint(
@@ -875,27 +878,32 @@ impl Tracer {
                     // A SIGTRAP during a single-step is normally
                     // the step trap itself — but it can also be a
                     // watchpoint hit if the stepped instruction
-                    // touched a watched address. Probe FAR_EL1
-                    // before declaring the step done.
+                    // touched a watched address. Iterate threads
+                    // and probe each FAR_EL1; the kernel only
+                    // populates it on the faulting thread.
                     let raw_pc = RegisterMap::current(stopped_pid)?.pc();
                     if let Ok(task) = crate::debugger::darwin_mach::task_for_pid(stopped_pid)
-                        && let Ok(thread) = crate::debugger::darwin_mach::first_thread_of(task)
-                        && let Ok(exc) =
-                            crate::debugger::darwin_mach::thread_get_arm_exception_state64(
-                                thread,
-                            )
+                        && let Ok(threads) =
+                            crate::debugger::darwin_mach::task_threads_vec(task)
                         && let Ok(mut state) =
                             crate::debugger::register::debug::HardwareDebugState::current(
                                 stopped_pid,
                             )
-                        && let Some(dr) = state.detect_and_flush_hit(Some(exc.far as usize))
                     {
-                        let _ = state.sync(stopped_pid);
-                        return Ok(Some(StopReason::Watchpoint(
-                            stopped_pid,
-                            crate::debugger::address::RelocatedAddress::from(raw_pc as usize),
-                            WatchpointHitType::DebugRegister(dr),
-                        )));
+                        let hit = threads.iter().find_map(|&thread| {
+                            let exc = crate::debugger::darwin_mach::
+                                thread_get_arm_exception_state64(thread)
+                                .ok()?;
+                            state.detect_and_flush_hit(Some(exc.far as usize))
+                        });
+                        if let Some(dr) = hit {
+                            let _ = state.sync(stopped_pid);
+                            return Ok(Some(StopReason::Watchpoint(
+                                stopped_pid,
+                                crate::debugger::address::RelocatedAddress::from(raw_pc as usize),
+                                WatchpointHitType::DebugRegister(dr),
+                            )));
+                        }
                     }
                     return Ok(None);
                 }
