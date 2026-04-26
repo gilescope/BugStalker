@@ -237,6 +237,47 @@ fn exception_port_receive_times_out() {
     );
 }
 
+/// `thread_set_arm_state64` round-trip on a suspended worker:
+/// snapshot state, mutate `x[0]` to a sentinel, write it back,
+/// re-read, assert the sentinel survives. We don't resume the
+/// worker — between resume and the next suspend it could clobber
+/// x0 by executing one instruction, and we want to test the
+/// kernel-side write semantics, not a race-resistant inferior.
+/// The worker leaks but the test process is short-lived.
+#[test]
+fn thread_set_arm_state64_roundtrip() {
+    use bugstalker::debugger::darwin_mach::{
+        thread_get_arm_state64, thread_set_arm_state64, thread_suspend,
+    };
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<u32>();
+    std::thread::spawn(move || {
+        let me = unsafe { mach2::mach_init::mach_thread_self() };
+        tx.send(me).expect("send port");
+        loop {
+            std::thread::park();
+        }
+    });
+    let worker = rx.recv().expect("worker port");
+
+    thread_suspend(worker).expect("thread_suspend");
+    let mut s = thread_get_arm_state64(worker).expect("thread_get_arm_state64 (before)");
+    let sentinel: u64 = 0xDEAD_BEEF_FEED_FACE;
+    s.__x[0] = sentinel;
+    thread_set_arm_state64(worker, &s).expect("thread_set_arm_state64");
+    let after = thread_get_arm_state64(worker).expect("thread_get_arm_state64 (after)");
+
+    assert_eq!(
+        after.__x[0], sentinel,
+        "x0 didn't survive the set/get round-trip; got {:#x}",
+        after.__x[0]
+    );
+    // PC + SP shouldn't have changed — we only touched x[0].
+    assert_eq!(after.__pc, s.__pc, "PC drifted across set");
+    assert_eq!(after.__sp, s.__sp, "SP drifted across set");
+}
+
 /// `thread_get_arm_state64` against a suspended worker thread:
 /// PC and SP must be non-zero and within the aarch64 user-space
 /// range. We suspend before reading because Mach docs only
