@@ -351,6 +351,42 @@ surface on `Tracer` and `Debugger`. Either way, the refactor is
 `CallError::Mmap` on darwin (clear failure rather than corrupt
 state).
 
+### Status — `tests/debugger` on darwin/aarch64
+
+Running with `--test-threads=1 --skip multithreaded --skip tokio
+--skip signal --skip test_step_over_for_loop_issue_156 --skip
+test_read_tls`: **58 passed, 4 failed, 1 ignored, 12 filtered out
+(75 runnable)**.
+
+Remaining runnable failures, all known categories needing additional
+darwin work (each tracked below):
+
+* `breakpoints::test_brkpt_on_line_collision` — dyld notification
+  BP not catching dlopen events (LinkerMapFn rendezvous).
+* `breakpoints::test_deferred_breakpoint` — same.
+* `variables::test_debug_trait_repr_args` — Debug::fmt vtable call
+  dispatches but writes nothing into the inferior's String buffer.
+* `variables::test_debug_trait_repr_vars` — same.
+
+Recent darwin-specific fixes in this phase:
+
+* CU disambiguation when dsymutil's `low_pc/high_pc` engulfs other
+  CUs (`95e477d`).
+* Mach-O eh_frame BaseAddresses use `__eh_frame` etc. (`3b3c514`).
+* Dylib slide computed from per-file `__TEXT.vmaddr`, not assumed 0
+  (`c08b87a`).
+* `mmap` for inferior calls drops PROT_EXEC (W^X EACCES) (`d486a1c`).
+* Stray BRK in dyld pages no longer surfaces as SignalStop SIGTRAP
+  (`b8a3965`).
+* `Tracee::location()` falls back to identity when registry has no
+  mapping for PC (e.g. internal stops in dyld).
+* `restart_debugee` no longer fails on LinkerMapFn BPs (`166e16b`).
+* Mach-O symbol-name regex strips leading `_` (`0ec4e1e`).
+* Test fixtures: `.comment` fallback to workspace MSRV; backtrace
+  test asserts a sane lower bound rather than libc-startup-chain
+  exact count.
+* Test runner self-signs + re-execs if missing `cs.debugger`.
+
 ### Phase 3 — parity with linux/aarch64
 
 * **Cut `Tracer` over from ptrace+SIGTRAP to Mach exception ports.**
