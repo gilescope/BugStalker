@@ -804,9 +804,15 @@ impl DebugInformationBuilder {
         })?;
         #[cfg(target_arch = "aarch64")]
         eh_frame.set_vendor(gimli::Vendor::AArch64);
-        let section_addr = |name: &str| -> Option<u64> {
+        // Section names differ across container formats:
+        //   ELF:    `.text`, `.eh_frame`, `.eh_frame_hdr`, `.got`
+        //   Mach-O: `__text`, `__eh_frame`, `__got` (no `.eh_frame_hdr`
+        //           on darwin — `.eh_frame_hdr` is a GNU/ELF extension).
+        // Try both spellings; whichever the object reports wins.
+        let section_addr = |names: &[&str]| -> Option<u64> {
             file.sections().find_map(|section| {
-                if section.name().ok()? == name {
+                let n = section.name().ok()?;
+                if names.iter().any(|w| *w == n) {
                     Some(section.address())
                 } else {
                     None
@@ -814,16 +820,16 @@ impl DebugInformationBuilder {
             })
         };
         let mut bases = BaseAddresses::default();
-        if let Some(got) = section_addr(".got") {
+        if let Some(got) = section_addr(&[".got", "__got"]) {
             bases = bases.set_got(got);
         }
-        if let Some(text) = section_addr(".text") {
+        if let Some(text) = section_addr(&[".text", "__text"]) {
             bases = bases.set_text(text);
         }
-        if let Some(eh) = section_addr(".eh_frame") {
+        if let Some(eh) = section_addr(&[".eh_frame", "__eh_frame"]) {
             bases = bases.set_eh_frame(eh);
         }
-        if let Some(eh_frame_hdr) = section_addr(".eh_frame_hdr") {
+        if let Some(eh_frame_hdr) = section_addr(&[".eh_frame_hdr"]) {
             bases = bases.set_eh_frame_hdr(eh_frame_hdr);
         }
 
