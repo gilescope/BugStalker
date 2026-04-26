@@ -72,6 +72,14 @@ pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
     // SAFETY: mach_task_self() is always valid; raw_task_for_pid
     // takes an out-port and writes to it iff KERN_SUCCESS.
     let kr = unsafe { raw_task_for_pid(mach_task_self(), pid.as_raw(), &mut task) };
+    if kr != KERN_SUCCESS {
+        eprintln!(
+            "[bs/darwin] task_for_pid({pid}) -> kr={kr:#x} \
+             (KERN_FAILURE=5; KERN_INVALID_ARGUMENT=4; KERN_NO_ACCESS=8 — \
+             likely missing com.apple.security.cs.debugger entitlement \
+             on `bs` itself, or a SIP-protected target)"
+        );
+    }
     check(kr)?;
     Ok(task)
 }

@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Allow `task_for_pid` on processes we attach to. Required
+         on modern macOS (>= 10.11 with SIP). -->
+    <key>com.apple.security.cs.debugger</key>
+    <true/>
+    <!-- Allow other processes to call `task_for_pid` on US (so a
+         debugger could attach to bs itself for self-debug). Useful
+         for development; not strictly required for the debuggee
+         attach path. -->
+    <key>com.apple.security.get-task-allow</key>
+    <true/>
+</dict>
+</plist>

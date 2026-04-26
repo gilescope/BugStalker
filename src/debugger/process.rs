@@ -313,8 +313,13 @@ impl<S: State> Child<S> {
                 //   * SIGSTOP if the child raise()s before exec.
                 // Either way we just need the child to be paused so
                 // the next phase can attach its Mach exception port.
-                let status = waitpid(pid, Some(WaitPidFlag::WSTOPPED))
-                    .map_err(|e| Error::Attach(e))?;
+                eprintln!("[bs/darwin] fork ok, child pid={pid}; waitpid(WUNTRACED)…");
+                let status = waitpid(pid, Some(WaitPidFlag::WUNTRACED))
+                    .map_err(|e| {
+                        eprintln!("[bs/darwin] waitpid failed: {e:?}");
+                        Error::Attach(e)
+                    })?;
+                eprintln!("[bs/darwin] waitpid returned: {status:?}");
                 debug_assert!(matches!(
                     status,
                     WaitStatus::Stopped(_, signal)
