@@ -91,7 +91,7 @@ libc = "0.2"
 # x86_64/i686 only). Pinned by rev for reproducibility.
 [dependencies.thread_db]
 git = "https://github.com/gilescope/thread_db"
-rev = "453658a"
+rev = "c36ca728d12aff4083375b7823fcf5794c2438a5"
 
 [dev-dependencies]
 serial_test = "3.2.0"
