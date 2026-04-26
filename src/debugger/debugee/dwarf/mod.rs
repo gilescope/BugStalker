@@ -241,19 +241,72 @@ impl DebugInformation {
     /// * `pc`: program counter value
     ///
     /// returns: `None` if unit not found, error if no debug information found
+    ///
+    /// **Note on darwin:** dsymutil emits per-CU `DW_AT_low_pc` /
+    /// `DW_AT_high_pc` covering the full enclosing range even when
+    /// the CU's actual code is non-contiguous (and the *between*
+    /// addresses belong to other CUs). The naive "first match" walk
+    /// then picks the CU with the widest claim — typically a
+    /// generic instantiation CU whose range engulfs unrelated code
+    /// — and the line lookup ends up in some other source file
+    /// (e.g. `alloc/sync.rs:2226`). To stay correct we collect all
+    /// candidate CUs and prefer the one whose own line table has
+    /// an entry exactly at `pc`; that's a unit which actually
+    /// generated this instruction, not just one that happens to
+    /// span it. Falls back to the tightest range otherwise.
     fn find_unit_by_pc(&self, pc: GlobalAddress) -> Result<Option<&BsUnit>, Error> {
-        Ok(self.get_units()?.iter().find(|&unit| {
-            match unit
+        let pc_u = u64::from(pc);
+        let mut candidates: Vec<&BsUnit> = Vec::new();
+        for unit in self.get_units()?.iter() {
+            let in_range = match unit
                 .ranges()
-                .binary_search_by_key(&(pc.into()), |r| r.begin)
+                .binary_search_by_key(&pc_u, |r| r.begin)
             {
                 Ok(_) => true,
                 Err(pos) => unit.ranges()[..pos]
                     .iter()
                     .rev()
                     .any(|range| pc.in_range(range)),
+            };
+            if in_range {
+                candidates.push(unit);
             }
-        }))
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        if candidates.len() == 1 {
+            return Ok(Some(candidates[0]));
+        }
+        // Prefer a unit whose own line program has an exact entry at pc.
+        if let Some(exact) = candidates
+            .iter()
+            .find(|u| u.find_exact_place_by_pc(pc).is_some())
+        {
+            return Ok(Some(*exact));
+        }
+        // Otherwise pick the unit with the tightest enclosing range —
+        // the smallest `(end - begin)` containing `pc`. dsymutil's
+        // CU-spanning ranges lose this contest to a real per-function
+        // range every time.
+        let mut best: Option<(&BsUnit, u64)> = None;
+        for unit in &candidates {
+            let mut tightest: Option<u64> = None;
+            for range in unit.ranges() {
+                if pc_u >= range.begin && pc_u < range.end {
+                    let span = range.end - range.begin;
+                    if tightest.is_none_or(|t| span < t) {
+                        tightest = Some(span);
+                    }
+                }
+            }
+            if let Some(span) = tightest
+                && best.is_none_or(|(_, b)| span < b)
+            {
+                best = Some((unit, span));
+            }
+        }
+        Ok(best.map(|(u, _)| u).or_else(|| candidates.first().copied()))
     }
 
     /// Returns best matched place by program counter global address.

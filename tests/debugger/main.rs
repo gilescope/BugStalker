@@ -31,7 +31,88 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::thread;
 
+/// Darwin: ensure the running test binary carries the
+/// `com.apple.security.cs.debugger` entitlement; without it,
+/// `task_for_pid` on the spawned inferior returns KERN_FAILURE
+/// even though we own the child. Cargo rebuilds wipe ad-hoc
+/// signatures, so we self-sign + re-exec on first run if the
+/// entitlement is missing. Idempotent — once the running image
+/// already has it, this is a no-op.
+#[cfg(target_os = "macos")]
+fn ensure_entitled_self_or_reexec() {
+    use std::process::Command;
+    use std::sync::OnceLock;
+    static GUARD: OnceLock<()> = OnceLock::new();
+    if GUARD.get().is_some() {
+        return;
+    }
+    if std::env::var_os("BS_DARWIN_RESIGNED").is_some() {
+        // Already re-exec'd once; if it still isn't entitled, give up
+        // rather than loop. The earlier `codesign` clearly succeeded.
+        let _ = GUARD.set(());
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = GUARD.set(());
+            return;
+        }
+    };
+    // Probe entitlements; if cs.debugger is already present, nothing to do.
+    let out = Command::new("codesign")
+        .args(["-d", "--entitlements", "-"])
+        .arg(&exe)
+        .output();
+    if let Ok(out) = &out {
+        let blob = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+        if blob.contains("com.apple.security.cs.debugger") {
+            let _ = GUARD.set(());
+            return;
+        }
+    }
+    // Locate the entitlements plist relative to the workspace.
+    let plist = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/darwin.entitlements");
+    if !plist.exists() {
+        eprintln!("[bs/test] entitlements plist not found at {plist:?}; skipping resign");
+        let _ = GUARD.set(());
+        return;
+    }
+    let status = Command::new("codesign")
+        .args(["--entitlements"])
+        .arg(&plist)
+        .args(["--force", "--sign", "-"])
+        .arg(&exe)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            // Re-exec ourselves so the kernel picks up the new
+            // signature. The original `cargo test` invocation will
+            // see this child's exit code as the test result.
+            let mut cmd = Command::new(&exe);
+            cmd.args(std::env::args_os().skip(1));
+            cmd.env("BS_DARWIN_RESIGNED", "1");
+            // Use exec to avoid leaving a stub parent behind.
+            use std::os::unix::process::CommandExt;
+            let err = cmd.exec();
+            eprintln!("[bs/test] failed to re-exec after resign: {err}");
+            std::process::exit(70);
+        }
+        Ok(s) => {
+            eprintln!("[bs/test] codesign exited with status {s}; tests will likely fail");
+        }
+        Err(e) => {
+            eprintln!("[bs/test] codesign failed to spawn: {e}");
+        }
+    }
+    let _ = GUARD.set(());
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_entitled_self_or_reexec() {}
+
 pub fn prepare_debugee_process(prog: &str, args: &[&'static str]) -> Child<Installed> {
+    ensure_entitled_self_or_reexec();
     let (reader, writer) = os_pipe::pipe().unwrap();
 
     thread::spawn(move || {

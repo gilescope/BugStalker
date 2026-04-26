@@ -113,8 +113,15 @@ impl From<MachError> for Error {
         // honest mapping for "Mach denied access". We log the
         // detailed kr+description at error level so callers grep'ing
         // logs see what actually went wrong rather than a bare
-        // EFAULT.
+        // EFAULT. Set `BS_DARWIN_DEBUG=1` to also print a stderr
+        // backtrace at the conversion site — useful when the
+        // caller surfaces a bare `Ptrace(EFAULT)` and you need to
+        // see which Mach call started the chain.
         log::error!(target: "darwin_mach", "{}", e);
+        if std::env::var_os("BS_DARWIN_DEBUG").is_some() {
+            eprintln!("[darwin_mach->Error] {}", e);
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
         Ptrace(Errno::EFAULT)
     }
 }
