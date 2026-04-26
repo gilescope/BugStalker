@@ -70,8 +70,8 @@ impl Debugger {
     ///
     /// # Errors
     ///
-    /// Return [`SetupError::PlaceNotFound`] if no place found for address,
-    /// return [`BreakpointError::DebugInformation`] if errors occur while fetching debug information.
+    /// Return [`Error::PlaceNotFound`] if no place found for address,
+    /// return [`Error::NoDebugInformation`] if errors occur while fetching debug information.
     pub fn set_breakpoint_at_addr(
         &mut self,
         addr: RelocatedAddress,
@@ -274,8 +274,8 @@ impl Debugger {
     ///
     /// # Errors
     ///
-    /// Return [`SetupError::PlaceNotFound`] if function not found,
-    /// return [`BreakpointError::DebugInformation`] if errors occur while fetching debug information.
+    /// Return [`Error::PlaceNotFound`] if function not found,
+    /// return [`Error::NoDebugInformation`] if errors occur while fetching debug information.
     pub fn set_breakpoint_at_fn(
         &mut self,
         template: &str,
@@ -339,8 +339,8 @@ impl Debugger {
     ///
     /// # Errors
     ///
-    /// Return [`SetupError::PlaceNotFound`] if line or file not exist,
-    /// return [`BreakpointError::DebugInformation`] if errors occur while fetching debug information.
+    /// Return [`Error::PlaceNotFound`] if line or file not exist,
+    /// return [`Error::NoDebugInformation`] if errors occur while fetching debug information.
     pub fn set_breakpoint_at_line(
         &mut self,
         fine_path_tpl: &str,

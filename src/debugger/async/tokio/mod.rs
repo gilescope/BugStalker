@@ -27,7 +27,7 @@ impl Display for TokioVersion {
 
 /// Temporary function, parse tokio version from static string found in `rodata`` section.
 ///
-/// WAITFORFIX: https://github.com/tokio-rs/tokio/issues/6950
+/// WAITFORFIX: <https://github.com/tokio-rs/tokio/issues/6950>
 pub fn extract_tokio_version_naive(rodata: &[u8]) -> Option<TokioVersion> {
     const TOKIO_V_TPL: &str = "tokio-1.";
 
