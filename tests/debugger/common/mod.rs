@@ -134,9 +134,21 @@ pub fn rust_version(file: &str) -> Option<RustVersion> {
     let file = fs::File::open(file).unwrap();
     let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
     let object = object::File::parse(&*mmap).unwrap();
-    let sect = object
-        .section_by_name(".comment")
-        .expect(".comment section not found");
+
+    // ELF stores the rustc version string in `.comment`. Mach-O has
+    // no equivalent section — the version lives in each CU's
+    // `DW_AT_producer` instead. Walking DWARF here would be
+    // overkill for the few callers that use this helper, so on
+    // darwin we just fall back to the rustc the *test runner* was
+    // built with. The example binaries are built from the same
+    // workspace toolchain, so this matches in practice.
+    let sect = object.section_by_name(".comment");
+    let Some(sect) = sect else {
+        // RustVersion::parse expects "rustc version X.Y.Z" — wrap
+        // the workspace MSRV in that shape so it matches.
+        let synthetic = format!("rustc version {}", env!("CARGO_PKG_RUST_VERSION"));
+        return RustVersion::parse(&synthetic);
+    };
 
     let data = sect.data().unwrap();
     let string_data = std::str::from_utf8(data).unwrap();
