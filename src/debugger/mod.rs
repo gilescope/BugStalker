@@ -402,7 +402,29 @@ impl Debugger {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let object = object::File::parse(&*mmap)?;
 
+        // `object.entry()`:
+        //   linux ELF: returns a virtual address (PIE: an RVA;
+        //     non-PIE: a fixed VA). The downstream `GlobalAddress`
+        //     + `mapping_offset` flow expects this RVA-style value.
+        //   darwin Mach-O: returns the LC_MAIN `entryoff` — a
+        //     __TEXT-relative offset (e.g. `0x9F8` for hello_world,
+        //     not `0x1000009F8`). Add `__TEXT.vmaddr` to convert
+        //     into a runtime VA assuming the default load base,
+        //     matching the convention DWARF line tables use on
+        //     Mach-O. The shared `mapping_offset = slide` then
+        //     applies uniformly across DWARF and entry.
+        #[cfg(target_os = "linux")]
         let entry_point = GlobalAddress::from(object.entry());
+        #[cfg(not(target_os = "linux"))]
+        let entry_point = {
+            use object::{Object, ObjectSegment};
+            let text_vmaddr = object
+                .segments()
+                .find(|s| s.name().ok().flatten() == Some("__TEXT"))
+                .map(|s| s.address())
+                .unwrap_or(0);
+            GlobalAddress::from(object.entry() + text_vmaddr)
+        };
         let mut breakpoints = BreakpointRegistry::default();
         breakpoints.add_uninit(UninitBreakpoint::new_entry_point(
             None::<PathBuf>,

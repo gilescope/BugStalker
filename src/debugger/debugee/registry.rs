@@ -112,7 +112,28 @@ impl DwarfRegistry {
                 .max_by(|map1, map2| map1.start().cmp(&map2.start()))
                 .expect("at least one mapping must exists");
 
+            // mapping_offset semantics differ across OSes:
+            //   linux PIE ELF: DWARF/symbol addresses are RVAs
+            //     (relative to load base 0); mapping_offset is
+            //     the runtime load base.
+            //   darwin Mach-O: DWARF/symbol addresses are
+            //     pre-relocated to runtime VAs assuming the
+            //     default __TEXT.vmaddr (typically 0x1_0000_0000).
+            //     mapping_offset must be the *slide* — i.e.
+            //     load_base - __TEXT.vmaddr — not load_base.
+            //
+            // With POSIX_SPAWN_DISABLE_ASLR the slide is 0 on
+            // darwin, so DWARF addresses resolve directly.
+            // Reading __TEXT.vmaddr per-file would require
+            // re-parsing the Mach-O header here; for now treat
+            // mapping_offset as 0 on darwin (assumes ASLR-disabled
+            // spawn, which Child::install enforces). Real ASLR
+            // handling lands when attach-by-pid (where we don't
+            // control the slide) gets exercised end-to-end.
+            #[cfg(target_os = "linux")]
             let mapping = lower_sect.start();
+            #[cfg(not(target_os = "linux"))]
+            let mapping = 0usize;
 
             let range = RegionRange {
                 from: RelocatedAddress::from(lower_sect.start()),
