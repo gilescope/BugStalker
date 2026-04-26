@@ -61,7 +61,10 @@ use crate::oracle::Oracle;
 use crate::{print_warns, weak_error};
 use indexmap::IndexMap;
 use log::debug;
-use nix::libc::{c_void, uintptr_t};
+use nix::libc::uintptr_t;
+#[cfg(target_os = "linux")]
+use nix::libc::c_void;
+#[cfg(target_os = "linux")]
 use nix::sys;
 use nix::sys::signal;
 use nix::sys::signal::{SIGKILL, Signal};
@@ -70,6 +73,7 @@ use nix::unistd::Pid;
 use object::Object;
 use os_pipe::PipeWriter;
 use regex::Regex;
+#[cfg(target_os = "linux")]
 use std::ffi::c_long;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -479,12 +483,26 @@ impl Debugger {
             .collect();
 
         if !current_tids.is_empty() {
-            current_tids
-                .iter()
-                .try_for_each(|tid| sys::ptrace::detach(*tid, None).map_err(Ptrace))?;
+            #[cfg(target_os = "linux")]
+            {
+                current_tids
+                    .iter()
+                    .try_for_each(|tid| sys::ptrace::detach(*tid, None).map_err(Ptrace))?;
 
-            signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGCONT)
-                .map_err(|e| Syscall("kill", e))?;
+                signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGCONT)
+                    .map_err(|e| Syscall("kill", e))?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Darwin: no ptrace relationship to detach. Drop
+                // the Mach suspend count so the inferior can run
+                // free from us.
+                if let Ok(task) =
+                    darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid())
+                {
+                    let _ = darwin_mach::task_resume(task);
+                }
+            }
         }
 
         self.detached = true;
@@ -1274,12 +1292,23 @@ impl Drop for Debugger {
                 .collect();
 
             if !current_tids.is_empty() {
-                current_tids.iter().for_each(|tid| {
-                    sys::ptrace::detach(*tid, None).expect("detach debugee");
-                });
+                #[cfg(target_os = "linux")]
+                {
+                    current_tids.iter().for_each(|tid| {
+                        sys::ptrace::detach(*tid, None).expect("detach debugee");
+                    });
 
-                signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGCONT)
-                    .expect("kill debugee");
+                    signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGCONT)
+                        .expect("kill debugee");
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    if let Ok(task) =
+                        darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid())
+                    {
+                        let _ = darwin_mach::task_resume(task);
+                    }
+                }
             }
 
             return;
@@ -1305,20 +1334,36 @@ impl Drop for Debugger {
                     .map(|t| t.pid)
                     .collect();
 
-                // todo currently ok only if all threads in group stop
-                // continue all threads with SIGSTOP
-                let prepare_stopped: Vec<_> = current_tids
-                    .into_iter()
-                    .filter(|&tid| sys::ptrace::cont(tid, Signal::SIGSTOP).is_ok())
-                    .collect();
-                let stopped: Vec<_> = prepare_stopped
-                    .into_iter()
-                    .filter(|&tid| waitpid(tid, None).is_ok())
-                    .collect();
-                // detach ptrace
-                stopped.into_iter().for_each(|tid| {
-                    sys::ptrace::detach(tid, None).expect("detach tracee");
-                });
+                #[cfg(target_os = "linux")]
+                {
+                    // todo currently ok only if all threads in group stop
+                    // continue all threads with SIGSTOP
+                    let prepare_stopped: Vec<_> = current_tids
+                        .into_iter()
+                        .filter(|&tid| sys::ptrace::cont(tid, Signal::SIGSTOP).is_ok())
+                        .collect();
+                    let stopped: Vec<_> = prepare_stopped
+                        .into_iter()
+                        .filter(|&tid| waitpid(tid, None).is_ok())
+                        .collect();
+                    // detach ptrace
+                    stopped.into_iter().for_each(|tid| {
+                        sys::ptrace::detach(tid, None).expect("detach tracee");
+                    });
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // Darwin: no ptrace. Drop the Mach suspend
+                    // count so SIGKILL can actually be processed
+                    // (kernel won't deliver signals to a fully
+                    // suspended task).
+                    let _ = current_tids; // captured for symmetry; unused on darwin
+                    if let Ok(task) =
+                        darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid())
+                    {
+                        let _ = darwin_mach::task_resume(task);
+                    }
+                }
                 // kill debugee process
                 signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGKILL)
                     .expect("kill debugee");

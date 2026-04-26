@@ -21,12 +21,20 @@ use crate::{
 };
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::{
-    debugger::{context::gcx, read_memory_by_pid, utils},
+    debugger::{context::gcx, read_memory_by_pid},
     disable_when_not_stared,
 };
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux")
+))]
+use crate::debugger::utils;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use log::debug;
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux")
+))]
 use nix::sys::{self, signal::Signal, wait::WaitStatus};
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use std::rc::Rc;
@@ -446,7 +454,18 @@ impl CallHelper {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+// aarch64 CallHelper still uses ptrace::cont / ptrace::step to
+// drive the trampoline (cont-until-BRK + single-step). That works
+// on linux/aarch64 but is incompatible with the darwin/aarch64
+// pure-Mach Tracer cutover (`Child::install` no longer calls
+// PT_TRACE_ME, so the inferior isn't in a ptrace relationship and
+// these ptrace ops fail). A Mach-native CallHelper for darwin
+// would need to allocate a temporary exception port, swap it in
+// over the Tracer's port via task_set_exception_ports (saving the
+// original via the LLDB-style SaveExceptionPortInfo pattern),
+// drive task_resume / arm_set_single_step + port.receive for each
+// trampoline step, then restore. Deferred — see roadmap.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 impl CallHelper {
     fn call_fn(ccx: &CallContext, pc: u64, fn_addr: u64, args: CallArgs) -> Result<(), Error> {
         const BLR_X8_BRK0: usize = 0xD420_0000usize << 32 | 0xD63F_0100usize;
@@ -555,6 +574,30 @@ impl CallHelper {
         ccx.dbg.write_memory(ccx.pc.as_usize(), ccx.text)?;
 
         Ok(())
+    }
+}
+
+/// Darwin/aarch64 stub CallHelper. Inferior function calls
+/// (`vard`, `argd`, `fmt::call_debug_fmt`, `Debugger::call`) are
+/// not yet wired to the Mach exception-port loop — the linux
+/// impl above uses ptrace::cont/step which is incompatible with
+/// our pure-Mach Tracer cutover. Returning a clear `Mmap` error
+/// (the first step the caller takes) keeps the engine's state
+/// machine intact and surfaces the gap to the user instead of
+/// hanging or corrupting the inferior.
+#[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
+impl CallHelper {
+    fn call_fn(_ccx: &CallContext, _pc: u64, _fn_addr: u64, _args: CallArgs) -> Result<(), Error> {
+        Err(CallError::Mmap.into())
+    }
+    fn jump(_ccx: &CallContext, _dest_ptr: u64) -> Result<(), Error> {
+        Err(CallError::Jmp.into())
+    }
+    fn mmap(_ccx: &CallContext) -> Result<u64, Error> {
+        Err(CallError::Mmap.into())
+    }
+    fn munmap(_ccx: &CallContext, _addr: u64) -> Result<(), Error> {
+        Err(CallError::Munmap.into())
     }
 }
 

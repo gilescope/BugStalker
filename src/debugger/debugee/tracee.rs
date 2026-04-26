@@ -68,6 +68,10 @@ impl Tracee {
     }
 
     /// Move the stopped tracee process forward by a single instruction step.
+    /// Linux-only — the darwin Tracer drives stepping through
+    /// `arm_set_single_step` + `task_resume` + Mach exception
+    /// receive; no caller on darwin reaches this.
+    #[cfg(target_os = "linux")]
     pub fn step(&self, sig: Option<Signal>) -> Result<(), Error> {
         sys::ptrace::step(self.pid, sig).map_err(Ptrace)
     }
@@ -82,6 +86,9 @@ impl Tracee {
     }
 
     /// Resume tracee with, if signal is some - inject signal or resuming.
+    /// Linux-only — darwin's Tracer uses `task_resume` + Mach
+    /// exception reply for the same purpose.
+    #[cfg(target_os = "linux")]
     pub fn r#continue(&mut self, sig: Option<Signal>) -> Result<(), Error> {
         debug!(
             target: "tracer",
@@ -198,7 +205,9 @@ impl TraceeCtl {
         self.threads_state.remove(&pid)
     }
 
-    /// Continue all currently stopped tracees.
+    /// Continue all currently stopped tracees. Linux-only —
+    /// darwin's Tracer drives resumption through `task_resume`.
+    #[cfg(target_os = "linux")]
     pub fn cont_stopped(&mut self) -> Result<(), Vec<Error>> {
         let mut errors = vec![];
 
@@ -224,12 +233,13 @@ impl TraceeCtl {
         Ok(())
     }
 
-    /// Continue all currently stopped tracees.
+    /// Continue all currently stopped tracees. Linux-only.
     ///
     /// # Arguments
     ///
     /// * `inject_request`: send signal to one of threads.
     /// * `exclude`: set of threads that must be not continued.
+    #[cfg(target_os = "linux")]
     pub fn cont_stopped_ex(
         &mut self,
         inject_request: Option<(Pid, Signal)>,

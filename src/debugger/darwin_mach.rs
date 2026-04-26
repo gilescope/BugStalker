@@ -427,6 +427,38 @@ pub fn thread_set_arm_debug_state64(
     Ok(())
 }
 
+/// Arm or disarm hardware single-step on a single Mach thread.
+///
+/// Software single-step on aarch64 is two-bit cooperation between
+/// `MDSCR_EL1.SS` (bit 0) — "single-step enable" in the debug
+/// state — and `SPSR.SS` (bit 21 of `cpsr`) — "the next ERET
+/// should generate a software-step exception". Both must be set
+/// before `task_resume` for the kernel to deliver one
+/// `EXC_BREAKPOINT`/SS-trap after exactly one instruction.
+///
+/// Set `enable = true` before stepping; clear via `enable = false`
+/// after, otherwise the next normal `task_resume` would also
+/// step. (The kernel typically clears `SPSR.SS` on exception
+/// entry, but `MDSCR_EL1.SS` is sticky.)
+pub fn arm_set_single_step(thread: thread_act_t, enable: bool) -> Result<(), MachError> {
+    let mut dbg = thread_get_arm_debug_state64(thread)?;
+    if enable {
+        dbg.mdscr_el1 |= 1;
+    } else {
+        dbg.mdscr_el1 &= !1u64;
+    }
+    thread_set_arm_debug_state64(thread, &dbg)?;
+
+    let mut s = thread_get_arm_state64(thread)?;
+    if enable {
+        s.__cpsr |= 1 << 21;
+    } else {
+        s.__cpsr &= !(1u32 << 21);
+    }
+    thread_set_arm_state64(thread, &s)?;
+    Ok(())
+}
+
 // --- ARM_EXCEPTION_STATE64 (per-thread fault attribution) ----
 //
 // `<mach/arm/_structs.h>::__darwin_arm_exception_state64`:

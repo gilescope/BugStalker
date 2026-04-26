@@ -890,56 +890,84 @@ impl Tracer {
         _tcx: TraceContext,
         pid: Pid,
     ) -> Result<Option<StopReason>, Error> {
+        use crate::debugger::darwin_mach::{self, ExceptionPort};
         use crate::debugger::register::RegisterMap;
-        use nix::sys::ptrace;
-        use nix::sys::wait::{WaitStatus, waitpid};
+        use mach2::kern_return::KERN_SUCCESS;
 
-        // TODO: rewrite to use ARM_DEBUG_STATE64.MDSCR_EL1.SS bit
-        // + ARM_THREAD_STATE64.cpsr.SS bit + task_resume +
-        // port.receive. For the POC, ptrace::step still works after
-        // posix_spawn IF the kernel allows ptrace ops on a child we
-        // own — which it does, no PT_TRACE_ME required, just BSD
-        // ptrace operations on a known child pid. Verify via the
-        // entitlement-gated tests.
-        ptrace::step(pid, None).map_err(Error::Ptrace)?;
-        let status = waitpid(pid, None).map_err(Error::Waitpid)?;
-        match status {
-            WaitStatus::Stopped(stopped_pid, sig) if sig == nix::sys::signal::SIGTRAP => {
-                // A SIGTRAP during a single-step is normally
-                // the step trap itself — but it can also be a
-                // watchpoint hit if the stepped instruction
-                // touched a watched address. Iterate threads
-                // and probe each FAR_EL1; the kernel only
-                // populates it on the faulting thread.
-                let raw_pc = RegisterMap::current(stopped_pid)?.pc();
-                if let Ok(task) = crate::debugger::darwin_mach::task_for_pid(stopped_pid)
-                    && let Ok(threads) = crate::debugger::darwin_mach::task_threads_vec(task)
-                    && let Ok(mut state) =
-                        crate::debugger::register::debug::HardwareDebugState::current(
-                            stopped_pid,
-                        )
-                {
-                    let hit = threads.iter().find_map(|&thread| {
-                        let exc = crate::debugger::darwin_mach::thread_get_arm_exception_state64(
-                            thread,
-                        )
-                        .ok()?;
-                        state.detect_and_flush_hit(Some(exc.far as usize))
-                    });
-                    if let Some(dr) = hit {
-                        let _ = state.sync(stopped_pid);
-                        return Ok(Some(StopReason::Watchpoint(
-                            stopped_pid,
-                            crate::debugger::address::RelocatedAddress::from(raw_pc as usize),
-                            WatchpointHitType::DebugRegister(dr),
-                        )));
-                    }
-                }
-                Ok(None)
-            }
-            WaitStatus::Stopped(p, sig) => Ok(Some(StopReason::SignalStop(p, sig))),
-            WaitStatus::Exited(_, code) => Ok(Some(StopReason::DebugeeExit(code))),
-            _ => Ok(None),
+        let state = self.ensure_darwin_supervision()?;
+
+        // Reply to any prior pending exception so the parked
+        // thread can leave the exception handler before we re-arm.
+        if let Some((remote, id)) = state.pending_reply.take() {
+            ExceptionPort::reply(remote, id, KERN_SUCCESS)?;
         }
+
+        // Arm software single-step on the focus thread.
+        // first_thread_of returns the main task thread which is
+        // what `pid` aliases to in our single-thread Tracee model.
+        let focus = darwin_mach::first_thread_of(state.task)?;
+        darwin_mach::arm_set_single_step(focus, true)?;
+
+        // Resume — the kernel executes one instruction then traps.
+        darwin_mach::task_resume(state.task)?;
+
+        // Block until the resulting Mach exception lands. With
+        // `MDSCR_EL1.SS=1 + SPSR.SS=1` the kernel reports a software
+        // step as `EXC_BREAKPOINT`; on aarch64 codes[0] is unset
+        // (or 0) for SS — distinct from BRK which has codes[0]=1.
+        let exc = loop {
+            match state.port.receive(u32::MAX)? {
+                Some(e) => break e,
+                None => continue,
+            }
+        };
+
+        // Re-suspend so the rest of the threads stay coherent.
+        darwin_mach::task_suspend(state.task)?;
+        state.pending_reply = Some((exc.remote_port, exc.msg_id));
+
+        // Disarm the SS bits so the next plain resume() doesn't
+        // accidentally step again. (MDSCR_EL1.SS is sticky across
+        // exception entry; SPSR.SS may already be cleared but be
+        // explicit.)
+        let _ = darwin_mach::arm_set_single_step(focus, false);
+
+        const EXC_BREAKPOINT: i32 = 6;
+        const EXC_BAD_ACCESS: i32 = 1;
+        const EXC_ARM_DA_DEBUG: i64 = 0x102;
+
+        // Watchpoint may also fire mid-step if the stepped
+        // instruction touched a watched address. Check the
+        // exception type before declaring a clean step.
+        if exc.exception == EXC_BAD_ACCESS
+            && exc.codes.first().copied() == Some(EXC_ARM_DA_DEBUG)
+        {
+            let raw_pc = RegisterMap::current(pid)?.pc();
+            let fault_addr = exc.codes.get(1).copied().unwrap_or(0) as usize;
+            let mut hwstate =
+                crate::debugger::register::debug::HardwareDebugState::current(pid)?;
+            if let Some(dr) = hwstate.detect_and_flush_hit(Some(fault_addr)) {
+                let _ = hwstate.sync(pid);
+                return Ok(Some(StopReason::Watchpoint(
+                    pid,
+                    crate::debugger::address::RelocatedAddress::from(raw_pc as usize),
+                    WatchpointHitType::DebugRegister(dr),
+                )));
+            }
+        }
+
+        // EXC_BREAKPOINT with no breakpoint registry match is the
+        // step trap itself — return None so the caller knows the
+        // step landed cleanly.
+        if exc.exception == EXC_BREAKPOINT {
+            return Ok(None);
+        }
+
+        // Anything else: surface as a SignalStop with SIGTRAP
+        // (matches the linux Tracer's catch-all shape).
+        Ok(Some(StopReason::SignalStop(
+            pid,
+            nix::sys::signal::SIGTRAP,
+        )))
     }
 }

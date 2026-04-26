@@ -179,15 +179,12 @@ impl Child<Installed> {
         })
     }
 
-    /// Darwin: attach to an already-running process by pid.
-    ///
-    /// `ptrace::attach` (BSD `PT_ATTACHEXC`) sends `SIGSTOP` and
-    /// grants the parent the right to call `task_for_pid` on the
-    /// target without the `com.apple.security.cs.debugger`
-    /// entitlement — same handshake the spawn path uses for newly
-    /// forked children. We pull the executable path / cwd / argv
-    /// out of `sysinfo` so the post-attach behaviour mirrors what
-    /// `Child::new` records for spawned processes.
+    /// Darwin: attach to an already-running process by pid via
+    /// pure Mach. `task_for_pid` resolves the task port (requires
+    /// the `com.apple.security.cs.debugger` entitlement on the
+    /// caller for cross-process attach), then `task_suspend`
+    /// parks the inferior so the engine can install BPs / read
+    /// state before the next `Tracer::resume` releases it.
     ///
     /// **Multi-thread limitation:** the linux side records every
     /// tid (from `/proc/<pid>/task/`) so each thread ends up as a
@@ -199,7 +196,7 @@ impl Child<Installed> {
     /// works through `task_threads_vec` from the inside.
     #[cfg(not(target_os = "linux"))]
     pub fn from_external(pid: Pid, stdout: PipeWriter, stderr: PipeWriter) -> Result<Self, Error> {
-        use nix::sys::wait::{WaitPidFlag, waitpid};
+        use crate::debugger::darwin_mach;
         use sysinfo::{RefreshKind, System};
 
         let sys = System::new_with_specifics(
@@ -215,11 +212,12 @@ impl Child<Installed> {
         let cwd = external.cwd().map(ToOwned::to_owned);
         let args: Vec<String> = external.cmd().get(1..).unwrap_or(&[]).to_vec();
 
-        // BSD ptrace::attach delivers SIGSTOP and unlocks
-        // task_for_pid. Wait for the resulting stop before we
-        // hand the Child off to the engine.
-        nix::sys::ptrace::attach(pid).map_err(Error::Attach)?;
-        let _ = waitpid(pid, Some(WaitPidFlag::WUNTRACED)).map_err(Error::Attach)?;
+        // Pure-Mach attach: task_for_pid + task_suspend. No ptrace.
+        // The caller must have com.apple.security.cs.debugger for
+        // cross-process task_for_pid; that's the same requirement
+        // the entitlement-gated tests document.
+        let task = darwin_mach::task_for_pid(pid)?;
+        darwin_mach::task_suspend(task)?;
 
         Ok(Self {
             stdout,
