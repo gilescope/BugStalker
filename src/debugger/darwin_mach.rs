@@ -188,6 +188,78 @@ pub fn thread_get_arm_state64(thread: thread_act_t) -> Result<arm_thread_state64
     Ok(state)
 }
 
+// --- ARM_DEBUG_STATE64 (hardware breakpoint + watchpoint registers) -
+//
+// `<mach/arm/_structs.h>` declares:
+//   struct __darwin_arm_debug_state64 {
+//       uint64_t __bvr[16];   // breakpoint value
+//       uint64_t __bcr[16];   // breakpoint control
+//       uint64_t __wvr[16];   // watchpoint value
+//       uint64_t __wcr[16];   // watchpoint control
+//       uint64_t __mdscr_el1; // single-step / debug-mode control
+//   };
+//
+// mach2 0.6 exposes the `ARM_DEBUG_STATE64` flavor constant but not
+// the matching struct, so we lay it out here.
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct arm_debug_state64_t {
+    pub bvr: [u64; 16],
+    pub bcr: [u64; 16],
+    pub wvr: [u64; 16],
+    pub wcr: [u64; 16],
+    pub mdscr_el1: u64,
+}
+
+impl arm_debug_state64_t {
+    /// Number of `int`s in the struct, as `thread_get_state` /
+    /// `thread_set_state` expect.
+    pub fn count() -> mach_msg_type_number_t {
+        (mem::size_of::<Self>() / mem::size_of::<i32>()) as mach_msg_type_number_t
+    }
+}
+
+const ARM_DEBUG_STATE64: i32 = 15;
+
+pub fn thread_get_arm_debug_state64(
+    thread: thread_act_t,
+) -> Result<arm_debug_state64_t, MachError> {
+    let mut state = arm_debug_state64_t::default();
+    let mut count = arm_debug_state64_t::count();
+    // SAFETY: thread valid; state sized by `count`.
+    let kr = unsafe {
+        thread_get_state(
+            thread,
+            ARM_DEBUG_STATE64,
+            &mut state as *mut _ as *mut u32,
+            &mut count,
+        )
+    };
+    check(kr)?;
+    Ok(state)
+}
+
+pub fn thread_set_arm_debug_state64(
+    thread: thread_act_t,
+    state: &arm_debug_state64_t,
+) -> Result<(), MachError> {
+    let count = arm_debug_state64_t::count();
+    // SAFETY: state lives across the call; kernel copies and
+    // doesn't retain the pointer.
+    let kr = unsafe {
+        thread_set_state(
+            thread,
+            ARM_DEBUG_STATE64,
+            state as *const _ as *mut u32,
+            count,
+        )
+    };
+    check(kr)?;
+    Ok(())
+}
+
 /// Mirror of `thread_get_arm_state64` for writes.
 pub fn thread_set_arm_state64(
     thread: thread_act_t,

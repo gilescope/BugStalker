@@ -440,14 +440,21 @@ impl From<RegisterMap> for DwarfRegisterMap {
     }
 }
 
-// `debug_impl` below is the Linux-side hardware-watchpoint backend
-// (NT_ARM_HW_WATCH / NT_ARM_HW_BREAK regsets via PTRACE_GETREGSET).
-// Darwin needs a parallel implementation on top of
-// `thread_set_state(ARM_DEBUG_STATE64)`; until then, expose a stub
-// with the same public surface so the watchpoint registry compiles.
+// Darwin hardware-watchpoint backend.
+//
+// The aarch64 WCR / WVR encoding is identical to the linux side
+// (same architecture spec — DDI 0487); only the kernel-call shape
+// differs. On linux it's `PTRACE_{GET,SET}REGSET(NT_ARM_HW_WATCH)`;
+// on darwin it's `thread_{get,set}_state(ARM_DEBUG_STATE64)` with
+// `arm_debug_state64_t { bvr, bcr, wvr, wcr, mdscr_el1 }`.
+//
+// `arm_debug_state64_t` exposes 16 watchpoint slots; we expose the
+// first 4 to match `DebugRegisterNumber::DR0..DR3` and the cross-
+// arch slot count the watchpoint registry uses today.
 #[cfg(not(target_os = "linux"))]
 pub mod debug_impl {
     use crate::debugger::Error;
+    use crate::debugger::darwin_mach::{self, arm_debug_state64_t};
     use crate::debugger::register::debug::{
         BreakCondition, BreakSize, DebugRegisterNumber,
     };
@@ -455,45 +462,114 @@ pub mod debug_impl {
 
     pub type DebugAddressRegister = usize;
 
+    /// Number of watchpoint slots we expose to the registry.
+    /// `arm_debug_state64_t` actually has 16; capped at 4 to mirror
+    /// the linux side.
+    const SLOT_COUNT: usize = 4;
+
+    /// Encode WCR — same layout the linux/aarch64 path uses.
+    fn encode_ctrl(cond: BreakCondition, bas: u8) -> u32 {
+        let lsc: u32 = match cond {
+            BreakCondition::DataWrites => 0b10,
+            BreakCondition::DataReadsWrites => 0b11,
+        };
+        1 | (0b10u32 << 1) | (lsc << 3) | ((bas as u32) << 5)
+    }
+
+    fn compute_bas(addr: usize, size: BreakSize) -> (u64, u8) {
+        let window = (addr as u64) & !7;
+        let offset = addr & 7;
+        let width = match size {
+            BreakSize::Bytes1 => 1,
+            BreakSize::Bytes2 => 2,
+            BreakSize::Bytes4 => 4,
+            BreakSize::Bytes8 => 8,
+        };
+        let mask: u8 = ((1u16 << width) - 1) as u8;
+        (window, mask << offset)
+    }
+
+    fn decode_bas(window: u64, bas: u8) -> usize {
+        if bas == 0 {
+            return window as usize;
+        }
+        let offset = bas.trailing_zeros() as usize;
+        window as usize + offset
+    }
+
     #[derive(PartialEq, Debug, Default)]
-    pub struct HardwareDebugState;
+    pub struct HardwareDebugState {
+        raw: arm_debug_state64_t,
+    }
 
     impl HardwareDebugState {
-        pub fn current(_pid: Pid) -> Result<Self, Error> {
-            unimplemented!(
-                "darwin: HardwareDebugState::current via thread_get_state(ARM_DEBUG_STATE64)"
-            )
+        pub fn current(pid: Pid) -> Result<Self, Error> {
+            let task = darwin_mach::task_for_pid(pid)?;
+            let thread = darwin_mach::first_thread_of(task)?;
+            let raw = darwin_mach::thread_get_arm_debug_state64(thread)?;
+            Ok(Self { raw })
         }
 
-        pub fn sync(&self, _pid: Pid) -> Result<(), Error> {
-            unimplemented!(
-                "darwin: HardwareDebugState::sync via thread_set_state(ARM_DEBUG_STATE64)"
-            )
+        pub fn sync(&self, pid: Pid) -> Result<(), Error> {
+            let task = darwin_mach::task_for_pid(pid)?;
+            let thread = darwin_mach::first_thread_of(task)?;
+            darwin_mach::thread_set_arm_debug_state64(thread, &self.raw)?;
+            Ok(())
         }
 
-        pub fn slot_enabled(&self, _slot: DebugRegisterNumber) -> bool {
-            false
+        pub fn slot_enabled(&self, slot: DebugRegisterNumber) -> bool {
+            (self.raw.wcr[slot as usize] & 1) == 1
         }
 
-        pub fn slot_addr(&self, _slot: DebugRegisterNumber) -> usize {
-            0
+        pub fn slot_addr(&self, slot: DebugRegisterNumber) -> usize {
+            let i = slot as usize;
+            let bas = ((self.raw.wcr[i] >> 5) & 0xff) as u8;
+            decode_bas(self.raw.wvr[i], bas)
         }
 
         pub fn install(
             &mut self,
-            _slot: DebugRegisterNumber,
-            _addr: usize,
-            _cond: BreakCondition,
-            _size: BreakSize,
+            slot: DebugRegisterNumber,
+            addr: usize,
+            cond: BreakCondition,
+            size: BreakSize,
         ) {
+            let (window, bas) = compute_bas(addr, size);
+            let i = slot as usize;
+            self.raw.wvr[i] = window;
+            self.raw.wcr[i] = encode_ctrl(cond, bas) as u64;
         }
 
-        pub fn uninstall(&mut self, _slot: DebugRegisterNumber) {}
+        pub fn uninstall(&mut self, slot: DebugRegisterNumber) {
+            let i = slot as usize;
+            self.raw.wvr[i] = 0;
+            self.raw.wcr[i] = 0;
+        }
 
+        /// Identify which slot fired by matching `si_addr` against
+        /// each enabled slot's BAS-selected byte set. Same shape as
+        /// the linux path because the WCR/WVR semantics are the
+        /// same — only the kernel call to read state differs.
         pub fn detect_and_flush_hit(
             &mut self,
-            _si_addr: Option<usize>,
+            si_addr: Option<usize>,
         ) -> Option<DebugRegisterNumber> {
+            let addr = si_addr?;
+            for i in 0..SLOT_COUNT {
+                let dr = DebugRegisterNumber::from_repr(i)?;
+                if !self.slot_enabled(dr) {
+                    continue;
+                }
+                let window = self.raw.wvr[i] as usize;
+                let mut bas = ((self.raw.wcr[i] >> 5) & 0xff) as u8;
+                while bas != 0 {
+                    let b = bas.trailing_zeros() as usize;
+                    if addr == window + b {
+                        return Some(dr);
+                    }
+                    bas &= bas - 1;
+                }
+            }
             None
         }
     }
