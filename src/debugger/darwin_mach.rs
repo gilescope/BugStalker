@@ -868,9 +868,10 @@ pub struct ReceivedException {
     /// EXC_BAD_ACCESS (1), …
     pub exception: i32,
     /// Exception-type-specific codes. For EXC_BREAKPOINT on
-    /// aarch64, codes[0] is the BRK immediate, codes[1] is 0.
-    /// For EXC_BAD_ACCESS, codes[0] is the kern_return_t reason
-    /// (e.g. KERN_INVALID_ADDRESS), codes[1] is the fault address.
+    /// aarch64, `codes\[0\]` is the BRK immediate, `codes\[1\]`
+    /// is `0`. For EXC_BAD_ACCESS, `codes\[0\]` is the
+    /// `kern_return_t` reason (e.g. `KERN_INVALID_ADDRESS`),
+    /// `codes\[1\]` is the fault address.
     pub codes: Vec<i64>,
 }
 
@@ -891,8 +892,8 @@ impl Drop for ExceptionPort {
 /// Address of dyld's image-load/unload notification function in the
 /// debuggee. Install a software breakpoint here and dyld will stop
 /// the inferior every time it enters this routine to announce a
-/// `dlopen` / `dlclose` (mode is in `x0` / `rdi`, count in `x1` /
-/// `rsi`, info-array pointer in `x2` / `rdx`).
+/// `dlopen` / `dlclose` (mode is in `x0`, count in `x1`,
+/// info-array pointer in `x2` — AAPCS64).
 ///
 /// Returns `Ok(0)` if dyld hasn't yet populated the field — that
 /// happens transiently between exec and dyld's first run; callers
