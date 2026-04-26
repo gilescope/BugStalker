@@ -82,7 +82,10 @@ build-examples:
 # need the example binaries visible inside the image.
 test:
     FROM +build-examples
-    RUN mkdir -p examples/target && \
+    # `examples/target` may be a (broken) symlink on hosts that redirect
+    # cargo target dirs out of the source tree — strip it before recreating.
+    RUN rm -rf examples/target && \
+        mkdir -p examples/target && \
         mv examples/_built/debug examples/target/debug
     RUN --privileged \
         --mount=type=cache,target=/usr/local/cargo/registry \
@@ -101,7 +104,10 @@ cargo-test-lib:
 # triage so the DAP tests don't halt cargo before these run.
 test-debugger:
     FROM +build-examples
-    RUN mkdir -p examples/target && \
+    # `examples/target` may be a (broken) symlink on hosts that redirect
+    # cargo target dirs out of the source tree — strip it before recreating.
+    RUN rm -rf examples/target && \
+        mkdir -p examples/target && \
         mv examples/_built/debug examples/target/debug
     RUN --privileged \
         --mount=type=cache,target=/usr/local/cargo/registry \
@@ -112,7 +118,10 @@ test-debugger:
 trace:
     ARG TEST=test_debugger_runs
     FROM +build-examples
-    RUN mkdir -p examples/target && \
+    # `examples/target` may be a (broken) symlink on hosts that redirect
+    # cargo target dirs out of the source tree — strip it before recreating.
+    RUN rm -rf examples/target && \
+        mkdir -p examples/target && \
         mv examples/_built/debug examples/target/debug
     ENV RUST_LOG=debug
     ENV RUST_BACKTRACE=1
@@ -132,7 +141,10 @@ flake-hunt:
     ARG TEST=test_debug_trait_repr_vars
     ARG N=20
     FROM +build-examples
-    RUN mkdir -p examples/target && \
+    # `examples/target` may be a (broken) symlink on hosts that redirect
+    # cargo target dirs out of the source tree — strip it before recreating.
+    RUN rm -rf examples/target && \
+        mkdir -p examples/target && \
         mv examples/_built/debug examples/target/debug
     RUN --privileged \
         --mount=type=cache,target=/usr/local/cargo/registry \

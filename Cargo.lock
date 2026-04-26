@@ -2323,7 +2323,8 @@ dependencies = [
 
 [[package]]
 name = "thread_db"
-version = "0.1.4"
+version = "0.1.5"
+source = "git+https://github.com/gilescope/thread_db?rev=453658a#453658adcab32980ce438d267f3fc988a7bce405"
 dependencies = [
  "dlopen",
  "dlopen_derive",
