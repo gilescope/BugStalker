@@ -1232,9 +1232,16 @@ impl BreakpointRegistry {
                 errors.push(e);
             }
 
-            let addr = Address::Global(brkpt.addr.into_global(debugee)?);
+            // Only compute the global address for breakpoints we
+            // actually re-save below — `LinkerMapFn` BPs sit in
+            // dyld/ld-linux pages whose mapping the registry may
+            // not track (notably on darwin, where dsymutil never
+            // covers system libraries), so converting them would
+            // fail with `MappingOffsetNotFound` and abort the whole
+            // restart. We're throwing those away anyway.
             match brkpt.r#type {
                 BrkptType::EntryPoint => {
+                    let addr = Address::Global(brkpt.addr.into_global(debugee)?);
                     self.add_uninit(UninitBreakpoint::new_entry_point(
                         Some(brkpt.debug_info_file),
                         addr,
@@ -1242,6 +1249,7 @@ impl BreakpointRegistry {
                     ));
                 }
                 BrkptType::UserDefined => {
+                    let addr = Address::Global(brkpt.addr.into_global(debugee)?);
                     self.add_uninit(UninitBreakpoint::new_inherited(addr, brkpt));
                 }
                 BrkptType::Temporary
