@@ -237,6 +237,50 @@ fn exception_port_receive_times_out() {
     );
 }
 
+/// Exercise the `ARM_DEBUG_STATE64` API surface on a suspended
+/// worker. Reads must return KERN_SUCCESS with the default-zero
+/// state (a fresh thread has no hw watchpoints set), and the set
+/// path must round-trip the syscall (returns KERN_SUCCESS) — but
+/// we deliberately *don't* assert the kernel preserved the bytes
+/// we wrote. Darwin silently drops `thread_set_state` for the
+/// `ARM_DEBUG_STATE64` flavour on threads that aren't being
+/// supervised (no ptrace, no exception-port subscription). That's
+/// a feature: an unprivileged process shouldn't be able to arm
+/// watchpoints on arbitrary threads. The actual write semantics
+/// are exercised by the entitlement-gated end-to-end debugger
+/// path.
+#[test]
+fn arm_debug_state64_api_surface() {
+    use bugstalker::debugger::darwin_mach::{
+        thread_get_arm_debug_state64, thread_set_arm_debug_state64, thread_suspend,
+    };
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<u32>();
+    std::thread::spawn(move || {
+        let me = unsafe { mach2::mach_init::mach_thread_self() };
+        tx.send(me).expect("send port");
+        loop {
+            std::thread::park();
+        }
+    });
+    let worker = rx.recv().expect("worker port");
+
+    thread_suspend(worker).expect("thread_suspend");
+    let s = thread_get_arm_debug_state64(worker).expect("get debug state");
+    assert!(
+        s.bvr.iter().all(|&v| v == 0)
+            && s.bcr.iter().all(|&v| v == 0)
+            && s.wvr.iter().all(|&v| v == 0)
+            && s.wcr.iter().all(|&v| v == 0)
+            && s.mdscr_el1 == 0,
+        "fresh thread should have no hw debug registers set"
+    );
+    // Setting the same default state must be a successful syscall —
+    // we assert the *call* works, not that the bytes stick.
+    thread_set_arm_debug_state64(worker, &s).expect("set debug state");
+}
+
 /// `thread_set_arm_state64` round-trip on a suspended worker:
 /// snapshot state, mutate `x[0]` to a sentinel, write it back,
 /// re-read, assert the sentinel survives. We don't resume the
