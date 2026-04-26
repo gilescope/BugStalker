@@ -31,6 +31,20 @@ All notable changes to this project will be documented in this file.
 - doc: new `doc/ROADMAP.md` describing the larger-than-one-PR efforts
   the codebase is moving towards (Linux/aarch64 port progress, planned
   time-travel record-and-replay support, eventual native macOS port).
+- debugger: experimental native macOS-arm64 support — pure-Mach
+  Tracer (no ptrace), Mach-native `CallHelper`, software-breakpoint
+  install via `mach_vm_write` + page-protection round-tripping,
+  per-dylib `__TEXT.vmaddr` slide computation, dSYM bundle DWARF
+  loader, eh_frame BaseAddresses with Mach-O section names, CU
+  disambiguation when dsymutil's range engulfs other CUs, stray-BRK
+  swallowing in dyld pages, and `Tracee::location()` fallback for
+  unknown PC mappings. The integration suite reaches **58 passed /
+  4 failed / 1 ignored / 12 filtered out (75 runnable)** on darwin
+  with `--skip multithreaded --skip tokio --skip signal --skip
+  test_step_over_for_loop_issue_156 --skip test_read_tls`. The 4
+  remaining failures (dyld dlopen rendezvous, Debug::fmt vtable
+  dispatch) and the skipped categories (multithreading, signals,
+  TLS, the loop-step edge case) are tracked in the roadmap.
 
 ### Fixed
 
