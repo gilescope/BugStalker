@@ -813,53 +813,6 @@ impl Tracer {
             return Ok(StopReason::DebugeeStart);
         }
 
-        let state = self.ensure_darwin_supervision()?;
-
-        // Reply to the previously-saved exception (if any) — that
-        // unblocks the kernel-side handler chain so the parked
-        // thread continues from the fault.
-        if let Some((remote, id)) = state.pending_reply.take() {
-            ExceptionPort::reply(remote, id, KERN_SUCCESS)?;
-        }
-
-        // Resume the inferior. After Child::install's spawn-suspend,
-        // the task suspend count is 1; this drops it to 0 and the
-        // child runs.
-        darwin_mach::task_resume(state.task)?;
-
-        // Poll the exception port + waitpid in turn. The Mach
-        // exception path covers BRK / WP / signals, but the
-        // kernel does NOT raise a Mach exception for clean
-        // process exit (return 0 from main). For that we need
-        // waitpid to surface SIGCHLD/Exited. The 200 ms poll is
-        // a balance between responsiveness on stop events and
-        // not burning CPU on idle waits.
-        let exc = loop {
-            match state.port.receive(200)? {
-                Some(e) => break e,
-                None => {
-                    // Port timed out — check if the inferior exited.
-                    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-                    match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-                        Ok(WaitStatus::Exited(_, code)) => {
-                            return Ok(StopReason::DebugeeExit(code));
-                        }
-                        Ok(WaitStatus::Signaled(_, sig, _)) => {
-                            return Ok(StopReason::DebugeeExit(128 + sig as i32));
-                        }
-                        _ => continue,
-                    }
-                }
-            }
-        };
-
-        // Suspend the task again so the rest of the threads don't
-        // keep running while the user inspects coherent state. The
-        // faulting thread is already parked by the kernel awaiting
-        // our reply.
-        darwin_mach::task_suspend(state.task)?;
-        state.pending_reply.set(Some((exc.remote_port, exc.msg_id)));
-
         // Classify. aarch64 darwin Mach exception encoding:
         //   EXC_BREAKPOINT (6) + codes[0]=EXC_ARM_BREAKPOINT (1)
         //                                          → BRK instr
@@ -878,47 +831,111 @@ impl Tracer {
         const EXC_ARM_DA_DEBUG: i64 = 0x102;
         const EXC_SOFT_SIGNAL: i64 = 0x10003;
 
-        let raw_pc = RegisterMap::current(pid)?.pc();
+        // Outer loop: lets us swallow stray BRKs (e.g. dyld's
+        // `_dyld_debugger_notification` on darwin, fired from
+        // inside dyld on every dylib load) without surfacing them
+        // to the user as a SignalStop. We advance PC past the
+        // unknown BRK and re-resume.
+        loop {
+            let state = self.ensure_darwin_supervision()?;
 
-        match exc.exception {
-            EXC_BREAKPOINT if exc.codes.first().copied() == Some(EXC_ARM_BREAKPOINT) => {
-                let candidate_pc = crate::debugger::address::RelocatedAddress::from(
-                    raw_pc - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
-                );
-                let is_ours = tcx
-                    .breakpoints
-                    .iter()
-                    .any(|b| b.addr == candidate_pc);
-                if is_ours {
-                    Ok(StopReason::Breakpoint(pid, candidate_pc))
-                } else {
-                    Ok(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP))
+            // Reply to the previously-saved exception (if any) —
+            // that unblocks the kernel-side handler chain so the
+            // parked thread continues from the fault.
+            if let Some((remote, id)) = state.pending_reply.take() {
+                ExceptionPort::reply(remote, id, KERN_SUCCESS)?;
+            }
+
+            // Resume the inferior. After Child::install's
+            // spawn-suspend, the task suspend count is 1; this drops
+            // it to 0 and the child runs.
+            darwin_mach::task_resume(state.task)?;
+
+            // Poll the exception port + waitpid in turn. The Mach
+            // exception path covers BRK / WP / signals, but the
+            // kernel does NOT raise a Mach exception for clean
+            // process exit (return 0 from main). For that we need
+            // waitpid to surface SIGCHLD/Exited. The 200 ms poll
+            // is a balance between responsiveness on stop events
+            // and not burning CPU on idle waits.
+            let exc = loop {
+                match state.port.receive(200)? {
+                    Some(e) => break e,
+                    None => {
+                        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+                        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                            Ok(WaitStatus::Exited(_, code)) => {
+                                return Ok(StopReason::DebugeeExit(code));
+                            }
+                            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                                return Ok(StopReason::DebugeeExit(128 + sig as i32));
+                            }
+                            _ => continue,
+                        }
+                    }
                 }
-            }
-            EXC_BAD_ACCESS if exc.codes.first().copied() == Some(EXC_ARM_DA_DEBUG) => {
-                let fault_addr =
-                    exc.codes.get(1).copied().unwrap_or(0) as usize;
-                let mut state =
-                    crate::debugger::register::debug::HardwareDebugState::current(pid)?;
-                if let Some(dr) = state.detect_and_flush_hit(Some(fault_addr)) {
-                    let _ = state.sync(pid);
-                    Ok(StopReason::Watchpoint(
-                        pid,
-                        crate::debugger::address::RelocatedAddress::from(raw_pc as usize),
-                        WatchpointHitType::DebugRegister(dr),
-                    ))
-                } else {
-                    Ok(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP))
+            };
+
+            // Suspend the task again so the rest of the threads
+            // don't keep running while the user inspects coherent
+            // state. The faulting thread is already parked by the
+            // kernel awaiting our reply.
+            darwin_mach::task_suspend(state.task)?;
+            state.pending_reply.set(Some((exc.remote_port, exc.msg_id)));
+
+            let raw_pc = RegisterMap::current(pid)?.pc();
+
+            return match exc.exception {
+                EXC_BREAKPOINT if exc.codes.first().copied() == Some(EXC_ARM_BREAKPOINT) => {
+                    let candidate_pc = crate::debugger::address::RelocatedAddress::from(
+                        raw_pc - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
+                    );
+                    let is_ours = tcx.breakpoints.iter().any(|b| b.addr == candidate_pc);
+                    if is_ours {
+                        Ok(StopReason::Breakpoint(pid, candidate_pc))
+                    } else {
+                        // Stray BRK — most commonly dyld's
+                        // `_dyld_debugger_notification` on darwin,
+                        // which dyld hits internally on every
+                        // dylib load to give a debugger a chance
+                        // to refresh its module table. We don't
+                        // (yet) consume these as proper rendezvous
+                        // notifications, but we must not crash on
+                        // them either: skip the 4-byte BRK and
+                        // re-arm. The mapping/global-PC lookup
+                        // would fail for dyld pages anyway since
+                        // the registry tracks only modules with
+                        // their own DWARF.
+                        let mut regs = RegisterMap::current(pid)?;
+                        regs.set_pc(raw_pc + 4);
+                        regs.persist(pid)?;
+                        // Continue the outer loop to re-resume.
+                        continue;
+                    }
                 }
-            }
-            EXC_SOFTWARE if exc.codes.first().copied() == Some(EXC_SOFT_SIGNAL) => {
-                let signum =
-                    exc.codes.get(1).copied().unwrap_or(0) as i32;
-                let signal = nix::sys::signal::Signal::try_from(signum)
-                    .unwrap_or(nix::sys::signal::SIGTRAP);
-                Ok(StopReason::SignalStop(pid, signal))
-            }
-            _ => Ok(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP)),
+                EXC_BAD_ACCESS if exc.codes.first().copied() == Some(EXC_ARM_DA_DEBUG) => {
+                    let fault_addr = exc.codes.get(1).copied().unwrap_or(0) as usize;
+                    let mut state =
+                        crate::debugger::register::debug::HardwareDebugState::current(pid)?;
+                    if let Some(dr) = state.detect_and_flush_hit(Some(fault_addr)) {
+                        let _ = state.sync(pid);
+                        Ok(StopReason::Watchpoint(
+                            pid,
+                            crate::debugger::address::RelocatedAddress::from(raw_pc as usize),
+                            WatchpointHitType::DebugRegister(dr),
+                        ))
+                    } else {
+                        Ok(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP))
+                    }
+                }
+                EXC_SOFTWARE if exc.codes.first().copied() == Some(EXC_SOFT_SIGNAL) => {
+                    let signum = exc.codes.get(1).copied().unwrap_or(0) as i32;
+                    let signal = nix::sys::signal::Signal::try_from(signum)
+                        .unwrap_or(nix::sys::signal::SIGTRAP);
+                    Ok(StopReason::SignalStop(pid, signal))
+                }
+                _ => Ok(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP)),
+            };
         }
     }
 

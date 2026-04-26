@@ -128,12 +128,26 @@ impl Tracee {
     }
 
     /// Get current tracee location.
+    ///
+    /// If the registry has no mapping for `pc` (e.g. we stopped
+    /// inside a system module like dyld which we don't load DWARF
+    /// for), fall back to `global_pc = pc.as_usize() as u64`. The
+    /// caller will then see no DWARF match and treat the PC as
+    /// "outside the user's source" — which is exactly the situation.
+    /// Without this fallback any internal stop in dyld (e.g. the
+    /// rendezvous LinkerMapFn BP, or a stray BRK during dylib
+    /// loading) would propagate `MappingOffsetNotFound` back to the
+    /// user even though the debugger is fine.
     pub fn location(&self, debugee: &Debugee) -> Result<Location, Error> {
+        use crate::debugger::address::GlobalAddress;
         let pc = self.pc()?;
+        let global_pc = pc.into_global(debugee).unwrap_or_else(|_| {
+            GlobalAddress::from(pc.as_u64())
+        });
         Ok(Location {
             pid: self.pid,
             pc,
-            global_pc: pc.into_global(debugee)?,
+            global_pc,
         })
     }
 }

@@ -12,13 +12,8 @@ pub fn main() {
         .to_string_lossy()
         .to_string()
         + "/examples/target/debug";
-    let lib_ext = if cfg!(target_os = "macos") {
-        "dylib"
-    } else {
-        "so"
-    };
     let print_lib =
-        unsafe { libloading::Library::new(format!("{cwd}/libprinter_lib.{lib_ext}")).unwrap() };
+        unsafe { libloading::Library::new(format!("{cwd}/libprinter_lib.{}", if cfg!(target_os = "macos") { "dylib" } else { "so" })).unwrap() };
 
     let print_sum_fn: libloading::Symbol<unsafe extern "C" fn(u32)> =
         unsafe { print_lib.get(b"print_sum").unwrap() };
