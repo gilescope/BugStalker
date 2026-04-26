@@ -729,11 +729,13 @@ impl Tracer {
                     if signal == nix::sys::signal::SIGTRAP {
                         // Could be (a) an installed breakpoint
                         // firing — the BRK at PC will appear as
-                        // SIGTRAP; or (b) a user-level BRK (e.g.
-                        // `__builtin_trap`); or (c) the post-exec
-                        // attach trap on the very first resume.
-                        // We classify by reading PC and matching
-                        // against the breakpoint registry.
+                        // SIGTRAP; (b) a hardware watchpoint hit
+                        // — same SIGTRAP shape, but PC is *after*
+                        // the faulting instruction and FAR_EL1
+                        // holds the fault address; (c) a user-
+                        // level BRK (`__builtin_trap`); or (d)
+                        // the post-exec attach trap on the very
+                        // first resume.
                         let raw_pc = RegisterMap::current(stopped_pid)?.pc();
                         let candidate_pc = crate::debugger::address::RelocatedAddress::from(
                             raw_pc - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
@@ -743,10 +745,38 @@ impl Tracer {
                             .iter()
                             .any(|b| b.addr == candidate_pc);
                         if is_ours {
-                            // Rewind PC if the arch needs it
-                            // (no-op on aarch64 where PC_ADJUST=0)
-                            // and report.
                             return Ok(StopReason::Breakpoint(stopped_pid, candidate_pc));
+                        }
+                        // Watchpoint check — darwin's analogue of
+                        // linux's `siginfo.si_addr`/`TRAP_HWBKPT`
+                        // path is the per-thread FAR_EL1 captured
+                        // in `ARM_EXCEPTION_STATE64`. Match against
+                        // the BAS-encoded byte set of every armed
+                        // slot; on a hit, surface as Watchpoint.
+                        if let Ok(task) = crate::debugger::darwin_mach::task_for_pid(stopped_pid)
+                            && let Ok(thread) = crate::debugger::darwin_mach::first_thread_of(task)
+                            && let Ok(exc) =
+                                crate::debugger::darwin_mach::thread_get_arm_exception_state64(
+                                    thread,
+                                )
+                            && let Ok(mut state) =
+                                crate::debugger::register::debug::HardwareDebugState::current(
+                                    stopped_pid,
+                                )
+                        {
+                            if let Some(dr) =
+                                state.detect_and_flush_hit(Some(exc.far as usize))
+                            {
+                                let _ = state.sync(stopped_pid);
+                                let hit_type = WatchpointHitType::DebugRegister(dr);
+                                return Ok(StopReason::Watchpoint(
+                                    stopped_pid,
+                                    crate::debugger::address::RelocatedAddress::from(
+                                        raw_pc as usize,
+                                    ),
+                                    hit_type,
+                                ));
+                            }
                         }
                         return Ok(StopReason::SignalStop(stopped_pid, signal));
                     }

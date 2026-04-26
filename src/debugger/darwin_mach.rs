@@ -433,6 +433,59 @@ pub fn thread_set_arm_debug_state64(
     Ok(())
 }
 
+// --- ARM_EXCEPTION_STATE64 (per-thread fault attribution) ----
+//
+// `<mach/arm/_structs.h>::__darwin_arm_exception_state64`:
+//   uint64_t __far;       // FAR_EL1 — virtual fault address
+//   uint32_t __esr;       // ESR_EL1 — exception syndrome
+//   uint32_t __exception; // exception class (rough)
+//
+// The darwin equivalent of linux's `siginfo.si_addr` for a watch-
+// point hit is `__far`. ESR carries the syndrome info (read vs
+// write, byte-access-select, etc.) but for "which slot fired" the
+// FAR is enough — `HardwareDebugState::detect_and_flush_hit`
+// matches it against the BAS-encoded byte set of each enabled slot.
+
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
+pub struct arm_exception_state64_t {
+    pub far: u64,
+    pub esr: u32,
+    pub exception: u32,
+}
+
+impl arm_exception_state64_t {
+    pub fn count() -> mach_msg_type_number_t {
+        (mem::size_of::<Self>() / mem::size_of::<i32>()) as mach_msg_type_number_t
+    }
+}
+
+const ARM_EXCEPTION_STATE64: i32 = 7;
+
+/// Read the per-thread FAR + ESR. The kernel populates both
+/// every time the thread takes a synchronous exception (debug,
+/// page fault, alignment, …); they survive until the next
+/// exception, so a debugger reads them at the stop and trusts
+/// them to describe whatever just fired.
+pub fn thread_get_arm_exception_state64(
+    thread: thread_act_t,
+) -> Result<arm_exception_state64_t, MachError> {
+    let mut state = arm_exception_state64_t::default();
+    let mut count = arm_exception_state64_t::count();
+    // SAFETY: state is sized to `count`.
+    let kr = unsafe {
+        thread_get_state(
+            thread,
+            ARM_EXCEPTION_STATE64,
+            &mut state as *mut _ as *mut u32,
+            &mut count,
+        )
+    };
+    check(kr)?;
+    Ok(state)
+}
+
 /// Mirror of `thread_get_arm_state64` for writes.
 pub fn thread_set_arm_state64(
     thread: thread_act_t,
