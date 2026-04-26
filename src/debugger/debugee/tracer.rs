@@ -827,13 +827,29 @@ impl Tracer {
         // child runs.
         darwin_mach::task_resume(state.task)?;
 
-        // Block on the exception port until the next event.
-        // u32::MAX ms is ~49 days; effectively infinite for our
-        // purposes (the user can Ctrl-C if stuck).
+        // Poll the exception port + waitpid in turn. The Mach
+        // exception path covers BRK / WP / signals, but the
+        // kernel does NOT raise a Mach exception for clean
+        // process exit (return 0 from main). For that we need
+        // waitpid to surface SIGCHLD/Exited. The 200 ms poll is
+        // a balance between responsiveness on stop events and
+        // not burning CPU on idle waits.
         let exc = loop {
-            match state.port.receive(u32::MAX)? {
+            match state.port.receive(200)? {
                 Some(e) => break e,
-                None => continue,
+                None => {
+                    // Port timed out — check if the inferior exited.
+                    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+                    match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                        Ok(WaitStatus::Exited(_, code)) => {
+                            return Ok(StopReason::DebugeeExit(code));
+                        }
+                        Ok(WaitStatus::Signaled(_, sig, _)) => {
+                            return Ok(StopReason::DebugeeExit(128 + sig as i32));
+                        }
+                        _ => continue,
+                    }
+                }
             }
         };
 

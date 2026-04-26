@@ -103,16 +103,27 @@ impl EventHook for TestHooks {
 #[macro_export]
 macro_rules! assert_no_proc {
     ($pid:expr) => {
-        // Give the system a bit of time for process cleanup
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        let sys = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::everything()
-                .without_cpu()
-                .without_memory(),
-        );
+        // Poll for up to 2 seconds — darwin's sysinfo reflects
+        // process state with more lag than linux. Earliest pass
+        // typically lands within 100 ms; a stuck inferior won't
+        // disappear in any duration.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let raw = $pid.as_raw() as u32;
+        let mut found = true;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let sys = sysinfo::System::new_with_specifics(
+                sysinfo::RefreshKind::everything()
+                    .without_cpu()
+                    .without_memory(),
+            );
+            if sysinfo::System::process(&sys, sysinfo::Pid::from_u32(raw)).is_none() {
+                found = false;
+                break;
+            }
+        }
         assert!(
-            sysinfo::System::process(&sys, sysinfo::Pid::from_u32($pid.as_raw() as u32)).is_none(),
+            !found,
             "Process {} should have been terminated but still exists",
             $pid
         )

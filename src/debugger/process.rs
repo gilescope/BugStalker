@@ -351,6 +351,16 @@ impl<S: State> Child<S> {
         // is the magic flag — the kernel creates the child as if
         // it had received SIGSTOP, leaving it parked until we
         // task_resume (or send SIGCONT) it.
+        //
+        // _POSIX_SPAWN_DISABLE_ASLR (0x0100, Apple extension) is
+        // the equivalent of linux's `personality(ADDR_NO_RANDOMIZE)`:
+        // forces deterministic load addresses across runs so the
+        // entry-point breakpoint we computed from the static
+        // binary's `entry()` lands at the actual runtime PC. Without
+        // this the inferior segfaults the moment it crosses into
+        // the (mis-installed) entry BP.
+        const POSIX_SPAWN_DISABLE_ASLR_NP: i16 = 0x0100;
+
         let mut attr: libc::posix_spawnattr_t = ptr::null_mut();
         // SAFETY: out-pointer; libc writes if KERN_SUCCESS.
         let r = unsafe { libc::posix_spawnattr_init(&mut attr) };
@@ -367,7 +377,10 @@ impl<S: State> Child<S> {
         let _attr_guard = AttrGuard(attr);
         // SAFETY: attr is freshly initialised.
         let r = unsafe {
-            libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_START_SUSPENDED as i16)
+            libc::posix_spawnattr_setflags(
+                &mut attr,
+                libc::POSIX_SPAWN_START_SUSPENDED as i16 | POSIX_SPAWN_DISABLE_ASLR_NP,
+            )
         };
         if r != 0 {
             return Err(Error::Attach(nix::errno::Errno::from_i32(r)));
