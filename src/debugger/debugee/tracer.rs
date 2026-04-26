@@ -675,11 +675,18 @@ impl Tracer {
     }
 }
 
-/// Darwin stub of `impl Tracer`. The Mach-based equivalent (exception
-/// ports for stop notifications, `thread_set_state` for single-step,
-/// `task_resume` for continue) lives in a future commit; until then
-/// these constructors and methods exist so the rest of the debugger
-/// compiles.
+/// Darwin POC of `impl Tracer`. Uses macOS-flavoured ptrace
+/// (`PT_CONTINUE` / `PT_STEP` via the BSD branch of `nix`) plus
+/// `waitpid` to drive the wait/event loop. This works for
+/// single-thread debuggees attached via `Child::install`'s
+/// `PT_TRACE_ME` path because `BRK #0` exceptions get demoted by
+/// the kernel into `SIGTRAP` when the task has no exception port
+/// installed.
+///
+/// The full Mach exception-ports loop (multi-thread,
+/// `EXC_BREAKPOINT` / `EXC_SOFTWARE` / `EXC_BAD_ACCESS` routed
+/// through a dedicated Mach port) is the later, richer
+/// implementation that lands once the POC is stable.
 #[cfg(not(target_os = "linux"))]
 impl Tracer {
     pub fn new(proc_pid: Pid) -> Self {
@@ -698,19 +705,92 @@ impl Tracer {
         }
     }
 
-    pub fn resume(&mut self, _tcx: TraceContext) -> Result<StopReason, Error> {
-        unimplemented!("darwin: Tracer::resume via Mach exception-port loop")
+    pub fn resume(&mut self, tcx: TraceContext) -> Result<StopReason, Error> {
+        use crate::debugger::register::RegisterMap;
+        use nix::sys::ptrace;
+        use nix::sys::wait::{WaitStatus, waitpid};
+
+        let pid = self.tracee_ctl.proc_pid();
+        loop {
+            // Continue the inferior. `PT_CONTINUE` with addr=1
+            // (which is what `nix::ptrace::cont` does internally on
+            // BSD) means "resume from the current PC".
+            ptrace::cont(pid, None).map_err(Error::Ptrace)?;
+            let status = waitpid(pid, None).map_err(Error::Waitpid)?;
+            match status {
+                WaitStatus::Exited(_, code) => return Ok(StopReason::DebugeeExit(code)),
+                WaitStatus::Signaled(_, sig, _) => {
+                    // Treat fatal signals like a non-zero exit so
+                    // the rest of the debugger sees a single
+                    // termination shape regardless of how it ended.
+                    return Ok(StopReason::DebugeeExit(128 + sig as i32));
+                }
+                WaitStatus::Stopped(stopped_pid, signal) => {
+                    if signal == nix::sys::signal::SIGTRAP {
+                        // Could be (a) an installed breakpoint
+                        // firing — the BRK at PC will appear as
+                        // SIGTRAP; or (b) a user-level BRK (e.g.
+                        // `__builtin_trap`); or (c) the post-exec
+                        // attach trap on the very first resume.
+                        // We classify by reading PC and matching
+                        // against the breakpoint registry.
+                        let raw_pc = RegisterMap::current(stopped_pid)?.pc();
+                        let candidate_pc = crate::debugger::address::RelocatedAddress::from(
+                            raw_pc - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
+                        );
+                        let is_ours = tcx
+                            .breakpoints
+                            .iter()
+                            .any(|b| b.addr == candidate_pc);
+                        if is_ours {
+                            // Rewind PC if the arch needs it
+                            // (no-op on aarch64 where PC_ADJUST=0)
+                            // and report.
+                            return Ok(StopReason::Breakpoint(stopped_pid, candidate_pc));
+                        }
+                        return Ok(StopReason::SignalStop(stopped_pid, signal));
+                    }
+                    if signal == nix::sys::signal::SIGSTOP {
+                        // First-time post-exec stop: surface as
+                        // DebugeeStart so the front-end can
+                        // initialise the debug-info registry.
+                        return Ok(StopReason::DebugeeStart);
+                    }
+                    return Ok(StopReason::SignalStop(stopped_pid, signal));
+                }
+                _ => {
+                    // Any other wait status (continued, etc.) — keep
+                    // looping until a real stop arrives.
+                    continue;
+                }
+            }
+        }
     }
 
     pub fn pause(&mut self, _tcx: TraceContext) -> Result<(), Error> {
-        unimplemented!("darwin: Tracer::pause via task_suspend")
+        // SIGSTOP the whole process; on darwin the next `waitpid`
+        // will see the stop. The Mach-native equivalent
+        // (`task_suspend`) lands with the exception-port loop.
+        nix::sys::signal::kill(self.tracee_ctl.proc_pid(), nix::sys::signal::SIGSTOP)
+            .map_err(Error::Ptrace)?;
+        Ok(())
     }
 
     pub fn single_step(
         &mut self,
         _tcx: TraceContext,
-        _pid: Pid,
+        pid: Pid,
     ) -> Result<Option<StopReason>, Error> {
-        unimplemented!("darwin: Tracer::single_step via thread_set_state(ARM_DEBUG_STATE64) + MDSCR.SS")
+        use nix::sys::ptrace;
+        use nix::sys::wait::{WaitStatus, waitpid};
+
+        ptrace::step(pid, None).map_err(Error::Ptrace)?;
+        let status = waitpid(pid, None).map_err(Error::Waitpid)?;
+        match status {
+            WaitStatus::Stopped(_, sig) if sig == nix::sys::signal::SIGTRAP => Ok(None),
+            WaitStatus::Stopped(p, sig) => Ok(Some(StopReason::SignalStop(p, sig))),
+            WaitStatus::Exited(_, code) => Ok(Some(StopReason::DebugeeExit(code))),
+            _ => Ok(None),
+        }
     }
 }
