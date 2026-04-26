@@ -51,7 +51,21 @@ fn read_tpidr_el0(pid: nix::unistd::Pid) -> Result<usize, nix::Error> {
 
 #[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
 fn read_tpidr_el0(_pid: nix::unistd::Pid) -> Result<usize, nix::Error> {
-    unimplemented!("darwin/aarch64: read TPIDR_EL0 via thread_get_state(ARM_THREAD_STATE64)")
+    // Darwin doesn't expose TPIDR_EL0 (or TPIDRRO_EL0, which holds
+    // the pthread pointer on aarch64 darwin) via
+    // `thread_get_state(ARM_THREAD_STATE64)` — the struct only
+    // carries x0..x28, fp, lr, sp, pc, cpsr. The right resolution
+    // path for darwin TLS is to walk the dyld TLV descriptor
+    // (`{thunk, key, offset}`) plus the per-thread TSD array out
+    // of `pthread_t` (which `thread_info(THREAD_IDENTIFIER_INFO)`
+    // gives us as `thread_handle`). That's a separate code path
+    // from the linux DTV walker the caller falls through to here.
+    //
+    // Returning `ENOSYS` instead of panicking lets `weak_error!`
+    // in the caller log a warning and surface "no TLS for this
+    // variable" rather than crashing the debugger. Real TLS
+    // support on darwin lands when the TLV walker does.
+    Err(nix::errno::Errno::ENOSYS)
 }
 
 #[derive(Clone, Copy)]
