@@ -237,6 +237,49 @@ fn exception_port_receive_times_out() {
     );
 }
 
+/// `vm_read_n` and `vm_write_word` round-trip against our own
+/// task. Allocates a fresh page (so we know the layout), writes
+/// a sentinel via `vm_write_word`, reads it back via `vm_read_n`,
+/// asserts equality. This exercises the `mach_vm_protect` framing
+/// dance even on a writable page (`VM_PROT_COPY|R|W` → write →
+/// restore) which is the same dance used to write to r-x text
+/// pages in the debuggee.
+///
+/// Catches regressions in the BRK install path on every macOS
+/// host without needing a debuggee or entitlement.
+#[test]
+fn vm_write_then_read_self() {
+    use bugstalker::debugger::darwin_mach::{vm_read_n, vm_write_word};
+
+    // 16 KiB page is darwin/aarch64's default; libc::sysconf is
+    // the portable way to ask. We just need a writable region.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    let page = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    assert!(page != libc::MAP_FAILED, "mmap failed");
+
+    let task = unsafe { mach2::traps::mach_task_self() };
+    let sentinel: usize = 0xCAFEBABEDEADBEEF;
+    let addr = page as usize;
+
+    vm_write_word(task, addr, sentinel).expect("vm_write_word");
+    let bytes = vm_read_n(task, addr, std::mem::size_of::<usize>()).expect("vm_read_n");
+    let read_back = usize::from_ne_bytes(bytes.as_slice().try_into().expect("8 bytes"));
+    assert_eq!(read_back, sentinel, "round-trip mismatch");
+
+    unsafe {
+        libc::munmap(page, page_size);
+    }
+}
+
 /// `thread_suspend` + `thread_resume` round-trip on a worker
 /// thread we control. Suspending the test's *own* main thread
 /// would deadlock the test (it'd never resume itself), so spawn
