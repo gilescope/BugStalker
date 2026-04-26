@@ -46,6 +46,12 @@ impl Register {
     pub const SP: Register = Register::Rsp;
     /// Architecture-agnostic alias for the program counter.
     pub const PC: Register = Register::Rip;
+    /// Architecture-agnostic alias for the return-address register
+    /// (the DWARF column the CIE conventionally points its
+    /// `return_address_register` field at). On x86_64 the saved
+    /// return address shares column 16 with `rip`; on aarch64 it
+    /// lives in `x30`/LR (column 30).
+    pub const RA: Register = Register::Rip;
 
     pub fn dwarf_register(self) -> Option<DwarfRegister> {
         let register = match self {

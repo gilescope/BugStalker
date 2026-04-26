@@ -58,6 +58,11 @@ impl Register {
     pub const SP: Register = Register::Sp;
     /// Architecture-agnostic alias for the program counter.
     pub const PC: Register = Register::Pc;
+    /// Architecture-agnostic alias for the return-address register
+    /// (the DWARF column the CIE conventionally points its
+    /// `return_address_register` field at). aarch64 uses `x30`/LR
+    /// for procedure return; x86_64 uses the synthetic RIP column.
+    pub const RA: Register = Register::X30;
 
     pub fn dwarf_register(self) -> Option<DwarfRegister> {
         let n = match self {

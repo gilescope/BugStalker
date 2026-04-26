@@ -193,8 +193,8 @@ impl super::DebugSession {
             return self.send_err(req, "restartFrame: function start address is unavailable");
         };
 
-        dbg.set_register_value("rip", start_ip.as_u64())
-            .context("restartFrame: set rip")?;
+        dbg.set_pc(start_ip.as_u64())
+            .context("restartFrame: set pc")?;
         let _ = dbg.set_frame_into_focus(0);
 
         self.send_success(req)?;

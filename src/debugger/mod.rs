@@ -1156,6 +1156,19 @@ impl Debugger {
         map.persist(in_focus_pid)
     }
 
+    /// Architecture-agnostic program-counter setter. Prefer this over
+    /// `set_register_value("rip", _)` from cross-arch call sites (DAP
+    /// `goto` / `restartFrame`, internal stepping helpers): the
+    /// register is named `rip` on x86_64 but `pc` on aarch64.
+    pub fn set_pc(&self, val: u64) -> Result<(), Error> {
+        disable_when_not_stared!(self);
+
+        let in_focus_pid = self.ecx().pid_on_focus();
+        let mut map = RegisterMap::current(in_focus_pid)?;
+        map.set_pc(val);
+        map.persist(in_focus_pid)
+    }
+
     /// Return list of known files income from dwarf parser.
     pub fn known_files(&self) -> impl Iterator<Item = &PathBuf> {
         self.debugee

@@ -136,14 +136,6 @@ fn test_frame_cfa() {
     assert_no_proc!(debugee_pid);
 }
 
-// On x86_64 the CIE's return-address register is 16 (`rip`) and the
-// unwinder's `frame.return_addr` is the DWARF value for reg 16 at the
-// caller frame. Asserting that against `registers.value(reg16)` in the
-// current frame is meaningful. On aarch64 the CIE's RA register is 30
-// (`x30`/LR) and DWARF reg 32 (PC) is the current program counter — the
-// two are not the same quantity, so the assertion has no equivalent
-// without rewriting the test.
-#[cfg(target_arch = "x86_64")]
 #[test]
 #[serial]
 fn test_registers() {
@@ -160,17 +152,19 @@ fn test_registers() {
     debugger.start_debugee().unwrap();
     assert_eq!(info.line.take(), Some(5));
 
-    // there is only info about return address (dwarf reg 16) in .debug_info section
-    // so assert it with the built-in unwinder provided address
+    // The unwinder fills `frame.return_addr` from whichever DWARF
+    // column the CIE designates as its return-address register —
+    // column 16 (rip) on x86_64, column 30 (x30/LR) on aarch64.
+    // `Register::RA` resolves to that arch-appropriate column.
     let pc = debugger.ecx().location().pc;
     let frame = debugger.frame_info().unwrap();
     let registers = debugger.current_thread_registers_at_pc(pc).unwrap();
-    let ip_register = Register::PC
+    let ra_register = Register::RA
         .dwarf_register()
-        .expect("instruction pointer register must map to dwarf register");
+        .expect("return-address register must map to a DWARF register");
     assert_eq!(
         u64::from(frame.return_addr.unwrap()),
-        registers.value(ip_register).unwrap()
+        registers.value(ra_register).unwrap()
     );
 
     drop(debugger);
