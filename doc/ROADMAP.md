@@ -18,7 +18,7 @@ exercises. On linux/arm64: 20/20 lib + 75/75 tests/debugger +
 0 ignored**. The 9 hardware-watchpoint integration tests are
 `#[cfg]`-excluded on aarch64 — see "Hardware watchpoints" below.
 
-**Done**
+### Done
 
 * Compile-ready skeleton: `register/{x86_64,aarch64,debug}.rs` split,
   `BRK #0` software breakpoint, `PTRACE_GETREGSET(NT_PRSTATUS)` for
@@ -52,7 +52,7 @@ exercises. On linux/arm64: 20/20 lib + 75/75 tests/debugger +
   `.github/workflows/ci.yml`, mirroring the x86_64 setup with the
   latest supported rustc.
 
-**Hardware watchpoints — environment caveat**
+### Hardware watchpoints — environment caveat
 
 The aarch64 `HardwareDebugState` implementation is correct: a
 `PTRACE_SETREGSET(NT_ARM_HW_WATCH)` write succeeds and the kernel
@@ -67,7 +67,7 @@ tests are therefore `#[cfg(target_arch = "x86_64")]`-gated in
 pass on a KVM host or bare-metal aarch64; flipping the gate is a
 one-line change once such a runner is wired up.
 
-**Remaining (small, opportunistic)**
+### Remaining (small, opportunistic)
 
 1. **Bare-metal / KVM aarch64 runner** for the
    `watchpoint::*` tests. Drops the `#[cfg]` exclusion in
@@ -163,16 +163,18 @@ opcode, AAPCS64 calling convention, `Register::PC`/`SP`/`RA`); the
 new surface is the *backend* (how to spawn, attach, stop, read
 memory, read registers, install breakpoints).
 
-**Status:** compileable skeleton landed on the
-`giles-darwin-aarch64` branch. `cargo check` and `cargo build`
-both pass on `aarch64-apple-darwin`. Every linux-specific call
-site (`nix::sys::ptrace`, `nix::sys::personality`,
-`nix::sys::uio::process_vm_readv`, `libc::PTRACE_*` constants,
-`thread_db`) is `#[cfg(target_os = "linux")]`-gated, with a
-`#[cfg(not(target_os = "linux"))]` darwin parallel that
-`unimplemented!()`s with a comment naming the Mach API to use.
+**Status:** the POC is in. A debuggee spawns, hits a `BRK`-installed
+breakpoint, and the engine surfaces it back to the front-end (the
+`debugger_runs_to_first_breakpoint` smoke test under
+`tests/darwin_smoke.rs`). The Mach exception-port loop
+(allocate / register / receive / reply) is wired up but not yet
+substituted for the ptrace-driven `Tracer::resume`; the cutover is
+the next big chunk. `cargo check` and `cargo build` pass
+unconditionally on `aarch64-apple-darwin`; `cargo test` runs the
+non-entitlement-gated smokes (`exception_port_*`) on every macOS
+host.
 
-**Done**
+### Done — Phase 2 (POC)
 
 * `build.rs` accepts macOS/aarch64 (darwin/x86_64 explicitly not
   supported); skips the `--export-dynamic` linker flag (ld64 doesn't
@@ -180,72 +182,73 @@ site (`nix::sys::ptrace`, `nix::sys::personality`,
 * `thread_db` Cargo dep moved under
   `[target.'cfg(target_os = "linux")'.dependencies]`. The
   `thread_db_compat` shim's stub branch covers darwin too.
-* Linux ptrace path gated to `target_os = "linux"` in:
-  `process.rs` (spawn/attach), `tracer.rs` (wait/event loop),
-  `tracee.rs` (per-thread state — `tls_base` already
-  lives behind a `NoThreadDB` error path), `breakpoint.rs`
-  (software-bp install/remove via `PTRACE_POKEDATA`),
-  `register/aarch64.rs::current`/`persist`,
-  `register/aarch64.rs::debug_impl` (hw watchpoints),
-  `debugee/dwarf/unit/die_ref.rs::read_tpidr_el0` (TPIDR_EL0
-  reader),
-  `debugee/rendezvous.rs` (entire GNU `r_debug` walker),
-  `Debugger::write_memory`, `read_memory_by_pid`. Each darwin stub
-  carries a comment naming the Mach API the runtime impl will use.
+* Linux ptrace path gated to `target_os = "linux"`; every linux-
+  specific call site has a `#[cfg(not(target_os = "linux"))]`
+  darwin parallel naming or using the Mach API. Affected:
+  `process.rs`, `tracer.rs`, `tracee.rs`, `breakpoint.rs`,
+  `register/aarch64.rs`, `debugee/dwarf/unit/die_ref.rs`,
+  `debugee/rendezvous.rs`, `Debugger::write_memory`,
+  `read_memory_by_pid`.
+* `darwin_mach.rs`: Mach shim — `task_for_pid`, `vm_read_n`,
+  `vm_write_word` (with `VM_PROT_READ|WRITE|COPY` framing for r-x
+  text pages), `task_threads_vec`, `thread_get_arm_state64` /
+  `thread_set_arm_state64`, `arm_debug_state64_t` round-trip,
+  `dyld_image_list` (TASK_DYLD_INFO walk).
+* DWARF via `dsymutil`-produced
+  `<binary>.dSYM/Contents/Resources/DWARF/<basename>`; the
+  loader follows the `LC_UUID` of the binary to find the matching
+  dSYM.
+* Hardware watchpoints via `ARM_DEBUG_STATE64` (WCR/WVR/MDSCR_EL1
+  identical encoding to linux). `HardwareDebugState::sync` writes
+  the slot table to **every** thread of the task —
+  `task_threads()` + per-thread `thread_set_state` — so worker-
+  thread accesses don't miss the watch.
+* AAPCS64 inferior calls (`Debugger::call`, `vard`, `argd`,
+  `fmt::call_debug_fmt`): syscall trampoline parameterised by
+  `syscall_abi` submodule — darwin uses x16 for the syscall
+  number, `svc #0x80`, BSD nrs (mmap=197, munmap=73), and reads
+  CPSR.C (bit 29 of pstate) for success/failure rather than
+  `x0 == -errno`. Linux behaviour unchanged.
+* `ExceptionPort`: allocate (receive right + insert send right),
+  register on `EXC_MASK_{BREAKPOINT,SOFTWARE,BAD_ACCESS}` with
+  `EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES`, `receive(timeout)`
+  via `mach_msg(MACH_RCV_MSG | MACH_RCV_TIMEOUT)` decoding
+  `mach_exception_raise` (msg id 2405) into a `ReceivedException`,
+  `reply` writing the 36-byte `__Reply__mach_exception_raise_t`
+  with `MACH_MSG_TYPE_MOVE_SEND_ONCE` and `MACH_SEND_TIMEOUT`.
+* Codesigning workflow documented in the smoke-test header;
+  `tests/darwin.entitlements` ships `com.apple.security.cs.debugger`
+  and `get-task-allow`. The entitlement-gated smokes are `#[ignore]`
+  so an un-codesigned `cargo test` run is clean.
 
-**Phase 2 — first end-to-end stop (the POC)**
+### Phase 3 — parity with linux/aarch64
 
-1. **Spawn + attach.** `posix_spawn` with
-   `_POSIX_SPAWN_DISABLE_ASLR` (= `0x0100`) so addresses are
-   deterministic. `task_for_pid()` (requires the
-   `com.apple.security.cs.debugger` entitlement on `bs` itself, and
-   `get-task-allow` on the debuggee — easy when we control the
-   build) returns the Mach task port. `task_set_exception_ports()`
-   subscribes to `EXC_MASK_BREAKPOINT | EXC_MASK_SOFTWARE |
-   EXC_MASK_BAD_ACCESS`.
-2. **Stop loop.** A dedicated thread `mach_msg_receive`s on the
-   exception port; translates an incoming `mach_exception_raise`
-   into the same `StopReason` shape `Tracer::resume` returns on
-   linux today.
-3. **Memory I/O.** `mach_vm_read_overwrite` for reads;
-   `mach_vm_write` framed by `mach_vm_protect(VM_PROT_READ |
-   VM_PROT_WRITE | VM_PROT_COPY)` for writes (because text pages
-   are normally `r-x`).
-4. **Registers.**
-   `thread_get_state(thread, ARM_THREAD_STATE64, &state, &count)`
-   / `thread_set_state` for the GP set;
-   `ARM_NEON_STATE64` for vector regs;
-   `ARM_DEBUG_STATE64` for the WCR/WVR slots needed for hardware
-   watchpoints.
-5. **Breakpoint write.** Same `BRK #0` opcode and `PC_ADJUST = 0`
-   that already work on linux/aarch64; only the write path
-   changes (vm_protect dance + mach_vm_write).
-6. **First test:** `bs ./hello_world` spawns, hits a breakpoint at
-   `main`, prints the source line, single-steps, continues, the
-   debuggee exits cleanly.
+* **Cut `Tracer` over from ptrace+SIGTRAP to Mach exception ports.**
+  Today's darwin `Tracer::resume` does `ptrace::cont` + `waitpid`,
+  classifying SIGTRAP as a breakpoint by matching PC against the
+  registry. The post-BP single-step path is racy because the
+  ptrace event is the only stop signal we have. Wiring
+  `ExceptionPort::receive` as the primary stop source (decoding
+  EXC_BREAKPOINT, EXC_BAD_ACCESS-as-watchpoint, EXC_SOFTWARE) and
+  `reply(KERN_SUCCESS)` as the resume primitive lets us drop the
+  ptrace stop-signal coupling and gives multi-thread for free.
+* **TLS reads.** `thread_get_state(ARM_THREAD_STATE64)` doesn't
+  expose `TPIDRRO_EL0` (the pthread pointer on darwin); we have
+  to follow the dyld pthread struct layout via `mach_vm_read`.
+  Replaces the `thread_db_compat::NoThreadDB` stub.
+* **Multi-thread tracee enumeration.** `TraceeCtl` currently only
+  knows about the main thread; `task_threads()` enumeration
+  populates the rest. Mach thread ports are u32 names — we need a
+  stable mapping into the `Pid`-typed `TraceeCtl` API.
+* **Module-load notifications.** `dyld_image_list` is a snapshot;
+  for runtime dlopen/dlclose tracking we install a software BP on
+  `dyld_all_image_infos.notification` and re-walk the image array
+  on each fire (the linux equivalent is the `r_brk` rendezvous
+  callback).
+* **DAP.** Free once the underlying `Debugger` works end-to-end
+  with the exception-port loop.
 
-**Phase 3 — parity with linux/aarch64**
-
-* TLS via `thread_get_state(ARM_THREAD_STATE64)` →
-  `pthread_self` pointer → walk `_pthread_t` to find the per-image
-  TLS slot (or the dyld TLV records). Replaces the
-  `thread_db_compat` stub.
-* Module discovery via `task_info(TASK_DYLD_INFO)` →
-  `dyld_all_image_infos` → walk image array. Replaces the linux
-  `r_debug` rendezvous walker.
-* DWARF in `.dSYM/Contents/Resources/DWARF/<binary>` bundles. The
-  `object` crate already parses Mach-O; `gimli` is portable. The
-  `dsymutil`-produced bundle is the macOS equivalent of separate
-  debug info and we'll need to follow the `LC_UUID` from the
-  binary to find the matching dSYM.
-* Multi-thread support via Mach `task_threads()` + per-thread
-  exception subscription.
-* AAPCS64 inferior calls — already done at the trampoline level on
-  linux; only the `mach_vm_write`-of-the-shellcode and `task_resume`
-  details change.
-* DAP: same as on linux once the underlying `Debugger` works.
-
-**Open architectural decisions**
+### Open architectural decisions
 
 * **Codesigning of `bs`.** `task_for_pid` requires
   `com.apple.security.cs.debugger`. We can either (a) ship
