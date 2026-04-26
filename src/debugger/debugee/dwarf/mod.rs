@@ -700,6 +700,40 @@ impl DebugInformationBuilder {
     // todo configure this path
     const DEBUG_FILES_DIR: &'static str = "/usr/lib/debug";
 
+    /// Look for `<obj_path>.dSYM/Contents/Resources/DWARF/<basename>`
+    /// — Apple's bundle layout for separate-file DWARF, produced by
+    /// `dsymutil`. Cargo's `target/debug/<bin>` does NOT contain
+    /// embedded DWARF on macOS by default; the user (or a build
+    /// script) has to invoke `dsymutil` to extract debug info from
+    /// the `.o` files into the bundle. If no bundle is present, we
+    /// return `None` and the caller falls back to using the binary
+    /// itself (which will yield "no debug information" rather than
+    /// crash).
+    #[cfg(target_os = "macos")]
+    fn get_dwarf_from_dsym_bundle(
+        &self,
+        obj_path: &Path,
+    ) -> Result<Option<(PathBuf, Mmap)>, Error> {
+        let basename = match obj_path.file_name() {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        // Try `<obj_path>.dSYM` first (the cargo / dsymutil default).
+        let mut candidate = obj_path.as_os_str().to_owned();
+        candidate.push(".dSYM");
+        let bundle = PathBuf::from(candidate)
+            .join("Contents")
+            .join("Resources")
+            .join("DWARF")
+            .join(basename);
+        if !bundle.exists() {
+            return Ok(None);
+        }
+        let file = fs::File::open(&bundle)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        Ok(Some((bundle, mmap)))
+    }
+
     fn get_dwarf_from_separate_debug_file<'a, 'b, OBJ>(
         &self,
         obj_file: &'a OBJ,
@@ -793,19 +827,35 @@ impl DebugInformationBuilder {
             bases = bases.set_eh_frame_hdr(eh_frame_hdr);
         }
 
+        // Order of debug-info lookup:
+        //   1. (macos) <obj_path>.dSYM bundle — Apple's separate-file
+        //      layout produced by `dsymutil`.
+        //   2. (linux) build-id index under /usr/lib/debug/.build-id.
+        //   3. (linux) `.gnu_debuglink` walk of /usr/lib/debug.
+        //   4. fall back to the binary's embedded DWARF.
         let debug_split_file_data;
         let debug_split_file;
-        let debug_info_file =
-            if let Ok(Some((path, debug_file))) = self.get_dwarf_from_separate_debug_file(file) {
-                debug!(target: "dwarf-loader", "{obj_path:?} has separate debug information file");
-                debug!(target: "dwarf-loader", "load debug information from {path:?}");
-                debug_split_file_data = debug_file;
-                debug_split_file = object::File::parse(&*debug_split_file_data)?;
-                &debug_split_file
-            } else {
-                debug!(target: "dwarf-loader", "load debug information from {obj_path:?}");
-                file
-            };
+
+        #[cfg(target_os = "macos")]
+        let dsym = self.get_dwarf_from_dsym_bundle(obj_path).ok().flatten();
+        #[cfg(not(target_os = "macos"))]
+        let dsym: Option<(PathBuf, Mmap)> = None;
+
+        let debug_info_file = if let Some((path, debug_file)) = dsym {
+            debug!(target: "dwarf-loader", "{obj_path:?} has dSYM bundle at {path:?}");
+            debug_split_file_data = debug_file;
+            debug_split_file = object::File::parse(&*debug_split_file_data)?;
+            &debug_split_file
+        } else if let Ok(Some((path, debug_file))) = self.get_dwarf_from_separate_debug_file(file) {
+            debug!(target: "dwarf-loader", "{obj_path:?} has separate debug information file");
+            debug!(target: "dwarf-loader", "load debug information from {path:?}");
+            debug_split_file_data = debug_file;
+            debug_split_file = object::File::parse(&*debug_split_file_data)?;
+            &debug_split_file
+        } else {
+            debug!(target: "dwarf-loader", "load debug information from {obj_path:?}");
+            file
+        };
 
         let dwarf = loader::load_par(debug_info_file, endian)?;
         let debug_frame = if debug_info_file.section_by_name(".debug_frame").is_some() {

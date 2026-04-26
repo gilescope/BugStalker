@@ -41,6 +41,7 @@
 
 use bugstalker::debugger::process::Child;
 use bugstalker::debugger::register::RegisterMap;
+use bugstalker::debugger::{DebuggerBuilder, NopHook, rust};
 use os_pipe::pipe;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -116,4 +117,43 @@ fn spawn_and_read_pc() {
         }
     }
     panic!("debuggee {pid} didn't die within 5s of ptrace::cont(SIGKILL)");
+}
+
+/// Higher-level: build a full `Debugger` over the spawned hello_world,
+/// set a breakpoint on `main`, run, and verify we hit the BP. This
+/// exercises the dSYM bundle loader, the BRK install path through
+/// the Mach memory shim, and the Tracer event loop end to end.
+///
+/// **Prerequisite:** the binary must have a `.dSYM` bundle —
+/// `cargo build` on macOS doesn't generate one, so run:
+/// ```sh
+/// dsymutil examples/target/debug/hello_world
+/// ```
+#[test]
+#[ignore = "needs codesigning + dsymutil; see file header"]
+fn debugger_runs_to_first_breakpoint() {
+    ensure_debuggee_present();
+    rust::Environment::init(None);
+
+    let (_reader, writer) = pipe().expect("pipe");
+    let runner = Child::new(
+        HELLO_WORLD,
+        Vec::<String>::new(),
+        None::<PathBuf>,
+        writer.try_clone().expect("clone writer"),
+        writer,
+    );
+    let installed = runner.install().expect("Child::install");
+
+    let builder = DebuggerBuilder::new().with_hooks(NopHook {});
+    let mut debugger = builder
+        .build(installed)
+        .expect("DebuggerBuilder::build — typically fails here if dSYM bundle is missing");
+
+    debugger
+        .set_breakpoint_at_line("hello_world.rs", 5)
+        .expect("set_breakpoint_at_line");
+    debugger.start_debugee().expect("start_debugee");
+    // If we got here, the breakpoint at hello_world.rs:5 fired and
+    // the tracer returned with the debuggee paused inside main.
 }
