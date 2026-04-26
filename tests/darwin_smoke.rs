@@ -237,6 +237,26 @@ fn exception_port_receive_times_out() {
     );
 }
 
+/// `thread_info(THREAD_IDENTIFIER_INFO)` on our own main thread
+/// returns a non-zero stable id and a pthread_t handle. We use
+/// `mach_thread_self()` (no entitlement needed for our own task)
+/// so the test runs on every macOS host.
+#[test]
+fn thread_identity_self() {
+    use bugstalker::debugger::darwin_mach::thread_identity;
+
+    // SAFETY: mach_thread_self always succeeds; result is a port
+    // name in our task's IPC space.
+    let me = unsafe { mach2::mach_init::mach_thread_self() };
+    let id = thread_identity(me).expect("thread_identity on self");
+
+    assert!(id.thread_id != 0, "thread_id must be non-zero");
+    assert!(
+        id.thread_handle != 0,
+        "thread_handle (pthread_t) must be non-zero on a live thread"
+    );
+}
+
 /// `ExceptionPort::reply` to a port name we don't hold a send
 /// right to should fail predictably (`MACH_SEND_INVALID_DEST` =
 /// `0x10000003`) rather than crash, hang, or succeed silently.

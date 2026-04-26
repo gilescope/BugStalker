@@ -235,6 +235,72 @@ pub fn task_threads_vec(task: task_t) -> Result<Vec<thread_act_t>, MachError> {
     Ok(slice.to_vec())
 }
 
+/// Stable 64-bit identifier for a Mach thread.
+///
+/// Mach thread *ports* (`thread_act_t`) are u32 IPC names — they're
+/// unique within our task's port space at one moment, but the
+/// kernel may recycle them when threads come and go. The
+/// `THREAD_IDENTIFIER_INFO` flavour gives us:
+///
+/// * `thread_id` — a 64-bit globally-unique-and-stable id (the
+///   value `pthread_threadid_np(pth, &id)` returns from inside
+///   the inferior),
+/// * `thread_handle` — the pthread_t pointer for that thread,
+///   which is what we'll deref to walk TLS (`__pthread_t->tsd[]`)
+///   and pull thread-local Rust variables out.
+///
+/// Both fields will be loadbearing for the multi-thread Tracee
+/// enumeration; we land the shim now so the call sites are
+/// already there when the rest of the wiring catches up.
+pub struct ThreadIdentity {
+    pub thread_id: u64,
+    pub thread_handle: u64,
+}
+
+/// `<mach/thread_info.h>` :: `thread_identifier_info_t`.
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+#[allow(non_camel_case_types)]
+struct thread_identifier_info {
+    thread_id: u64,
+    thread_handle: u64,
+    dispatch_qaddr: u64,
+}
+
+/// `THREAD_IDENTIFIER_INFO` flavour and the count it expects.
+const THREAD_IDENTIFIER_INFO_FLAVOR: u32 = 4;
+const THREAD_IDENTIFIER_INFO_COUNT: u32 =
+    (mem::size_of::<thread_identifier_info>() / mem::size_of::<u32>()) as u32;
+
+unsafe extern "C" {
+    fn thread_info(
+        target_act: thread_act_t,
+        flavor: u32,
+        thread_info_out: *mut u32,
+        thread_info_outCnt: *mut u32,
+    ) -> kern_return_t;
+}
+
+pub fn thread_identity(thread: thread_act_t) -> Result<ThreadIdentity, MachError> {
+    let mut info = thread_identifier_info::default();
+    let mut count = THREAD_IDENTIFIER_INFO_COUNT;
+    // SAFETY: info is sized to match `count`; the kernel writes
+    // `count` u32-words into it iff success.
+    let kr = unsafe {
+        thread_info(
+            thread,
+            THREAD_IDENTIFIER_INFO_FLAVOR,
+            &mut info as *mut _ as *mut u32,
+            &mut count,
+        )
+    };
+    check(kr)?;
+    Ok(ThreadIdentity {
+        thread_id: info.thread_id,
+        thread_handle: info.thread_handle,
+    })
+}
+
 /// Read the aarch64 GP register set for a single Mach thread. Use
 /// `task_threads_vec` to get the thread port; for the typical
 /// "stopped at a breakpoint, only one thread" case the first
