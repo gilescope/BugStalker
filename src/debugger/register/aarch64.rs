@@ -510,10 +510,34 @@ pub mod debug_impl {
             Ok(Self { raw })
         }
 
+        /// Mirror this slot table to **every** thread of the
+        /// task. Hardware watchpoint registers (WCR/WVR) are
+        /// per-thread on aarch64; if we set them on the main
+        /// thread only, accesses from a worker thread go
+        /// undetected. Linux gets this for free because the
+        /// `Tracer` already enumerates all tids and the kernel
+        /// applies `PTRACE_SETREGSET(NT_ARM_HW_WATCH)` per tid;
+        /// on darwin the analogous step is `task_threads()` +
+        /// `thread_set_state(ARM_DEBUG_STATE64)` per thread port.
+        ///
+        /// We continue on per-thread errors so a transient thread
+        /// (created and then exited between enumerate and write)
+        /// can't sink the whole sync. The first error is returned
+        /// once the loop is done.
         pub fn sync(&self, pid: Pid) -> Result<(), Error> {
             let task = darwin_mach::task_for_pid(pid)?;
-            let thread = darwin_mach::first_thread_of(task)?;
-            darwin_mach::thread_set_arm_debug_state64(thread, &self.raw)?;
+            let threads = darwin_mach::task_threads_vec(task)?;
+            let mut first_err: Option<Error> = None;
+            for thread in threads {
+                if let Err(e) = darwin_mach::thread_set_arm_debug_state64(thread, &self.raw) {
+                    if first_err.is_none() {
+                        first_err = Some(Error::from(e));
+                    }
+                }
+            }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
             Ok(())
         }
 
