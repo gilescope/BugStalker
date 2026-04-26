@@ -178,12 +178,15 @@ pub fn vm_read_n(task: task_t, addr: usize, n: usize) -> Result<Vec<u8>, MachErr
 /// breakpoint would be visible to other processes mapping the
 /// same binary.
 pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Error> {
+    use mach2::vm_prot::VM_PROT_EXECUTE;
     let bytes = value.to_ne_bytes();
     let len = mem::size_of::<usize>() as mach_vm_size_t;
 
-    // Widen protection to W (CoW); ignore the result — many pages
-    // are already writable, and the subsequent write surfaces any
-    // real failure with a meaningful kr.
+    // Widen protection to W (CoW). The VM_PROT_COPY bit makes the
+    // kernel turn the shared text page into a private CoW copy
+    // before applying the new permissions, so the BP we're about
+    // to write isn't visible to other processes mapping the same
+    // binary. Result ignored — many pages are already writable.
     let _ = unsafe {
         mach_vm_protect(
             task as vm_task_entry_t,
@@ -205,6 +208,22 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
         )
     };
     check(kr)?;
+
+    // Restore the page to R+X — without this the inferior takes
+    // KERN_PROTECTION_FAILURE on the next instruction it tries to
+    // execute through the patched page. We always want R+X after
+    // a BP install (the only caller of vm_write_word writes
+    // trampolines / BRKs into text pages); a hypothetical caller
+    // writing to a data page would need a different helper anyway.
+    let _ = unsafe {
+        mach_vm_protect(
+            task as vm_task_entry_t,
+            addr as mach_vm_address_t,
+            len,
+            0,
+            VM_PROT_READ | VM_PROT_EXECUTE,
+        )
+    };
     Ok(())
 }
 
