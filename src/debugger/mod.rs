@@ -1367,6 +1367,19 @@ pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8
 /// have to know about Mach error codes.
 #[cfg(target_os = "macos")]
 pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8>, nix::Error> {
-    let task = darwin_mach::task_for_pid(pid).map_err(|_| nix::errno::Errno::EFAULT)?;
-    darwin_mach::vm_read_n(task, addr, read_n).map_err(|_| nix::errno::Errno::EFAULT)
+    // Log the rich MachError before collapsing to EFAULT — the
+    // signature returns nix::Error so we can't propagate the kr
+    // upstream; logging keeps the diagnostic recoverable from
+    // `--log` output.
+    let task = darwin_mach::task_for_pid(pid).map_err(|e| {
+        log::error!(target: "darwin_mach", "read_memory_by_pid task_for_pid({pid}): {e}");
+        nix::errno::Errno::EFAULT
+    })?;
+    darwin_mach::vm_read_n(task, addr, read_n).map_err(|e| {
+        log::error!(
+            target: "darwin_mach",
+            "read_memory_by_pid vm_read_n(addr={addr:#x}, n={read_n}): {e}"
+        );
+        nix::errno::Errno::EFAULT
+    })
 }
