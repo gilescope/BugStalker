@@ -246,6 +246,30 @@ host.
   `weak_error!` surfaces "no TLS for this variable" gracefully
   rather than crashing the debugger.
 
+### Done — Tracer cutover (path A, pure Mach)
+
+* **`Child::install`** rewritten to `posix_spawnp` with
+  `POSIX_SPAWN_START_SUSPENDED`; no ptrace involvement on the
+  spawn path. The kernel parks the inferior at creation; the
+  parent gets `task_for_pid` rights for free (parent/child
+  relationship, no entitlement needed for the spawn case).
+* **`Tracer::resume`** drives through the Mach loop: reply to
+  the previously-saved `(remote_port, msg_id)` to release the
+  parked faulting thread, `task_resume`, `port.receive` blocking,
+  `task_suspend` to coherent the rest of the threads while we
+  classify, save the new pending reply, return `StopReason`.
+* **Classifier** uses Mach exception type + codes directly:
+  EXC_BREAKPOINT(6)+EXC_ARM_BREAKPOINT(1) → software BP;
+  EXC_BAD_ACCESS(1)+EXC_ARM_DA_DEBUG(0x102) → HW watchpoint
+  (codes[1]=FAR_EL1); EXC_SOFTWARE(5)+EXC_SOFT_SIGNAL(0x10003) →
+  Unix signal.
+* **`Tracer::pause`** is `task_suspend` (was `kill(SIGSTOP)`).
+* **First call** synthesises `DebugeeStart` from the
+  spawn-suspend state; subsequent calls drive the receive loop.
+* All 3 entitlement-gated smoke tests pass on the cutover code:
+  `spawn_and_read_pc`, `exception_port_allocate_and_register`,
+  `debugger_runs_to_first_breakpoint`.
+
 ### Phase 3 — parity with linux/aarch64
 
 * **Cut `Tracer` over from ptrace+SIGTRAP to Mach exception ports.**
