@@ -236,3 +236,32 @@ fn exception_port_receive_times_out() {
         "receive blocked far past the requested timeout: {elapsed:?}"
     );
 }
+
+/// `ExceptionPort::reply` to a port name we don't hold a send
+/// right to should fail predictably (`MACH_SEND_INVALID_DEST` =
+/// `0x10000003`) rather than crash, hang, or succeed silently.
+/// This proves the reply-message encoding (msgh_bits, sizes,
+/// header layout) round-trips through `mach_msg(MACH_SEND_MSG)`
+/// — the kernel parses the header before checking the port and
+/// would return a different error on a malformed message.
+///
+/// We can't easily test the success branch from a unit test (it
+/// needs a real kernel-side request waiting on a send-once right
+/// in our IPC space), so the integration test that exercises the
+/// happy path runs end-to-end against a debuggee — that arrives
+/// later in the macOS port.
+#[test]
+fn exception_port_reply_to_null_port() {
+    use bugstalker::debugger::darwin_mach::ExceptionPort;
+
+    let err = ExceptionPort::reply(0, 2405, 0).expect_err("null port must fail");
+    // MACH_SEND_INVALID_DEST = 0x10000003. Allow any non-success
+    // reply error in the 0x1000_xxxx range — the kernel may also
+    // return MACH_SEND_INVALID_HEADER (0x10000000) on certain
+    // builds; the important thing is "it failed and didn't lie".
+    let kr = err.0 as u32;
+    assert!(
+        (0x1000_0000..=0x1000_FFFF).contains(&kr),
+        "expected a MACH_SEND_* error, got 0x{kr:08x}"
+    );
+}

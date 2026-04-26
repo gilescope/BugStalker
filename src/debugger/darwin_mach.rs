@@ -32,7 +32,8 @@ use mach2::exception_types::{
 };
 use mach2::mach_port::{mach_port_allocate, mach_port_insert_right};
 use mach2::message::{
-    MACH_MSG_TYPE_MAKE_SEND, MACH_RCV_MSG, MACH_RCV_TIMED_OUT, MACH_RCV_TIMEOUT, mach_msg,
+    MACH_MSG_TYPE_MAKE_SEND, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_RCV_MSG, MACH_RCV_TIMED_OUT,
+    MACH_RCV_TIMEOUT, MACH_SEND_MSG, MACH_SEND_TIMEOUT, MACH_MSGH_BITS, mach_msg,
     mach_msg_header_t,
 };
 use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_name_t};
@@ -562,6 +563,66 @@ impl ExceptionPort {
             exception,
             codes,
         }))
+    }
+
+    /// Acknowledge an exception. The kernel parks the faulted thread
+    /// until we send a reply on the request's `remote_port`; what
+    /// we put in the `kern_return_t` field determines what happens
+    /// next:
+    ///
+    /// * `KERN_SUCCESS` (0) — we handled it, please resume the
+    ///   thread (after we've adjusted PC, fixed memory, etc.).
+    /// * `KERN_FAILURE` (5) — let the next handler in the chain
+    ///   take this; this is what we'd send for an exception we
+    ///   didn't subscribe to but somehow got. Equivalent to
+    ///   ptrace's "transparent passthrough" of an unwanted signal.
+    ///
+    /// The reply layout is the `__Reply__mach_exception_raise_t`
+    /// generated from `<mach/exc.defs>`: header (24) + NDR (8) +
+    /// kern_return_t (4) = 36 bytes total. The reply id is always
+    /// `request_id + 100` (Mach RPC convention).
+    ///
+    /// `remote_port` came as a SEND_ONCE right; we move it back to
+    /// the kernel by tagging the bits as `MOVE_SEND_ONCE`.
+    pub fn reply(
+        remote_port: u32,
+        request_msg_id: i32,
+        retcode: kern_return_t,
+    ) -> Result<(), MachError> {
+        const REPLY_LEN: usize = 36;
+        let mut buf = [0u8; REPLY_LEN];
+
+        // Header.
+        let bits: u32 = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        buf[0..4].copy_from_slice(&bits.to_ne_bytes());
+        buf[4..8].copy_from_slice(&(REPLY_LEN as u32).to_ne_bytes());
+        buf[8..12].copy_from_slice(&remote_port.to_ne_bytes());
+        // local_port @ 12 = MACH_PORT_NULL (already zero).
+        // voucher_port @ 16 = 0 (already zero).
+        let reply_id: i32 = request_msg_id + 100;
+        buf[20..24].copy_from_slice(&reply_id.to_ne_bytes());
+
+        // NDR_record @ 24..32: zeros are fine for a single integer.
+
+        // kern_return_t @ 32..36.
+        buf[32..36].copy_from_slice(&retcode.to_ne_bytes());
+
+        // SAFETY: buf holds a fully-formed reply message; we ask
+        // mach_msg to send it with no receive part. We use a short
+        // timeout so a misconfigured caller (e.g. dead remote port)
+        // can't wedge the tracer.
+        let kr = unsafe {
+            mach_msg(
+                buf.as_mut_ptr() as *mut mach_msg_header_t,
+                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                REPLY_LEN as u32,
+                0,
+                MACH_PORT_NULL,
+                /* timeout_ms = */ 100,
+                MACH_PORT_NULL,
+            )
+        };
+        check(kr)
     }
 }
 
