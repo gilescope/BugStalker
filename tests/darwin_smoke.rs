@@ -437,6 +437,35 @@ fn thread_suspend_resume_roundtrip() {
     thread_resume(worker_port).expect("thread_resume — must rebalance the suspend count");
 }
 
+/// `dyld_notification_addr` against our own task: the value must
+/// be a non-zero, plausibly-mapped function pointer. The dyld
+/// notification function is what we install a software BP on as
+/// the macOS analogue of `r_debug.r_brk`; if `dyld_notification_addr`
+/// returned the wrong offset into `dyld_all_image_infos` (e.g.
+/// reading version or infoArrayCount instead) the BP would land
+/// somewhere benign and module-load tracking would silently break.
+///
+/// We don't try to verify the address is *actually* dyld's
+/// notification — that needs DWARF/symbol resolution. Just that
+/// it's a non-zero user-space address, which catches the common
+/// "wrong field offset" bug.
+#[test]
+fn dyld_notification_addr_self() {
+    use bugstalker::debugger::darwin_mach::dyld_notification_addr;
+
+    let task = unsafe { mach2::traps::mach_task_self() };
+    let addr = dyld_notification_addr(task).expect("dyld_notification_addr on self");
+
+    assert!(addr != 0, "dyld notification addr must be set on a live process");
+    // aarch64 darwin user space tops out below 0x0000_FFFF_FFFF_FFFF;
+    // dyld lives high but not in the kernel range.
+    assert!(
+        addr < 0x0000_FFFF_FFFF_FFFF,
+        "expected user-space addr, got {:#x}",
+        addr
+    );
+}
+
 /// `dyld_image_list` walked against our own task port (no
 /// debuggee, no entitlement) returns at least one image — the
 /// test binary itself — and every entry has a non-zero
