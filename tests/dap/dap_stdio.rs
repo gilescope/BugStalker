@@ -45,6 +45,10 @@ fn start_bs_stdio_dap(debugee: &str) -> anyhow::Result<StdioDAP> {
 }
 
 pub struct StdioDAP {
+    /// Held only to keep the spawned `bs` process alive for the
+    /// lifetime of the DAP session — `Child::drop` reaps and
+    /// kills it when this struct goes out of scope.
+    #[allow(dead_code)]
     child: Child,
     stdin: Box<dyn Write + Send>,
     reader: BufReader<std::process::ChildStdout>,

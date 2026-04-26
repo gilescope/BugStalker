@@ -210,7 +210,12 @@ fn ptrace_regset(request: libc::c_uint, pid: Pid, regs: &mut user_regs_struct) -
         iov_base: regs as *mut _ as *mut c_void,
         iov_len: std::mem::size_of::<user_regs_struct>(),
     };
-    // NT_PRSTATUS = 1 — general-purpose register set.
+    // NT_PRSTATUS = 1 — general-purpose register set. The `addr`
+    // argument here is the regset number, not a real pointer, so
+    // we use a magic sentinel constant rather than a true address.
+    // (clippy::manual_dangling_ptr would suggest dangling_mut, but
+    // that's a different sentinel value the kernel doesn't accept.)
+    #[allow(clippy::manual_dangling_ptr)]
     let ret = unsafe {
         libc::ptrace(
             request,
@@ -746,17 +751,9 @@ pub mod debug_impl {
         Ok(())
     }
 
-    #[derive(PartialEq, Debug)]
+    #[derive(PartialEq, Debug, Default)]
     pub struct HardwareDebugState {
         raw: UserHwDebugState,
-    }
-
-    impl Default for HardwareDebugState {
-        fn default() -> Self {
-            Self {
-                raw: UserHwDebugState::default(),
-            }
-        }
     }
 
     impl HardwareDebugState {
