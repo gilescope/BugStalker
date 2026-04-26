@@ -835,16 +835,62 @@ impl Tracer {
         _tcx: TraceContext,
         pid: Pid,
     ) -> Result<Option<StopReason>, Error> {
+        use crate::debugger::register::RegisterMap;
         use nix::sys::ptrace;
+        use nix::sys::signal::Signal::{
+            SIGALRM, SIGCHLD, SIGIO, SIGPROF, SIGURG, SIGVTALRM,
+        };
         use nix::sys::wait::{WaitStatus, waitpid};
 
-        ptrace::step(pid, None).map_err(Error::Ptrace)?;
-        let status = waitpid(pid, None).map_err(Error::Waitpid)?;
-        match status {
-            WaitStatus::Stopped(_, sig) if sig == nix::sys::signal::SIGTRAP => Ok(None),
-            WaitStatus::Stopped(p, sig) => Ok(Some(StopReason::SignalStop(p, sig))),
-            WaitStatus::Exited(_, code) => Ok(Some(StopReason::DebugeeExit(code))),
-            _ => Ok(None),
+        loop {
+            ptrace::step(pid, None).map_err(Error::Ptrace)?;
+            let status = waitpid(pid, None).map_err(Error::Waitpid)?;
+            match status {
+                WaitStatus::Stopped(stopped_pid, sig) if sig == nix::sys::signal::SIGTRAP => {
+                    // A SIGTRAP during a single-step is normally
+                    // the step trap itself — but it can also be a
+                    // watchpoint hit if the stepped instruction
+                    // touched a watched address. Probe FAR_EL1
+                    // before declaring the step done.
+                    let raw_pc = RegisterMap::current(stopped_pid)?.pc();
+                    if let Ok(task) = crate::debugger::darwin_mach::task_for_pid(stopped_pid)
+                        && let Ok(thread) = crate::debugger::darwin_mach::first_thread_of(task)
+                        && let Ok(exc) =
+                            crate::debugger::darwin_mach::thread_get_arm_exception_state64(
+                                thread,
+                            )
+                        && let Ok(mut state) =
+                            crate::debugger::register::debug::HardwareDebugState::current(
+                                stopped_pid,
+                            )
+                        && let Some(dr) = state.detect_and_flush_hit(Some(exc.far as usize))
+                    {
+                        let _ = state.sync(stopped_pid);
+                        return Ok(Some(StopReason::Watchpoint(
+                            stopped_pid,
+                            crate::debugger::address::RelocatedAddress::from(raw_pc as usize),
+                            WatchpointHitType::DebugRegister(dr),
+                        )));
+                    }
+                    return Ok(None);
+                }
+                WaitStatus::Stopped(stopped_pid, sig)
+                    if matches!(
+                        sig,
+                        SIGALRM | SIGURG | SIGCHLD | SIGIO | SIGVTALRM | SIGPROF
+                    ) =>
+                {
+                    // Re-inject and step again — same pass-through
+                    // policy as resume(); a quiet timer tick mid-step
+                    // shouldn't surface as a user-visible stop.
+                    ptrace::cont(stopped_pid, Some(sig)).map_err(Error::Ptrace)?;
+                    let _ = waitpid(stopped_pid, None).map_err(Error::Waitpid)?;
+                    continue;
+                }
+                WaitStatus::Stopped(p, sig) => return Ok(Some(StopReason::SignalStop(p, sig))),
+                WaitStatus::Exited(_, code) => return Ok(Some(StopReason::DebugeeExit(code))),
+                _ => return Ok(None),
+            }
         }
     }
 }
