@@ -220,6 +220,31 @@ host.
   `tests/darwin.entitlements` ships `com.apple.security.cs.debugger`
   and `get-task-allow`. The entitlement-gated smokes are `#[ignore]`
   so an un-codesigned `cargo test` run is clean.
+* Hardware watchpoint **hit detection** via `ARM_EXCEPTION_STATE64`'s
+  `FAR_EL1` field — the macOS analogue of linux's
+  `siginfo.si_addr` for a `TRAP_HWBKPT` SIGTRAP. The darwin Tracer
+  classifies SIGTRAP into Breakpoint (PC matches BP registry) or
+  Watchpoint (FAR matches an armed slot's BAS-encoded byte set)
+  before falling through to SignalStop.
+* Quiet-signal pass-through in `Tracer::resume` and
+  `Tracer::single_step`: SIGALRM, SIGURG, SIGCHLD, SIGIO,
+  SIGVTALRM, SIGPROF are re-injected via `ptrace::cont(Some(sig))`
+  rather than dropping to a user prompt — matches the linux
+  `QUIET_SIGNALS` policy.
+* `MachError` carries human-readable diagnostics: `Display` decodes
+  the `kern_return_t` to a name + context (e.g. `KERN_FAILURE` →
+  *"missing com.apple.security.cs.debugger entitlement on the
+  caller"*); `From<MachError> for Error` logs the full form before
+  collapsing to `Errno::EFAULT` so log greps surface the real cause.
+* dyld notification BP at `dyld_all_image_infos.notification`
+  (offset 16) — the macOS analogue of `r_debug.r_brk` for module-
+  load tracking. `Rendezvous::r_brk` returns this address;
+  installing a BP there fires on every dlopen/dlclose.
+* TLS read on darwin returns `ENOSYS` instead of panicking — real
+  resolution needs the dyld TLV walker plus the per-thread TSD
+  array out of `pthread_t`; until then the surrounding
+  `weak_error!` surfaces "no TLS for this variable" gracefully
+  rather than crashing the debugger.
 
 ### Phase 3 — parity with linux/aarch64
 
