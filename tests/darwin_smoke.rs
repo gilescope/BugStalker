@@ -237,6 +237,45 @@ fn exception_port_receive_times_out() {
     );
 }
 
+/// `thread_get_arm_state64` against a suspended worker thread:
+/// PC and SP must be non-zero and within the aarch64 user-space
+/// range. We suspend before reading because Mach docs only
+/// guarantee a coherent snapshot when the thread isn't executing
+/// — same discipline the eventual Tracer uses around every
+/// register read.
+#[test]
+fn thread_get_arm_state64_suspended_worker() {
+    use bugstalker::debugger::darwin_mach::{thread_get_arm_state64, thread_resume, thread_suspend};
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<u32>();
+    std::thread::spawn(move || {
+        let me = unsafe { mach2::mach_init::mach_thread_self() };
+        tx.send(me).expect("send port");
+        loop {
+            std::thread::park();
+        }
+    });
+    let worker = rx.recv().expect("worker port");
+
+    thread_suspend(worker).expect("thread_suspend");
+    let s = thread_get_arm_state64(worker).expect("thread_get_arm_state64");
+    thread_resume(worker).expect("thread_resume");
+
+    assert!(s.__pc != 0, "PC must be set on a live thread");
+    assert!(
+        s.__pc < 0x0000_FFFF_FFFF_FFFF,
+        "PC must be in aarch64 user-space range; got {:#x}",
+        s.__pc
+    );
+    assert!(s.__sp != 0, "SP must be set");
+    assert!(
+        s.__sp < 0x0000_FFFF_FFFF_FFFF,
+        "SP must be in aarch64 user-space range; got {:#x}",
+        s.__sp
+    );
+}
+
 /// `vm_read_n` and `vm_write_word` round-trip against our own
 /// task. Allocates a fresh page (so we know the layout), writes
 /// a sentinel via `vm_write_word`, reads it back via `vm_read_n`,
