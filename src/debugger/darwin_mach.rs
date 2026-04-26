@@ -210,3 +210,136 @@ pub fn first_thread_of(task: task_t) -> Result<thread_act_t, MachError> {
         .copied()
         .ok_or(MachError(mach2::kern_return::KERN_FAILURE))
 }
+
+// --- dyld image list (the Mach equivalent of GNU `r_debug`) ----------
+//
+// On linux the rendezvous protocol is `r_debug` — a struct ld.so
+// maintains in the debuggee whose `link_map` field is the head of a
+// linked list of loaded shared objects. On darwin, dyld publishes the
+// equivalent in a slightly different shape:
+//
+//   1. `task_info(task, TASK_DYLD_INFO, …)` returns a virtual address
+//      in the debuggee pointing at a `dyld_all_image_infos` struct.
+//   2. That struct's `infoArray` field points at a contiguous array of
+//      `dyld_image_info` records (one per loaded image), sized by
+//      `infoArrayCount`.
+//   3. Each `dyld_image_info` carries `imageLoadAddress` (the
+//      `mach_header` virtual address of the image) and
+//      `imageFilePath` (a NUL-terminated debuggee VA of the image's
+//      filesystem path).
+//
+// We don't go through `mach2::structs` for these because they're not
+// exposed there — the layout below mirrors `<mach-o/dyld_images.h>`.
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+#[allow(non_camel_case_types)]
+struct dyld_all_image_infos_v1 {
+    version: u32,
+    info_array_count: u32,
+    info_array: u64, // *const dyld_image_info in the debuggee
+                     // (further fields ignored — they're version-dependent
+                     //  and we only need infoArray + count for now)
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+#[allow(non_camel_case_types)]
+struct dyld_image_info {
+    image_load_address: u64, // *const mach_header
+    image_file_path: u64,    // *const c_char (NUL-term)
+    image_file_mod_date: u64,
+}
+
+/// One entry in dyld's loaded-image list.
+pub struct ImageInfo {
+    /// Virtual address of the image's `mach_header` in the debuggee.
+    pub load_addr: usize,
+    /// Filesystem path of the image (read out of the debuggee).
+    pub path: String,
+}
+
+/// Resolve the address of the debuggee's `dyld_all_image_infos`
+/// struct via `task_info(TASK_DYLD_INFO)`.
+fn task_dyld_all_image_infos_addr(task: task_t) -> Result<u64, MachError> {
+    use mach2::task::task_info;
+    use mach2::task_info::{TASK_DYLD_INFO, TASK_DYLD_INFO_COUNT, task_dyld_info};
+
+    let mut info = task_dyld_info::default();
+    let mut count = TASK_DYLD_INFO_COUNT;
+    // SAFETY: kernel writes `info` iff success.
+    let kr = unsafe {
+        task_info(
+            task,
+            TASK_DYLD_INFO,
+            &mut info as *mut _ as *mut i32,
+            &mut count,
+        )
+    };
+    check(kr)?;
+    Ok(info.all_image_info_addr as u64)
+}
+
+/// Read `n` bytes at `addr` and decode them as `T`. Used to slurp
+/// fixed-layout structs out of the debuggee.
+fn read_struct<T: Copy + Default>(task: task_t, addr: u64) -> Result<T, MachError> {
+    let bytes = vm_read_n(task, addr as usize, mem::size_of::<T>())?;
+    let mut out = T::default();
+    // SAFETY: bytes is exactly sizeof::<T> long; T is repr(C) and
+    // Default for our internal types means all-zero, which is a
+    // valid bit pattern for the integer fields they contain.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            &mut out as *mut T as *mut u8,
+            mem::size_of::<T>(),
+        );
+    }
+    Ok(out)
+}
+
+/// Read a NUL-terminated C string from the debuggee.
+fn read_cstr(task: task_t, addr: u64, max_len: usize) -> Result<String, MachError> {
+    let bytes = vm_read_n(task, addr as usize, max_len)?;
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Ok(String::from_utf8_lossy(&bytes[..len]).into_owned())
+}
+
+/// Walk the dyld image list and return one `ImageInfo` per loaded
+/// image. The first entry is conventionally the main executable.
+pub fn dyld_image_list(task: task_t) -> Result<Vec<ImageInfo>, MachError> {
+    let infos_addr = task_dyld_all_image_infos_addr(task)?;
+    let header: dyld_all_image_infos_v1 = read_struct(task, infos_addr)?;
+    let count = header.info_array_count as usize;
+    if count == 0 || header.info_array == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Read the whole array in one round-trip.
+    let array_bytes = vm_read_n(
+        task,
+        header.info_array as usize,
+        count * mem::size_of::<dyld_image_info>(),
+    )?;
+
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * mem::size_of::<dyld_image_info>();
+        let mut entry = dyld_image_info::default();
+        // SAFETY: array_bytes covers `count` whole entries.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                array_bytes.as_ptr().add(off),
+                &mut entry as *mut _ as *mut u8,
+                mem::size_of::<dyld_image_info>(),
+            );
+        }
+        // PATH_MAX on darwin is 1024; cap reads at that.
+        let path = read_cstr(task, entry.image_file_path, 1024).unwrap_or_default();
+        out.push(ImageInfo {
+            load_addr: entry.image_load_address as usize,
+            path,
+        });
+    }
+    Ok(out)
+}

@@ -27,13 +27,16 @@ pub enum RendezvousError {
 /// Rendezvous structure maintained by dynamic linker.
 /// This structure maintains a list of shared library descriptors.
 pub struct Rendezvous {
+    #[allow(dead_code)]
     pid: Pid,
     #[cfg(target_os = "linux")]
     inner: ffi::r_debug,
-    /// Marker field on darwin until the dyld_image_info-based path
-    /// replaces the GNU `r_debug` walk.
+    /// Snapshot of dyld's loaded-image list, captured at
+    /// `Rendezvous::new` time. Refreshing on shared-library
+    /// load/unload is a follow-up — wire
+    /// `_dyld_register_func_for_add_image` later.
     #[cfg(not(target_os = "linux"))]
-    _darwin_stub: std::marker::PhantomData<()>,
+    images: Vec<crate::debugger::darwin_mach::ImageInfo>,
 }
 
 impl Rendezvous {
@@ -102,30 +105,74 @@ impl Rendezvous {
         RelocatedAddress::from(self.inner.r_brk)
     }
 
-    /// Darwin path: build a `Rendezvous` from `task_info(TASK_DYLD_INFO)`
-    /// which yields a `dyld_all_image_infos` pointer + count. Stubbed.
+    /// Darwin path: build a `Rendezvous` from
+    /// `task_info(TASK_DYLD_INFO)` — that gives us a debuggee VA
+    /// pointing at dyld's `dyld_all_image_infos`, which we walk to
+    /// snapshot the loaded-image list. The `mapping_offset` and
+    /// `sections` arguments come from the GNU ELF rendezvous flow
+    /// and have no darwin equivalent — kept in the signature so
+    /// the cross-platform call site (in `Debugee::new_*`) doesn't
+    /// have to cfg-branch.
     #[cfg(not(target_os = "linux"))]
     pub fn new(
-        _proc_pid: Pid,
+        proc_pid: Pid,
         _mapping_offset: usize,
         _sections: &HashMap<String, u64>,
     ) -> Result<Self, RendezvousError> {
-        unimplemented!("darwin: Rendezvous::new via task_info(TASK_DYLD_INFO)")
+        use crate::debugger::darwin_mach;
+        let task = darwin_mach::task_for_pid(proc_pid)
+            .map_err(|_| RendezvousError::NotFound)?;
+        let images = darwin_mach::dyld_image_list(task)
+            .map_err(|_| RendezvousError::NotFound)?;
+        if images.is_empty() {
+            return Err(RendezvousError::NotFound);
+        }
+        Ok(Self {
+            pid: proc_pid,
+            images,
+        })
     }
 
+    /// Darwin: the first dyld image is the main executable's
+    /// `mach_header`; that's the cross-platform equivalent of
+    /// linux's `link_map` head pointer.
     #[cfg(not(target_os = "linux"))]
     pub fn link_map_main(&self) -> RelocatedAddress {
-        unimplemented!("darwin: link_map_main via dyld_all_image_infos")
+        let load = self
+            .images
+            .first()
+            .map(|i| i.load_addr)
+            .unwrap_or(0);
+        RelocatedAddress::from(load)
     }
 
+    /// Darwin: one `LinkMap` per loaded dyld image. We use each
+    /// image's `mach_header` load address as the `addr` field
+    /// (analogous to linux's `link_map` node address) and the
+    /// path string as the name.
     #[cfg(not(target_os = "linux"))]
     pub fn link_maps(&self) -> Result<Vec<LinkMap>, RendezvousError> {
-        unimplemented!("darwin: link_maps via dyld_all_image_infos")
+        Ok(self
+            .images
+            .iter()
+            .map(|i| LinkMap {
+                addr: RelocatedAddress::from(i.load_addr),
+                name: i.path.clone(),
+            })
+            .collect())
     }
 
+    /// Darwin: dyld doesn't publish an exact `r_brk` equivalent —
+    /// the conventional way to learn about image load/unload is
+    /// `_dyld_register_func_for_add_image` (in-process callbacks).
+    /// For the POC we hand back the address of the first image's
+    /// `mach_header` so the caller's "set a BP here" code installs
+    /// a no-op (the BP will sit at module-start memory which is
+    /// already executable, but won't fire on dyld changes). Module
+    /// load/unload tracking lands as a later follow-up.
     #[cfg(not(target_os = "linux"))]
     pub fn r_brk(&self) -> RelocatedAddress {
-        unimplemented!("darwin: r_brk has no direct dyld equivalent — use _dyld_register_func_for_add_image")
+        self.link_map_main()
     }
 }
 
