@@ -260,6 +260,16 @@ fn exception_port_reply_to_null_port() {
     // return MACH_SEND_INVALID_HEADER (0x10000000) on certain
     // builds; the important thing is "it failed and didn't lie".
     let kr = err.0 as u32;
+    // Sanity: Display gives back the kr in hex plus a name.
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains(&format!("0x{kr:08x}")),
+        "Display should include the raw kr; got {rendered}"
+    );
+    assert!(
+        !rendered.contains("unknown"),
+        "MACH_SEND_* code should be named, got {rendered}"
+    );
     assert!(
         (0x1000_0000..=0x1000_FFFF).contains(&kr),
         "expected a MACH_SEND_* error, got 0x{kr:08x}"

@@ -55,11 +55,66 @@ use std::mem;
 #[derive(Debug)]
 pub struct MachError(pub kern_return_t);
 
+impl MachError {
+    /// Human-readable name for the wrapped `kern_return_t`. Covers
+    /// the codes we actually hit in this codebase plus the most
+    /// common others; unknown codes fall through to `"unknown"`.
+    /// The point is rustc-level diagnostics — when something
+    /// upstream prints `MachError(5)` the developer should see
+    /// "task_for_pid denied: needs cs.debugger entitlement", not
+    /// "0x5".
+    pub fn describe(&self) -> &'static str {
+        match self.0 {
+            // <mach/kern_return.h>
+            0 => "KERN_SUCCESS",
+            1 => "KERN_INVALID_ADDRESS — read/write of unmapped vm",
+            2 => "KERN_PROTECTION_FAILURE — page perms reject the op (e.g. write to r-x without VM_PROT_COPY)",
+            3 => "KERN_NO_SPACE",
+            4 => "KERN_INVALID_ARGUMENT — bad task/thread port, wrong state flavour, or out-of-range count",
+            5 => "KERN_FAILURE — generic; for task_for_pid this almost always means missing com.apple.security.cs.debugger entitlement on the *caller*",
+            6 => "KERN_RESOURCE_SHORTAGE",
+            7 => "KERN_NOT_RECEIVER",
+            8 => "KERN_NO_ACCESS",
+            10 => "KERN_MEMORY_ERROR",
+            14 => "KERN_ABORTED",
+            15 => "KERN_INVALID_NAME — port name doesn't refer to a port we own",
+            16 => "KERN_INVALID_TASK",
+            17 => "KERN_INVALID_RIGHT — port name lacks the requested right (send/recv/send-once)",
+            18 => "KERN_INVALID_VALUE",
+            22 => "KERN_INVALID_HOST",
+            37 => "KERN_TERMINATED — the target task/thread has exited",
+            46 => "KERN_NOT_SUPPORTED",
+            49 => "KERN_OPERATION_TIMED_OUT",
+            // <mach/message.h> — only the ones we actually trigger.
+            0x10000001 => "MACH_SEND_INVALID_DATA",
+            0x10000002 => "MACH_SEND_INVALID_DEST — destination port name is not a valid send right",
+            0x10000003 => "MACH_SEND_TIMED_OUT",
+            0x10000004 => "MACH_SEND_INTERRUPTED",
+            0x10000007 => "MACH_SEND_INVALID_HEADER — malformed mach_msg_header_t (bits, size, or port refs)",
+            0x10004003 => "MACH_RCV_TIMED_OUT",
+            0x10004002 => "MACH_RCV_INVALID_NAME",
+            _ => "unknown kern_return_t",
+        }
+    }
+}
+
+impl std::fmt::Display for MachError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Mach kr=0x{:08x}: {}", self.0, self.describe())
+    }
+}
+
+impl std::error::Error for MachError {}
+
 impl From<MachError> for Error {
-    fn from(_: MachError) -> Self {
+    fn from(e: MachError) -> Self {
         // The closest existing variant — the caller failed to poke
         // the inferior. The wrapped `Errno::EFAULT` is the most
-        // honest mapping for "Mach denied access".
+        // honest mapping for "Mach denied access". We log the
+        // detailed kr+description at error level so callers grep'ing
+        // logs see what actually went wrong rather than a bare
+        // EFAULT.
+        log::error!(target: "darwin_mach", "{}", e);
         Ptrace(Errno::EFAULT)
     }
 }
