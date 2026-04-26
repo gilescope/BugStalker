@@ -118,22 +118,33 @@ impl DwarfRegistry {
             //     the runtime load base.
             //   darwin Mach-O: DWARF/symbol addresses are
             //     pre-relocated to runtime VAs assuming the
-            //     default __TEXT.vmaddr (typically 0x1_0000_0000).
-            //     mapping_offset must be the *slide* — i.e.
-            //     load_base - __TEXT.vmaddr — not load_base.
+            //     default __TEXT.vmaddr. mapping_offset must be
+            //     the *slide* — i.e. load_base - __TEXT.vmaddr.
             //
-            // With POSIX_SPAWN_DISABLE_ASLR the slide is 0 on
-            // darwin, so DWARF addresses resolve directly.
-            // Reading __TEXT.vmaddr per-file would require
-            // re-parsing the Mach-O header here; for now treat
-            // mapping_offset as 0 on darwin (assumes ASLR-disabled
-            // spawn, which Child::install enforces). Real ASLR
-            // handling lands when attach-by-pid (where we don't
-            // control the slide) gets exercised end-to-end.
+            // For the main executable on POSIX_SPAWN_DISABLE_ASLR
+            // the slide is conventionally 0 (the kernel honours the
+            // requested __TEXT.vmaddr exactly). For dylibs dyld
+            // picks an arbitrary load address regardless of ASLR
+            // settings, so we MUST read each file's preferred
+            // __TEXT.vmaddr and subtract.
             #[cfg(target_os = "linux")]
             let mapping = lower_sect.start();
             #[cfg(not(target_os = "linux"))]
-            let mapping = 0usize;
+            let mapping = {
+                use object::{Object, ObjectSegment};
+                let preferred_vmaddr = std::fs::File::open(absolute_debugee_path)
+                    .ok()
+                    .and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() })
+                    .and_then(|m| {
+                        let parsed = object::File::parse(&*m).ok()?;
+                        parsed
+                            .segments()
+                            .find(|s| s.name().ok().flatten() == Some("__TEXT"))
+                            .map(|s| s.address())
+                    })
+                    .unwrap_or(0) as usize;
+                lower_sect.start().wrapping_sub(preferred_vmaddr)
+            };
 
             let range = RegionRange {
                 from: RelocatedAddress::from(lower_sect.start()),
