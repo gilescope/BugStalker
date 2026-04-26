@@ -270,7 +270,32 @@ host.
   `spawn_and_read_pc`, `exception_port_allocate_and_register`,
   `debugger_runs_to_first_breakpoint`.
 
-### Inferior calls — design notes
+### Done — Mach-native CallHelper (`69dd33e`)
+
+The trampoline driver chose path (C) from the design notes
+below: `Cell<Option<(u32, i32)>>` on
+`DarwinSupervision::pending_reply` lets the trampoline mutate
+the port's reply state via `&Tracer` — the FFI-opaque
+mutability linux gets for free through `ptrace::cont`/`step`.
+
+`CallHelper::drive_one(ccx, single_step)` is the per-step
+primitive: arm SS bits if needed, reply prior pending exception
+(releases the parked thread), `task_resume`, `port.receive`
+blocking, `task_suspend`, save new pending reply, optionally
+disarm SS. `mmap`/`munmap`/`jump` use `single_step=true` (one
+instruction); `call_fn` uses `single_step=false` (run-to-BRK).
+
+Plumbing: `pub(crate) Debugger::debugee()` →
+`Debugee::tracer()` → `Tracer::darwin_state()` exposes the
+supervision state through `&Debugger`; `DarwinSupervision`
+gains `task()`/`port()`/`take_pending_reply()`/`set_pending_reply()`,
+all `&self`-callable thanks to the `Cell`. No `&mut` cascade.
+
+Validated: 3/3 entitlement-gated tests pass; 13/13 non-ignored
+darwin smokes; 20/20 lib tests; earthly +check clean. The
+design notes below stay for context.
+
+### Inferior calls — design notes (resolved by `69dd33e`)
 
 The trampoline driver (`CallHelper::mmap` → `jump` → `call_fn` →
 `munmap`) on aarch64 still uses `ptrace::cont`/`step` + `waitpid`,
