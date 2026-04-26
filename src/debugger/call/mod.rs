@@ -498,11 +498,10 @@ impl CallHelper {
         debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
 
         let mut regs = ccx.regs.clone();
-        const MMAP: u64 = 222;
         const PROT: u64 =
             (nix::libc::PROT_READ | nix::libc::PROT_EXEC | nix::libc::PROT_WRITE) as u64;
         const FLAGS: u64 = (nix::libc::MAP_PRIVATE | nix::libc::MAP_ANONYMOUS) as u64;
-        regs.update(Register::X8, MMAP);
+        regs.update(syscall_abi::NR_REG, syscall_abi::NR_MMAP);
         regs.update(Register::X0, 0);
         let page_size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as u64 };
         regs.update(Register::X1, page_size);
@@ -513,10 +512,7 @@ impl CallHelper {
 
         regs.persist(ccx.pid)?;
 
-        const SVC_0: usize = 0xD400_0001;
-        const SVC_0_MASK: usize = 0xFFFF_FFFF_0000_0000;
-
-        let new_instructions = (ccx.text & SVC_0_MASK) | SVC_0;
+        let new_instructions = (ccx.text & syscall_abi::SVC_MASK) | syscall_abi::SVC_INSTR;
 
         ccx.dbg.write_memory(ccx.pc.as_usize(), new_instructions)?;
 
@@ -526,7 +522,7 @@ impl CallHelper {
 
         let regs = RegisterMap::current(ccx.pid)?;
         let alloc_ptr: u64 = regs.value(Register::X0);
-        if alloc_ptr as i64 == -1 {
+        if syscall_abi::is_syscall_error(&regs, alloc_ptr) {
             return Err(CallError::Mmap.into());
         }
 
@@ -536,15 +532,11 @@ impl CallHelper {
     }
 
     fn munmap(ccx: &CallContext, addr: u64) -> Result<(), Error> {
-        const SVC_0: usize = 0xD400_0001;
-        const SVC_0_MASK: usize = 0xFFFF_FFFF_0000_0000;
-
-        let new_text = (ccx.text & SVC_0_MASK) | SVC_0;
+        let new_text = (ccx.text & syscall_abi::SVC_MASK) | syscall_abi::SVC_INSTR;
         ccx.dbg.write_memory(ccx.pc.as_usize(), new_text)?;
 
         let mut regs = ccx.regs.clone();
-        const MUNMAP: u64 = 215;
-        regs.update(Register::X8, MUNMAP);
+        regs.update(syscall_abi::NR_REG, syscall_abi::NR_MUNMAP);
         regs.update(Register::X0, addr);
         let page_size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as u64 };
         regs.update(Register::X1, page_size);
@@ -555,7 +547,7 @@ impl CallHelper {
         debug_assert!(matches!(res, WaitStatus::Stopped(_, _)));
 
         let regs: RegisterMap = RegisterMap::current(ccx.pid)?;
-        if regs.value(Register::X0) != 0 {
+        if syscall_abi::is_syscall_error(&regs, regs.value(Register::X0)) {
             return Err(CallError::Munmap.into());
         }
         debug_assert!(utils::region_non_exist(ccx.pid, addr)?);
@@ -563,6 +555,67 @@ impl CallHelper {
         ccx.dbg.write_memory(ccx.pc.as_usize(), ccx.text)?;
 
         Ok(())
+    }
+}
+
+/// aarch64 OS-specific syscall ABI bits. Both linux and darwin run
+/// the AArch64 architecture, but the syscall convention is OS, not
+/// arch:
+///
+/// |               | linux            | darwin           |
+/// |---------------|------------------|------------------|
+/// | nr register   | x8               | x16              |
+/// | trap insn     | `svc #0`         | `svc #0x80`      |
+/// | mmap nr       | 222              | 197 (BSD)        |
+/// | munmap nr     | 215              | 73  (BSD)        |
+/// | error signal  | x0 = -errno      | CPSR.C set, x0=errno |
+///
+/// The encoding for `svc #imm16` is
+/// `1101_0100_000_imm16_0000_1`, so:
+/// * `svc #0`     → `0xD400_0001`
+/// * `svc #0x80`  → `0xD400_0001 | (0x80 << 5)` = `0xD400_1001`
+#[cfg(target_arch = "aarch64")]
+mod syscall_abi {
+    use super::{Register, RegisterMap};
+
+    #[cfg(target_os = "linux")]
+    pub const NR_REG: Register = Register::X8;
+    #[cfg(not(target_os = "linux"))]
+    pub const NR_REG: Register = Register::X16;
+
+    #[cfg(target_os = "linux")]
+    pub const NR_MMAP: u64 = 222;
+    #[cfg(target_os = "linux")]
+    pub const NR_MUNMAP: u64 = 215;
+
+    #[cfg(not(target_os = "linux"))]
+    pub const NR_MMAP: u64 = 197;
+    #[cfg(not(target_os = "linux"))]
+    pub const NR_MUNMAP: u64 = 73;
+
+    #[cfg(target_os = "linux")]
+    pub const SVC_INSTR: usize = 0xD400_0001;
+    #[cfg(not(target_os = "linux"))]
+    pub const SVC_INSTR: usize = 0xD400_1001;
+    pub const SVC_MASK: usize = 0xFFFF_FFFF_0000_0000;
+
+    /// linux: raw syscall return is `-errno` on failure; valid mmap
+    /// addresses are large positive values, so `x0 == -1` means
+    /// `EPERM` (or any address-as-MAP_FAILED).  Stricter checks
+    /// would inspect the full negative range; we keep the original
+    /// liberal check for behavioural parity.
+    #[cfg(target_os = "linux")]
+    pub fn is_syscall_error(_regs: &RegisterMap, x0: u64) -> bool {
+        x0 as i64 == -1
+    }
+
+    /// darwin BSD syscall: success → `CPSR.C = 0`, x0 holds the
+    /// result; failure → `CPSR.C = 1`, x0 holds the errno (positive).
+    /// Read CPSR via the `pstate` slot of the register map; the C
+    /// flag lives at bit 29 of NZCV.
+    #[cfg(not(target_os = "linux"))]
+    pub fn is_syscall_error(regs: &RegisterMap, _x0: u64) -> bool {
+        regs.value(Register::Pstate) & (1u64 << 29) != 0
     }
 }
 
