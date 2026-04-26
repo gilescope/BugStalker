@@ -112,6 +112,17 @@ pub struct Tracer {
     /// Linux-only: guards the group-stop race in `PTRACE_O_TRACECLONE`.
     #[cfg(target_os = "linux")]
     group_stop_guard: bool,
+    /// Darwin: have we already consumed the post-exec SIGTRAP/
+    /// SIGSTOP? Linux distinguishes the initial stop via
+    /// `PTRACE_EVENT_STOP`; darwin doesn't have that, so we just
+    /// flip a flag the first time SIGSTOP is seen and treat it
+    /// as `DebugeeStart`. Every subsequent SIGSTOP is a user-
+    /// initiated pause (via `Tracer::pause`'s `kill(SIGSTOP)`)
+    /// and surfaces as a regular `SignalStop` so the engine's
+    /// pause handler sees it for what it is, not a spurious
+    /// "debugger just started" event.
+    #[cfg(not(target_os = "linux"))]
+    darwin_seen_initial_stop: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -702,12 +713,16 @@ impl Tracer {
     pub fn new(proc_pid: Pid) -> Self {
         Self {
             tracee_ctl: TraceeCtl::new(proc_pid),
+            darwin_seen_initial_stop: false,
         }
     }
 
     pub fn new_external(proc_pid: Pid, threads: &[Pid]) -> Self {
         Self {
             tracee_ctl: TraceeCtl::new_external(proc_pid, threads),
+            // We attached to a running process — the initial stop
+            // semantics don't apply.
+            darwin_seen_initial_stop: true,
         }
     }
 
@@ -787,10 +802,20 @@ impl Tracer {
                         return Ok(StopReason::SignalStop(stopped_pid, signal));
                     }
                     if signal == nix::sys::signal::SIGSTOP {
-                        // First-time post-exec stop: surface as
-                        // DebugeeStart so the front-end can
-                        // initialise the debug-info registry.
-                        return Ok(StopReason::DebugeeStart);
+                        if !self.darwin_seen_initial_stop {
+                            // First-time post-exec stop: surface
+                            // as DebugeeStart so the front-end
+                            // can initialise the debug-info
+                            // registry.
+                            self.darwin_seen_initial_stop = true;
+                            return Ok(StopReason::DebugeeStart);
+                        }
+                        // Any subsequent SIGSTOP came from
+                        // `Tracer::pause`'s `kill(SIGSTOP)` — a
+                        // user-initiated pause. Surface as a
+                        // regular SignalStop so the engine's
+                        // pause handler sees it.
+                        return Ok(StopReason::SignalStop(stopped_pid, signal));
                     }
                     // Pass-through: signals the inferior produces
                     // for its own bookkeeping (timers, async I/O,
