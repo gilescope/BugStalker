@@ -1379,9 +1379,25 @@ impl Drop for Debugger {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    // Darwin: no ptrace. Drop the Mach suspend
-                    // count so SIGKILL can actually be processed
-                    // (kernel won't deliver signals to a fully
+                    // Darwin: no ptrace. Two things to do before
+                    // SIGKILL can land:
+                    //   1. Release any thread parked in a Mach
+                    //      exception (BRK / WP fire that the
+                    //      Tracer hasn't replied to yet).
+                    //      Otherwise the kernel keeps the thread
+                    //      stuck and the process can't die.
+                    //   2. Drop the Mach suspend count so the
+                    //      kernel can deliver the signal.
+                    use crate::debugger::darwin_mach::ExceptionPort;
+                    use mach2::kern_return::KERN_SUCCESS;
+                    if let Some(state) = self.debugee.tracer().darwin_state()
+                        && let Some((remote, id)) = state.take_pending_reply()
+                    {
+                        let _ = ExceptionPort::reply(remote, id, KERN_SUCCESS);
+                    }
+                    // Drop the Mach suspend count so SIGKILL can
+                    // actually be processed (kernel won't deliver
+                    // signals to a fully
                     // suspended task).
                     let _ = current_tids; // captured for symmetry; unused on darwin
                     if let Ok(task) =
@@ -1390,19 +1406,27 @@ impl Drop for Debugger {
                         let _ = darwin_mach::task_resume(task);
                     }
                 }
-                // kill debugee process
-                signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGKILL)
-                    .expect("kill debugee");
+                // kill debugee process. On darwin, the inferior
+                // may have already exited cleanly (passing through
+                // user BPs and running to completion) by the time
+                // we get here — the engine surfaces BPs and
+                // inspect commands without halting forever, so the
+                // inferior naturally finishes. Tolerate ESRCH from
+                // kill and Exited from waitpid.
+                let kill_pid = self.debugee.tracee_ctl().proc_pid();
+                let _ = signal::kill(kill_pid, Signal::SIGKILL);
                 let wait_result = loop {
-                    let wait_result = waitpid(Pid::from_raw(-1), None).expect("waiting debugee");
-                    if wait_result.pid() == Some(self.debugee.tracee_ctl().proc_pid()) {
-                        break wait_result;
+                    let wp = waitpid(Pid::from_raw(-1), None);
+                    match wp {
+                        Ok(w) if w.pid() == Some(kill_pid) => break w,
+                        Ok(_) => continue, // some other child; keep waiting
+                        Err(_) => break WaitStatus::StillAlive,
                     }
                 };
 
                 debug_assert!(matches!(
                     wait_result,
-                    WaitStatus::Signaled(_, Signal::SIGKILL, _)
+                    WaitStatus::Signaled(_, Signal::SIGKILL, _) | WaitStatus::Exited(_, _)
                 ));
             }
             ExecutionStatus::Exited => {}
