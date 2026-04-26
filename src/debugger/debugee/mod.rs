@@ -267,6 +267,10 @@ impl Debugee {
     }
 
     /// Return debugee [`Tracer`]
+    pub fn tracer(&self) -> &Tracer {
+        &self.tracer
+    }
+
     pub fn tracer_mut(&mut self) -> &mut Tracer {
         &mut self.tracer
     }

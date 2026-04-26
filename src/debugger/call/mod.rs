@@ -587,17 +587,137 @@ impl CallHelper {
 /// hanging or corrupting the inferior.
 #[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
 impl CallHelper {
-    fn call_fn(_ccx: &CallContext, _pc: u64, _fn_addr: u64, _args: CallArgs) -> Result<(), Error> {
-        Err(CallError::Mmap.into())
+    /// Drive one trampoline step on darwin: arm software single-step
+    /// (or not, for a BRK-terminated trampoline), reply the prior
+    /// pending exception to release the parked thread, `task_resume`
+    /// the kernel-suspended task, block on the Tracer's exception
+    /// port for the resulting trap, re-suspend, save the new pending
+    /// reply, optionally disarm SS.
+    ///
+    /// Mutates `darwin_state.pending_reply` via `Cell` (mutation
+    /// through `&Tracer` — the only reason this is reachable from
+    /// `&CallContext.dbg`).
+    fn drive_one(ccx: &CallContext, single_step: bool) -> Result<(), Error> {
+        use crate::debugger::darwin_mach::{self, ExceptionPort};
+        use mach2::kern_return::KERN_SUCCESS;
+
+        let supervision = ccx
+            .dbg
+            .debugee()
+            .tracer()
+            .darwin_state()
+            .ok_or(CallError::Mmap)?;
+        let task = supervision.task();
+        let port = supervision.port();
+
+        let focus = darwin_mach::first_thread_of(task).map_err(Error::from)?;
+        if single_step {
+            darwin_mach::arm_set_single_step(focus, true).map_err(Error::from)?;
+        }
+
+        if let Some((remote, id)) = supervision.take_pending_reply() {
+            ExceptionPort::reply(remote, id, KERN_SUCCESS).map_err(Error::from)?;
+        }
+
+        darwin_mach::task_resume(task).map_err(Error::from)?;
+
+        let exc = loop {
+            match port.receive(u32::MAX).map_err(Error::from)? {
+                Some(e) => break e,
+                None => continue,
+            }
+        };
+
+        darwin_mach::task_suspend(task).map_err(Error::from)?;
+        if single_step {
+            let _ = darwin_mach::arm_set_single_step(focus, false);
+        }
+        supervision.set_pending_reply(Some((exc.remote_port, exc.msg_id)));
+        Ok(())
     }
-    fn jump(_ccx: &CallContext, _dest_ptr: u64) -> Result<(), Error> {
-        Err(CallError::Jmp.into())
+
+    fn call_fn(ccx: &CallContext, pc: u64, fn_addr: u64, args: CallArgs) -> Result<(), Error> {
+        const BLR_X8_BRK0: usize = 0xD420_0000usize << 32 | 0xD63F_0100usize;
+        ccx.dbg.write_memory(pc as usize, BLR_X8_BRK0)?;
+
+        let mut regs: RegisterMap = ccx.regs.clone();
+        args.prepare_registers(&mut regs);
+        regs.update(Register::X8, fn_addr);
+        regs.update(Register::Pc, pc);
+        regs.persist(ccx.pid)?;
+
+        // Run-to-BRK; not single-step.
+        Self::drive_one(ccx, false)
     }
-    fn mmap(_ccx: &CallContext) -> Result<u64, Error> {
-        Err(CallError::Mmap.into())
+
+    fn jump(ccx: &CallContext, dest_ptr: u64) -> Result<(), Error> {
+        debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
+
+        let mut regs = ccx.regs.clone();
+        regs.update(Register::X8, dest_ptr);
+        regs.persist(ccx.pid)?;
+
+        const BR_X8: usize = 0xD61F_0100;
+        const BR_X8_MASK: usize = 0xFFFF_FFFF_0000_0000;
+        let new_text = (ccx.text & BR_X8_MASK) | BR_X8;
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_text)?;
+
+        Self::drive_one(ccx, true)?;
+
+        if RegisterMap::current(ccx.pid)?.value(Register::Pc) != dest_ptr {
+            return Err(CallError::Jmp.into());
+        }
+        Ok(())
     }
-    fn munmap(_ccx: &CallContext, _addr: u64) -> Result<(), Error> {
-        Err(CallError::Munmap.into())
+
+    fn mmap(ccx: &CallContext) -> Result<u64, Error> {
+        debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
+
+        let mut regs = ccx.regs.clone();
+        const PROT: u64 = (libc::PROT_READ | libc::PROT_EXEC | libc::PROT_WRITE) as u64;
+        const FLAGS: u64 = (libc::MAP_PRIVATE | libc::MAP_ANON) as u64;
+        regs.update(syscall_abi::NR_REG, syscall_abi::NR_MMAP);
+        regs.update(Register::X0, 0);
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+        regs.update(Register::X1, page_size);
+        regs.update(Register::X2, PROT);
+        regs.update(Register::X3, FLAGS);
+        regs.update(Register::X4, -1i32 as u64);
+        regs.update(Register::X5, 0);
+        regs.persist(ccx.pid)?;
+
+        let new_instructions = (ccx.text & syscall_abi::SVC_MASK) | syscall_abi::SVC_INSTR;
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_instructions)?;
+
+        Self::drive_one(ccx, true)?;
+
+        let regs = RegisterMap::current(ccx.pid)?;
+        let alloc_ptr: u64 = regs.value(Register::X0);
+        if syscall_abi::is_syscall_error(&regs, alloc_ptr) {
+            return Err(CallError::Mmap.into());
+        }
+        Ok(alloc_ptr)
+    }
+
+    fn munmap(ccx: &CallContext, addr: u64) -> Result<(), Error> {
+        let new_text = (ccx.text & syscall_abi::SVC_MASK) | syscall_abi::SVC_INSTR;
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_text)?;
+
+        let mut regs = ccx.regs.clone();
+        regs.update(syscall_abi::NR_REG, syscall_abi::NR_MUNMAP);
+        regs.update(Register::X0, addr);
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+        regs.update(Register::X1, page_size);
+        regs.persist(ccx.pid)?;
+
+        Self::drive_one(ccx, true)?;
+
+        let regs: RegisterMap = RegisterMap::current(ccx.pid)?;
+        if syscall_abi::is_syscall_error(&regs, regs.value(Register::X0)) {
+            return Err(CallError::Munmap.into());
+        }
+        ccx.dbg.write_memory(ccx.pc.as_usize(), ccx.text)?;
+        Ok(())
     }
 }
 

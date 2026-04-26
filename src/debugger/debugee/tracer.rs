@@ -128,7 +128,7 @@ pub struct Tracer {
 }
 
 #[cfg(not(target_os = "linux"))]
-struct DarwinSupervision {
+pub(crate) struct DarwinSupervision {
     task: mach2::mach_types::task_t,
     port: crate::debugger::darwin_mach::ExceptionPort,
     /// `(remote_port, msg_id)` of the most recent
@@ -136,7 +136,39 @@ struct DarwinSupervision {
     /// The kernel parks the faulting thread until reply; we hold
     /// off until the next `resume`/`single_step` so the user can
     /// inspect coherent state.
-    pending_reply: Option<(u32, i32)>,
+    ///
+    /// `Cell` so this can be mutated via `&self` — the Mach-native
+    /// CallHelper drives the trampoline through `&CallContext`
+    /// (which holds `&Debugger`); going through `&mut Tracer`
+    /// would cascade `&mut self` through the entire CallHelper +
+    /// Print Handler stack and conflict with `QueryResult<'a>`'s
+    /// shared borrow on `Debugger`. Linux gets the equivalent
+    /// "FFI-opaque mutability" for free since `ptrace::cont`/`step`
+    /// aren't visible to the borrow checker.
+    pending_reply: std::cell::Cell<Option<(u32, i32)>>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl DarwinSupervision {
+    pub(crate) fn task(&self) -> mach2::mach_types::task_t {
+        self.task
+    }
+    pub(crate) fn port(&self) -> &crate::debugger::darwin_mach::ExceptionPort {
+        &self.port
+    }
+    pub(crate) fn take_pending_reply(&self) -> Option<(u32, i32)> {
+        self.pending_reply.take()
+    }
+    pub(crate) fn set_pending_reply(&self, v: Option<(u32, i32)>) {
+        self.pending_reply.set(v);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Tracer {
+    pub(crate) fn darwin_state(&self) -> Option<&DarwinSupervision> {
+        self.darwin_state.as_ref()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -756,7 +788,7 @@ impl Tracer {
             self.darwin_state = Some(DarwinSupervision {
                 task,
                 port,
-                pending_reply: None,
+                pending_reply: std::cell::Cell::new(None),
             });
         }
         Ok(self.darwin_state.as_mut().expect("just initialised"))
@@ -810,7 +842,7 @@ impl Tracer {
         // faulting thread is already parked by the kernel awaiting
         // our reply.
         darwin_mach::task_suspend(state.task)?;
-        state.pending_reply = Some((exc.remote_port, exc.msg_id));
+        state.pending_reply.set(Some((exc.remote_port, exc.msg_id)));
 
         // Classify. aarch64 darwin Mach exception encoding:
         //   EXC_BREAKPOINT (6) + codes[0]=EXC_ARM_BREAKPOINT (1)
@@ -924,7 +956,7 @@ impl Tracer {
 
         // Re-suspend so the rest of the threads stay coherent.
         darwin_mach::task_suspend(state.task)?;
-        state.pending_reply = Some((exc.remote_port, exc.msg_id));
+        state.pending_reply.set(Some((exc.remote_port, exc.msg_id)));
 
         // Disarm the SS bits so the next plain resume() doesn't
         // accidentally step again. (MDSCR_EL1.SS is sticky across

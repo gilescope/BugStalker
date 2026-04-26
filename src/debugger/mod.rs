@@ -466,6 +466,10 @@ impl Debugger {
         &self.process
     }
 
+    pub(crate) fn debugee(&self) -> &Debugee {
+        &self.debugee
+    }
+
     pub fn detach(&mut self) -> Result<(), Error> {
         if self.detached {
             return Ok(());
