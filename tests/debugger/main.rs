@@ -111,8 +111,65 @@ fn ensure_entitled_self_or_reexec() {
 #[cfg(not(target_os = "macos"))]
 fn ensure_entitled_self_or_reexec() {}
 
+/// Darwin: ensure each example binary has a fresh `.dSYM` bundle.
+/// Mach-O carries no DWARF in the executable itself; `dsymutil` has
+/// to extract it from the per-CU `.o` files into a sidecar bundle.
+/// Cargo doesn't run this step on its own, and a stale bundle —
+/// older than the binary it describes — points at addresses that no
+/// longer exist. We re-run `dsymutil` lazily, only when the bundle
+/// is missing or older than the binary, so test re-runs don't pay
+/// the cost twice.
+#[cfg(target_os = "macos")]
+fn ensure_dsym_fresh(prog: &str) {
+    use std::process::Command;
+    let bin = Path::new(prog);
+    let bin_meta = match std::fs::metadata(bin) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    let bin_mtime = bin_meta
+        .modified()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let dsym_inner = bin
+        .with_extension(format!(
+            "{}.dSYM",
+            bin.extension().and_then(|e| e.to_str()).unwrap_or("")
+        ))
+        .join("Contents")
+        .join("Resources")
+        .join("DWARF")
+        .join(bin.file_name().unwrap_or_default());
+    let dsym_path = match bin.file_name() {
+        Some(name) => {
+            let mut p = bin.to_path_buf().into_os_string();
+            p.push(".dSYM");
+            std::path::PathBuf::from(p)
+                .join("Contents")
+                .join("Resources")
+                .join("DWARF")
+                .join(name)
+        }
+        None => return,
+    };
+    let _ = dsym_inner; // keep the variable for future symlink-aware checks
+    let needs_refresh = match std::fs::metadata(&dsym_path) {
+        Ok(m) => m
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            < bin_mtime,
+        Err(_) => true,
+    };
+    if needs_refresh {
+        let _ = Command::new("dsymutil").arg(bin).status();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_dsym_fresh(_prog: &str) {}
+
 pub fn prepare_debugee_process(prog: &str, args: &[&'static str]) -> Child<Installed> {
     ensure_entitled_self_or_reexec();
+    ensure_dsym_fresh(prog);
     let (reader, writer) = os_pipe::pipe().unwrap();
 
     thread::spawn(move || {
