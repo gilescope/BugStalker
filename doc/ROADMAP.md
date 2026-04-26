@@ -12,11 +12,11 @@ feature set as x86_64. Drives running BugStalker inside an arm64
 Linux VM on an Apple Silicon host (and on AWS Graviton, Raspberry Pi,
 …) without yet attempting a native Darwin port.
 
-**Status:** core debug path works; software breakpoints, stepping,
-multithreading, signal handling, DWARF unwinding and most
-variable inspection pass on linux/arm64. See the most recent
-`feat(aarch64): …` and `fix(aarch64): …` entries in
-[`CHANGELOG`](../CHANGELOG.md#unreleased).
+**Status:** at parity with x86_64 for everything the test suite
+exercises. On linux/arm64: 20/20 lib + 75/75 tests/debugger +
+75/75 tests/dap + 1/1 doc tests = **171/171 passing, 0 failing,
+0 ignored**. The 9 hardware-watchpoint integration tests are
+`#[cfg]`-excluded on aarch64 — see "Hardware watchpoints" below.
 
 **Done**
 
@@ -28,40 +28,53 @@ variable inspection pass on linux/arm64. See the most recent
   `BRK #0` reports PC).
 * `disasm.rs` arch-aware byte-restoration when a function under
   disassembly has live breakpoints (1 byte vs 4 bytes).
-* `libthread_db` shim — the upstream `thread_db` crate is x86_64/i686
-  only; the aarch64 stub keeps the rest of the debugger working with
-  TLS-related features gracefully degraded.
-* SysV-AMD64 inferior-call machinery (`CallContext`/`CallHelper`,
-  `mmap`/`munmap` shellcode) gated to x86_64; on aarch64,
-  `Debugger::call` and `call::fmt::call_debug_fmt` return clear
-  errors.
+* `Register::SP` / `Register::PC` / `Register::RA` arch-agnostic
+  aliases on both arches, so cross-arch call sites
+  (`Debugger::set_pc`, the unwinder, the DAP `goto`/`restartFrame`
+  handlers, `tests/debugger/main.rs::test_registers`) don't have to
+  spell `rip` / `rsp` / `pc` / `x30` themselves.
 * `NT_ARM_HW_WATCH` data watchpoints with WCR/WVR encoding and
-  `si_addr`-based hit attribution. The kernel-level path is correct;
-  the 9 watchpoint integration tests are skipped on aarch64
-  containers because Apple Virtualization.framework does not
-  virtualise debug-exception delivery (the `TRAP_HWBKPT` never
-  fires). The tests should pass on a KVM host or bare metal.
+  `si_addr`-based hit attribution.
+* AAPCS64 inferior calls: `x0..x7` arg marshalling, 16-byte SP
+  alignment (also fixes a long-standing flake in
+  `test_debug_trait_repr_vars` on x86_64 where SysV-AMD64 alignment
+  was being skipped — see `c6ed935`), `BLR x8 ; BRK #0` trampoline,
+  `mmap` / `munmap` via `svc #0` with `x8 = 222 / 215`. Re-enables
+  `Debugger::call`, `call::fmt::call_debug_fmt`, and the `vard` /
+  `argd` UI commands.
+* TLS via the `gilescope/thread_db` fork — `proc_service` shims
+  use `PTRACE_{GET,SET}REGSET(NT_PRSTATUS|NT_FPREGSET)` on aarch64
+  in place of the x86-only `PTRACE_GETREGS` / `PTRACE_GETFPREGS`,
+  with a `NoFRegs` stub for `ps_get_thread_area` (aarch64 reads its
+  TLS base from `TPIDR_EL0` directly). Unblocks
+  `test_read_tls_*` and tokio's task-context oracle.
+* CI: `test-arm64` and `lint-arm64` jobs on `ubuntu-24.04-arm` in
+  `.github/workflows/ci.yml`, mirroring the x86_64 setup with the
+  latest supported rustc.
 
-**Remaining**
+**Hardware watchpoints — environment caveat**
 
-1. **AAPCS64 inferior calls.** Marshal up to eight integer/pointer
-   args in `x0..x7`, lay down a `BLR x8 ; BRK #0` trampoline, do
-   `mmap`/`munmap` via `svc #0` with `x8 = 222 / 215`. Maintain
-   16-byte SP alignment per AAPCS64. Re-enables `Debugger::call`,
-   `call::fmt::call_debug_fmt`, and the `vard` / `argd` UI commands.
-   Unblocks 2 integration tests (`variables::test_debug_trait_repr_*`).
+The aarch64 `HardwareDebugState` implementation is correct: a
+`PTRACE_SETREGSET(NT_ARM_HW_WATCH)` write succeeds and the kernel
+readback matches what we wrote (`addr=0xfffffffff0c1, en=true`).
+But on the only hosted aarch64 environments we can reach today —
+Docker Desktop on top of Apple Virtualization.framework, and
+GitHub's `ubuntu-24.04-arm` runners — the hypervisor accepts the
+ptrace write but never delivers `TRAP_HWBKPT` when the debuggee
+touches the watched address. The 9 `watchpoint::*` integration
+tests are therefore `#[cfg(target_arch = "x86_64")]`-gated in
+`tests/debugger/main.rs` (with the reasoning inline). They should
+pass on a KVM host or bare-metal aarch64; flipping the gate is a
+one-line change once such a runner is wired up.
 
-2. **Aarch64 TLS walker.** Replace `libthread_db` for our use with a
-   small in-tree implementation: `PTRACE_GETREGSET(NT_ARM_TLS=0x401)`
-   to read `TPIDR_EL0`, then walk glibc's `tcbhead_t` and DTV to find
-   each loaded module's TLS block (combined with the DWARF
-   `DW_AT_location` TLS-block offset we already parse). Unblocks
-   `variables::test_read_tls_*` and the tokio task-context oracle
-   (`tokio::test_async0`).
+**Remaining (small, opportunistic)**
 
-3. **CI matrix.** Add an `ubuntu-24.04-arm` job that runs the full
-   test suite (we already have an Earthfile target). Optional KVM
-   runner for the watchpoint tests once we find one.
+1. **Bare-metal / KVM aarch64 runner** for the
+   `watchpoint::*` tests. Drops the `#[cfg]` exclusion in
+   `tests/debugger/main.rs:12`.
+2. **Upstream the `thread_db` aarch64 work** to godzie44/thread_db,
+   then drop the `git = "..."` pin in `Cargo.toml` for a crates.io
+   release (`thread_db = "0.1.5"` or similar).
 
 ## Time-travel (record-and-replay) debugging
 

@@ -13,7 +13,7 @@ jobs:
         rustc_sup_version: [1.91.0, 1.92.0, 1.93.0, 1.94.0, 1.95.0]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install debug symbols
         run: |
           sudo apt-get update
@@ -21,27 +21,25 @@ jobs:
       - name: Install rust toolchain
         run: |
           rustup toolchain install ${{ matrix.rustc_sup_version }}
-          rustup toolchain install $MSRV
+          rustup toolchain install "$MSRV"
       - name: Build test applications for functional testing
         run: make build-examples-for-func-test RUST_VERSION=${{ matrix.rustc_sup_version }}
       - name: Verify test applications rustc version
         run: |
           strings examples/target/debug/calc | grep "^rustc version" | grep ${{ matrix.rustc_sup_version }}
       - name: Run functional tests
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
+        run: cargo test
 
   integration-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install rust
         run: |
-          rustup toolchain install $LRV
-          rustup toolchain install $MSRV
+          rustup toolchain install "$LRV"
+          rustup toolchain install "$MSRV"
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.13"
       - name: Install pip and test dependencies
@@ -60,42 +58,80 @@ jobs:
       - name: Build debugger and test applications
         run: |
           make build-rel
-          make build-examples RUST_VERSION=$LRV
+          make build-examples RUST_VERSION="$LRV"
       - name: Verify test applications and debugger rustc versions
         run: |
-          strings ./target/release/bs | grep "rustc version" | grep $MSRV
-          strings ./examples/target/debug/calc | grep "^rustc version" | grep $LRV
+          strings ./target/release/bs | grep "rustc version" | grep "$MSRV"
+          strings ./examples/target/debug/calc | grep "^rustc version" | grep "$LRV"
       - name: Run integration tests
         run: make int-test-rel
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install rust
         run: |
-          rustup toolchain install $MSRV
-          rustup component add --toolchain $MSRV rustfmt clippy
-          rustup override set $MSRV
+          rustup toolchain install "$MSRV"
+          rustup component add --toolchain "$MSRV" rustfmt clippy
+          rustup override set "$MSRV"
       - name: Build debugger and test programs
         run: make build-all
       - name: Verify msrv
         run: "grep \"^rust-version = .$MSRV.\" Cargo.toml"
       - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+        run: cargo fmt --all -- --check
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: -- -D warnings
+        run: cargo clippy -- -D warnings
 
   nix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Nix
         uses: cachix/install-nix-action@v31
       - run: nix flake check
+
+  # Linux/aarch64 build: catch regressions in the aarch64 port without
+  # needing local Earthly. We run the latest supported rustc only — full
+  # rustc-matrix coverage already exists for x86_64 above; aarch64 is
+  # there to catch arch-specific breakages (register file, BRK opcode,
+  # PC adjust, hardware-watchpoint regset, AAPCS64 inferior calls, …).
+  # Hardware-watchpoint integration tests (`watchpoint::*`) are
+  # `#[cfg]`-excluded on aarch64 because GitHub's hosted ARM runners do
+  # not virtualise debug-exception delivery — see
+  # `tests/debugger/main.rs` for the reasoning.
+  test-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install debug symbols
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libc6-dbg
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install "$LRV"
+          rustup toolchain install "$MSRV"
+      - name: Build test applications for functional testing
+        run: make build-examples-for-func-test RUST_VERSION="$LRV"
+      - name: Run library + functional tests
+        run: cargo test
+      - name: Run debugger integration tests
+        run: cargo test --features int_test --test debugger -- --test-threads=1
+      - name: Run DAP integration tests
+        run: cargo test --features int_test --test dap
+
+  lint-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rust
+        run: |
+          rustup toolchain install "$MSRV"
+          rustup component add --toolchain "$MSRV" rustfmt clippy
+          rustup override set "$MSRV"
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+      - name: Run cargo clippy
+        run: cargo clippy -- -D warnings
