@@ -437,6 +437,36 @@ fn thread_suspend_resume_roundtrip() {
     thread_resume(worker_port).expect("thread_resume — must rebalance the suspend count");
 }
 
+/// `thread_get_arm_exception_state64` against a suspended worker.
+/// On a thread that hasn't taken a synchronous exception, FAR/ESR
+/// /exception are typically zero (or whatever the kernel left from
+/// some prior, unrelated exception). The test asserts the syscall
+/// round-trips KERN_SUCCESS — the value-correctness branch is
+/// covered by the entitlement-gated debuggee path that drives a
+/// real watchpoint hit and reads FAR.
+#[test]
+fn thread_get_arm_exception_state64_suspended_worker() {
+    use bugstalker::debugger::darwin_mach::{
+        thread_get_arm_exception_state64, thread_resume, thread_suspend,
+    };
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<u32>();
+    std::thread::spawn(move || {
+        let me = unsafe { mach2::mach_init::mach_thread_self() };
+        tx.send(me).expect("send port");
+        loop {
+            std::thread::park();
+        }
+    });
+    let worker = rx.recv().expect("worker port");
+
+    thread_suspend(worker).expect("thread_suspend");
+    let _ = thread_get_arm_exception_state64(worker)
+        .expect("thread_get_arm_exception_state64 should return KERN_SUCCESS");
+    thread_resume(worker).expect("thread_resume");
+}
+
 /// `dyld_notification_addr` against our own task: the value must
 /// be a non-zero, plausibly-mapped function pointer. The dyld
 /// notification function is what we install a software BP on as
