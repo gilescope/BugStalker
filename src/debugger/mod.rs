@@ -4,6 +4,8 @@ mod breakpoint;
 pub mod call;
 mod code;
 mod context;
+#[cfg(target_os = "macos")]
+mod darwin_mach;
 mod debugee;
 mod error;
 pub mod process;
@@ -1012,10 +1014,15 @@ impl Debugger {
     }
 
     /// Darwin path: `mach_vm_write` framed by `mach_vm_protect` so
-    /// read-only pages are temporarily writable. Stubbed.
-    #[cfg(not(target_os = "linux"))]
-    pub fn write_memory(&self, _addr: uintptr_t, _value: uintptr_t) -> Result<(), Error> {
-        unimplemented!("darwin: write_memory via mach_vm_protect + mach_vm_write")
+    /// read-only pages (typically `r-x` for code) are temporarily
+    /// writable. The `value` is `usize`-sized — the caller composes
+    /// breakpoint opcodes / restored bytes into a usize first, same
+    /// shape as the linux `PTRACE_POKEDATA` path above.
+    #[cfg(target_os = "macos")]
+    pub fn write_memory(&self, addr: uintptr_t, value: uintptr_t) -> Result<(), Error> {
+        disable_when_not_stared!(self);
+        let task = darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid())?;
+        darwin_mach::vm_write_word(task, addr, value)
     }
 
     /// Move to higher stack frame.
@@ -1354,9 +1361,12 @@ pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8
     Ok(result)
 }
 
-/// Darwin path: `mach_vm_read_overwrite` instead of word-at-a-time
-/// PTRACE_PEEKDATA. Stubbed for the macOS port.
-#[cfg(not(target_os = "linux"))]
-pub fn read_memory_by_pid(_pid: Pid, _addr: usize, _read_n: usize) -> Result<Vec<u8>, nix::Error> {
-    unimplemented!("darwin: read_memory_by_pid via mach_vm_read_overwrite")
+/// Darwin path: `mach_vm_read_overwrite` reads N bytes in a single
+/// kernel round-trip (no PTRACE_PEEKDATA-style word loop). We map
+/// any Mach error to a coarse `nix::Error::EFAULT` so callers don't
+/// have to know about Mach error codes.
+#[cfg(target_os = "macos")]
+pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8>, nix::Error> {
+    let task = darwin_mach::task_for_pid(pid).map_err(|_| nix::errno::Errno::EFAULT)?;
+    darwin_mach::vm_read_n(task, addr, read_n).map_err(|_| nix::errno::Errno::EFAULT)
 }

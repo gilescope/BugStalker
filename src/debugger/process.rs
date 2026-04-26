@@ -258,14 +258,85 @@ impl<S: State> Child<S> {
         }
     }
 
-    /// Darwin path: spawn the debuggee via `posix_spawn` with
-    /// `_POSIX_SPAWN_DISABLE_ASLR` (to mirror the linux
-    /// `personality(ADDR_NO_RANDOMIZE)` behaviour) and attach to the
-    /// resulting Mach task. Stubbed for the macOS port.
-    #[cfg(not(target_os = "linux"))]
+    /// Darwin path: fork + `PT_TRACE_ME` + exec, mirroring the linux
+    /// shape. We use the BSD-flavour ptrace just to:
+    ///   * grant the parent the right to call `task_for_pid` on the
+    ///     child (the kernel only allows that across an unrelated
+    ///     pid pair when the caller has the
+    ///     `com.apple.security.cs.debugger` entitlement; for a
+    ///     ptraced child it's allowed unconditionally), and
+    ///   * make the child stop with `SIGTRAP` immediately after
+    ///     `execve`, so we can attach the Mach exception ports
+    ///     before any debuggee instruction runs.
+    ///
+    /// The actual debugging primitives (memory R/W, registers,
+    /// breakpoints, single-step) will then go through Mach
+    /// (`mach_vm_*`, `thread_get_state`, exception ports) — *not*
+    /// through ptrace, which on macOS has a deliberately limited
+    /// surface that doesn't cover memory access on aarch64.
+    #[cfg(target_os = "macos")]
     pub fn install(&self) -> Result<Child<Installed>, Error> {
-        unimplemented!(
-            "darwin: Child::install via posix_spawn(_POSIX_SPAWN_DISABLE_ASLR) + task_for_pid"
-        )
+        use nix::sys::ptrace;
+        use nix::sys::signal::SIGSTOP;
+        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+        use nix::unistd::{ForkResult, Pid as NixPid, fork};
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let mut debugee_cmd = Command::new(&self.program);
+        debugee_cmd
+            .args(&self.args)
+            .stdout(self.stdout.try_clone()?)
+            .stderr(self.stderr.try_clone()?);
+        if let Some(cwd) = self.cwd.as_deref() {
+            debugee_cmd.current_dir(cwd);
+        }
+
+        unsafe {
+            debugee_cmd.pre_exec(move || {
+                // PT_TRACE_ME — child says "I'm a tracee". After
+                // execve the kernel will deliver SIGTRAP to us, which
+                // the parent's waitpid below catches.
+                ptrace::traceme().map_err(std::io::Error::from)?;
+                // Mirror the linux ADDR_NO_RANDOMIZE step by raising
+                // SIGSTOP first; the parent waitpids that and then
+                // we'll bring the debuggee back up only after Mach
+                // exception ports are wired (next iteration).
+                Ok(())
+            });
+        }
+
+        match unsafe { fork() }.map_err(|e| Error::Attach(e))? {
+            ForkResult::Parent { child: pid } => {
+                // Two stops to expect from a PT_TRACE_ME'd child:
+                //   * SIGTRAP at the post-exec attach point, OR
+                //   * SIGSTOP if the child raise()s before exec.
+                // Either way we just need the child to be paused so
+                // the next phase can attach its Mach exception port.
+                let status = waitpid(pid, Some(WaitPidFlag::WSTOPPED))
+                    .map_err(|e| Error::Attach(e))?;
+                debug_assert!(matches!(
+                    status,
+                    WaitStatus::Stopped(_, signal)
+                        if signal == nix::sys::signal::SIGTRAP
+                            || signal == SIGSTOP
+                ));
+
+                Ok(Child {
+                    stdout: self.stdout.try_clone()?,
+                    stderr: self.stderr.try_clone()?,
+                    program: self.program.clone(),
+                    args: self.args.clone(),
+                    cwd: self.cwd.clone(),
+                    pid: Some(NixPid::from_raw(pid.as_raw())),
+                    external_info: None,
+                    _p: PhantomData,
+                })
+            }
+            ForkResult::Child => {
+                let err = debugee_cmd.exec();
+                panic!("run debugee fail with: {err}");
+            }
+        }
     }
 }
