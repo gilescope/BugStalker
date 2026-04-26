@@ -6,6 +6,7 @@ use crate::debugger::register::debug::DebugRegisterNumber;
 use crate::debugger::watchpoint::WatchpointRegistry;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+#[cfg(target_os = "linux")]
 use std::collections::VecDeque;
 
 // The whole `impl Tracer` below is built around Linux ptrace
@@ -40,6 +41,7 @@ use nix::{libc, sys};
 
 /// List of signals that dont interrupt a debugging process and send
 /// to debugee directly on fire.
+#[cfg(target_os = "linux")]
 static QUIET_SIGNALS: &[Signal] = &[
     Signal::SIGALRM,
     Signal::SIGURG,
@@ -51,6 +53,7 @@ static QUIET_SIGNALS: &[Signal] = &[
 ];
 
 /// List of signals that may interrupt a debugging process but debugger will not inject it into.
+#[cfg(target_os = "linux")]
 static TRANSPARENT_SIGNALS: &[Signal] = &[Signal::SIGINT];
 
 #[derive(Debug, Clone)]
@@ -100,7 +103,14 @@ impl<'a> TraceContext<'a> {
 pub struct Tracer {
     pub(super) tracee_ctl: TraceeCtl,
 
+    /// Linux-only: signals queued for re-injection on the next
+    /// resume (`PTRACE_CONT(sig)`). Darwin's Mach exception port
+    /// flow doesn't have an equivalent — replies to exceptions
+    /// are the resume primitive.
+    #[cfg(target_os = "linux")]
     inject_signal_queue: VecDeque<(Pid, Signal)>,
+    /// Linux-only: guards the group-stop race in `PTRACE_O_TRACECLONE`.
+    #[cfg(target_os = "linux")]
     group_stop_guard: bool,
 }
 
@@ -692,16 +702,12 @@ impl Tracer {
     pub fn new(proc_pid: Pid) -> Self {
         Self {
             tracee_ctl: TraceeCtl::new(proc_pid),
-            inject_signal_queue: VecDeque::new(),
-            group_stop_guard: false,
         }
     }
 
     pub fn new_external(proc_pid: Pid, threads: &[Pid]) -> Self {
         Self {
             tracee_ctl: TraceeCtl::new_external(proc_pid, threads),
-            inject_signal_queue: VecDeque::new(),
-            group_stop_guard: false,
         }
     }
 
