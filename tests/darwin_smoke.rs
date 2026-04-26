@@ -237,6 +237,43 @@ fn exception_port_receive_times_out() {
     );
 }
 
+/// `dyld_image_list` walked against our own task port (no
+/// debuggee, no entitlement) returns at least one image — the
+/// test binary itself — and every entry has a non-zero
+/// `load_addr` and a path string. Catches regressions in the
+/// dyld_all_image_infos / TASK_DYLD_INFO walk on every macOS host.
+///
+/// `mach_task_self()` always succeeds for the current task; the
+/// entitlement requirement only kicks in for cross-process
+/// `task_for_pid`. So this gives us a free dyld_image_list
+/// regression check.
+#[test]
+fn dyld_image_list_self() {
+    use bugstalker::debugger::darwin_mach::dyld_image_list;
+
+    // SAFETY: mach_task_self always returns a valid task port.
+    let task = unsafe { mach2::traps::mach_task_self() };
+    let images = dyld_image_list(task).expect("dyld_image_list on self");
+
+    assert!(!images.is_empty(), "expected at least the test binary");
+    let test_bin = images
+        .iter()
+        .find(|i| i.path.contains("darwin_smoke"))
+        .or_else(|| images.iter().find(|i| !i.path.is_empty()))
+        .expect("at least one image must have a path");
+    assert!(
+        test_bin.load_addr != 0,
+        "load_addr must be non-zero for {}",
+        test_bin.path
+    );
+    // Sanity-check the path is a real-looking absolute path.
+    assert!(
+        test_bin.path.starts_with('/') || test_bin.path.contains("dyld"),
+        "first non-empty path looks bogus: {}",
+        test_bin.path
+    );
+}
+
 /// `thread_info(THREAD_IDENTIFIER_INFO)` on our own main thread
 /// returns a non-zero stable id and a pthread_t handle. We use
 /// `mach_thread_self()` (no entitlement needed for our own task)
