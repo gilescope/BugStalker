@@ -204,3 +204,35 @@ fn exception_port_allocate_and_register() {
     }
     panic!("debuggee {pid} didn't die within 5s of ptrace::cont(SIGKILL)");
 }
+
+/// Allocate a port, don't subscribe it to anything, and prove
+/// `receive` returns `Ok(None)` when the timeout elapses with no
+/// message in the queue. This is the cheapest possible exercise
+/// of the `mach_msg(MACH_RCV_MSG | MACH_RCV_TIMEOUT)` path — no
+/// child process needed, no codesigning needed, runs on every
+/// macOS host. It catches obvious mistakes (wrong message header
+/// pointer, wrong port name, byte-order/timeout argument swaps).
+#[test]
+fn exception_port_receive_times_out() {
+    use bugstalker::debugger::darwin_mach::ExceptionPort;
+
+    let port = ExceptionPort::allocate().expect("ExceptionPort::allocate");
+    let started = Instant::now();
+    let result = port
+        .receive(50)
+        .expect("receive should not error on timeout");
+    let elapsed = started.elapsed();
+
+    assert!(result.is_none(), "no exception was queued; expected None");
+    // Generous bounds: kernel scheduling can delay return a bit,
+    // and on a heavily loaded machine the lower bound matters less
+    // than the upper bound (it shouldn't block forever).
+    assert!(
+        elapsed >= Duration::from_millis(40),
+        "receive returned before the timeout elapsed: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "receive blocked far past the requested timeout: {elapsed:?}"
+    );
+}

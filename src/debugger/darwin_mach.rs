@@ -31,7 +31,10 @@ use mach2::exception_types::{
     MACH_EXCEPTION_CODES, exception_mask_t,
 };
 use mach2::mach_port::{mach_port_allocate, mach_port_insert_right};
-use mach2::message::MACH_MSG_TYPE_MAKE_SEND;
+use mach2::message::{
+    MACH_MSG_TYPE_MAKE_SEND, MACH_RCV_MSG, MACH_RCV_TIMED_OUT, MACH_RCV_TIMEOUT, mach_msg,
+    mach_msg_header_t,
+};
 use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_name_t};
 use mach2::task::task_set_exception_ports;
 use mach2::thread_status::THREAD_STATE_NONE;
@@ -475,12 +478,119 @@ impl ExceptionPort {
         Ok(())
     }
 
-    /// Underlying port name. Iteration 10 (the receive + decode
-    /// loop) will use this with `mach_msg`.
+    /// Underlying port name.
     #[allow(dead_code)]
     pub fn name(&self) -> mach_port_name_t {
         self.port
     }
+
+    /// Block on the port until either an exception arrives or
+    /// `timeout_ms` elapses. Returns `Ok(None)` on timeout.
+    ///
+    /// We decode the `mach_exception_raise` (message ID 2405)
+    /// variant — the 64-bit-codes flavour, since that's the
+    /// behaviour we asked for in `register`. Field offsets follow
+    /// `<mach/exc.defs>`'s generated `__Request__mach_exception_raise_t`
+    /// layout. The buffer is sized for the worst-case modern
+    /// message (≤ 256 bytes); the kernel writes only as many bytes
+    /// as the actual message needs.
+    pub fn receive(&self, timeout_ms: u32) -> Result<Option<ReceivedException>, MachError> {
+        const RECEIVE_BUF: usize = 256;
+        let mut buf = [0u8; RECEIVE_BUF];
+        // SAFETY: buf is large enough for the message; mach_msg
+        // writes at most `recv_size` bytes into it. We pass our
+        // owned port for `recv_name`. Notify port is null because
+        // we don't want a notification.
+        let kr = unsafe {
+            mach_msg(
+                buf.as_mut_ptr() as *mut mach_msg_header_t,
+                MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                0,
+                RECEIVE_BUF as u32,
+                self.port,
+                timeout_ms,
+                MACH_PORT_NULL,
+            )
+        };
+        if kr == MACH_RCV_TIMED_OUT {
+            return Ok(None);
+        }
+        check(kr)?;
+
+        // Header (24 bytes):
+        //   bits         u32  @ 0
+        //   size         u32  @ 4
+        //   remote_port  u32  @ 8
+        //   local_port   u32  @ 12
+        //   voucher_port u32  @ 16
+        //   id           i32  @ 20
+        //
+        // Body (4 bytes):
+        //   descriptor_count u32  @ 24
+        //
+        // mach_msg_port_descriptor_t × 2  (12 bytes each on 64-bit):
+        //   thread.name  u32 @ 28
+        //   thread.pad1  u32 @ 32
+        //   thread.pad2_disp_type u32 @ 36   // bitfield: pad2:16|disp:8|type:8
+        //   task.name    u32 @ 40
+        //   task.pad1    u32 @ 44
+        //   task.pad2_disp_type u32 @ 48
+        //
+        // NDR_record_t  8 bytes @ 52..60
+        //
+        // exception     i32 @ 60
+        // codeCnt       u32 @ 64
+        // code[0]       i64 @ 68
+        // code[1]       i64 @ 76
+        let id = i32::from_ne_bytes(buf[20..24].try_into().unwrap());
+        let remote_port = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let thread_name = u32::from_ne_bytes(buf[28..32].try_into().unwrap());
+        let task_name = u32::from_ne_bytes(buf[40..44].try_into().unwrap());
+        let exception = i32::from_ne_bytes(buf[60..64].try_into().unwrap());
+        let code_cnt = u32::from_ne_bytes(buf[64..68].try_into().unwrap()) as usize;
+        let mut codes = Vec::with_capacity(code_cnt);
+        for i in 0..code_cnt.min(2) {
+            let off = 68 + i * 8;
+            codes.push(i64::from_ne_bytes(buf[off..off + 8].try_into().unwrap()));
+        }
+
+        Ok(Some(ReceivedException {
+            msg_id: id,
+            remote_port,
+            thread_port: thread_name,
+            task_port: task_name,
+            exception,
+            codes,
+        }))
+    }
+}
+
+/// Decoded `mach_exception_raise` message body.
+///
+/// The Mach kernel posts one of these to our subscribed port when
+/// the debuggee raises an EXC_BREAKPOINT / EXC_SOFTWARE /
+/// EXC_BAD_ACCESS exception. The Tracer translates it into a
+/// `StopReason`; the response is sent by `ExceptionPort::reply`.
+pub struct ReceivedException {
+    /// Original message ID. For our subscription this is always
+    /// 2405 (`mach_exception_raise`); we keep it because we need
+    /// to compute the reply message ID = `msg_id + 100`.
+    pub msg_id: i32,
+    /// `msgh_remote_port` from the request header — we send the
+    /// reply *back to* this port.
+    pub remote_port: u32,
+    /// Mach thread port that raised the exception.
+    pub thread_port: u32,
+    /// Mach task port containing that thread.
+    pub task_port: u32,
+    /// Exception type: EXC_BREAKPOINT (6), EXC_SOFTWARE (5),
+    /// EXC_BAD_ACCESS (1), …
+    pub exception: i32,
+    /// Exception-type-specific codes. For EXC_BREAKPOINT on
+    /// aarch64, codes[0] is the BRK immediate, codes[1] is 0.
+    /// For EXC_BAD_ACCESS, codes[0] is the kern_return_t reason
+    /// (e.g. KERN_INVALID_ADDRESS), codes[1] is the fault address.
+    pub codes: Vec<i64>,
 }
 
 impl Drop for ExceptionPort {
