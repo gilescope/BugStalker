@@ -86,10 +86,12 @@ string-interner = "0.19.0"
 libc = "0.2"
 
 # thread_db wraps glibc's libthread_db for TLS variable access.
+# Linux-only: there's no equivalent library on macOS (TLS lookup goes
+# via Mach thread_get_state + the glibc-equivalent in libpthread).
 # Pinned to gilescope/thread_db's giles-aarch64-support branch until
 # aarch64 support is upstreamed (the crates.io 0.1.4 release is
 # x86_64/i686 only). Pinned by rev for reproducibility.
-[dependencies.thread_db]
+[target.'cfg(target_os = "linux")'.dependencies.thread_db]
 git = "https://github.com/gilescope/thread_db"
 rev = "c36ca728d12aff4083375b7823fcf5794c2438a5"
 

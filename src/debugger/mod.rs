@@ -998,6 +998,7 @@ impl Debugger {
     ///
     /// * `addr`: address to write
     /// * `value`: value to write
+    #[cfg(target_os = "linux")]
     pub fn write_memory(&self, addr: uintptr_t, value: uintptr_t) -> Result<(), Error> {
         disable_when_not_stared!(self);
         unsafe {
@@ -1008,6 +1009,13 @@ impl Debugger {
             )
             .map_err(Ptrace)
         }
+    }
+
+    /// Darwin path: `mach_vm_write` framed by `mach_vm_protect` so
+    /// read-only pages are temporarily writable. Stubbed.
+    #[cfg(not(target_os = "linux"))]
+    pub fn write_memory(&self, _addr: uintptr_t, _value: uintptr_t) -> Result<(), Error> {
+        unimplemented!("darwin: write_memory via mach_vm_protect + mach_vm_write")
     }
 
     /// Move to higher stack frame.
@@ -1325,6 +1333,7 @@ impl Drop for Debugger {
 }
 
 /// Read N bytes from `PID` process.
+#[cfg(target_os = "linux")]
 pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8>, nix::Error> {
     let mut read_reminder = read_n as isize;
     let mut result = Vec::with_capacity(read_n);
@@ -1343,4 +1352,11 @@ pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8
     debug_assert!(result.len() == read_n);
 
     Ok(result)
+}
+
+/// Darwin path: `mach_vm_read_overwrite` instead of word-at-a-time
+/// PTRACE_PEEKDATA. Stubbed for the macOS port.
+#[cfg(not(target_os = "linux"))]
+pub fn read_memory_by_pid(_pid: Pid, _addr: usize, _read_n: usize) -> Result<Vec<u8>, nix::Error> {
+    unimplemented!("darwin: read_memory_by_pid via mach_vm_read_overwrite")
 }

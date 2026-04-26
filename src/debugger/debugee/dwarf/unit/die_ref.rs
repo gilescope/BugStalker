@@ -21,7 +21,12 @@ use indexmap::IndexMap;
 use std::marker::PhantomData;
 
 /// Read TPIDR_EL0 (thread pointer) from a stopped tracee on aarch64.
-#[cfg(target_arch = "aarch64")]
+///
+/// Linux exposes the register through the `NT_ARM_TLS` regset of
+/// `PTRACE_GETREGSET`. Darwin would read it via
+/// `thread_get_state(thread, ARM_THREAD_STATE64, &state, &count)` and
+/// pull the pthread-self pointer out — stubbed for now.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 fn read_tpidr_el0(pid: nix::unistd::Pid) -> Result<usize, nix::Error> {
     use std::mem;
     const NT_ARM_TLS: libc::c_int = 0x401;
@@ -42,6 +47,11 @@ fn read_tpidr_el0(pid: nix::unistd::Pid) -> Result<usize, nix::Error> {
         return Err(nix::errno::Errno::last());
     }
     Ok(reg as usize)
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
+fn read_tpidr_el0(_pid: nix::unistd::Pid) -> Result<usize, nix::Error> {
+    unimplemented!("darwin/aarch64: read TPIDR_EL0 via thread_get_state(ARM_THREAD_STATE64)")
 }
 
 #[derive(Clone, Copy)]

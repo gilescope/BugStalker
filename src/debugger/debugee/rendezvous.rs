@@ -1,10 +1,12 @@
 #![allow(dead_code)]
 
 use crate::debugger::address::RelocatedAddress;
-use nix::libc;
 use nix::unistd::Pid;
-use object::elf::DT_DEBUG;
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
+use nix::libc;
+#[cfg(target_os = "linux")]
+use object::elf::DT_DEBUG;
 
 #[derive(Debug)]
 pub struct LinkMap {
@@ -26,10 +28,16 @@ pub enum RendezvousError {
 /// This structure maintains a list of shared library descriptors.
 pub struct Rendezvous {
     pid: Pid,
+    #[cfg(target_os = "linux")]
     inner: ffi::r_debug,
+    /// Marker field on darwin until the dyld_image_info-based path
+    /// replaces the GNU `r_debug` walk.
+    #[cfg(not(target_os = "linux"))]
+    _darwin_stub: std::marker::PhantomData<()>,
 }
 
 impl Rendezvous {
+    #[cfg(target_os = "linux")]
     pub fn new(
         proc_pid: Pid,
         mapping_offset: usize,
@@ -61,10 +69,12 @@ impl Rendezvous {
         Err(RendezvousError::NotFound)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn link_map_main(&self) -> RelocatedAddress {
         RelocatedAddress::from(self.inner.link_map as usize)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn link_maps(&self) -> Result<Vec<LinkMap>, RendezvousError> {
         let mut result = vec![];
         let mut next_link_map_addr = usize::from(self.link_map_main()) as *const libc::c_void;
@@ -87,11 +97,44 @@ impl Rendezvous {
     /// Return an address of a function internal to the run-time linker,
     /// that will always be called when the linker begins to map in a
     /// library or unmap it, and again when the mapping change is complete.
+    #[cfg(target_os = "linux")]
     pub fn r_brk(&self) -> RelocatedAddress {
         RelocatedAddress::from(self.inner.r_brk)
     }
+
+    /// Darwin path: build a `Rendezvous` from `task_info(TASK_DYLD_INFO)`
+    /// which yields a `dyld_all_image_infos` pointer + count. Stubbed.
+    #[cfg(not(target_os = "linux"))]
+    pub fn new(
+        _proc_pid: Pid,
+        _mapping_offset: usize,
+        _sections: &HashMap<String, u64>,
+    ) -> Result<Self, RendezvousError> {
+        unimplemented!("darwin: Rendezvous::new via task_info(TASK_DYLD_INFO)")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn link_map_main(&self) -> RelocatedAddress {
+        unimplemented!("darwin: link_map_main via dyld_all_image_infos")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn link_maps(&self) -> Result<Vec<LinkMap>, RendezvousError> {
+        unimplemented!("darwin: link_maps via dyld_all_image_infos")
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn r_brk(&self) -> RelocatedAddress {
+        unimplemented!("darwin: r_brk has no direct dyld equivalent — use _dyld_register_func_for_add_image")
+    }
 }
 
+// The rendezvous protocol read here is GNU ld.so's `r_debug` /
+// `link_map` linked list, accessed via `process_vm_readv` (linux-only).
+// Darwin has a completely different image-list discovery path:
+// `task_info(TASK_DYLD_INFO)` returns a `dyld_image_info_array` —
+// that's what the macOS port will plumb in when we get there.
+#[cfg(target_os = "linux")]
 mod ffi {
     #![allow(non_camel_case_types)]
 

@@ -1,20 +1,42 @@
 use crate::debugger::address::RelocatedAddress;
-use crate::debugger::breakpoint::{Breakpoint, BrkptType};
-use crate::debugger::debugee::tracee::{StopType, TraceeCtl, TraceeStatus};
+use crate::debugger::breakpoint::Breakpoint;
+use crate::debugger::debugee::tracee::TraceeCtl;
 use crate::debugger::error::Error;
-use crate::debugger::error::Error::{MultipleErrors, ProcessExit, Ptrace, Waitpid};
 use crate::debugger::register::debug::DebugRegisterNumber;
 use crate::debugger::watchpoint::WatchpointRegistry;
-use crate::debugger::{code, register};
-use crate::weak_error;
-use log::{debug, warn};
-use nix::errno::Errno;
-use nix::libc::pid_t;
-use nix::sys::signal::{SIGSTOP, Signal};
-use nix::sys::wait::{WaitStatus, waitpid};
+use nix::sys::signal::Signal;
 use nix::unistd::Pid;
-use nix::{libc, sys};
 use std::collections::VecDeque;
+
+// The whole `impl Tracer` below is built around Linux ptrace
+// (`PTRACE_SEIZE`, `PTRACE_INTERRUPT`, `PTRACE_GETSIGINFO`,
+// `WaitStatus::PtraceEvent`, …). Darwin uses Mach exception ports
+// for the equivalent flow; until that backend lands, the cross-arch
+// `impl Tracer` at the bottom of the file routes everything through
+// `unimplemented!()`. The imports below are linux-only because they
+// only resolve when `target_os = "linux"`.
+#[cfg(target_os = "linux")]
+use crate::debugger::breakpoint::BrkptType;
+#[cfg(target_os = "linux")]
+use crate::debugger::debugee::tracee::{StopType, TraceeStatus};
+#[cfg(target_os = "linux")]
+use crate::debugger::error::Error::{MultipleErrors, ProcessExit, Ptrace, Waitpid};
+#[cfg(target_os = "linux")]
+use crate::debugger::{code, register};
+#[cfg(target_os = "linux")]
+use crate::weak_error;
+#[cfg(target_os = "linux")]
+use log::{debug, warn};
+#[cfg(target_os = "linux")]
+use nix::errno::Errno;
+#[cfg(target_os = "linux")]
+use nix::libc::pid_t;
+#[cfg(target_os = "linux")]
+use nix::sys::signal::SIGSTOP;
+#[cfg(target_os = "linux")]
+use nix::sys::wait::{WaitStatus, waitpid};
+#[cfg(target_os = "linux")]
+use nix::{libc, sys};
 
 /// List of signals that dont interrupt a debugging process and send
 /// to debugee directly on fire.
@@ -82,6 +104,7 @@ pub struct Tracer {
     group_stop_guard: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl Tracer {
     /// Create new [`Tracer`] for internally created debugee process.
     ///
@@ -649,5 +672,45 @@ impl Tracer {
             }
         };
         Ok(reason)
+    }
+}
+
+/// Darwin stub of `impl Tracer`. The Mach-based equivalent (exception
+/// ports for stop notifications, `thread_set_state` for single-step,
+/// `task_resume` for continue) lives in a future commit; until then
+/// these constructors and methods exist so the rest of the debugger
+/// compiles.
+#[cfg(not(target_os = "linux"))]
+impl Tracer {
+    pub fn new(proc_pid: Pid) -> Self {
+        Self {
+            tracee_ctl: TraceeCtl::new(proc_pid),
+            inject_signal_queue: VecDeque::new(),
+            group_stop_guard: false,
+        }
+    }
+
+    pub fn new_external(proc_pid: Pid, threads: &[Pid]) -> Self {
+        Self {
+            tracee_ctl: TraceeCtl::new_external(proc_pid, threads),
+            inject_signal_queue: VecDeque::new(),
+            group_stop_guard: false,
+        }
+    }
+
+    pub fn resume(&mut self, _tcx: TraceContext) -> Result<StopReason, Error> {
+        unimplemented!("darwin: Tracer::resume via Mach exception-port loop")
+    }
+
+    pub fn pause(&mut self, _tcx: TraceContext) -> Result<(), Error> {
+        unimplemented!("darwin: Tracer::pause via task_suspend")
+    }
+
+    pub fn single_step(
+        &mut self,
+        _tcx: TraceContext,
+        _pid: Pid,
+    ) -> Result<Option<StopReason>, Error> {
+        unimplemented!("darwin: Tracer::single_step via thread_set_state(ARM_DEBUG_STATE64) + MDSCR.SS")
     }
 }

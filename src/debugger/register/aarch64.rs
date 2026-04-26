@@ -1,13 +1,39 @@
 use crate::debugger::error::Error;
-use crate::debugger::error::Error::{Ptrace, RegisterNotFound};
+use crate::debugger::error::Error::RegisterNotFound;
 use gimli::Register as DwarfRegister;
-use nix::errno::Errno;
-use nix::libc::{self, c_void, iovec, user_regs_struct};
 use nix::unistd::Pid;
 use smallvec::{SmallVec, smallvec};
-use std::mem::MaybeUninit;
 use strum_macros::Display;
 use strum_macros::EnumString;
+
+// Linux exposes the aarch64 GP registers through `PTRACE_GETREGSET`
+// with a `nix::libc::user_regs_struct` payload. Darwin uses Mach
+// (`thread_get_state(thread, ARM_THREAD_STATE64, …)`) and a
+// `arm_thread_state64_t`. Until the Mach-based path lands we just
+// stub the darwin side so `cargo check` passes.
+#[cfg(target_os = "linux")]
+use crate::debugger::error::Error::Ptrace;
+#[cfg(target_os = "linux")]
+use nix::errno::Errno;
+#[cfg(target_os = "linux")]
+use nix::libc::{self, c_void, iovec, user_regs_struct};
+#[cfg(target_os = "linux")]
+use std::mem::MaybeUninit;
+
+// On darwin the kernel-level register struct isn't exposed through
+// libc (no `user_regs_struct`); we re-declare an equivalent layout
+// so the rest of the file doesn't have to reach for `mach2`/Mach
+// types just for the From-impls below.
+#[cfg(not(target_os = "linux"))]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+#[allow(non_camel_case_types)]
+struct user_regs_struct {
+    regs: [u64; 31],
+    sp: u64,
+    pc: u64,
+    pstate: u64,
+}
 
 /// aarch64 registers.
 ///
@@ -178,6 +204,7 @@ impl From<RegisterMap> for user_regs_struct {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn ptrace_regset(request: libc::c_uint, pid: Pid, regs: &mut user_regs_struct) -> Result<(), Error> {
     let mut iov = iovec {
         iov_base: regs as *mut _ as *mut c_void,
@@ -199,12 +226,22 @@ fn ptrace_regset(request: libc::c_uint, pid: Pid, regs: &mut user_regs_struct) -
 }
 
 impl RegisterMap {
+    #[cfg(target_os = "linux")]
     pub fn current(pid: Pid) -> Result<Self, Error> {
         let mut regs = MaybeUninit::<user_regs_struct>::zeroed();
         unsafe {
             ptrace_regset(libc::PTRACE_GETREGSET, pid, regs.assume_init_mut())?;
             Ok(regs.assume_init().into())
         }
+    }
+
+    /// Darwin path: read the GP register set via Mach
+    /// `thread_get_state(thread, ARM_THREAD_STATE64, …)`. Not yet
+    /// implemented — this is the first runtime hook the macOS port
+    /// needs to fill in.
+    #[cfg(not(target_os = "linux"))]
+    pub fn current(_pid: Pid) -> Result<Self, Error> {
+        unimplemented!("darwin: RegisterMap::current via thread_get_state(ARM_THREAD_STATE64)")
     }
 
     /// Architecture-agnostic program counter accessor (aarch64: `pc`).
@@ -306,9 +343,18 @@ impl RegisterMap {
         };
     }
 
+    #[cfg(target_os = "linux")]
     pub fn persist(self, pid: Pid) -> Result<(), Error> {
         let mut regs: user_regs_struct = self.into();
         ptrace_regset(libc::PTRACE_SETREGSET, pid, &mut regs)
+    }
+
+    /// Darwin path: write the GP register set via Mach
+    /// `thread_set_state(thread, ARM_THREAD_STATE64, …)`. Stubbed
+    /// alongside `current`.
+    #[cfg(not(target_os = "linux"))]
+    pub fn persist(self, _pid: Pid) -> Result<(), Error> {
+        unimplemented!("darwin: RegisterMap::persist via thread_set_state(ARM_THREAD_STATE64)")
     }
 }
 
@@ -350,6 +396,66 @@ impl From<RegisterMap> for DwarfRegisterMap {
     }
 }
 
+// `debug_impl` below is the Linux-side hardware-watchpoint backend
+// (NT_ARM_HW_WATCH / NT_ARM_HW_BREAK regsets via PTRACE_GETREGSET).
+// Darwin needs a parallel implementation on top of
+// `thread_set_state(ARM_DEBUG_STATE64)`; until then, expose a stub
+// with the same public surface so the watchpoint registry compiles.
+#[cfg(not(target_os = "linux"))]
+pub mod debug_impl {
+    use crate::debugger::Error;
+    use crate::debugger::register::debug::{
+        BreakCondition, BreakSize, DebugRegisterNumber,
+    };
+    use nix::unistd::Pid;
+
+    pub type DebugAddressRegister = usize;
+
+    #[derive(PartialEq, Debug, Default)]
+    pub struct HardwareDebugState;
+
+    impl HardwareDebugState {
+        pub fn current(_pid: Pid) -> Result<Self, Error> {
+            unimplemented!(
+                "darwin: HardwareDebugState::current via thread_get_state(ARM_DEBUG_STATE64)"
+            )
+        }
+
+        pub fn sync(&self, _pid: Pid) -> Result<(), Error> {
+            unimplemented!(
+                "darwin: HardwareDebugState::sync via thread_set_state(ARM_DEBUG_STATE64)"
+            )
+        }
+
+        pub fn slot_enabled(&self, _slot: DebugRegisterNumber) -> bool {
+            false
+        }
+
+        pub fn slot_addr(&self, _slot: DebugRegisterNumber) -> usize {
+            0
+        }
+
+        pub fn install(
+            &mut self,
+            _slot: DebugRegisterNumber,
+            _addr: usize,
+            _cond: BreakCondition,
+            _size: BreakSize,
+        ) {
+        }
+
+        pub fn uninstall(&mut self, _slot: DebugRegisterNumber) {}
+
+        pub fn detect_and_flush_hit(
+            &mut self,
+            _si_addr: Option<usize>,
+        ) -> Option<DebugRegisterNumber> {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub mod debug_impl {
     //! aarch64 data-watchpoint plumbing backed by `NT_ARM_HW_WATCH`
     //! (`PTRACE_GETREGSET` / `PTRACE_SETREGSET` regset 0x403).

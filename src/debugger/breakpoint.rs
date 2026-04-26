@@ -5,7 +5,9 @@ use crate::debugger::debugee::dwarf::DebugInformation;
 use crate::debugger::debugee::dwarf::unit::PlaceDescriptorOwned;
 use crate::debugger::error::Error;
 use crate::debugger::error::Error::{NoDebugInformation, NoSuitablePlace, PlaceNotFound};
+#[cfg(target_os = "linux")]
 use nix::libc::c_void;
+#[cfg(target_os = "linux")]
 use nix::sys;
 use nix::unistd::Pid;
 use std::borrow::Cow;
@@ -786,6 +788,7 @@ impl Breakpoint {
         matches!(self.r#type, BrkptType::TemporaryAsync)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn enable(&self) -> Result<(), Error> {
         let addr = self.addr.as_usize() as *mut c_void;
         let data = sys::ptrace::read(self.pid, addr).map_err(Error::Ptrace)? as u64;
@@ -800,6 +803,18 @@ impl Breakpoint {
         Ok(())
     }
 
+    /// Darwin path: the breakpoint opcode and PC-rewind constants
+    /// (`BRK_OPCODE`, `BRK_MASK`, `PC_ADJUST`) are arch-correct on
+    /// aarch64 already; what differs is how we *write* it. Linux
+    /// uses `PTRACE_POKEDATA`; darwin needs
+    /// `mach_vm_write` framed by `mach_vm_protect(VM_PROT_WRITE)` so
+    /// the read-only code page is temporarily writable. Stubbed.
+    #[cfg(not(target_os = "linux"))]
+    pub fn enable(&self) -> Result<(), Error> {
+        unimplemented!("darwin: Breakpoint::enable via mach_vm_protect + mach_vm_write")
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn disable(&self) -> Result<(), Error> {
         let addr = self.addr.as_usize() as *mut c_void;
         let data = sys::ptrace::read(self.pid, addr).map_err(Error::Ptrace)? as u64;
@@ -810,6 +825,11 @@ impl Breakpoint {
         self.enabled.set(false);
 
         Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn disable(&self) -> Result<(), Error> {
+        unimplemented!("darwin: Breakpoint::disable via mach_vm_protect + mach_vm_write")
     }
 }
 

@@ -1,20 +1,39 @@
 use crate::debugger::error::Error;
-use crate::debugger::error::Error::{Ptrace, Waitpid};
-use nix::sys;
-use nix::sys::personality::Persona;
-use nix::sys::ptrace::Options;
-use nix::sys::signal::{SIGSTOP, SIGTRAP};
-use nix::sys::wait::WaitStatus::PtraceEvent;
-use nix::sys::wait::{WaitPidFlag, waitpid};
-use nix::unistd::{ForkResult, Pid, fork};
+use nix::unistd::Pid;
 use os_pipe::PipeWriter;
-use std::collections::HashSet;
-use std::iter;
 use std::marker::PhantomData;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+#[cfg(target_os = "linux")]
 use sysinfo::{RefreshKind, System};
+
+// Linux uses ptrace + the GNU `personality` syscall to disable ASLR
+// in the debuggee. Darwin uses `posix_spawnattr_set_disable_aslr_np`
+// + Mach exception ports; the spawn/attach paths below are gated on
+// linux only until the darwin path lands.
+#[cfg(target_os = "linux")]
+use crate::debugger::error::Error::{Ptrace, Waitpid};
+#[cfg(target_os = "linux")]
+use nix::sys;
+#[cfg(target_os = "linux")]
+use nix::sys::personality::Persona;
+#[cfg(target_os = "linux")]
+use nix::sys::ptrace::Options;
+#[cfg(target_os = "linux")]
+use nix::sys::signal::{SIGSTOP, SIGTRAP};
+#[cfg(target_os = "linux")]
+use nix::sys::wait::WaitStatus::PtraceEvent;
+#[cfg(target_os = "linux")]
+use nix::sys::wait::{WaitPidFlag, waitpid};
+#[cfg(target_os = "linux")]
+use nix::unistd::{ForkResult, fork};
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+#[cfg(target_os = "linux")]
+use std::iter;
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
+#[cfg(target_os = "linux")]
+use std::process::Command;
 
 /// Process state.
 pub trait State {}
@@ -89,6 +108,7 @@ impl Child<Installed> {
     /// * `pid`: an external process pid
     /// * `stdout`: stdout pipe, this pipe will not be used for the current process but it will be used after a possible restart
     /// * `stderr`: stderr pipe, this pipe will not be used for the current process but it will be used after a possible restart
+    #[cfg(target_os = "linux")]
     pub fn from_external(pid: Pid, stdout: PipeWriter, stderr: PipeWriter) -> Result<Self, Error> {
         let sys =
             System::new_with_specifics(RefreshKind::everything().without_cpu().without_memory());
@@ -158,6 +178,13 @@ impl Child<Installed> {
             _p: PhantomData,
         })
     }
+
+    /// Darwin path: attach to an existing pid via `task_for_pid` +
+    /// Mach exception ports. Stubbed for the macOS port.
+    #[cfg(not(target_os = "linux"))]
+    pub fn from_external(_pid: Pid, _stdout: PipeWriter, _stderr: PipeWriter) -> Result<Self, Error> {
+        unimplemented!("darwin: Child::from_external via task_for_pid + Mach exception ports")
+    }
 }
 
 impl<S: State> Child<S> {
@@ -178,6 +205,7 @@ impl<S: State> Child<S> {
 
     /// Instantiate process by `fork()` system call with caller as a parent process.
     /// After installation child process stopped by `SIGSTOP` signal.
+    #[cfg(target_os = "linux")]
     pub fn install(&self) -> Result<Child<Installed>, Error> {
         let mut debugee_cmd = Command::new(&self.program);
         let debugee_cmd = debugee_cmd
@@ -228,5 +256,16 @@ impl<S: State> Child<S> {
                 panic!("run debugee fail with: {err}");
             }
         }
+    }
+
+    /// Darwin path: spawn the debuggee via `posix_spawn` with
+    /// `_POSIX_SPAWN_DISABLE_ASLR` (to mirror the linux
+    /// `personality(ADDR_NO_RANDOMIZE)` behaviour) and attach to the
+    /// resulting Mach task. Stubbed for the macOS port.
+    #[cfg(not(target_os = "linux"))]
+    pub fn install(&self) -> Result<Child<Installed>, Error> {
+        unimplemented!(
+            "darwin: Child::install via posix_spawn(_POSIX_SPAWN_DISABLE_ASLR) + task_for_pid"
+        )
     }
 }
