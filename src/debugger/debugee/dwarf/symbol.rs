@@ -102,10 +102,25 @@ impl SymbolTab {
     }
 
     pub fn find(&'_ self, regex: &Regex) -> Vec<Symbol<'_>> {
-        let keys = self
-            .0
-            .keys()
-            .filter(|key| regex.find(key.as_str()).is_some());
+        let keys = self.0.keys().filter(|key| {
+            let s = key.as_str();
+            if regex.find(s).is_some() {
+                return true;
+            }
+            // Mach-O symbol names carry a leading `_` that ELF doesn't.
+            // Match the user's regex against the underscore-stripped
+            // form too so that `^main$` finds `_main`, `^foo$` finds
+            // `_foo`, etc. (Rust-mangled names like `__ZN…` don't have
+            // a single leading underscore — they start with `__Z` —
+            // so this only affects C-level symbols.)
+            #[cfg(target_os = "macos")]
+            if let Some(stripped) = s.strip_prefix('_')
+                && !stripped.starts_with('_')
+            {
+                return regex.find(stripped).is_some();
+            }
+            false
+        });
         keys.map(|k| {
             let s = &self.0[k];
             Symbol {
