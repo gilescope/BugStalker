@@ -792,6 +792,24 @@ impl Tracer {
                         // initialise the debug-info registry.
                         return Ok(StopReason::DebugeeStart);
                     }
+                    // Pass-through: signals the inferior produces
+                    // for its own bookkeeping (timers, async I/O,
+                    // child reaping) shouldn't drop us back to a
+                    // user prompt every time they fire. Re-inject
+                    // them into the inferior via `PT_CONTINUE(sig)`
+                    // and keep waiting. Linux Tracer does the same
+                    // via `QUIET_SIGNALS`; this is the darwin
+                    // analogue.
+                    use nix::sys::signal::Signal::{
+                        SIGALRM, SIGCHLD, SIGIO, SIGPROF, SIGURG, SIGVTALRM,
+                    };
+                    if matches!(
+                        signal,
+                        SIGALRM | SIGURG | SIGCHLD | SIGIO | SIGVTALRM | SIGPROF
+                    ) {
+                        ptrace::cont(stopped_pid, Some(signal)).map_err(Error::Ptrace)?;
+                        continue;
+                    }
                     return Ok(StopReason::SignalStop(stopped_pid, signal));
                 }
                 _ => {
