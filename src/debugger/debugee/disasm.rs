@@ -6,6 +6,23 @@ use crate::debugger::debugee::Debugee;
 use crate::debugger::debugee::dwarf::DebugInformation;
 use crate::debugger::debugee::dwarf::unit::die_ref::{FatDieRef, Function};
 use capstone::prelude::*;
+
+#[cfg(target_arch = "x86_64")]
+fn new_capstone() -> Result<Capstone, capstone::Error> {
+    Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Att)
+        .build()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn new_capstone() -> Result<Capstone, capstone::Error> {
+    Capstone::new()
+        .arm64()
+        .mode(arch::arm64::ArchMode::Arm)
+        .build()
+}
 use lru::LruCache;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
@@ -31,12 +48,7 @@ impl Disassembler {
     /// Create a new [`Disassembler`].
     pub fn new() -> Result<Self, Error> {
         Ok(Self {
-            cs: Capstone::new()
-                .x86()
-                .mode(arch::x86::ArchMode::Mode64)
-                .syntax(arch::x86::ArchSyntax::Att)
-                .build()
-                .map_err(Error::DisAsmInit)?,
+            cs: new_capstone().map_err(Error::DisAsmInit)?,
             cache: RefCell::new(LruCache::new(NonZeroUsize::new(1000).expect("infallible"))),
         })
     }

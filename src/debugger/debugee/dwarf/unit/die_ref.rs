@@ -1,3 +1,4 @@
+use crate::debugger;
 use crate::debugger::ExplorationContext;
 use crate::debugger::address::{GlobalAddress, RelocatedAddress};
 use crate::debugger::debugee::Debugee;
@@ -18,6 +19,30 @@ use crate::{debug_info_exists, weak_error};
 use gimli::{DW_TAG_lexical_block, DW_TAG_subprogram, Range, UnitOffset};
 use indexmap::IndexMap;
 use std::marker::PhantomData;
+
+/// Read TPIDR_EL0 (thread pointer) from a stopped tracee on aarch64.
+#[cfg(target_arch = "aarch64")]
+fn read_tpidr_el0(pid: nix::unistd::Pid) -> Result<usize, nix::Error> {
+    use std::mem;
+    const NT_ARM_TLS: libc::c_int = 0x401;
+    let mut reg: u64 = 0;
+    let mut iov = libc::iovec {
+        iov_base: &mut reg as *mut _ as *mut libc::c_void,
+        iov_len: mem::size_of::<u64>(),
+    };
+    let ret = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGSET,
+            pid.as_raw(),
+            NT_ARM_TLS as *mut libc::c_void,
+            &mut iov as *mut _ as *mut libc::c_void,
+        )
+    };
+    if ret < 0 {
+        return Err(nix::errno::Errno::last());
+    }
+    Ok(reg as usize)
+}
 
 #[derive(Clone, Copy)]
 pub enum DieReference {
@@ -249,31 +274,94 @@ impl<'dbg, H: Typed> FatDieRef<'dbg, H> {
         r#type: &ComplexType,
     ) -> Option<ObjectBinaryRepr> {
         let die = weak_error!(self.deref())?;
-        let location = die.location()?;
-        let location_expr = DwarfLocation(&location).try_as_expression(
-            self.debug_info,
-            self.unit(),
-            ecx.location().global_pc,
-        );
+        let location = die.location();
 
-        location_expr.and_then(|expr| {
-            let evaluator =
-                ref_resolve_unit_call!(self, evaluator, debugee, self.debug_info.dwarf());
-            let eval_result = weak_error!(evaluator.evaluate(ecx, expr))?;
-            let type_size = r#type.type_size_in_bytes(
-                &EvaluationContext {
-                    evaluator: &evaluator,
-                    ecx,
-                },
-                r#type.root(),
-            )? as usize;
-            let (address, raw_data) =
-                weak_error!(eval_result.into_raw_bytes(type_size, AddressKind::MemoryAddress))?;
-            Some(ObjectBinaryRepr {
-                raw_data,
-                size: type_size,
-                address,
-            })
+        // Normal DWARF location path
+        if let Some(ref loc) = location {
+            let location_expr = DwarfLocation(loc).try_as_expression(
+                self.debug_info,
+                self.unit(),
+                ecx.location().global_pc,
+            );
+
+            if let Some(result) = location_expr.and_then(|expr| {
+                let evaluator =
+                    ref_resolve_unit_call!(self, evaluator, debugee, self.debug_info.dwarf());
+                let eval_result = weak_error!(evaluator.evaluate(ecx, expr))?;
+                let type_size = r#type.type_size_in_bytes(
+                    &EvaluationContext {
+                        evaluator: &evaluator,
+                        ecx,
+                    },
+                    r#type.root(),
+                )? as usize;
+                let (address, raw_data) =
+                    weak_error!(eval_result.into_raw_bytes(type_size, AddressKind::MemoryAddress))?;
+                Some(ObjectBinaryRepr {
+                    raw_data,
+                    size: type_size,
+                    address,
+                })
+            }) {
+                return Some(result);
+            }
+        }
+
+        // TLS fallback: if no DWARF location, check ELF TLS symbols by linkage name.
+        // Try exact match first; for const-init TLS the init closure's hash differs
+        // from the ELF symbol, so fall back to hash-stripped matching.
+        let linkage_name = die.linkage_name()?;
+        let tls_offset = self.debug_info.tls_symbol_offset(&linkage_name)
+            .or_else(|| {
+                if linkage_name.contains("thread_local_const_init") {
+                    self.debug_info.tls_symbol_offset_stripped(&linkage_name)
+                } else {
+                    None
+                }
+            })?;
+        let lm_addr = debugee.rendezvous().link_map_main();
+        let pid = ecx.pid_on_focus();
+        let tls_addr_result = debugee.tracee_ctl().tls_addr(pid, lm_addr, tls_offset as usize);
+
+        let tls_addr = if let Ok(addr) = tls_addr_result {
+            addr
+        } else {
+            // thread_db TLS resolution failed; compute directly from thread pointer.
+            // On aarch64 glibc TLS variant I: DTV[1] + offset gives the TLS address.
+            #[cfg(target_arch = "aarch64")]
+            {
+                let tp = weak_error!(read_tpidr_el0(pid))?;
+                let dtv_bytes = weak_error!(debugger::read_memory_by_pid(pid, tp, 8))?;
+                let dtv_ptr = usize::from_ne_bytes(dtv_bytes[..8].try_into().unwrap());
+                let dtv1_bytes = weak_error!(debugger::read_memory_by_pid(pid, dtv_ptr + 16, 8))?;
+                let tls_base = usize::from_ne_bytes(dtv1_bytes[..8].try_into().unwrap());
+                RelocatedAddress::from(tls_base + tls_offset as usize)
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                return None;
+            }
+        };
+
+        let evaluator =
+            ref_resolve_unit_call!(self, evaluator, debugee, self.debug_info.dwarf());
+        let type_size = r#type.type_size_in_bytes(
+            &EvaluationContext {
+                evaluator: &evaluator,
+                ecx,
+            },
+            r#type.root(),
+        )? as usize;
+
+        let raw_data = weak_error!(debugger::read_memory_by_pid(
+            pid,
+            usize::from(tls_addr),
+            type_size
+        ))?;
+        Some(ObjectBinaryRepr {
+            raw_data: raw_data.into(),
+            size: type_size,
+            address: Some(usize::from(tls_addr)),
         })
     }
 }

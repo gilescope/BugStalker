@@ -256,6 +256,7 @@ impl DwarfRegistry {
         self.mappings.get(dwarf.pathname()).copied()
     }
 
+
     /// Find main executable object debug information.
     pub fn find_main_program_dwarf(&self) -> Option<&DebugInformation> {
         self.files.get(&self.program_path)

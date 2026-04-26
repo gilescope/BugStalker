@@ -306,4 +306,21 @@ impl TraceeCtl {
             thread.tls_addr(link_map_addr.into(), offset)? as usize,
         ))
     }
+
+    /// Get TLS base address for a module by its module ID.
+    /// For the main executable, modid is always 1.
+    pub fn tls_base(
+        &self,
+        tid: Pid,
+        modid: u32,
+    ) -> Result<RelocatedAddress, Error> {
+        let td_proc = self.thread_db_proc.as_ref().ok_or(NoThreadDB)?;
+
+        let thread: thread_db::Thread =
+            td_proc.borrow_process().get_thread(tid).map_err(ThreadDB)?;
+
+        Ok(RelocatedAddress::from(
+            thread.tls_base(modid)? as usize,
+        ))
+    }
 }

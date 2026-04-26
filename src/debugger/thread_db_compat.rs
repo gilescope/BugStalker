@@ -1,25 +1,18 @@
 //! Architecture shim for the `thread_db` crate.
 //!
-//! `thread_db` binds glibc's `libthread_db`, which is only implemented for
-//! x86_64 (and i686) at the time of writing. On other architectures this
-//! module exposes stubs that preserve the public shape of the API but
-//! always report "not supported", allowing the rest of the debugger to
-//! compile and run with TLS-related features gracefully degraded.
-//!
-//! The expected failure path on non-x86_64 is:
-//!   * `Lib::try_load()` succeeds (a zero-sized handle).
-//!   * `Lib::attach(pid)` returns `Err(ThreadDbError)`.
-//!   * `Debugee::attach_libthread_db` already logs a warning and
-//!     continues when attach fails, so no thread_db-dependent feature is
-//!     silently exercised.
+//! `thread_db` binds glibc's `libthread_db`, supported on x86_64 and aarch64.
+//! On other architectures this module exposes stubs that preserve the public
+//! shape of the API but always report "not supported", allowing the rest of
+//! the debugger to compile and run with TLS-related features gracefully
+//! degraded.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use ::thread_db::{Lib, Process, Thread, ThreadDbError};
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub use stub::{Lib, Process, Thread, ThreadDbError};
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod stub {
     use nix::unistd::Pid;
     use std::fmt;
@@ -32,7 +25,7 @@ mod stub {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 f,
-                "libthread_db is not available on this architecture (upstream `thread_db` crate supports x86_64/i686 only)"
+                "libthread_db is not available on this architecture"
             )
         }
     }

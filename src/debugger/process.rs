@@ -191,7 +191,11 @@ impl<S: State> Child<S> {
 
         unsafe {
             debugee_cmd.pre_exec(move || {
-                sys::personality::set(Persona::ADDR_NO_RANDOMIZE)?;
+                // Best-effort: some environments (e.g. Docker containers with
+                // restricted seccomp profiles) don't allow the personality
+                // syscall.  ASLR being enabled makes addresses non-deterministic
+                // across runs but doesn't break debugging.
+                let _ = sys::personality::set(Persona::ADDR_NO_RANDOMIZE);
                 Ok(())
             });
         }

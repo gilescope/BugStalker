@@ -16,6 +16,31 @@ use nix::unistd::Pid;
 use std::collections::HashSet;
 use std::mem;
 
+/// Strip Pointer Authentication Code (PAC) signature bits from an address.
+///
+/// On aarch64 CPUs with PAC enabled, the link register (return address) has
+/// authentication bits set in the upper bits. These must be cleared before the
+/// address can be used for code lookups.
+#[cfg(target_arch = "aarch64")]
+fn strip_pac(addr: u64) -> u64 {
+    // On aarch64, bit 55 distinguishes user-space (0) from kernel-space (1).
+    // PAC signs the unused upper bits above the virtual address width.
+    // For user-space (48-bit VA): clear bits 48-63 to recover the VA.
+    // For kernel-space: sign-extend from bit 55 (set bits 56-63).
+    // We only debug user-space processes so the first branch dominates.
+    if addr & (1 << 55) == 0 {
+        addr & 0x0000_FFFF_FFFF_FFFF
+    } else {
+        addr | 0xFFFF_0000_0000_0000
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn strip_pac(addr: u64) -> u64 {
+    addr
+}
+
 /// Unique frame identifier. It is just an address of the first instruction in function.
 pub type FrameID = RelocatedAddress;
 
@@ -258,7 +283,7 @@ impl<'a> UnwindContext<'a> {
         let register = self.fde.cie().return_address_register();
         self.registers
             .value(register)
-            .map(RelocatedAddress::from)
+            .map(|addr| RelocatedAddress::from(strip_pac(addr)))
             .ok()
     }
 
@@ -330,9 +355,20 @@ impl<'a> DwarfUnwinder<'a> {
                 break;
             }
 
+            let global_pc = match return_addr.into_global(self.debugee) {
+                Ok(gpc) => gpc,
+                Err(Error::MappingOffsetNotFound(_)) => {
+                    // Address is outside any known mapped region (e.g. vDSO,
+                    // dynamic linker trampoline, or bottom-of-stack sentinel).
+                    // This is a normal unwind termination condition.
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
+
             let next_location = Location {
                 pc: return_addr,
-                global_pc: return_addr.into_global(self.debugee)?,
+                global_pc,
                 pid: ucx.location.pid,
             };
 

@@ -66,6 +66,7 @@ const SIGNALS_APP: &str = "./examples/target/debug/signals";
 const SHARED_LIB_APP: &str = "./examples/target/debug/calc_bin";
 const SLEEPER_APP: &str = "./examples/target/debug/sleeper";
 const FIZZBUZZ_APP: &str = "./examples/target/debug/fizzbuzz";
+#[cfg(target_arch = "x86_64")]
 const CALCULATIONS_APP: &str = "./examples/target/debug/calculations";
 const TOKIO_TICKER_APP: &str = "./examples/target/debug/tokioticker";
 const CALLS_APP: &str = "./examples/target/debug/calls";

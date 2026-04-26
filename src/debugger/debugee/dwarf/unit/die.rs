@@ -8,7 +8,8 @@ use crate::{
 use gimli::{
     Attribute, AttributeValue, DW_AT_byte_size, DW_AT_const_value, DW_AT_count,
     DW_AT_data_member_location, DW_AT_discr, DW_AT_discr_value, DW_AT_encoding, DW_AT_frame_base,
-    DW_AT_location, DW_AT_lower_bound, DW_AT_name, DW_AT_type, DW_AT_upper_bound,
+    DW_AT_linkage_name, DW_AT_location, DW_AT_lower_bound, DW_AT_name, DW_AT_type,
+    DW_AT_upper_bound,
     DebuggingInformationEntry, DwAt, DwTag, Dwarf, Range, Reader, Unit, UnitOffset,
 };
 use std::collections::VecDeque;
@@ -68,6 +69,10 @@ impl<'a> Die<'a> {
 
     impl_no_virt!(name, Option<String>, |dcx: &DerefContext, die: GimliDie| {
         Self::attr_to_string(dcx.dwarf, dcx.unit, die, DW_AT_name).ok()?
+    });
+
+    impl_no_virt!(linkage_name, Option<String>, |dcx: &DerefContext, die: GimliDie| {
+        Self::attr_to_string(dcx.dwarf, dcx.unit, die, DW_AT_linkage_name).ok()?
     });
 
     impl_no_virt!(ranges, Box<[Range]>, |dcx: &DerefContext, die: GimliDie| {

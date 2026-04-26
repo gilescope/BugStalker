@@ -12,7 +12,7 @@ use crate::debugger::variable::execute::DqeExecutor;
 use crate::debugger::variable::execute::QueryResult;
 use crate::debugger::variable::value::{SupportedScalar, Value};
 use crate::debugger::variable::r#virtual::VirtualVariableDie;
-use crate::debugger::{Debugger, Error, ThreadSnapshot, Tracee, utils};
+use crate::debugger::{Debugger, Error, ThreadSnapshot, Tracee};
 use crate::type_from_cache;
 use crate::ui::command::parser::expression;
 use crate::version::RustVersion;
@@ -159,8 +159,6 @@ impl WorkerInternal {
             state = Some(WorkerState::Unknown);
         }
         let state = state?;
-
-        use utils::PopIf;
 
         // local queue DQE: var (*(*(*CONTEXT.scheduler.inner).0.core.value.0).run_queue.inner).data
         let mut core_run_queue_inner = context.modify_value(|c, v: Value| {

@@ -13,7 +13,7 @@ use crate::debugger::ExplorationContext;
 use crate::debugger::address::{GlobalAddress, RelocatedAddress};
 use crate::debugger::context::gcx;
 use crate::debugger::debugee::dwarf::eval::AddressKind;
-use crate::debugger::debugee::dwarf::symbol::SymbolTab;
+use crate::debugger::debugee::dwarf::symbol::{SymbolTab, TlsSymbolTab};
 use crate::debugger::debugee::dwarf::unit::die::{DerefContext, Die};
 use crate::debugger::debugee::dwarf::unit::die_ref::{FatDieRef, Function, Variable};
 use crate::debugger::debugee::dwarf::unit::{
@@ -56,6 +56,7 @@ pub struct DebugInformation<R: gimli::Reader = EndianArcSlice> {
     bases: BaseAddresses,
     units: Option<Vec<BsUnit>>,
     symbol_table: Option<SymbolTab>,
+    tls_symbol_tab: Option<TlsSymbolTab>,
     pub_names: Option<Trie<u8>>,
     pub_types: HashMap<String, (DebugInfoOffset, UnitOffset)>,
     /// Index for fast search files by full path or part of file path. Contains unit index and
@@ -95,6 +96,7 @@ impl Clone for DebugInformation {
                 .as_ref()
                 .map(|units| units.iter().map(|u| u.clone(self.dwarf())).collect()),
             symbol_table: self.symbol_table.clone(),
+            tls_symbol_tab: self.tls_symbol_tab.clone(),
             // it is ok cause pub_names currently unused, maybe it will be changed in future
             pub_names: None,
             pub_types: self.pub_types.clone(),
@@ -537,6 +539,14 @@ impl DebugInformation {
             .unwrap_or_default()
     }
 
+    pub fn tls_symbol_offset(&self, mangled_name: &str) -> Option<u64> {
+        self.tls_symbol_tab.as_ref()?.get_offset(mangled_name)
+    }
+
+    pub fn tls_symbol_offset_stripped(&self, mangled_name: &str) -> Option<u64> {
+        self.tls_symbol_tab.as_ref()?.get_offset_stripped(mangled_name)
+    }
+
     pub fn find_variables(
         &self,
         location: Location,
@@ -755,9 +765,11 @@ impl DebugInformationBuilder {
             RunTimeEndian::Big
         };
 
-        let eh_frame = EhFrame::load(|id| -> Result<EndianArcSlice, Error> {
+        let mut eh_frame = EhFrame::load(|id| -> Result<EndianArcSlice, Error> {
             loader::load_section(id, file, endian)
         })?;
+        #[cfg(target_arch = "aarch64")]
+        eh_frame.set_vendor(gimli::Vendor::AArch64);
         let section_addr = |name: &str| -> Option<u64> {
             file.sections().find_map(|section| {
                 if section.name().ok()? == name {
@@ -797,13 +809,17 @@ impl DebugInformationBuilder {
 
         let dwarf = loader::load_par(debug_info_file, endian)?;
         let debug_frame = if debug_info_file.section_by_name(".debug_frame").is_some() {
-            Some(DebugFrame::load(|id| -> Result<EndianArcSlice, Error> {
+            let mut df = DebugFrame::load(|id| -> Result<EndianArcSlice, Error> {
                 loader::load_section(id, debug_info_file, endian)
-            })?)
+            })?;
+            #[cfg(target_arch = "aarch64")]
+            df.set_vendor(gimli::Vendor::AArch64);
+            Some(df)
         } else {
             None
         };
         let symbol_table = SymbolTab::new(debug_info_file);
+        let tls_symbol_tab = TlsSymbolTab::new(debug_info_file);
 
         // let mb_pub_names_sect = muted_error!(DebugPubNames::load(|id| {
         //     loader::load_section(id, debug_info_file, endian)
@@ -858,6 +874,7 @@ impl DebugInformationBuilder {
                 bases,
                 units: None,
                 symbol_table,
+                tls_symbol_tab,
                 pub_names,
                 pub_types: pub_types.unwrap_or_default(),
                 files_index: PathSearchIndex::new(""),
@@ -894,6 +911,7 @@ impl DebugInformationBuilder {
             bases,
             units: Some(units),
             symbol_table,
+            tls_symbol_tab,
             pub_names,
             pub_types: pub_types.unwrap_or_default(),
             files_index,
