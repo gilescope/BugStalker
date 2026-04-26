@@ -112,17 +112,31 @@ pub struct Tracer {
     /// Linux-only: guards the group-stop race in `PTRACE_O_TRACECLONE`.
     #[cfg(target_os = "linux")]
     group_stop_guard: bool,
-    /// Darwin: have we already consumed the post-exec SIGTRAP/
-    /// SIGSTOP? Linux distinguishes the initial stop via
-    /// `PTRACE_EVENT_STOP`; darwin doesn't have that, so we just
-    /// flip a flag the first time SIGSTOP is seen and treat it
-    /// as `DebugeeStart`. Every subsequent SIGSTOP is a user-
-    /// initiated pause (via `Tracer::pause`'s `kill(SIGSTOP)`)
-    /// and surfaces as a regular `SignalStop` so the engine's
-    /// pause handler sees it for what it is, not a spurious
-    /// "debugger just started" event.
+    /// Darwin: lazily-initialised Mach supervision state. Set up
+    /// on the first call to `resume`/`single_step`: allocates the
+    /// exception port and registers it on the task. Subsequent
+    /// calls reuse the cached `(task, port, pending_reply)` tuple.
+    #[cfg(not(target_os = "linux"))]
+    darwin_state: Option<DarwinSupervision>,
+    /// Darwin: did we already report the synthetic `DebugeeStart`
+    /// for the initial spawn-suspend stop? POSIX_SPAWN_START_SUSPENDED
+    /// leaves the inferior parked from creation; we surface that
+    /// as DebugeeStart on the first resume so the engine can run
+    /// its init path.
     #[cfg(not(target_os = "linux"))]
     darwin_seen_initial_stop: bool,
+}
+
+#[cfg(not(target_os = "linux"))]
+struct DarwinSupervision {
+    task: mach2::mach_types::task_t,
+    port: crate::debugger::darwin_mach::ExceptionPort,
+    /// `(remote_port, msg_id)` of the most recent
+    /// `mach_exception_raise` we received but haven't replied to.
+    /// The kernel parks the faulting thread until reply; we hold
+    /// off until the next `resume`/`single_step` so the user can
+    /// inspect coherent state.
+    pending_reply: Option<(u32, i32)>,
 }
 
 #[cfg(target_os = "linux")]
@@ -713,6 +727,7 @@ impl Tracer {
     pub fn new(proc_pid: Pid) -> Self {
         Self {
             tracee_ctl: TraceeCtl::new(proc_pid),
+            darwin_state: None,
             darwin_seen_initial_stop: false,
         }
     }
@@ -720,143 +735,153 @@ impl Tracer {
     pub fn new_external(proc_pid: Pid, threads: &[Pid]) -> Self {
         Self {
             tracee_ctl: TraceeCtl::new_external(proc_pid, threads),
-            // We attached to a running process — the initial stop
-            // semantics don't apply.
+            darwin_state: None,
+            // Attached to a running process — no initial-stop event.
             darwin_seen_initial_stop: true,
         }
     }
 
+    /// Path A: pure Mach. Lazy-init the exception port + register
+    /// it on the task on first call. Subsequent calls reuse the
+    /// cached state. No ptrace involvement — `Child::install`
+    /// spawned the child via `posix_spawn(POSIX_SPAWN_START_SUSPENDED)`,
+    /// so we own the suspend state from the start.
+    fn ensure_darwin_supervision(&mut self) -> Result<&mut DarwinSupervision, Error> {
+        if self.darwin_state.is_none() {
+            use crate::debugger::darwin_mach::{self, ExceptionPort};
+            let pid = self.tracee_ctl.proc_pid();
+            let task = darwin_mach::task_for_pid(pid)?;
+            let port = ExceptionPort::allocate()?;
+            port.register(task)?;
+            self.darwin_state = Some(DarwinSupervision {
+                task,
+                port,
+                pending_reply: None,
+            });
+        }
+        Ok(self.darwin_state.as_mut().expect("just initialised"))
+    }
+
     pub fn resume(&mut self, tcx: TraceContext) -> Result<StopReason, Error> {
+        use crate::debugger::darwin_mach::{self, ExceptionPort};
         use crate::debugger::register::RegisterMap;
-        use nix::sys::ptrace;
-        use nix::sys::wait::{WaitStatus, waitpid};
+        use mach2::kern_return::KERN_SUCCESS;
 
         let pid = self.tracee_ctl.proc_pid();
-        // Initial resume of the (currently stopped) inferior. The
-        // quiet-signal re-injection branch below does its own
-        // `ptrace::cont(Some(sig))` and then loops directly to
-        // `waitpid` — calling cont again at the loop top would
-        // race against an already-running thread.
-        ptrace::cont(pid, None).map_err(Error::Ptrace)?;
-        loop {
-            let status = waitpid(pid, None).map_err(Error::Waitpid)?;
-            match status {
-                WaitStatus::Exited(_, code) => return Ok(StopReason::DebugeeExit(code)),
-                WaitStatus::Signaled(_, sig, _) => {
-                    // Treat fatal signals like a non-zero exit so
-                    // the rest of the debugger sees a single
-                    // termination shape regardless of how it ended.
-                    return Ok(StopReason::DebugeeExit(128 + sig as i32));
-                }
-                WaitStatus::Stopped(stopped_pid, signal) => {
-                    if signal == nix::sys::signal::SIGTRAP {
-                        // Could be (a) an installed breakpoint
-                        // firing — the BRK at PC will appear as
-                        // SIGTRAP; (b) a hardware watchpoint hit
-                        // — same SIGTRAP shape, but PC is *after*
-                        // the faulting instruction and FAR_EL1
-                        // holds the fault address; (c) a user-
-                        // level BRK (`__builtin_trap`); or (d)
-                        // the post-exec attach trap on the very
-                        // first resume.
-                        let raw_pc = RegisterMap::current(stopped_pid)?.pc();
-                        let candidate_pc = crate::debugger::address::RelocatedAddress::from(
-                            raw_pc - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
-                        );
-                        let is_ours = tcx
-                            .breakpoints
-                            .iter()
-                            .any(|b| b.addr == candidate_pc);
-                        if is_ours {
-                            return Ok(StopReason::Breakpoint(stopped_pid, candidate_pc));
-                        }
-                        // Watchpoint check — darwin's analogue of
-                        // linux's `siginfo.si_addr`/`TRAP_HWBKPT`
-                        // path is the per-thread FAR_EL1 captured
-                        // in `ARM_EXCEPTION_STATE64`. The kernel
-                        // sets FAR only on the thread that took
-                        // the abort, so iterate every thread and
-                        // pick the first whose FAR matches an
-                        // armed slot's BAS-encoded byte set.
-                        if let Ok(task) = crate::debugger::darwin_mach::task_for_pid(stopped_pid)
-                            && let Ok(threads) =
-                                crate::debugger::darwin_mach::task_threads_vec(task)
-                            && let Ok(mut state) =
-                                crate::debugger::register::debug::HardwareDebugState::current(
-                                    stopped_pid,
-                                )
-                        {
-                            let hit = threads.iter().find_map(|&thread| {
-                                let exc = crate::debugger::darwin_mach::
-                                    thread_get_arm_exception_state64(thread)
-                                    .ok()?;
-                                state.detect_and_flush_hit(Some(exc.far as usize))
-                            });
-                            if let Some(dr) = hit {
-                                let _ = state.sync(stopped_pid);
-                                let hit_type = WatchpointHitType::DebugRegister(dr);
-                                return Ok(StopReason::Watchpoint(
-                                    stopped_pid,
-                                    crate::debugger::address::RelocatedAddress::from(
-                                        raw_pc as usize,
-                                    ),
-                                    hit_type,
-                                ));
-                            }
-                        }
-                        return Ok(StopReason::SignalStop(stopped_pid, signal));
-                    }
-                    if signal == nix::sys::signal::SIGSTOP {
-                        if !self.darwin_seen_initial_stop {
-                            // First-time post-exec stop: surface
-                            // as DebugeeStart so the front-end
-                            // can initialise the debug-info
-                            // registry.
-                            self.darwin_seen_initial_stop = true;
-                            return Ok(StopReason::DebugeeStart);
-                        }
-                        // Any subsequent SIGSTOP came from
-                        // `Tracer::pause`'s `kill(SIGSTOP)` — a
-                        // user-initiated pause. Surface as a
-                        // regular SignalStop so the engine's
-                        // pause handler sees it.
-                        return Ok(StopReason::SignalStop(stopped_pid, signal));
-                    }
-                    // Pass-through: signals the inferior produces
-                    // for its own bookkeeping (timers, async I/O,
-                    // child reaping) shouldn't drop us back to a
-                    // user prompt every time they fire. Re-inject
-                    // them into the inferior via `PT_CONTINUE(sig)`
-                    // and keep waiting. Linux Tracer does the same
-                    // via `QUIET_SIGNALS`; this is the darwin
-                    // analogue.
-                    use nix::sys::signal::Signal::{
-                        SIGALRM, SIGCHLD, SIGIO, SIGPROF, SIGURG, SIGVTALRM,
-                    };
-                    if matches!(
-                        signal,
-                        SIGALRM | SIGURG | SIGCHLD | SIGIO | SIGVTALRM | SIGPROF
-                    ) {
-                        ptrace::cont(stopped_pid, Some(signal)).map_err(Error::Ptrace)?;
-                        continue;
-                    }
-                    return Ok(StopReason::SignalStop(stopped_pid, signal));
-                }
-                _ => {
-                    // Any other wait status (continued, etc.) — keep
-                    // looping until a real stop arrives.
-                    continue;
+
+        // First call after Child::install: the inferior is in the
+        // POSIX_SPAWN_START_SUSPENDED stop state and the engine
+        // needs to see DebugeeStart so it can initialise the debug
+        // info registry. We don't actually run the inferior here —
+        // we just confirm Mach supervision is up and report the
+        // synthetic start event. The next resume() drives the loop.
+        if !self.darwin_seen_initial_stop {
+            self.ensure_darwin_supervision()?;
+            self.darwin_seen_initial_stop = true;
+            return Ok(StopReason::DebugeeStart);
+        }
+
+        let state = self.ensure_darwin_supervision()?;
+
+        // Reply to the previously-saved exception (if any) — that
+        // unblocks the kernel-side handler chain so the parked
+        // thread continues from the fault.
+        if let Some((remote, id)) = state.pending_reply.take() {
+            ExceptionPort::reply(remote, id, KERN_SUCCESS)?;
+        }
+
+        // Resume the inferior. After Child::install's spawn-suspend,
+        // the task suspend count is 1; this drops it to 0 and the
+        // child runs.
+        darwin_mach::task_resume(state.task)?;
+
+        // Block on the exception port until the next event.
+        // u32::MAX ms is ~49 days; effectively infinite for our
+        // purposes (the user can Ctrl-C if stuck).
+        let exc = loop {
+            match state.port.receive(u32::MAX)? {
+                Some(e) => break e,
+                None => continue,
+            }
+        };
+
+        // Suspend the task again so the rest of the threads don't
+        // keep running while the user inspects coherent state. The
+        // faulting thread is already parked by the kernel awaiting
+        // our reply.
+        darwin_mach::task_suspend(state.task)?;
+        state.pending_reply = Some((exc.remote_port, exc.msg_id));
+
+        // Classify. aarch64 darwin Mach exception encoding:
+        //   EXC_BREAKPOINT (6) + codes[0]=EXC_ARM_BREAKPOINT (1)
+        //                                          → BRK instr
+        //   EXC_BAD_ACCESS (1) + codes[0]=EXC_ARM_DA_DEBUG (0x102)
+        //                       + codes[1]=fault addr (FAR_EL1)
+        //                                          → HW watchpoint
+        //   EXC_BAD_ACCESS (1) + codes[0]=KERN_INVALID_ADDRESS,...
+        //                                          → memory fault
+        //   EXC_SOFTWARE   (5) + codes[0]=EXC_SOFT_SIGNAL (0x10003)
+        //                       + codes[1]=signal number
+        //                                          → Unix signal
+        const EXC_BREAKPOINT: i32 = 6;
+        const EXC_BAD_ACCESS: i32 = 1;
+        const EXC_SOFTWARE: i32 = 5;
+        const EXC_ARM_BREAKPOINT: i64 = 1;
+        const EXC_ARM_DA_DEBUG: i64 = 0x102;
+        const EXC_SOFT_SIGNAL: i64 = 0x10003;
+
+        let raw_pc = RegisterMap::current(pid)?.pc();
+
+        match exc.exception {
+            EXC_BREAKPOINT if exc.codes.first().copied() == Some(EXC_ARM_BREAKPOINT) => {
+                let candidate_pc = crate::debugger::address::RelocatedAddress::from(
+                    raw_pc - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
+                );
+                let is_ours = tcx
+                    .breakpoints
+                    .iter()
+                    .any(|b| b.addr == candidate_pc);
+                if is_ours {
+                    Ok(StopReason::Breakpoint(pid, candidate_pc))
+                } else {
+                    Ok(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP))
                 }
             }
+            EXC_BAD_ACCESS if exc.codes.first().copied() == Some(EXC_ARM_DA_DEBUG) => {
+                let fault_addr =
+                    exc.codes.get(1).copied().unwrap_or(0) as usize;
+                let mut state =
+                    crate::debugger::register::debug::HardwareDebugState::current(pid)?;
+                if let Some(dr) = state.detect_and_flush_hit(Some(fault_addr)) {
+                    let _ = state.sync(pid);
+                    Ok(StopReason::Watchpoint(
+                        pid,
+                        crate::debugger::address::RelocatedAddress::from(raw_pc as usize),
+                        WatchpointHitType::DebugRegister(dr),
+                    ))
+                } else {
+                    Ok(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP))
+                }
+            }
+            EXC_SOFTWARE if exc.codes.first().copied() == Some(EXC_SOFT_SIGNAL) => {
+                let signum =
+                    exc.codes.get(1).copied().unwrap_or(0) as i32;
+                let signal = nix::sys::signal::Signal::try_from(signum)
+                    .unwrap_or(nix::sys::signal::SIGTRAP);
+                Ok(StopReason::SignalStop(pid, signal))
+            }
+            _ => Ok(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP)),
         }
     }
 
     pub fn pause(&mut self, _tcx: TraceContext) -> Result<(), Error> {
-        // SIGSTOP the whole process; on darwin the next `waitpid`
-        // will see the stop. The Mach-native equivalent
-        // (`task_suspend`) lands with the exception-port loop.
-        nix::sys::signal::kill(self.tracee_ctl.proc_pid(), nix::sys::signal::SIGSTOP)
-            .map_err(Error::Ptrace)?;
+        // task_suspend bumps the kernel's suspend count, parking
+        // every thread. Idempotent vs the count we already hold
+        // from the most recent resume() — the next resume will
+        // task_resume to drop back to 0.
+        if let Some(state) = self.darwin_state.as_ref() {
+            crate::debugger::darwin_mach::task_suspend(state.task)?;
+        }
         Ok(())
     }
 
@@ -869,6 +894,13 @@ impl Tracer {
         use nix::sys::ptrace;
         use nix::sys::wait::{WaitStatus, waitpid};
 
+        // TODO: rewrite to use ARM_DEBUG_STATE64.MDSCR_EL1.SS bit
+        // + ARM_THREAD_STATE64.cpsr.SS bit + task_resume +
+        // port.receive. For the POC, ptrace::step still works after
+        // posix_spawn IF the kernel allows ptrace ops on a child we
+        // own — which it does, no PT_TRACE_ME required, just BSD
+        // ptrace operations on a known child pid. Verify via the
+        // entitlement-gated tests.
         ptrace::step(pid, None).map_err(Error::Ptrace)?;
         let status = waitpid(pid, None).map_err(Error::Waitpid)?;
         match status {

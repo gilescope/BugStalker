@@ -100,13 +100,21 @@ fn spawn_and_read_pc() {
         regs.sp()
     );
 
-    // Clean up: the debuggee is a ptraced child stopped at SIGTRAP.
-    // A plain `kill(SIGKILL)` *delivers* the signal but the kernel
-    // queues it until the tracer continues the tracee. Use
-    // `ptrace::cont(pid, SIGKILL)` to inject + resume in one step,
-    // then `waitpid` reaps the process. (We could use `ptrace::kill`
-    // but it's documented as deprecated even on bsd.)
-    let _ = nix::sys::ptrace::cont(pid, Some(nix::sys::signal::SIGKILL));
+    // Clean up: the debuggee was created via posix_spawn with
+    // POSIX_SPAWN_START_SUSPENDED — Mach suspend count is 1, no
+    // ptrace relationship. Drop the suspend (via task_resume so
+    // the kernel can deliver the signal), then SIGKILL.
+    cleanup_spawn_suspended_debuggee(pid);
+}
+
+/// Resume the Mach-suspended child, kill it, reap it. Used by the
+/// smoke tests that just inspect post-spawn state and then exit.
+fn cleanup_spawn_suspended_debuggee(pid: nix::unistd::Pid) {
+    use bugstalker::debugger::darwin_mach;
+    if let Ok(task) = darwin_mach::task_for_pid(pid) {
+        let _ = darwin_mach::task_resume(task);
+    }
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::SIGKILL);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
@@ -116,7 +124,7 @@ fn spawn_and_read_pc() {
             _ => return,
         }
     }
-    panic!("debuggee {pid} didn't die within 5s of ptrace::cont(SIGKILL)");
+    panic!("debuggee {pid} didn't die within 5s of task_resume + SIGKILL");
 }
 
 /// Higher-level: build a full `Debugger` over the spawned hello_world,
@@ -192,17 +200,7 @@ fn exception_port_allocate_and_register() {
     // Drop the port (releases receive + send) and clean up the
     // ptraced child the same way the spawn-and-read smoke does.
     drop(port);
-    let _ = nix::sys::ptrace::cont(pid, Some(nix::sys::signal::SIGKILL));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
-            Ok(nix::sys::wait::WaitStatus::StillAlive) => {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            _ => return,
-        }
-    }
-    panic!("debuggee {pid} didn't die within 5s of ptrace::cont(SIGKILL)");
+    cleanup_spawn_suspended_debuggee(pid);
 }
 
 /// Allocate a port, don't subscribe it to anything, and prove

@@ -305,84 +305,155 @@ impl<S: State> Child<S> {
         }
     }
 
-    /// Darwin path: fork + `PT_TRACE_ME` + exec, mirroring the linux
-    /// shape. We use the BSD-flavour ptrace just to:
-    ///   * grant the parent the right to call `task_for_pid` on the
-    ///     child (the kernel only allows that across an unrelated
-    ///     pid pair when the caller has the
-    ///     `com.apple.security.cs.debugger` entitlement; for a
-    ///     ptraced child it's allowed unconditionally), and
-    ///   * make the child stop with `SIGTRAP` immediately after
-    ///     `execve`, so we can attach the Mach exception ports
-    ///     before any debuggee instruction runs.
+    /// Darwin path: `posix_spawnp` with
+    /// `POSIX_SPAWN_START_SUSPENDED`. The child is created in a
+    /// SIGSTOP-equivalent state — the kernel suspends it before
+    /// any user-space instruction runs — so the parent has time
+    /// to call `task_for_pid`, register a Mach exception port,
+    /// install breakpoints, and only then `task_resume` it.
     ///
-    /// The actual debugging primitives (memory R/W, registers,
-    /// breakpoints, single-step) will then go through Mach
-    /// (`mach_vm_*`, `thread_get_state`, exception ports) — *not*
-    /// through ptrace, which on macOS has a deliberately limited
-    /// surface that doesn't cover memory access on aarch64.
+    /// **No ptrace.** The whole debugger backend on darwin runs
+    /// through Mach (memory I/O via `mach_vm_*`, registers via
+    /// `thread_get/set_state`, BP and watchpoint events via
+    /// `task_set_exception_ports`). ptrace doesn't expose
+    /// memory access on aarch64 anyway, and mixing ptrace's
+    /// signal-translation chain with our Mach exception port
+    /// fights for the same routing — see `doc/ROADMAP.md`.
+    ///
+    /// The parent gets `task_for_pid` rights for free here
+    /// because we're the parent of the spawned child (the kernel
+    /// allows it across the parent/child relationship without
+    /// needing the `com.apple.security.cs.debugger` entitlement —
+    /// the entitlement is for *unrelated* pids).
     #[cfg(target_os = "macos")]
     pub fn install(&self) -> Result<Child<Installed>, Error> {
-        use nix::sys::ptrace;
-        use nix::sys::signal::SIGSTOP;
-        use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-        use nix::unistd::{ForkResult, Pid as NixPid, fork};
-        use std::os::unix::process::CommandExt;
-        use std::process::Command;
+        use nix::unistd::Pid as NixPid;
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::ptr;
 
-        let mut debugee_cmd = Command::new(&self.program);
-        debugee_cmd
-            .args(&self.args)
-            .stdout(self.stdout.try_clone()?)
-            .stderr(self.stderr.try_clone()?);
-        if let Some(cwd) = self.cwd.as_deref() {
-            debugee_cmd.current_dir(cwd);
+        let path = CString::new(self.program.as_str())
+            .map_err(|_| Error::Attach(nix::errno::Errno::EINVAL))?;
+        let mut argv: Vec<CString> = std::iter::once(path.clone())
+            .chain(
+                self.args
+                    .iter()
+                    .filter_map(|a| CString::new(a.as_str()).ok()),
+            )
+            .collect();
+        // posix_spawnp wants a NULL-terminated `*const *const c_char`.
+        let mut argv_ptrs: Vec<*mut libc::c_char> =
+            argv.iter_mut().map(|s| s.as_ptr() as *mut _).collect();
+        argv_ptrs.push(ptr::null_mut());
+        // Inherit the parent's environment — Command does this by
+        // default and we want the same shape.
+        let envp_ptrs: Vec<*mut libc::c_char> = vec![ptr::null_mut()];
+
+        // Build the spawn attributes: POSIX_SPAWN_START_SUSPENDED
+        // is the magic flag — the kernel creates the child as if
+        // it had received SIGSTOP, leaving it parked until we
+        // task_resume (or send SIGCONT) it.
+        let mut attr: libc::posix_spawnattr_t = ptr::null_mut();
+        // SAFETY: out-pointer; libc writes if KERN_SUCCESS.
+        let r = unsafe { libc::posix_spawnattr_init(&mut attr) };
+        if r != 0 {
+            return Err(Error::Attach(nix::errno::Errno::from_i32(r)));
         }
-
-        unsafe {
-            debugee_cmd.pre_exec(move || {
-                // PT_TRACE_ME — child says "I'm a tracee". After
-                // execve the kernel will deliver SIGTRAP to us, which
-                // the parent's waitpid below catches.
-                ptrace::traceme().map_err(std::io::Error::from)?;
-                // Mirror the linux ADDR_NO_RANDOMIZE step by raising
-                // SIGSTOP first; the parent waitpids that and then
-                // we'll bring the debuggee back up only after Mach
-                // exception ports are wired (next iteration).
-                Ok(())
-            });
-        }
-
-        match unsafe { fork() }.map_err(Error::Attach)? {
-            ForkResult::Parent { child: pid } => {
-                // Two stops to expect from a PT_TRACE_ME'd child:
-                //   * SIGTRAP at the post-exec attach point, OR
-                //   * SIGSTOP if the child raise()s before exec.
-                // Either way we just need the child to be paused so
-                // the next phase can attach its Mach exception port.
-                let status = waitpid(pid, Some(WaitPidFlag::WUNTRACED)).map_err(Error::Attach)?;
-                debug_assert!(matches!(
-                    status,
-                    WaitStatus::Stopped(_, signal)
-                        if signal == nix::sys::signal::SIGTRAP
-                            || signal == SIGSTOP
-                ));
-
-                Ok(Child {
-                    stdout: self.stdout.try_clone()?,
-                    stderr: self.stderr.try_clone()?,
-                    program: self.program.clone(),
-                    args: self.args.clone(),
-                    cwd: self.cwd.clone(),
-                    pid: Some(NixPid::from_raw(pid.as_raw())),
-                    external_info: None,
-                    _p: PhantomData,
-                })
-            }
-            ForkResult::Child => {
-                let err = debugee_cmd.exec();
-                panic!("run debugee fail with: {err}");
+        struct AttrGuard(libc::posix_spawnattr_t);
+        impl Drop for AttrGuard {
+            fn drop(&mut self) {
+                // SAFETY: paired init/destroy; idempotent on null.
+                unsafe { libc::posix_spawnattr_destroy(&mut self.0) };
             }
         }
+        let _attr_guard = AttrGuard(attr);
+        // SAFETY: attr is freshly initialised.
+        let r = unsafe {
+            libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_START_SUSPENDED as i16)
+        };
+        if r != 0 {
+            return Err(Error::Attach(nix::errno::Errno::from_i32(r)));
+        }
+
+        // File actions: dup the caller-provided pipes onto the
+        // child's stdout/stderr. stdin is left as-is (inherited).
+        let mut actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
+        let r = unsafe { libc::posix_spawn_file_actions_init(&mut actions) };
+        if r != 0 {
+            return Err(Error::Attach(nix::errno::Errno::from_i32(r)));
+        }
+        struct ActionsGuard(libc::posix_spawn_file_actions_t);
+        impl Drop for ActionsGuard {
+            fn drop(&mut self) {
+                // SAFETY: paired init/destroy.
+                unsafe { libc::posix_spawn_file_actions_destroy(&mut self.0) };
+            }
+        }
+        let _actions_guard = ActionsGuard(actions);
+        // SAFETY: stdout_w / stderr_w are owned PipeWriters; their
+        // raw fds remain valid for the duration of this function.
+        let stdout_fd = self.stdout.as_raw_fd();
+        let stderr_fd = self.stderr.as_raw_fd();
+        let r = unsafe {
+            libc::posix_spawn_file_actions_adddup2(&mut actions, stdout_fd, libc::STDOUT_FILENO)
+        };
+        if r != 0 {
+            return Err(Error::Attach(nix::errno::Errno::from_i32(r)));
+        }
+        let r = unsafe {
+            libc::posix_spawn_file_actions_adddup2(&mut actions, stderr_fd, libc::STDERR_FILENO)
+        };
+        if r != 0 {
+            return Err(Error::Attach(nix::errno::Errno::from_i32(r)));
+        }
+
+        // posix_spawn doesn't have a "set cwd" option that we can
+        // rely on portably; chdir before the spawn and restore
+        // after if the caller asked for one. The child inherits the
+        // parent's cwd at spawn time.
+        let saved_cwd = self
+            .cwd
+            .as_deref()
+            .map(|cwd| -> Result<std::path::PathBuf, Error> {
+                let prev = std::env::current_dir()
+                    .map_err(|_| Error::Attach(nix::errno::Errno::EIO))?;
+                std::env::set_current_dir(cwd)
+                    .map_err(|_| Error::Attach(nix::errno::Errno::EIO))?;
+                Ok(prev)
+            })
+            .transpose()?;
+
+        let mut child_pid: libc::pid_t = 0;
+        // SAFETY: argv/envp arrays are NUL-terminated (we pushed
+        // the trailing null above). path lives across the call.
+        let r = unsafe {
+            libc::posix_spawnp(
+                &mut child_pid,
+                path.as_ptr(),
+                &actions,
+                &attr,
+                argv_ptrs.as_ptr() as *const *mut _,
+                envp_ptrs.as_ptr() as *const *mut _,
+            )
+        };
+
+        if let Some(prev) = saved_cwd {
+            let _ = std::env::set_current_dir(prev);
+        }
+
+        if r != 0 {
+            return Err(Error::Attach(nix::errno::Errno::from_i32(r)));
+        }
+
+        Ok(Child {
+            stdout: self.stdout.try_clone()?,
+            stderr: self.stderr.try_clone()?,
+            program: self.program.clone(),
+            args: self.args.clone(),
+            cwd: self.cwd.clone(),
+            pid: Some(NixPid::from_raw(child_pid)),
+            external_info: None,
+            _p: PhantomData,
+        })
     }
 }
