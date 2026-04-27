@@ -370,43 +370,54 @@ darwin work (each tracked below):
 
 #### LinkerMapFn rendezvous — diagnosis
 
-The legacy GNU-style "set a SW BP at `dyld_all_image_infos.notification`
-and dyld will trap into us on every dlopen" protocol no longer works
-on macOS Sequoia / dyld 4. Confirmed empirically:
+The legacy "set a SW BP at `dyld_all_image_infos.notification` and dyld
+will trap into us on every image load" protocol *is* still wired up in
+dyld 4 — confirmed by reading
+[`dyld/ExternallyViewableState.cpp`](https://github.com/apple-oss-distributions/dyld/blob/main/dyld/ExternallyViewableState.cpp).
+The function `ExternallyViewableState::triggerNotifications` calls
+`_allImageInfo->notification(mode, infoCount, info)` unconditionally
+(gated only on the compile-time flag `DYLD_FEATURE_BREAKPOINT_NOTIFICATIONS`,
+which is on in production builds). The Mach-IPC path that follows
+(`RemoteNotificationResponder`) is *additive* — for Instruments /
+dtrace — not a replacement. And `lldb_image_notifier`'s body is the
+empty function we expected (just `ret`), perfect SW-BP target.
 
-* `dyld_all_image_infos.notification` *is* set: at runtime, the field
+What we observe:
+
+* `dyld_all_image_infos.notification` is set: at runtime, the field
   contains the bare 47-bit VA of `_lldb_image_notifier` (offset
   `0x37938` inside dyld). For arm64 inferiors the stored value is
-  unsigned, not PAC-signed.
+  unsigned, not PAC-signed (matches `paciza` becoming a no-op when
+  the process has PAC keys suppressed).
 * Installing a SW BP there *does* take effect — `vm_read_n` after
   `vm_write_word` confirms the `BRK #0` is in the inferior's memory
   view (read-back: `0xd4200000`).
-* But the BP never fires. dyld disasm shows the call path (`bl
-  __ZN5dyld423ExternallyViewableState20triggerNotificationsE...` →
-  `blraaz x9`) is gated on `RemoteNotificationResponder::active()` —
-  modern dyld funnels module-load notifications through Mach IPC to a
-  registered remote port (the dtrace/Instruments path), and skips the
-  legacy in-process callback when no remote responder is registered.
+* But the BP never fires on subsequent dlopens.
 * `mach_vm_msync(VM_SYNC_INVALIDATE)` and
   `mach_vm_machine_attribute(MATTR_CACHE, MATTR_VAL_CACHE_SYNC)` after
-  the BP write don't change anything — this isn't an I-cache /
-  shared-cache CoW issue, dyld really doesn't run that code.
+  the BP write don't help.
 
-Three viable Phase 3 fixes, in increasing effort:
+Most likely root cause: **inferior-CPU I-cache staleness**. dyld
+calls `lldb_image_notifier` once per statically-linked image during
+`__dyld_start`, so by the time we install the BP, the inferior CPU's
+L1 I-cache has a populated entry for offset `0x37938` holding the
+original `RET`. `mach_vm_write` (and the subsequent
+`mach_vm_protect` to RX) make the data view coherent but don't
+reliably issue `IC IVAU` for the inferior across cores. The CPU
+keeps executing the cached `RET` and the BRK never trips.
 
-1. **Hardware instruction breakpoint at `_lldb_image_notifier`.**
-   Bypasses the SW-BP / I-cache / PAC concerns entirely since DBGBVR/
-   DBGBCR trap on instruction fetch regardless of memory contents.
-   Doesn't help here — dyld still doesn't *call* the function.
-2. **HW data watchpoint on `dyld_all_image_infos.infoArrayCount`.**
-   Modern dyld does still update that field on dlopen/dlclose, so a
-   write-watch fires in dyld code; we then refresh deferred BPs.
-   The infrastructure is already there (`HardwareDebugState`).
-3. **Mach IPC via `_dyld_process_info_notify`.** The "real" fix that
-   lldb / Instruments use. Allocate a Mach port, pass it to dyld via
-   `task_dyld_process_info_notify_get`, decode the per-load Mach
-   message format. Largest delta but the only path that scales to
-   multi-process / detached debugees.
+Two viable Phase 3 fixes:
+
+1. **Force I-cache invalidation properly.** Try the lldb sequence:
+   `mach_vm_protect(VM_PROT_NONE) → mach_vm_protect(VM_PROT_RX)` after
+   the write — going through `VM_PROT_NONE` forces TLB shootdown +
+   I-cache flush across cores in current xnu.
+2. **Mach IPC via `_dyld_process_info_notify`.** Allocate a Mach port,
+   register it with dyld, decode the per-load Mach message format.
+   Largest delta but the right path long-term — sidesteps the
+   shared-cache/SW-BP/I-cache concerns altogether. The corresponding
+   syscall symbol `_task_dyld_process_info_notify_get` is already
+   present in dyld; lldb / Instruments use this path.
 
 #### Debug::fmt empty buffer — diagnosis
 
