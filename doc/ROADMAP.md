@@ -355,69 +355,48 @@ state).
 
 Running with `--test-threads=1 --skip multithreaded --skip tokio
 --skip signal --skip test_step_over_for_loop_issue_156 --skip
-test_read_tls`: **58 passed, 4 failed, 1 ignored, 12 filtered out
+test_read_tls`: **60 passed, 2 failed, 1 ignored, 12 filtered out
 (75 runnable)**.
 
-Remaining runnable failures, all known categories needing additional
-darwin work (each tracked below):
+Remaining runnable failures:
 
-* `breakpoints::test_brkpt_on_line_collision` — dyld notification
-  BP not catching dlopen events (LinkerMapFn rendezvous).
-* `breakpoints::test_deferred_breakpoint` — same.
 * `variables::test_debug_trait_repr_args` — Debug::fmt vtable call
   dispatches but writes nothing into the inferior's String buffer.
 * `variables::test_debug_trait_repr_vars` — same.
 
-#### LinkerMapFn rendezvous — diagnosis
+#### LinkerMapFn rendezvous — done via Mach IPC
 
-The legacy "set a SW BP at `dyld_all_image_infos.notification` and dyld
-will trap into us on every image load" protocol *is* still wired up in
-dyld 4 — confirmed by reading
-[`dyld/ExternallyViewableState.cpp`](https://github.com/apple-oss-distributions/dyld/blob/main/dyld/ExternallyViewableState.cpp).
-The function `ExternallyViewableState::triggerNotifications` calls
-`_allImageInfo->notification(mode, infoCount, info)` unconditionally
-(gated only on the compile-time flag `DYLD_FEATURE_BREAKPOINT_NOTIFICATIONS`,
-which is on in production builds). The Mach-IPC path that follows
-(`RemoteNotificationResponder`) is *additive* — for Instruments /
-dtrace — not a replacement. And `lldb_image_notifier`'s body is the
-empty function we expected (just `ret`), perfect SW-BP target.
+We use [`task_dyld_process_info_notify_register`](
+https://github.com/apple-oss-distributions/dyld/blob/main/libdyld/dyld_process_info_notify.cpp)
+to subscribe a Mach port to dyld's image-load/unload event stream
+(see `darwin_mach::DyldNotifyPort`). Wire format is decoded from
+`libdyld/dyld_process_info_internal.h` —
+`dyld_process_info_notify_header` followed by
+`dyld_process_info_image_entry[]` and a string pool. Every message
+dyld sends is synchronous (`mach_msg(MACH_SEND_MSG | MACH_RCV_MSG)`)
+so we reply to all of them, including LOAD/UNLOAD, or dyld wedges
+in `mach_msg_overwrite`. When a LOAD or UNLOAD arrives and a
+`LinkerMapFn` BP is registered, the tracer suspends the task and
+synthesises `StopReason::Breakpoint(linker_map_addr)` so the
+existing higher-level handler runs the deferred-BP refresh.
 
-What we observe:
+The legacy `_allImageInfo->notification` SW-BP is left wired up
+alongside — it still fires for the cases where it works, and is
+harmless when it doesn't.
 
-* `dyld_all_image_infos.notification` is set: at runtime, the field
-  contains the bare 47-bit VA of `_lldb_image_notifier` (offset
-  `0x37938` inside dyld). For arm64 inferiors the stored value is
-  unsigned, not PAC-signed (matches `paciza` becoming a no-op when
-  the process has PAC keys suppressed).
-* Installing a SW BP there *does* take effect — `vm_read_n` after
-  `vm_write_word` confirms the `BRK #0` is in the inferior's memory
-  view (read-back: `0xd4200000`).
-* But the BP never fires on subsequent dlopens.
-* `mach_vm_msync(VM_SYNC_INVALIDATE)` and
-  `mach_vm_machine_attribute(MATTR_CACHE, MATTR_VAL_CACHE_SYNC)` after
-  the BP write don't help.
+Two related fixes lit up at the same time:
 
-Most likely root cause: **inferior-CPU I-cache staleness**. dyld
-calls `lldb_image_notifier` once per statically-linked image during
-`__dyld_start`, so by the time we install the BP, the inferior CPU's
-L1 I-cache has a populated entry for offset `0x37938` holding the
-original `RET`. `mach_vm_write` (and the subsequent
-`mach_vm_protect` to RX) make the data view coherent but don't
-reliably issue `IC IVAU` for the inferior across cores. The CPU
-keeps executing the cached `RET` and the BRK never trips.
-
-Two viable Phase 3 fixes:
-
-1. **Force I-cache invalidation properly.** Try the lldb sequence:
-   `mach_vm_protect(VM_PROT_NONE) → mach_vm_protect(VM_PROT_RX)` after
-   the write — going through `VM_PROT_NONE` forces TLB shootdown +
-   I-cache flush across cores in current xnu.
-2. **Mach IPC via `_dyld_process_info_notify`.** Allocate a Mach port,
-   register it with dyld, decode the per-load Mach message format.
-   Largest delta but the right path long-term — sidesteps the
-   shared-cache/SW-BP/I-cache concerns altogether. The corresponding
-   syscall symbol `_task_dyld_process_info_notify_get` is already
-   present in dyld; lldb / Instruments use this path.
+1. **`Rendezvous::link_maps()` re-walks `dyld_image_list` on every
+   call** (was a stale snapshot from `Rendezvous::new`). Without
+   this `update_debug_info_registry` couldn't see newly `dlopen`-ed
+   dylibs.
+2. **`DwarfRegistry::update_mappings` consults dyld's `infoArray`
+   for each dylib's `imageLoadAddress`**, not the lowest-VA
+   `proc_pidinfo` region. On darwin the kernel keeps a parse-time
+   mmap of every dylib at a low VA in addition to the slid runtime
+   mapping, and `min_by(start)` was picking the parse region — so
+   every BP install into a dlopen-loaded dylib EFAULT'd at the
+   wrong address.
 
 #### Debug::fmt empty buffer — diagnosis
 

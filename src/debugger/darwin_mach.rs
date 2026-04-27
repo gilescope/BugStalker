@@ -1086,6 +1086,309 @@ pub fn dyld_self_load_addr(task: task_t) -> Result<u64, MachError> {
     Ok(header.dyld_image_load_address)
 }
 
+// --- dyld_process_info_notify Mach IPC -------------------------------
+//
+// The legacy "set a SW BP at `_lldb_image_notifier`" protocol is a poor
+// fit on darwin/aarch64 because (a) the function lives in the dyld
+// shared cache, where text-page CoW + cross-core I-cache invalidation
+// are unreliable through `mach_vm_write`, and (b) dyld has shipped a
+// purpose-built Mach-IPC protocol for the same purpose since Big Sur.
+// We use the latter.
+//
+// Wire protocol — all fields little-endian, source of truth is
+// [`apple-oss-distributions/dyld:libdyld/dyld_process_info_internal.h`](
+//   https://github.com/apple-oss-distributions/dyld/blob/main/libdyld/dyld_process_info_internal.h):
+//
+//   #define DYLD_PROCESS_INFO_NOTIFY_LOAD_ID           0x1000
+//   #define DYLD_PROCESS_INFO_NOTIFY_UNLOAD_ID         0x2000
+//   #define DYLD_PROCESS_INFO_NOTIFY_MAIN_ID           0x3000
+//   #define DYLD_PROCESS_EVENT_ID_BASE                 0x4000
+//   #define DYLD_PROCESS_INFO_NOTIFY_MAX_BUFFER_SIZE   (32*1024)
+//
+//   struct dyld_process_info_notify_header {
+//       mach_msg_header_t header;       // 24 bytes
+//       uint32_t version;
+//       uint32_t imageCount;
+//       uint32_t imagesOffset;
+//       uint32_t stringsOffset;
+//       uint64_t timestamp;
+//   };                                  // 24 + 24 = 48 bytes
+//
+//   struct dyld_process_info_image_entry {
+//       uuid_t uuid;                    // 16 bytes
+//       uint64_t loadAddress;
+//       uint32_t pathStringOffset;
+//       uint32_t pathLength;
+//   };                                  // 32 bytes
+//
+// Registration: pass a Mach send right to the inferior task via
+// `task_dyld_process_info_notify_register(task, port)`. dyld in the
+// inferior writes to `_allImageInfo->notifyPorts[i]`; on every
+// `triggerNotifications()` it constructs a notify message and sends
+// it to our port. We poll for those.
+
+const DYLD_PROCESS_INFO_NOTIFY_LOAD_ID: i32 = 0x1000;
+const DYLD_PROCESS_INFO_NOTIFY_UNLOAD_ID: i32 = 0x2000;
+
+/// One image in a dyld notify message — what dyld is telling us about.
+#[derive(Debug, Clone)]
+pub struct DyldNotifyImage {
+    pub load_addr: u64,
+    pub path: String,
+}
+
+/// A decoded dyld notify message. Every message dyld sends here is
+/// SYNCHRONOUS — `RemoteNotificationResponder::sendMessage` uses
+/// `MACH_SEND_MSG | MACH_RCV_MSG`, so dyld blocks until we deliver
+/// a reply on the included `remote_port` (a SEND_ONCE right). The
+/// caller must invoke [`DyldNotifyPort::reply_to_event`] on every
+/// arriving message — including Load/Unload — or the inferior wedges.
+#[derive(Debug)]
+pub enum DyldNotifyMsg {
+    Load {
+        images: Vec<DyldNotifyImage>,
+        remote_port: u32,
+        msg_id: i32,
+    },
+    Unload {
+        images: Vec<DyldNotifyImage>,
+        remote_port: u32,
+        msg_id: i32,
+    },
+    /// A non-image-list event (e.g. dyld-before-initializers,
+    /// main-called, atlas-changed, shared-cache-mapped).
+    Event {
+        remote_port: u32,
+        msg_id: i32,
+    },
+}
+
+unsafe extern "C" {
+    /// Register a Mach port to receive image-load notifications from
+    /// dyld in `task`. The port must carry a send right.
+    /// Declared in `<mach/task.h>` (private — not in the public SDK
+    /// but exported from libsystem_kernel).
+    fn task_dyld_process_info_notify_register(
+        task: task_t,
+        port: mach_port_name_t,
+    ) -> kern_return_t;
+
+    /// Reverse of `_register`. Best-effort cleanup at Drop time.
+    #[allow(dead_code)]
+    fn task_dyld_process_info_notify_deregister(
+        task: task_t,
+        port: mach_port_name_t,
+    ) -> kern_return_t;
+}
+
+/// Owned Mach port subscribed to dyld's load/unload notifications for
+/// a specific task. Registration is per-task; one port can serve at
+/// most one task at a time (dyld stores the send right in the
+/// inferior's `dyld_all_image_infos.notifyPorts[]` array).
+pub struct DyldNotifyPort {
+    port: mach_port_name_t,
+    /// Task this port is registered with — kept so `Drop` can call
+    /// the deregister RPC. `None` if registration hasn't happened
+    /// yet or has already been undone.
+    registered_task: Option<task_t>,
+}
+
+impl DyldNotifyPort {
+    /// Allocate a fresh receive port + send right in our own task.
+    /// The send right is what we hand to dyld via
+    /// `task_dyld_process_info_notify_register`.
+    pub fn allocate() -> Result<Self, MachError> {
+        let mut port: mach_port_name_t = MACH_PORT_NULL;
+        let kr = unsafe {
+            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mut port)
+        };
+        check(kr)?;
+        let kr = unsafe {
+            mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND)
+        };
+        check(kr)?;
+        Ok(Self {
+            port,
+            registered_task: None,
+        })
+    }
+
+    /// Hand the send right to dyld in `task`. After this returns,
+    /// `triggerNotifications()` calls in the inferior will deliver
+    /// messages to this port.
+    pub fn register(&mut self, task: task_t) -> Result<(), MachError> {
+        let kr = unsafe { task_dyld_process_info_notify_register(task, self.port) };
+        check(kr)?;
+        self.registered_task = Some(task);
+        Ok(())
+    }
+
+    /// Non-blocking poll for one notification message.
+    ///
+    /// Returns `Ok(None)` when nothing was queued. The caller owns
+    /// the loop — call repeatedly to drain the backlog (dyld emits
+    /// one message per `triggerNotifications` call, and on inferior
+    /// startup that's once per statically-linked image).
+    pub fn poll(&self, timeout_ms: u32) -> Result<Option<DyldNotifyMsg>, MachError> {
+        // The maximum dyld message is 32 KiB; we size for that plus
+        // the audit trailer. mach_msg writes only as many bytes as
+        // the actual message takes.
+        const RECEIVE_BUF: usize = 32 * 1024 + 256;
+        let mut buf = vec![0u8; RECEIVE_BUF];
+        let kr = unsafe {
+            mach_msg(
+                buf.as_mut_ptr() as *mut mach_msg_header_t,
+                MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                0,
+                RECEIVE_BUF as u32,
+                self.port,
+                timeout_ms,
+                MACH_PORT_NULL,
+            )
+        };
+        if kr == MACH_RCV_TIMED_OUT {
+            return Ok(None);
+        }
+        check(kr)?;
+
+        // Header (24 bytes):
+        //   bits          u32 @ 0
+        //   size          u32 @ 4
+        //   remote_port   u32 @ 8
+        //   local_port    u32 @ 12
+        //   voucher_port  u32 @ 16
+        //   id            i32 @ 20
+        let msg_size = u32::from_ne_bytes(buf[4..8].try_into().unwrap()) as usize;
+        let remote_port = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let msg_id = i32::from_ne_bytes(buf[20..24].try_into().unwrap());
+
+        // For events (synchronous block-on-event), the body is just
+        // the header — caller must reply for dyld to unblock.
+        if msg_id != DYLD_PROCESS_INFO_NOTIFY_LOAD_ID
+            && msg_id != DYLD_PROCESS_INFO_NOTIFY_UNLOAD_ID
+        {
+            return Ok(Some(DyldNotifyMsg::Event {
+                remote_port,
+                msg_id,
+            }));
+        }
+
+        // Notify header body starts at offset 24 (right after the
+        // mach_msg header). Layout:
+        //   version       u32 @ 24
+        //   imageCount    u32 @ 28
+        //   imagesOffset  u32 @ 32  (from start of message buffer)
+        //   stringsOffset u32 @ 36
+        //   timestamp     u64 @ 40
+        if msg_size < 48 {
+            return Err(MachError(mach2::kern_return::KERN_INVALID_ARGUMENT));
+        }
+        let image_count = u32::from_ne_bytes(buf[28..32].try_into().unwrap()) as usize;
+        let images_offset = u32::from_ne_bytes(buf[32..36].try_into().unwrap()) as usize;
+        let strings_offset = u32::from_ne_bytes(buf[36..40].try_into().unwrap()) as usize;
+        if images_offset > msg_size || strings_offset > msg_size {
+            return Err(MachError(mach2::kern_return::KERN_INVALID_ARGUMENT));
+        }
+
+        // Per-image entries (32 bytes each, layout in the comment
+        // block above). We skip the uuid (debugger doesn't need it
+        // for deferred-BP resolution) and read load address + path.
+        const ENTRY_SIZE: usize = 32;
+        const ENTRY_LOAD_OFF: usize = 16;
+        const ENTRY_PATH_OFF_OFF: usize = 24;
+        const ENTRY_PATH_LEN_OFF: usize = 28;
+        let mut images = Vec::with_capacity(image_count);
+        for i in 0..image_count {
+            let off = images_offset + i * ENTRY_SIZE;
+            if off + ENTRY_SIZE > msg_size {
+                break;
+            }
+            let load_addr =
+                u64::from_ne_bytes(buf[off + ENTRY_LOAD_OFF..off + ENTRY_LOAD_OFF + 8]
+                    .try_into()
+                    .unwrap());
+            let path_off = u32::from_ne_bytes(
+                buf[off + ENTRY_PATH_OFF_OFF..off + ENTRY_PATH_OFF_OFF + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let path_len = u32::from_ne_bytes(
+                buf[off + ENTRY_PATH_LEN_OFF..off + ENTRY_PATH_LEN_OFF + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let path_start = strings_offset + path_off;
+            let path_end = path_start.saturating_add(path_len).min(msg_size);
+            let path = if path_start < path_end {
+                String::from_utf8_lossy(&buf[path_start..path_end])
+                    .trim_end_matches('\0')
+                    .to_string()
+            } else {
+                String::new()
+            };
+            images.push(DyldNotifyImage { load_addr, path });
+        }
+
+        Ok(Some(if msg_id == DYLD_PROCESS_INFO_NOTIFY_LOAD_ID {
+            DyldNotifyMsg::Load {
+                images,
+                remote_port,
+                msg_id,
+            }
+        } else {
+            DyldNotifyMsg::Unload {
+                images,
+                remote_port,
+                msg_id,
+            }
+        }))
+    }
+
+    /// Send a one-shot reply to a synchronous event message so the
+    /// inferior's `RemoteNotificationResponder::blockOnSynchronousEvent`
+    /// returns. Body is just the empty Mach header — dyld doesn't
+    /// inspect the reply contents, only that it arrived.
+    pub fn reply_to_event(remote_port: u32, msg_id: i32) -> Result<(), MachError> {
+        const REPLY_LEN: usize = 24;
+        let mut buf = [0u8; REPLY_LEN];
+        let bits: u32 = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
+        buf[0..4].copy_from_slice(&bits.to_ne_bytes());
+        buf[4..8].copy_from_slice(&(REPLY_LEN as u32).to_ne_bytes());
+        buf[8..12].copy_from_slice(&remote_port.to_ne_bytes());
+        let reply_id: i32 = msg_id + 100;
+        buf[20..24].copy_from_slice(&reply_id.to_ne_bytes());
+        let kr = unsafe {
+            mach_msg(
+                buf.as_mut_ptr() as *mut mach_msg_header_t,
+                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                REPLY_LEN as u32,
+                0,
+                MACH_PORT_NULL,
+                /* timeout_ms = */ 100,
+                MACH_PORT_NULL,
+            )
+        };
+        check(kr)
+    }
+}
+
+impl Drop for DyldNotifyPort {
+    fn drop(&mut self) {
+        if let Some(task) = self.registered_task.take() {
+            // SAFETY: deregister is best-effort; the task may have
+            // exited, in which case the kernel has already cleaned up.
+            unsafe {
+                let _ = task_dyld_process_info_notify_deregister(task, self.port);
+            }
+        }
+        if self.port != MACH_PORT_NULL {
+            unsafe {
+                let _ = mach2::mach_port::mach_port_destroy(mach_task_self(), self.port);
+            }
+        }
+    }
+}
+
 /// Walk the dyld image list and return one `ImageInfo` per loaded
 /// image. The first entry is conventionally the main executable.
 pub fn dyld_image_list(task: task_t) -> Result<Vec<ImageInfo>, MachError> {

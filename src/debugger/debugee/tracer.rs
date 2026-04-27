@@ -146,6 +146,18 @@ pub(crate) struct DarwinSupervision {
     /// "FFI-opaque mutability" for free since `ptrace::cont`/`step`
     /// aren't visible to the borrow checker.
     pending_reply: std::cell::Cell<Option<(u32, i32)>>,
+    /// Mach port subscribed to dyld's image-load/unload notifications
+    /// for this task. Replaces the legacy "SW BP at
+    /// `_lldb_image_notifier`" rendezvous, which doesn't fire
+    /// reliably on darwin/aarch64 (shared-cache CoW + cross-core
+    /// I-cache). dyld writes one message here per
+    /// `triggerNotifications()` call; we poll between exception
+    /// receives and synthesise a `LinkerMapFn` breakpoint event so
+    /// the existing higher-level handler refreshes deferred BPs.
+    /// `None` until first registration succeeds — registration can
+    /// fail transiently if dyld hasn't installed its notifyPorts
+    /// table yet.
+    dyld_notify: Option<crate::debugger::darwin_mach::DyldNotifyPort>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -780,15 +792,28 @@ impl Tracer {
     /// so we own the suspend state from the start.
     fn ensure_darwin_supervision(&mut self) -> Result<&mut DarwinSupervision, Error> {
         if self.darwin_state.is_none() {
-            use crate::debugger::darwin_mach::{self, ExceptionPort};
+            use crate::debugger::darwin_mach::{self, DyldNotifyPort, ExceptionPort};
             let pid = self.tracee_ctl.proc_pid();
             let task = darwin_mach::task_for_pid(pid)?;
             let port = ExceptionPort::allocate()?;
             port.register(task)?;
+            // Registering the dyld notify port can fail right after
+            // posix_spawn-suspend if dyld hasn't yet built its
+            // notifyPorts table. We retry on demand from the resume
+            // loop below — until then, deferred-BP resolution falls
+            // back to the SW BP at `_lldb_image_notifier` (which is
+            // typically a no-op on dyld 4 but harmless).
+            let mut dyld_notify = DyldNotifyPort::allocate().ok();
+            if let Some(np) = dyld_notify.as_mut()
+                && np.register(task).is_err()
+            {
+                dyld_notify = None;
+            }
             self.darwin_state = Some(DarwinSupervision {
                 task,
                 port,
                 pending_reply: std::cell::Cell::new(None),
+                dyld_notify,
             });
         }
         Ok(self.darwin_state.as_mut().expect("just initialised"))
@@ -846,20 +871,101 @@ impl Tracer {
                 ExceptionPort::reply(remote, id, KERN_SUCCESS)?;
             }
 
+            // If we never managed to register the dyld notify port at
+            // setup time (typical right after posix_spawn-suspend),
+            // try once more now that the inferior has started running.
+            // Once registered, every dlopen/dlclose surfaces here as
+            // a `LinkerMapFn` event without needing a SW BP in dyld.
+            if state.dyld_notify.is_none() {
+                use crate::debugger::darwin_mach::DyldNotifyPort;
+                if let Ok(mut np) = DyldNotifyPort::allocate()
+                    && np.register(state.task).is_ok()
+                {
+                    state.dyld_notify = Some(np);
+                }
+            }
+
             // Resume the inferior. After Child::install's
             // spawn-suspend, the task suspend count is 1; this drops
             // it to 0 and the child runs.
             darwin_mach::task_resume(state.task)?;
 
-            // Poll the exception port + waitpid in turn. The Mach
-            // exception path covers BRK / WP / signals, but the
-            // kernel does NOT raise a Mach exception for clean
-            // process exit (return 0 from main). For that we need
-            // waitpid to surface SIGCHLD/Exited. The 200 ms poll
-            // is a balance between responsiveness on stop events
-            // and not burning CPU on idle waits.
+            // Poll the exception port + dyld notify port + waitpid in
+            // turn. The Mach exception path covers BRK / WP / signals,
+            // but image-load notifications come on a separate port
+            // (registered in `ensure_darwin_supervision`); we drain it
+            // first on every iteration so a dlopen that finishes
+            // between exception receives doesn't get lost. The kernel
+            // does NOT raise a Mach exception for clean process exit
+            // (return 0 from main), so we waitpid for that.
+            //
+            // The 50 ms poll on the exception port is a balance
+            // between dyld-notify responsiveness (fast inferiors run
+            // print_sum within microseconds of dlopen, so we want
+            // tight latency) and not burning CPU on idle waits.
             let exc = loop {
-                match state.port.receive(200)? {
+                use crate::debugger::darwin_mach::{DyldNotifyMsg, DyldNotifyPort};
+
+                // Drain any queued dyld notifications first.
+                let mut got_image_change = false;
+                while let Some(notify) = state.dyld_notify.as_ref() {
+                    match notify.poll(0)? {
+                        None => break,
+                        Some(msg) => {
+                            // Every message dyld sends is synchronous
+                            // (`mach_msg(MACH_SEND_MSG|MACH_RCV_MSG)`),
+                            // so reply IMMEDIATELY for every kind —
+                            // Load and Unload included — or dyld
+                            // wedges in `mach_msg_overwrite`.
+                            let (rp, id) = match &msg {
+                                DyldNotifyMsg::Load {
+                                    remote_port,
+                                    msg_id,
+                                    ..
+                                }
+                                | DyldNotifyMsg::Unload {
+                                    remote_port,
+                                    msg_id,
+                                    ..
+                                }
+                                | DyldNotifyMsg::Event {
+                                    remote_port,
+                                    msg_id,
+                                } => (*remote_port, *msg_id),
+                            };
+                            let _ = DyldNotifyPort::reply_to_event(rp, id);
+                            if matches!(
+                                msg,
+                                DyldNotifyMsg::Load { .. } | DyldNotifyMsg::Unload { .. }
+                            ) {
+                                got_image_change = true;
+                            }
+                        }
+                    }
+                }
+                if got_image_change
+                    && let Some(bp) = tcx.breakpoints.iter().find(|b| {
+                        matches!(
+                            b.r#type(),
+                            crate::debugger::breakpoint::BrkptType::LinkerMapFn
+                        )
+                    })
+                {
+                    // Surface the event through the same higher-level
+                    // handler the SW-BP path used. The synthesised PC
+                    // won't match the inferior's current PC;
+                    // `step_over_breakpoint` becomes a no-op (no BP
+                    // at PC) and the `BrkptType::LinkerMapFn` arm
+                    // runs `refresh_deferred` as before. If no
+                    // LinkerMapFn BP is registered yet (e.g. during
+                    // dyld's initial init flood — entry-point hasn't
+                    // installed it yet), we silently drain the
+                    // notifications.
+                    darwin_mach::task_suspend(state.task)?;
+                    return Ok(StopReason::Breakpoint(pid, bp.addr));
+                }
+
+                match state.port.receive(50)? {
                     Some(e) => break e,
                     None => {
                         use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};

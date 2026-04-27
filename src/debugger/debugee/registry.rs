@@ -73,6 +73,28 @@ impl DwarfRegistry {
     pub fn update_mappings(&mut self, only_main: bool) -> Result<Vec<Error>, Error> {
         let proc_maps: Vec<MapRange> = proc_maps::get_process_maps(self.pid.as_raw())?;
 
+        // On darwin, `proc_maps` (via `proc_pidinfo`) returns *every*
+        // memory region tagged with the dylib's path — including the
+        // read-only file-cache mmap dyld uses to *parse* the dylib
+        // before mapping it for execution. The parse-region lives in
+        // a low VA range (typical 0x100000000..0x101000000), while the
+        // actual runtime __TEXT is wherever dyld decided to slid it
+        // (typical 0x104000000..). `min_by(start)` would pick the
+        // parse-region, giving a bogus slide.
+        //
+        // dyld's own image-list (`dyld_all_image_infos.infoArray`)
+        // is the authoritative source of `imageLoadAddress`, so we
+        // consult it on darwin and use that as the slide directly.
+        // Fall back to proc_maps only if the lookup fails (e.g. the
+        // file isn't yet in dyld's list).
+        #[cfg(not(target_os = "linux"))]
+        let dyld_images: Vec<crate::debugger::darwin_mach::ImageInfo> = {
+            crate::debugger::darwin_mach::task_for_pid(self.pid)
+                .ok()
+                .and_then(|task| crate::debugger::darwin_mach::dyld_image_list(task).ok())
+                .unwrap_or_default()
+        };
+
         let mut mappings = HashMap::with_capacity(self.files.len());
         let mut ranges = vec![];
         let mut errors = Vec::new();
@@ -143,7 +165,20 @@ impl DwarfRegistry {
                             .map(|s| s.address())
                     })
                     .unwrap_or(0) as usize;
-                lower_sect.start().wrapping_sub(preferred_vmaddr)
+                // Prefer dyld's own load address — the canonical
+                // `imageLoadAddress` published in `infoArray`. Fall
+                // back to the proc_maps lower-section for the case
+                // where the file hasn't shown up in the image list
+                // yet (e.g. main exe right at startup).
+                let dyld_load = dyld_images
+                    .iter()
+                    .find(|i| {
+                        std::path::Path::new(&i.path).canonicalize().ok().as_deref()
+                            == Some(absolute_debugee_path)
+                    })
+                    .map(|i| i.load_addr);
+                let lower = dyld_load.unwrap_or_else(|| lower_sect.start());
+                lower.wrapping_sub(preferred_vmaddr)
             };
 
             let range = RegionRange {

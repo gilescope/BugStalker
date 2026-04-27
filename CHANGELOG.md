@@ -38,13 +38,42 @@ All notable changes to this project will be documented in this file.
   loader, eh_frame BaseAddresses with Mach-O section names, CU
   disambiguation when dsymutil's range engulfs other CUs, stray-BRK
   swallowing in dyld pages, and `Tracee::location()` fallback for
-  unknown PC mappings. The integration suite reaches **58 passed /
-  4 failed / 1 ignored / 12 filtered out (75 runnable)** on darwin
-  with `--skip multithreaded --skip tokio --skip signal --skip
-  test_step_over_for_loop_issue_156 --skip test_read_tls`. The 4
-  remaining failures (dyld dlopen rendezvous, Debug::fmt vtable
-  dispatch) and the skipped categories (multithreading, signals,
-  TLS, the loop-step edge case) are tracked in the roadmap.
+  unknown PC mappings.
+- debugger/darwin: dlopen/dlclose rendezvous now wired through
+  dyld's `task_dyld_process_info_notify_register` Mach-IPC port
+  instead of the legacy `_lldb_image_notifier` software-breakpoint
+  protocol. The new `DyldNotifyPort` allocates a receive port,
+  registers it with the inferior task, and polls for `LOAD` /
+  `UNLOAD` / event messages between exception receives; every
+  message is replied to (`mach_msg_overwrite(SEND|RCV)` semantics
+  mean dyld blocks on every kind, not just the synchronous
+  events). When a load arrives and a `LinkerMapFn` BP is
+  registered, the tracer suspends the task and synthesises
+  `StopReason::Breakpoint(linker_map_addr)` so the existing
+  refresh-deferred path runs. Unblocks
+  `tests/debugger/breakpoints::test_brkpt_on_line_collision`
+  and `test_deferred_breakpoint`.
+- debugger/darwin: `DwarfRegistry::update_mappings` now consults
+  dyld's own `infoArray` for each dylib's `imageLoadAddress`
+  rather than picking the lowest-VA `proc_pidinfo` region. On
+  darwin the kernel keeps a parse-time mmap of the dylib at a low
+  VA in addition to the runtime slid mapping, and the old
+  `min_by(start)` heuristic preferred the parse region — which
+  gave a bogus slide and made every BP install in a dlopen-loaded
+  dylib EFAULT.
+- debugger/darwin: `Rendezvous::link_maps()` re-walks the dyld
+  image list on every call, so newly `dlopen`-ed dylibs surface
+  in `update_debug_info_registry`. Was a stale snapshot taken at
+  `Rendezvous::new` time.
+- The integration suite reaches **60 passed / 2 failed / 1
+  ignored / 12 filtered out (75 runnable)** on darwin with
+  `--skip multithreaded --skip tokio --skip signal --skip
+  test_step_over_for_loop_issue_156 --skip test_read_tls`. The 2
+  remaining failures (Debug::fmt vtable dispatch — the inferior
+  call returns success but `<String as Write>::write_str` is
+  never invoked through our hand-built vtable) and the skipped
+  categories (multithreading, signals, TLS, the loop-step edge
+  case) are tracked in the roadmap.
 
 ### Fixed
 

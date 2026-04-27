@@ -163,14 +163,24 @@ impl Rendezvous {
     /// image's `mach_header` load address as the `addr` field
     /// (analogous to linux's `link_map` node address) and the
     /// path string as the name.
+    ///
+    /// Re-walks `dyld_all_image_infos.infoArray` on every call so
+    /// callers always see the inferior's *current* image list. The
+    /// snapshot taken at `Rendezvous::new` time is stale the moment
+    /// the inferior dlopens anything, and the deferred-BP refresh
+    /// path depends on this method seeing newly-loaded dylibs.
     #[cfg(not(target_os = "linux"))]
     pub fn link_maps(&self) -> Result<Vec<LinkMap>, RendezvousError> {
-        Ok(self
-            .images
-            .iter()
+        use crate::debugger::darwin_mach;
+        let task = darwin_mach::task_for_pid(self.pid)
+            .map_err(|_| RendezvousError::NotFound)?;
+        let images = darwin_mach::dyld_image_list(task)
+            .map_err(|_| RendezvousError::NotFound)?;
+        Ok(images
+            .into_iter()
             .map(|i| LinkMap {
                 addr: RelocatedAddress::from(i.load_addr),
-                name: i.path.clone(),
+                name: i.path,
             })
             .collect())
     }
