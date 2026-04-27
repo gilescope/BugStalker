@@ -255,15 +255,15 @@ impl RegisterMap {
     ///   * `pstate`       ← `__cpsr`  (only the low 32 bits are
     ///                                  meaningful; high bits zero)
     ///
-    /// We pick the first thread of the task — the existing
-    /// caller (`Tracer` and friends) treats single-threaded
-    /// stops as the common case; multi-thread support arrives
-    /// with the exception-port loop.
+    /// `pid` is interpreted as a synthetic per-thread id — the
+    /// Tracer registers each Mach thread port under one such id in
+    /// `darwin_mach::set_thread_port`. If the registry has no entry
+    /// (legacy single-thread callers), we fall back to the first
+    /// thread of the inferior's task.
     #[cfg(not(target_os = "linux"))]
     pub fn current(pid: Pid) -> Result<Self, Error> {
         use crate::debugger::darwin_mach;
-        let task = darwin_mach::task_for_pid(pid)?;
-        let thread = darwin_mach::first_thread_of(task)?;
+        let thread = darwin_mach::thread_port_for_pid_or_first(pid)?;
         let s = darwin_mach::thread_get_arm_state64(thread)?;
         let mut regs = [0u64; 31];
         regs[..29].copy_from_slice(&s.__x);
@@ -384,13 +384,12 @@ impl RegisterMap {
 
     /// Darwin path: write the GP register set via Mach
     /// `thread_set_state(thread, ARM_THREAD_STATE64, …)`. Inverse
-    /// of `current` above; same single-thread assumption.
+    /// of `current` above — same per-pid → thread-port lookup.
     #[cfg(not(target_os = "linux"))]
     pub fn persist(self, pid: Pid) -> Result<(), Error> {
         use crate::debugger::darwin_mach;
         use mach2::structs::arm_thread_state64_t;
-        let task = darwin_mach::task_for_pid(pid)?;
-        let thread = darwin_mach::first_thread_of(task)?;
+        let thread = darwin_mach::thread_port_for_pid_or_first(pid)?;
         let mut x = [0u64; 29];
         x.copy_from_slice(&self.regs[..29]);
         let state = arm_thread_state64_t {

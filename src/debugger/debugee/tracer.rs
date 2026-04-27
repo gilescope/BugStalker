@@ -130,7 +130,24 @@ pub struct Tracer {
 #[cfg(not(target_os = "linux"))]
 pub(crate) struct DarwinSupervision {
     task: mach2::mach_types::task_t,
+    /// Process pid the inferior spawned with — also the pid we use
+    /// for the main `Tracee`. Worker-thread tracees get synthetic
+    /// pids allocated via `next_synthetic_pid`.
+    proc_pid: nix::unistd::Pid,
     port: crate::debugger::darwin_mach::ExceptionPort,
+    /// Kernel thread_id (`pthread_threadid_np`-flavour) → synthetic
+    /// per-thread `Pid`. Populated by `reconcile_threads`; lookup
+    /// path for translating an exception's `thread_port` into the
+    /// `Pid` the rest of the engine expects.
+    thread_id_to_pid: std::collections::HashMap<u64, nix::unistd::Pid>,
+    /// Reverse of `thread_id_to_pid` so we can clean up registry
+    /// entries when a thread exits.
+    pid_to_thread_id: std::collections::HashMap<nix::unistd::Pid, u64>,
+    /// Next synthetic pid handed out for a worker thread. Starts at
+    /// `proc_pid + 1_000_000` so it can't collide with any real pid
+    /// the kernel might recycle for a future child of the parent
+    /// process.
+    next_synthetic_pid: i32,
     /// `(remote_port, msg_id)` of the most recent
     /// `mach_exception_raise` we received but haven't replied to.
     /// The kernel parks the faulting thread until reply; we hold
@@ -145,7 +162,15 @@ pub(crate) struct DarwinSupervision {
     /// shared borrow on `Debugger`. Linux gets the equivalent
     /// "FFI-opaque mutability" for free since `ptrace::cont`/`step`
     /// aren't visible to the borrow checker.
-    pending_reply: std::cell::Cell<Option<(u32, i32)>>,
+    /// `(remote_port, msg_id, retcode)` — `retcode` is the
+    /// `kern_return_t` we'll send when we finally reply. Default is
+    /// `KERN_SUCCESS` ("debugger handled this exception, kernel
+    /// resumes the thread normally"). For an `EXC_SOFT_SIGNAL`
+    /// we want to forward through to the BSD signal layer, the
+    /// caller stores `KERN_FAILURE` here so the kernel proceeds with
+    /// the original signal delivery (the user's signal handler
+    /// runs).
+    pending_reply: std::cell::Cell<Option<(u32, i32, mach2::kern_return::kern_return_t)>>,
     /// Mach port subscribed to dyld's image-load/unload notifications
     /// for this task. Replaces the legacy "SW BP at
     /// `_lldb_image_notifier`" rendezvous, which doesn't fire
@@ -168,10 +193,15 @@ impl DarwinSupervision {
     pub(crate) fn port(&self) -> &crate::debugger::darwin_mach::ExceptionPort {
         &self.port
     }
-    pub(crate) fn take_pending_reply(&self) -> Option<(u32, i32)> {
+    pub(crate) fn take_pending_reply(
+        &self,
+    ) -> Option<(u32, i32, mach2::kern_return::kern_return_t)> {
         self.pending_reply.take()
     }
-    pub(crate) fn set_pending_reply(&self, v: Option<(u32, i32)>) {
+    pub(crate) fn set_pending_reply(
+        &self,
+        v: Option<(u32, i32, mach2::kern_return::kern_return_t)>,
+    ) {
         self.pending_reply.set(v);
     }
 }
@@ -809,20 +839,123 @@ impl Tracer {
             {
                 dyld_notify = None;
             }
+            // Seed the per-pid thread-port registry for the main
+            // thread. Right after posix_spawn-suspend the inferior
+            // has exactly one thread; bind that port to `proc_pid`
+            // so the existing single-thread RegisterMap callers
+            // continue to resolve correctly.
+            let mut thread_id_to_pid = std::collections::HashMap::new();
+            let mut pid_to_thread_id = std::collections::HashMap::new();
+            if let Ok(main_thread) = darwin_mach::first_thread_of(task) {
+                darwin_mach::set_thread_port(pid, main_thread);
+                if let Ok(id) = darwin_mach::thread_identity(main_thread) {
+                    thread_id_to_pid.insert(id.thread_id, pid);
+                    pid_to_thread_id.insert(pid, id.thread_id);
+                }
+            }
             self.darwin_state = Some(DarwinSupervision {
                 task,
+                proc_pid: pid,
                 port,
                 pending_reply: std::cell::Cell::new(None),
                 dyld_notify,
+                thread_id_to_pid,
+                pid_to_thread_id,
+                next_synthetic_pid: pid.as_raw().saturating_add(1_000_000),
             });
         }
         Ok(self.darwin_state.as_mut().expect("just initialised"))
     }
 
+    /// Bring `tracee_ctl` and the per-pid thread-port registry into
+    /// sync with the inferior's current thread set.
+    ///
+    /// Called after every Mach exception, where new threads may have
+    /// appeared (pthread_create) or old ones disappeared (thread
+    /// returned from start fn → kernel terminated). We:
+    ///
+    /// * enumerate live threads via `task_threads_vec`,
+    /// * map each port → kernel thread_id, allocate a synthetic Pid
+    ///   if we haven't seen this thread before,
+    /// * insert/update `darwin_mach`'s pid → port registry so
+    ///   `RegisterMap::current(pid)` resolves to the right thread,
+    /// * add new tracees to `tracee_ctl`, drop tracees for threads
+    ///   that aren't live any more.
+    ///
+    /// Returns the synthetic Pid corresponding to `faulting_port`
+    /// (so the caller knows which thread to report to the engine).
+    fn reconcile_threads(
+        &mut self,
+        faulting_port: Option<mach2::mach_types::thread_act_t>,
+    ) -> Result<Option<nix::unistd::Pid>, Error> {
+        use crate::debugger::darwin_mach;
+        use std::collections::HashSet;
+
+        let state = self.darwin_state.as_mut().expect("supervision must exist");
+        let live = darwin_mach::task_threads_vec(state.task)
+            .map_err(|e| Error::from(e))?;
+
+        let mut seen_tids: HashSet<u64> = HashSet::new();
+        let mut faulting_pid: Option<nix::unistd::Pid> = None;
+        for &port in &live {
+            let id = match darwin_mach::thread_identity(port) {
+                Ok(i) => i,
+                Err(_) => continue, // thread terminated mid-enumerate
+            };
+            seen_tids.insert(id.thread_id);
+            let pid = if let Some(&existing) = state.thread_id_to_pid.get(&id.thread_id) {
+                // The Mach port name can change across resumes (the
+                // kernel rotates send-once rights); refresh the
+                // registry every iteration so RegisterMap::current
+                // never holds a stale port.
+                darwin_mach::set_thread_port(existing, port);
+                existing
+            } else {
+                let new_pid = nix::unistd::Pid::from_raw(state.next_synthetic_pid);
+                state.next_synthetic_pid = state.next_synthetic_pid.saturating_add(1);
+                state.thread_id_to_pid.insert(id.thread_id, new_pid);
+                state.pid_to_thread_id.insert(new_pid, id.thread_id);
+                darwin_mach::set_thread_port(new_pid, port);
+                self.tracee_ctl.add(new_pid);
+                new_pid
+            };
+            if Some(port) == faulting_port {
+                faulting_pid = Some(pid);
+            }
+        }
+
+        // Drop tracees for threads that have exited. Walk a snapshot
+        // because tracee_ctl::remove mutates the underlying map.
+        let dead: Vec<_> = self
+            .darwin_state
+            .as_ref()
+            .unwrap()
+            .pid_to_thread_id
+            .iter()
+            .filter_map(|(pid, tid)| (!seen_tids.contains(tid)).then_some((*pid, *tid)))
+            .collect();
+        let state = self.darwin_state.as_mut().unwrap();
+        for (pid, tid) in dead {
+            // Never drop the proc_pid tracee — even after the main
+            // thread "ends" the engine still uses proc_pid as the
+            // process identity. The process is gone only when
+            // waitpid says so.
+            if pid == state.proc_pid {
+                continue;
+            }
+            state.thread_id_to_pid.remove(&tid);
+            state.pid_to_thread_id.remove(&pid);
+            darwin_mach::clear_thread_port(pid);
+            self.tracee_ctl.remove(pid);
+        }
+
+        Ok(faulting_pid)
+    }
+
     pub fn resume(&mut self, tcx: TraceContext) -> Result<StopReason, Error> {
         use crate::debugger::darwin_mach::{self, ExceptionPort};
         use crate::debugger::register::RegisterMap;
-        use mach2::kern_return::KERN_SUCCESS;
+        use mach2::kern_return::{KERN_FAILURE, KERN_SUCCESS};
 
         let pid = self.tracee_ctl.proc_pid();
 
@@ -866,9 +999,13 @@ impl Tracer {
 
             // Reply to the previously-saved exception (if any) —
             // that unblocks the kernel-side handler chain so the
-            // parked thread continues from the fault.
-            if let Some((remote, id)) = state.pending_reply.take() {
-                ExceptionPort::reply(remote, id, KERN_SUCCESS)?;
+            // parked thread continues from the fault. `retcode` is
+            // KERN_SUCCESS for everything we consume locally
+            // (breakpoints, watchpoints) and KERN_FAILURE for soft
+            // signals we want to forward to the BSD signal layer
+            // so the user's signal handler runs.
+            if let Some((remote, id, retcode)) = state.pending_reply.take() {
+                ExceptionPort::reply(remote, id, retcode)?;
             }
 
             // If we never managed to register the dyld notify port at
@@ -987,8 +1124,27 @@ impl Tracer {
             // state. The faulting thread is already parked by the
             // kernel awaiting our reply.
             darwin_mach::task_suspend(state.task)?;
-            state.pending_reply.set(Some((exc.remote_port, exc.msg_id)));
+            // Default reply action is KERN_SUCCESS — the EXC_SOFT_SIGNAL
+            // arm below switches it to KERN_FAILURE so the BSD signal
+            // layer takes over and the user's signal handler runs.
+            state
+                .pending_reply
+                .set(Some((exc.remote_port, exc.msg_id, KERN_SUCCESS)));
+            // End the &mut borrow of `darwin_state` held via `state`
+            // so we can call `reconcile_threads` (which also wants
+            // &mut self).
+            let _ = state;
 
+            // Reconcile the tracee table against the live thread
+            // list and translate the faulting `thread_port` into
+            // the Pid the engine expects. For single-thread
+            // inferiors this collapses to `pid == proc_pid`.
+            let faulting_pid = self
+                .reconcile_threads(Some(exc.thread_port))?
+                .unwrap_or(pid);
+            // From here on use the faulting Pid so RegisterMap
+            // reads/writes target the correct thread.
+            let pid = faulting_pid;
             let raw_pc = RegisterMap::current(pid)?.pc();
 
             return match exc.exception {
@@ -1038,6 +1194,24 @@ impl Tracer {
                     let signum = exc.codes.get(1).copied().unwrap_or(0) as i32;
                     let signal = nix::sys::signal::Signal::try_from(signum)
                         .unwrap_or(nix::sys::signal::SIGTRAP);
+                    // Forward the soft signal to the BSD signal layer so
+                    // the user's signal handler runs once we resume.
+                    // KERN_SUCCESS would tell the kernel "debugger
+                    // consumed this signal" — silently dropping it.
+                    //
+                    // Note: in practice this arm rarely fires today —
+                    // the kernel only routes async signals (kill())
+                    // through Mach when the inferior has been
+                    // ptrace-attached (PT_ATTACHEXC). Without ptrace
+                    // the signal goes straight to the BSD path and we
+                    // never see it. The arm stays so synchronous
+                    // signal-like exceptions (e.g. raise()) still
+                    // surface as SignalStop, and so the codepath is
+                    // ready when PT_ATTACHEXC lands.
+                    if let Some(s) = self.darwin_state.as_ref() {
+                        s.pending_reply
+                            .set(Some((exc.remote_port, exc.msg_id, KERN_FAILURE)));
+                    }
                     Ok(StopReason::SignalStop(pid, signal))
                 }
                 _ => Ok(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP)),
@@ -1069,15 +1243,34 @@ impl Tracer {
 
         // Reply to any prior pending exception so the parked
         // thread can leave the exception handler before we re-arm.
-        if let Some((remote, id)) = state.pending_reply.take() {
-            ExceptionPort::reply(remote, id, KERN_SUCCESS)?;
+        if let Some((remote, id, retcode)) = state.pending_reply.take() {
+            ExceptionPort::reply(remote, id, retcode)?;
         }
 
-        // Arm software single-step on the focus thread.
-        // first_thread_of returns the main task thread which is
-        // what `pid` aliases to in our single-thread Tracee model.
-        let focus = darwin_mach::first_thread_of(state.task)?;
+        // Arm software single-step on the *focus* thread — the one
+        // the caller asked to step. Falls back to first_thread_of
+        // for legacy single-thread paths that haven't been
+        // registered yet (early init).
+        let focus = darwin_mach::thread_port_for_pid_or_first(pid)?;
         darwin_mach::arm_set_single_step(focus, true)?;
+
+        // Suspend every other thread so only `focus` runs while we
+        // step. Without this, a worker thread can hit one of our
+        // breakpoints during the brief task_resume window and the
+        // resulting EXC_BREAKPOINT gets consumed here as if it were
+        // our step trap — leaving the real step trap parked and
+        // mis-attributing the BP hit. Linux gets this for free
+        // because PTRACE_SINGLESTEP is per-tid.
+        let live_threads = darwin_mach::task_threads_vec(state.task).unwrap_or_default();
+        let mut suspended = Vec::with_capacity(live_threads.len());
+        for &t in &live_threads {
+            if t == focus {
+                continue;
+            }
+            if darwin_mach::thread_suspend(t).is_ok() {
+                suspended.push(t);
+            }
+        }
 
         // Resume — the kernel executes one instruction then traps.
         darwin_mach::task_resume(state.task)?;
@@ -1095,7 +1288,16 @@ impl Tracer {
 
         // Re-suspend so the rest of the threads stay coherent.
         darwin_mach::task_suspend(state.task)?;
-        state.pending_reply.set(Some((exc.remote_port, exc.msg_id)));
+        // Drop the per-thread suspend we added on every non-focus
+        // thread so a subsequent resume() unblocks them. (task_suspend
+        // already keeps them paused via the task-level count, so they
+        // won't actually run until the next task_resume.)
+        for t in suspended {
+            let _ = darwin_mach::thread_resume(t);
+        }
+        state
+            .pending_reply
+            .set(Some((exc.remote_port, exc.msg_id, KERN_SUCCESS)));
 
         // Disarm the SS bits so the next plain resume() doesn't
         // accidentally step again. (MDSCR_EL1.SS is sticky across

@@ -1,20 +1,32 @@
 use crate::debugger::address::RelocatedAddress;
 use crate::debugger::debugee::tracee::StopType::Interrupt;
-use crate::debugger::debugee::tracee::TraceeStatus::{Running, Stopped};
+use crate::debugger::debugee::tracee::TraceeStatus::Stopped;
 use crate::debugger::debugee::{Debugee, Location};
 use crate::debugger::error::Error;
-use crate::debugger::error::Error::{MultipleErrors, NoThreadDB, Ptrace, ThreadDB, Waitpid};
+use crate::debugger::error::Error::{NoThreadDB, ThreadDB};
 use crate::debugger::register::RegisterMap;
-use log::{debug, warn};
-use nix::errno::Errno;
-use nix::sys;
+use log::debug;
 use nix::sys::signal::Signal;
-use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use ouroboros::self_referencing;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+#[cfg(target_os = "linux")]
+use crate::debugger::debugee::tracee::TraceeStatus::Running;
+#[cfg(target_os = "linux")]
+use crate::debugger::error::Error::{MultipleErrors, Ptrace, Waitpid};
+#[cfg(target_os = "linux")]
+use log::warn;
+#[cfg(target_os = "linux")]
+use nix::errno::Errno;
+#[cfg(target_os = "linux")]
+use nix::sys;
+#[cfg(target_os = "linux")]
+use nix::sys::wait::{WaitStatus, waitpid};
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
 
 use crate::debugger::thread_db_compat as thread_db;
 
@@ -60,6 +72,9 @@ impl Tracee {
     }
 
     /// Wait for change of tracee status.
+    /// Linux-only — the darwin Tracer drives waits through Mach
+    /// exception ports, not `waitpid`.
+    #[cfg(target_os = "linux")]
     pub fn wait_one(&self) -> Result<WaitStatus, Error> {
         debug!(target: "tracer", "wait for tracee status, thread {pid}", pid = self.pid);
         let status = waitpid(self.pid, None).map_err(Waitpid)?;

@@ -806,6 +806,52 @@ pub fn first_thread_of(task: task_t) -> Result<thread_act_t, MachError> {
         .ok_or(MachError(mach2::kern_return::KERN_FAILURE))
 }
 
+// --- Per-pid → thread-port registry --------------------------------
+//
+// The cross-arch debugger keys everything off `Pid` (a linux tid).
+// Darwin doesn't have per-thread pids — threads are addressed by
+// `thread_act_t` (a Mach IPC port). The Tracer manufactures a synthetic
+// `Pid` for each thread it discovers and stashes the pairing here so
+// that callers downstream (`RegisterMap::current`, `unwind`, the
+// CallHelper, …) can resolve a `Pid` to its real thread port without
+// having to thread (no pun intended) the mapping through every API.
+//
+// Lifetime is the parent process's: we never compact, but `clear_pid`
+// is called on tracee exit. The size is bounded by the inferior's
+// thread count, which for the workloads in our test suite is < 32.
+
+pub fn set_thread_port(pid: Pid, port: thread_act_t) {
+    let mut g = THREAD_PORT_BY_PID.lock().unwrap();
+    g.get_or_insert_with(HashMap::new).insert(pid.as_raw(), port);
+}
+
+pub fn thread_port_for_pid(pid: Pid) -> Option<thread_act_t> {
+    let g = THREAD_PORT_BY_PID.lock().unwrap();
+    g.as_ref().and_then(|m| m.get(&pid.as_raw()).copied())
+}
+
+pub fn clear_thread_port(pid: Pid) {
+    let mut g = THREAD_PORT_BY_PID.lock().unwrap();
+    if let Some(m) = g.as_mut() {
+        m.remove(&pid.as_raw());
+    }
+}
+
+static THREAD_PORT_BY_PID: std::sync::Mutex<Option<HashMap<i32, thread_act_t>>> =
+    std::sync::Mutex::new(None);
+
+/// Best-effort thread port for `pid`: consult the registry first, fall
+/// back to `first_thread_of(task_for_pid(pid))` for the
+/// "single-thread, never registered" hot path that pre-multithreaded
+/// callers rely on.
+pub fn thread_port_for_pid_or_first(pid: Pid) -> Result<thread_act_t, MachError> {
+    if let Some(t) = thread_port_for_pid(pid) {
+        return Ok(t);
+    }
+    let task = task_for_pid(pid)?;
+    first_thread_of(task)
+}
+
 // --- dyld image list (the Mach equivalent of GNU `r_debug`) ----------
 //
 // On linux the rendezvous protocol is `r_debug` — a struct ld.so

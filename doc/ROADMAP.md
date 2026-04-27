@@ -353,12 +353,48 @@ state).
 
 ### Status — `tests/debugger` on darwin/aarch64
 
-Running with `--test-threads=1 --skip multithreaded --skip tokio
---skip signal --skip test_step_over_for_loop_issue_156 --skip
-test_read_tls`: **62 passed, 0 failed, 1 ignored, 12 filtered out
-(75 runnable)**.
+Running `cargo nextest run --test debugger -E 'not
+test(/multithreaded::test_multithreaded_backtrace|signal::|tokio::|test_step_over_for_loop_issue_156|test_read_tls/)'`:
+**65 passed, 0 failed, 10 filtered out (75 runnable)**.
 
-No remaining runnable failures in this filter set.
+The multithreading subsystem is wired in:
+
+* `darwin_mach::set_thread_port` / `thread_port_for_pid_or_first`
+  give every Mach thread port a synthetic `Pid` the rest of the
+  engine keys off (`RegisterMap::current/persist`, the unwinder,
+  `CallHelper`, `thread_state`).
+* `Tracer::reconcile_threads` runs after each Mach exception,
+  enumerates `task_threads_vec`, allocates synthetic Pids from
+  `proc_pid + 1_000_000` keyed on kernel `thread_id`, and adds /
+  removes tracees from `tracee_ctl` to match.
+* `Tracer::single_step` per-thread-suspends every non-focus
+  thread before `task_resume` so a step can't accidentally consume
+  another thread's BP exception as the step trap.
+* `FrameSpan::new` and `DwarfUnwinder::unwind` tolerate
+  `NoDebugInformation` for PCs in `libsystem_kernel.dylib` etc. —
+  parked-mid-syscall threads now get a single anonymous frame
+  rather than a `bt = None` that breaks `thread_state`.
+
+Still skipped on darwin (each needs a fresh subsystem):
+
+* `multithreaded::test_multithreaded_backtrace` — unwind only
+  walks 2 frames (return-addr resolves to `mt::sum1`'s own start
+  instead of climbing into `std::sys::pal::unix::thread::Thread::new::thread_start`).
+  Looks PAC-stripping or eh_frame-on-thread-entry related.
+* `signal::*` — async signals (`kill`) bypass the Mach exception
+  port entirely; the kernel only routes `EXC_SOFT_SIGNAL` for
+  ptrace-attached processes. Needs `PT_ATTACHEXC` on top of the
+  existing `posix_spawn(POSIX_SPAWN_START_SUSPENDED)` flow, or a
+  parent-side kqueue `EVFILT_SIGNAL` watcher.
+* `tokio::*` — depends on TLS resolution (worker discovery reads
+  the per-thread CONTEXT static).
+* `test_read_tls_*` — Mach-O uses TLV descriptors, not
+  glibc-style `__thread`. Needs `_tlv_get_addr`-style resolution:
+  read TPIDRRO_EL0 → pthread_t → tsd[tlv->key] + offset, plus a
+  DWARF-symbol ↔ TLV-descriptor mapping.
+* `test_step_over_for_loop_issue_156` — single-thread step
+  machinery edge case; jumps past the loop body to line 363
+  instead of staying on 359 across iterations.
 
 #### LinkerMapFn rendezvous — done via Mach IPC
 

@@ -1391,9 +1391,10 @@ impl Drop for Debugger {
                     use crate::debugger::darwin_mach::ExceptionPort;
                     use mach2::kern_return::KERN_SUCCESS;
                     if let Some(state) = self.debugee.tracer().darwin_state()
-                        && let Some((remote, id)) = state.take_pending_reply()
+                        && let Some((remote, id, retcode)) = state.take_pending_reply()
                     {
-                        let _ = ExceptionPort::reply(remote, id, KERN_SUCCESS);
+                        let _ = ExceptionPort::reply(remote, id, retcode);
+                        let _ = KERN_SUCCESS;
                     }
                     // Drop the Mach suspend count so SIGKILL can
                     // actually be processed (kernel won't deliver
@@ -1424,10 +1425,23 @@ impl Drop for Debugger {
                     }
                 };
 
-                debug_assert!(matches!(
-                    wait_result,
-                    WaitStatus::Signaled(_, Signal::SIGKILL, _) | WaitStatus::Exited(_, _)
-                ));
+                // On darwin the inferior may also die with SIGTRAP:
+                // when we drop the debugger, the Mach exception port
+                // is torn down. Any in-flight BRK exception (e.g. a
+                // worker thread that hit a software BP between our
+                // last reply and SIGKILL arrival) falls through to
+                // the BSD default handler, which terminates the
+                // process with SIGTRAP. That's still "process is
+                // dead" — the only outcome the test cares about.
+                debug_assert!(
+                    matches!(
+                        wait_result,
+                        WaitStatus::Signaled(_, Signal::SIGKILL, _)
+                            | WaitStatus::Signaled(_, Signal::SIGTRAP, _)
+                            | WaitStatus::Exited(_, _)
+                    ),
+                    "unexpected wait result for kill_pid={kill_pid}: {wait_result:?}"
+                );
             }
             ExecutionStatus::Exited => {}
         }

@@ -615,8 +615,8 @@ impl CallHelper {
             darwin_mach::arm_set_single_step(focus, true).map_err(Error::from)?;
         }
 
-        if let Some((remote, id)) = supervision.take_pending_reply() {
-            ExceptionPort::reply(remote, id, KERN_SUCCESS).map_err(Error::from)?;
+        if let Some((remote, id, retcode)) = supervision.take_pending_reply() {
+            ExceptionPort::reply(remote, id, retcode).map_err(Error::from)?;
         }
 
         darwin_mach::task_resume(task).map_err(Error::from)?;
@@ -632,7 +632,7 @@ impl CallHelper {
         if single_step {
             let _ = darwin_mach::arm_set_single_step(focus, false);
         }
-        supervision.set_pending_reply(Some((exc.remote_port, exc.msg_id)));
+        supervision.set_pending_reply(Some((exc.remote_port, exc.msg_id, KERN_SUCCESS)));
         Ok(())
     }
 

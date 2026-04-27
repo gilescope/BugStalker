@@ -55,7 +55,24 @@ pub struct FrameSpan {
 
 impl FrameSpan {
     fn new(debugee: &Debugee, location: Location) -> Result<Self, Error> {
-        let debug_information = debugee.debug_info(location.pc)?;
+        // PC may sit outside any module BugStalker has DWARF for —
+        // typical when a worker thread is mid-syscall in
+        // `libsystem_kernel.dylib` (darwin) or in libc (linux). Treat
+        // that as an anonymous frame rather than failing the whole
+        // unwind: the user still benefits from seeing the call stack
+        // *up to* the unknown frame.
+        let debug_information = match debugee.debug_info(location.pc) {
+            Ok(di) => di,
+            Err(Error::NoDebugInformation(_)) => {
+                return Ok(FrameSpan {
+                    func_name: None,
+                    fn_start_ip: None,
+                    ip: location.pc,
+                    place: None,
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         let function = debug_information
             .find_function_by_pc(location.global_pc)
@@ -328,11 +345,21 @@ impl<'a> DwarfUnwinder<'a> {
             .location(self.debugee)?;
 
         let mut ecx = ExplorationContext::new(frame_0_location, 0);
-        let mb_ucx = UnwindContext::new(
+        // A thread parked mid-syscall (libsystem_kernel.dylib on
+        // darwin, libc.so.6 on linux when ptrace catches a thread
+        // mid-`nanosleep`) has no debug-info module covering its
+        // current PC. Treat that as "we can produce frame 0 but can't
+        // unwind further" — emit a single anonymous-frame backtrace
+        // rather than failing the whole `thread_state` call.
+        let mb_ucx = match UnwindContext::new(
             self.debugee,
             DwarfRegisterMap::from(RegisterMap::current(ecx.pid_on_focus())?),
             &ecx,
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(Error::NoDebugInformation(_)) => None,
+            Err(e) => return Err(e),
+        };
 
         let mut bt = vec![FrameSpan::new(self.debugee, ecx.location())?];
         let mut visited_ips = HashSet::new();
