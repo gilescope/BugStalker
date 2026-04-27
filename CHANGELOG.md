@@ -65,15 +65,40 @@ All notable changes to this project will be documented in this file.
   image list on every call, so newly `dlopen`-ed dylibs surface
   in `update_debug_info_registry`. Was a stale snapshot taken at
   `Rendezvous::new` time.
-- The integration suite reaches **60 passed / 2 failed / 1
+- debugger/darwin: `vm_write_word` chooses its post-write
+  protection from `cur_protection & W`, not by hardcoding `R+X`.
+  Earlier versions assumed the only caller was a BP install into
+  text, but `Debugger::write_memory` also feeds the inferior-call
+  data scratchpad (string header, vtable, Formatter struct on a
+  freshly `mmap`-ed `R+W` page) — snapping that page to `R+X`
+  after each scratch write made the inferior's first store into
+  the buffer raise `KERN_PROTECTION_FAILURE`. We now key the
+  restore off `cur_prot`: writable pages stay `R+W` (data
+  scratchpad), non-writable pages restore to `R+X` (text and the
+  dyld shared cache, which reports `max=R` for genuinely
+  executable code so `max_protection` is *not* a usable signal).
+  The trampoline page is still `R+W` from `mmap` — `CallHelper::call_fn`
+  flips it explicitly via `darwin_mach::vm_protect_rx` after
+  writing `BLR x8 ; BRK #0`, since darwin's W^X bars the
+  inferior `mmap` from requesting `PROT_EXEC | PROT_WRITE`
+  directly.
+- debugger/darwin: `task_for_pid` results are cached per-pid so
+  hot paths (every `read_memory_by_pid` call) don't re-enter the
+  serialised kernel syscall. Without this, parallel test runs
+  collapse onto the kernel's `task_for_pid` lock; with it, the
+  full `tests/debugger` suite under `cargo nextest` finishes in
+  ~40s wallclock vs ~800s with `cargo test --test-threads=1`.
+- debugger/dwarf: `BsUnit::find_exact_place_by_pc` no longer
+  panics with a usize-underflow when `binary_search_by_key`
+  lands at index 0. Pre-existing on every platform but only
+  reachable via the darwin Debug::fmt path that was previously
+  short-circuiting before the lookup.
+- The integration suite reaches **62 passed / 0 failed / 1
   ignored / 12 filtered out (75 runnable)** on darwin with
   `--skip multithreaded --skip tokio --skip signal --skip
-  test_step_over_for_loop_issue_156 --skip test_read_tls`. The 2
-  remaining failures (Debug::fmt vtable dispatch — the inferior
-  call returns success but `<String as Write>::write_str` is
-  never invoked through our hand-built vtable) and the skipped
-  categories (multithreading, signals, TLS, the loop-step edge
-  case) are tracked in the roadmap.
+  test_step_over_for_loop_issue_156 --skip test_read_tls`. The
+  skipped categories (multithreading, signals, TLS, the
+  loop-step edge case) are tracked in the roadmap.
 
 ### Fixed
 

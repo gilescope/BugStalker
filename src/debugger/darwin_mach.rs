@@ -40,11 +40,13 @@ use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_name_t};
 use mach2::task::task_set_exception_ports;
 use mach2::thread_status::THREAD_STATE_NONE;
 use mach2::traps::{mach_task_self, task_for_pid as raw_task_for_pid};
-use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_write};
-use mach2::vm_prot::{VM_PROT_COPY, VM_PROT_READ, VM_PROT_WRITE};
+use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_region, mach_vm_write};
+use mach2::vm_prot::{VM_PROT_COPY, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, vm_prot_t};
+use mach2::vm_region::{VM_REGION_BASIC_INFO_64, vm_region_basic_info_64, vm_region_info_t};
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
 use nix::errno::Errno;
 use nix::unistd::Pid;
+use std::collections::HashMap;
 use std::mem;
 
 /// Coarse error envelope for Mach-side failures. We round-trip
@@ -144,12 +146,35 @@ fn check(kr: kern_return_t) -> Result<(), MachError> {
 /// allowed unconditionally. On failure, `MachError::Display`
 /// surfaces the kr name and the most likely cause (typically
 /// "missing cs.debugger entitlement on the caller").
+///
+/// Result is cached per pid for the process lifetime. The kernel
+/// `task_for_pid` syscall is heavyweight on darwin (a single
+/// global lock) and `read_memory_by_pid` calls it on every memory
+/// read — without caching, parallel test runs spend most of their
+/// time bouncing on that lock. The first hit per pid does the
+/// real syscall; subsequent hits return the cached `task_t`.
+/// Entries live until the parent exits; that's fine because the
+/// only callers in this codebase are tests with a 1:1 parent-to-
+/// inferior relationship and the inferior outlives the cache.
 pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<i32, task_t>>> = Mutex::new(None);
+    {
+        let guard = CACHE.lock().unwrap();
+        if let Some(map) = guard.as_ref()
+            && let Some(&t) = map.get(&pid.as_raw())
+        {
+            return Ok(t);
+        }
+    }
     let mut task: mach_port_t = 0;
     // SAFETY: mach_task_self() is always valid; raw_task_for_pid
     // takes an out-port and writes to it iff KERN_SUCCESS.
     let kr = unsafe { raw_task_for_pid(mach_task_self(), pid.as_raw(), &mut task) };
     check(kr)?;
+    debug_assert!(task != 0, "task_for_pid returned KERN_SUCCESS but null port");
+    let mut guard = CACHE.lock().unwrap();
+    guard.get_or_insert_with(HashMap::new).insert(pid.as_raw(), task);
     Ok(task)
 }
 
@@ -184,10 +209,51 @@ pub fn vm_read_n(task: task_t, addr: usize, n: usize) -> Result<Vec<u8>, MachErr
 /// what we want for software breakpoints — without it, a
 /// breakpoint would be visible to other processes mapping the
 /// same binary.
+///
+/// After the write we restore the *original* protection. Earlier
+/// versions hardcoded the post-write perms to `R+X` on the
+/// assumption that the only caller writes BPs into text; that
+/// assumption broke once `Debugger::write_memory` started writing
+/// scratch data into `mmap`-allocated `R+W` pages during inferior
+/// calls (`call::fmt::call_debug_fmt`). Snapping a data page to
+/// `R+X` made every subsequent inferior store to that page raise
+/// `KERN_PROTECTION_FAILURE`. Querying `mach_vm_region` once and
+/// restoring the page's original protection covers both shapes.
 pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Error> {
-    use mach2::vm_prot::VM_PROT_EXECUTE;
     let bytes = value.to_ne_bytes();
     let len = mem::size_of::<usize>() as mach_vm_size_t;
+
+    // Pick the post-write protection by what the page is *for*:
+    //
+    // * If the page was already writable (`cur_prot & W`), it
+    //   belongs to a data scratchpad — keep the writable state so
+    //   the inferior can keep writing through it.
+    // * Otherwise the page is text or shared-cache code — restore
+    //   to `R+X` (we CoW'd it through the protect-copy-write cycle
+    //   and need it executable for the inferior's next fetch).
+    //
+    // `max_protection` is *not* a reliable signal here: the dyld
+    // shared cache reports `max=R` for pages that are genuinely
+    // executable in practice. `cur_protection` distinguishes our
+    // two real cases — anonymous `mmap(R|W)` data pages vs.
+    // text/shared-cache code pages — so we key off of that.
+    let (cur_prot, max_prot) = vm_region_protections(task, addr)
+        .unwrap_or((VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE));
+    debug_assert!(
+        cur_prot & !(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE) == 0,
+        "vm_region_protections returned unexpected cur bits 0x{cur_prot:x}"
+    );
+    debug_assert!(
+        max_prot & !(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE) == 0,
+        "vm_region_protections returned unexpected max bits 0x{max_prot:x}"
+    );
+    let restore_prot = if cur_prot & VM_PROT_WRITE != 0 {
+        // Data scratchpad — keep what we found.
+        cur_prot
+    } else {
+        VM_PROT_READ | VM_PROT_EXECUTE
+    };
+    let _ = max_prot; // currently informational; only cur drives restore
 
     // Widen protection to W (CoW). The VM_PROT_COPY bit makes the
     // kernel turn the shared text page into a private CoW copy
@@ -216,22 +282,99 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
     };
     check(kr)?;
 
-    // Restore the page to R+X — without this the inferior takes
-    // KERN_PROTECTION_FAILURE on the next instruction it tries to
-    // execute through the patched page. We always want R+X after
-    // a BP install (the only caller of vm_write_word writes
-    // trampolines / BRKs into text pages); a hypothetical caller
-    // writing to a data page would need a different helper anyway.
+    // Restore protection. See `restore_prot` selection above.
     let _ = unsafe {
         mach_vm_protect(
             task as vm_task_entry_t,
             addr as mach_vm_address_t,
             len,
             0,
-            VM_PROT_READ | VM_PROT_EXECUTE,
+            restore_prot,
         )
     };
     Ok(())
+}
+
+/// Query a VM region for its `(protection, max_protection)` mask
+/// pair. The Mach kernel reports both: `protection` is the *current*
+/// permission, `max_protection` is the upper bound the page can ever
+/// be raised to without re-mapping.
+///
+/// The caller wants `max_protection` for restoration decisions —
+/// `protection` lies for some shared pages (notably the dyld shared
+/// cache reports `R` only even though the page is genuinely
+/// executable). `max_protection` reflects what the page is *for*:
+/// `R+X` for text loaded from disk, `R+W` for an anonymous
+/// `mmap(PROT_READ | PROT_WRITE)`, etc.
+fn vm_region_protections(task: task_t, addr: usize) -> Option<(vm_prot_t, vm_prot_t)> {
+    let mut region_addr = addr as mach_vm_address_t;
+    let mut region_size: mach_vm_size_t = 0;
+    let mut info = vm_region_basic_info_64::default();
+    let mut info_count = vm_region_basic_info_64::count();
+    let mut object_name: mach_port_t = MACH_PORT_NULL;
+    // SAFETY: all out-pointers point at locals that outlive the
+    // call; `flavor` is paired with the matching info struct.
+    let kr = unsafe {
+        mach_vm_region(
+            task as vm_task_entry_t,
+            &mut region_addr,
+            &mut region_size,
+            VM_REGION_BASIC_INFO_64,
+            &mut info as *mut _ as vm_region_info_t,
+            &mut info_count,
+            &mut object_name,
+        )
+    };
+    if kr != KERN_SUCCESS {
+        return None;
+    }
+    // `protection` / `max_protection` are `i32` fields in a
+    // `repr(C, packed(4))` struct — copy through locals before
+    // returning to dodge the unaligned-reference lint.
+    let prot = info.protection;
+    let max_prot = info.max_protection;
+    Some((prot, max_prot))
+}
+
+/// Mark a region of the inferior's address space as `R+X`. Used
+/// by the inferior-call path to make the freshly-`mmap`-ed
+/// trampoline page executable: darwin's W^X policy bars the
+/// inferior's `mmap` from requesting `PROT_EXEC` alongside
+/// `PROT_WRITE` without `MAP_JIT` (which itself needs an
+/// entitlement we don't ship), but a `mach_vm_protect` from the
+/// parent task port can flip a freshly-allocated `R+W` anonymous
+/// page to `R+X` after we've written the `BLR x8 ; BRK #0`
+/// trampoline. Linux skips this entirely — its `mmap` accepts
+/// `PROT_EXEC | PROT_WRITE` directly.
+pub fn vm_protect_rx(task: task_t, addr: usize, len: usize) -> Result<(), MachError> {
+    // mach_vm_protect requires page-aligned addr/len. Both come
+    // from the inferior's `mmap` reply in our only caller, so the
+    // alignment is structurally guaranteed; assert in debug
+    // builds to surface any future caller that violates it.
+    debug_assert!(len > 0, "vm_protect_rx with zero length");
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    debug_assert_eq!(
+        addr % page_size,
+        0,
+        "vm_protect_rx addr 0x{addr:x} not page-aligned (page={page_size})"
+    );
+    debug_assert_eq!(
+        len % page_size,
+        0,
+        "vm_protect_rx len {len} not page-multiple (page={page_size})"
+    );
+    // SAFETY: addr/len describe a valid mapping in the task; the
+    // kernel rejects with KERN_INVALID_ARGUMENT otherwise.
+    let kr = unsafe {
+        mach_vm_protect(
+            task as vm_task_entry_t,
+            addr as mach_vm_address_t,
+            len as mach_vm_size_t,
+            0,
+            VM_PROT_READ | VM_PROT_EXECUTE,
+        )
+    };
+    check(kr)
 }
 
 /// Enumerate all Mach thread ports for a task. Used by the

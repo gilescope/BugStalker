@@ -637,8 +637,20 @@ impl CallHelper {
     }
 
     fn call_fn(ccx: &CallContext, pc: u64, fn_addr: u64, args: CallArgs) -> Result<(), Error> {
+        use crate::debugger::darwin_mach;
+
         const BLR_X8_BRK0: usize = 0xD420_0000usize << 32 | 0xD63F_0100usize;
         ccx.dbg.write_memory(pc as usize, BLR_X8_BRK0)?;
+
+        // The trampoline page came from the inferior's `mmap`,
+        // which on darwin/aarch64 can only return `R+W` (W^X bars
+        // `PROT_EXEC` without `MAP_JIT`). Flip the page to `R+X`
+        // from the parent task port so the CPU can fetch the
+        // `BLR x8 ; BRK #0` we just wrote. Mirrors what the linux
+        // path gets for free by mmap-ing `R+W+X` directly.
+        let task = darwin_mach::task_for_pid(ccx.pid)?;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        darwin_mach::vm_protect_rx(task, pc as usize, page_size).map_err(Error::from)?;
 
         let mut regs: RegisterMap = ccx.regs.clone();
         args.prepare_registers(&mut regs);

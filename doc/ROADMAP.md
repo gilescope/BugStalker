@@ -355,14 +355,10 @@ state).
 
 Running with `--test-threads=1 --skip multithreaded --skip tokio
 --skip signal --skip test_step_over_for_loop_issue_156 --skip
-test_read_tls`: **60 passed, 2 failed, 1 ignored, 12 filtered out
+test_read_tls`: **62 passed, 0 failed, 1 ignored, 12 filtered out
 (75 runnable)**.
 
-Remaining runnable failures:
-
-* `variables::test_debug_trait_repr_args` — Debug::fmt vtable call
-  dispatches but writes nothing into the inferior's String buffer.
-* `variables::test_debug_trait_repr_vars` — same.
+No remaining runnable failures in this filter set.
 
 #### LinkerMapFn rendezvous — done via Mach IPC
 
@@ -398,19 +394,34 @@ Two related fixes lit up at the same time:
    every BP install into a dlopen-loaded dylib EFAULT'd at the
    wrong address.
 
-#### Debug::fmt empty buffer — diagnosis
+#### Debug::fmt empty buffer — fixed
 
-`call_debug_fmt` constructs a `String` header (24 bytes, empty Vec
-sentinel) and a `<String as core::fmt::Write>` vtable in inferior
-memory, then calls `<T as Debug>::fmt(&self, &mut formatter)`. The
-call returns success but the post-call read of the String header
-shows the same bytes as the initial empty Vec — write_str was never
-invoked. Likely vtable layout / Formatter struct offsets
-mismatch on darwin/aarch64 vs linux/aarch64; Mach-O lazy stubs are
-*not* in play (vtable holds resolved function addrs in the inferior's
-text segment, not symbol stubs). Needs side-by-side trace of the
-inferior's PC and register state during the call to pinpoint where
-the dispatch diverges.
+The vtable / formatter layout was correct all along; what
+silently swallowed the call was page-protection drift. The
+inferior-call data scratchpad is `mmap`-ed `R+W` in the
+inferior, then `Debugger::write_memory` (a.k.a.
+`darwin_mach::vm_write_word`) lays out the String header,
+vtable, and Formatter struct on it. The earlier `vm_write_word`
+hardcoded the post-write protection to `R+X` — fine for BP
+installs into text, but it tightened our scratch page from
+`R+W` to `R-X`, so the *first* inferior store into the buffer
+(e.g. `do_reserve_and_handle`'s `stp x20, x8, [x19]` when the
+empty `String` had to grow to fit `"["`) raised
+`KERN_PROTECTION_FAILURE` and the call returned without ever
+reaching `write_str`'s `memcpy`. Reading the dropped String
+header back showed the original empty-Vec sentinel, which is
+how the symptom looked like a vtable miss.
+
+Fix: `vm_write_word` snapshots the page's current protection
+via `mach_vm_region` and restores *exactly that* after the
+write. The trampoline page (also `mmap`-ed `R+W`, since darwin
+W^X bars `PROT_EXEC | PROT_WRITE` without `MAP_JIT`) now needs
+an explicit nudge to `R+X`, which `CallHelper::call_fn` does
+via `darwin_mach::vm_protect_rx` after writing
+`BLR x8 ; BRK #0`. A separate usize-underflow in
+`BsUnit::find_exact_place_by_pc` (pre-existing, but only
+reachable once the call chain ran far enough to hit a `pc==0`
+binary-search hit) was uncovered along the way.
 
 Recent darwin-specific fixes in this phase:
 
