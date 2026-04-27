@@ -49,25 +49,6 @@ fn read_tpidr_el0(pid: nix::unistd::Pid) -> Result<usize, nix::Error> {
     Ok(reg as usize)
 }
 
-#[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
-fn read_tpidr_el0(_pid: nix::unistd::Pid) -> Result<usize, nix::Error> {
-    // Darwin doesn't expose TPIDR_EL0 (or TPIDRRO_EL0, which holds
-    // the pthread pointer on aarch64 darwin) via
-    // `thread_get_state(ARM_THREAD_STATE64)` — the struct only
-    // carries x0..x28, fp, lr, sp, pc, cpsr. The right resolution
-    // path for darwin TLS is to walk the dyld TLV descriptor
-    // (`{thunk, key, offset}`) plus the per-thread TSD array out
-    // of `pthread_t` (which `thread_info(THREAD_IDENTIFIER_INFO)`
-    // gives us as `thread_handle`). That's a separate code path
-    // from the linux DTV walker the caller falls through to here.
-    //
-    // Returning `ENOSYS` instead of panicking lets `weak_error!`
-    // in the caller log a warning and surface "no TLS for this
-    // variable" rather than crashing the debugger. Real TLS
-    // support on darwin lands when the TLV walker does.
-    Err(nix::errno::Errno::ENOSYS)
-}
-
 #[derive(Clone, Copy)]
 pub enum DieReference {
     Offset(UnitOffset),
@@ -350,9 +331,25 @@ impl<'dbg, H: Typed> FatDieRef<'dbg, H> {
         let tls_addr = if let Ok(addr) = tls_addr_result {
             addr
         } else {
-            // thread_db TLS resolution failed; compute directly from thread pointer.
+            // thread_db TLS resolution failed; compute directly.
+            //
+            // On darwin/Mach-O `tls_offset` is the *static* VA of a
+            // `tlv_descriptor` in `__DATA,__thread_vars`. We add this
+            // dylib's slide and walk the TSD via `resolve_tlv`.
+            #[cfg(not(target_os = "linux"))]
+            {
+                use crate::debugger::darwin_mach;
+                let slide = debugee.mapping_offset_for_file(self.debug_info).ok()?;
+                let runtime = (tls_offset as usize).wrapping_add(slide) as u64;
+                let task = darwin_mach::task_for_pid(pid).ok()?;
+                let thread = darwin_mach::thread_port_for_pid_or_first(pid).ok()?;
+                let addr = weak_error!(
+                    darwin_mach::resolve_tlv(task, thread, runtime).map_err(Error::from)
+                )?;
+                RelocatedAddress::from(addr as usize)
+            }
             // On aarch64 glibc TLS variant I: DTV[1] + offset gives the TLS address.
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
             {
                 let tp = weak_error!(read_tpidr_el0(pid))?;
                 let dtv_bytes = weak_error!(debugger::read_memory_by_pid(pid, tp, 8))?;
@@ -361,7 +358,7 @@ impl<'dbg, H: Typed> FatDieRef<'dbg, H> {
                 let tls_base = usize::from_ne_bytes(dtv1_bytes[..8].try_into().unwrap());
                 RelocatedAddress::from(tls_base + tls_offset as usize)
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
             {
                 return None;
             }

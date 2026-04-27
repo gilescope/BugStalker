@@ -240,11 +240,34 @@ host.
   (offset 16) — the macOS analogue of `r_debug.r_brk` for module-
   load tracking. `Rendezvous::r_brk` returns this address;
   installing a BP there fires on every dlopen/dlclose.
-* TLS read on darwin returns `ENOSYS` instead of panicking — real
-  resolution needs the dyld TLV walker plus the per-thread TSD
-  array out of `pthread_t`; until then the surrounding
-  `weak_error!` surfaces "no TLS for this variable" gracefully
-  rather than crashing the debugger.
+* TLS read on darwin via `darwin_mach::resolve_tlv`. Mach-O
+  thread-locals have a 16-byte `tlv_descriptor` in
+  `__DATA,__thread_vars` — `{ void* thunk; uint32_t key; uint32_t
+  offset; }` per the disassembly of libdyld's `_tlv_get_addr`
+  (older docs that describe the trailing two fields as 8-byte are
+  wrong for current dyld). The resolver:
+  1. Slides the descriptor's static VA by the owning dylib's
+     mapping offset, iterating loaded images when the owner is
+     ambiguous and rejecting obviously-bogus descriptors
+     (`thunk < 0x1000`, `key == 0`, `key >= 0x1000`,
+     `offset >= 16 MB`) before walking the TSD.
+  2. Reads the per-thread pthread TSD base from
+     `THREAD_IDENTIFIER_INFO::thread_handle` (the kernel exports
+     `cthread_self`, which libpthread sets to `&pthread->tsd[0]`).
+  3. Returns `tsd[key] + offset`. If `tsd[key]` is null the var
+     hasn't been first-touched on this thread; we surface that as
+     `KERN_INVALID_ADDRESS` rather than running `_tlv_get_addr`'s
+     lazy-allocate fallback (which would need an inferior call).
+* `eval.rs::resolve_tls` (the `DW_OP_form_tls_address` path) and
+  `die_ref.rs::read_value`'s symbol-table fallback both route
+  through the new resolver on darwin.
+* Parser fix in `parser.rs::ValueModifiers::from_identity`: the
+  `const_tls_duplicate` heuristic now matches any `{closure#N}`
+  rather than the literal `{closure#0}` — dsymutil on
+  darwin/aarch64 renumbers the const-init lazy-wrapper closure
+  to `{closure#1}` (rustc's own `const { … }` evaluator is `#0`),
+  so the original check incorrectly classified the real DIE as a
+  duplicate-of-the-parent and dropped its value.
 
 ### Done — Tracer cutover (path A, pure Mach)
 
@@ -353,9 +376,17 @@ state).
 
 ### Status — `tests/debugger` on darwin/aarch64
 
-Running `cargo nextest run --test debugger -E 'not
-test(/multithreaded::test_multithreaded_backtrace|signal::|tokio::|test_step_over_for_loop_issue_156|test_read_tls/)'`:
-**65 passed, 0 failed, 10 filtered out (75 runnable)**.
+Running `cargo nextest run --test debugger --test-threads 1`
+serially: **74 passed, 0 failed, 1 skipped (75 runnable)**. The
+single skipped case is the rust-version-gated arm in
+`test_read_tls_const_variables` for toolchains that don't apply.
+
+Parallel runs (`--test-threads N`) currently flake on a few tests
+(`io::*`, `signal::*` under contention) — the per-test
+`task_for_pid` cache copes, but `PT_ATTACHEXC` plus the new Mach
+exception subscription racing across simultaneous attaches still
+needs a serialising mutex. Tracked under "Phase 3 — parity with
+linux/aarch64" below; serial runs are the canonical green.
 
 The multithreading subsystem is wired in:
 
@@ -375,26 +406,79 @@ The multithreading subsystem is wired in:
   parked-mid-syscall threads now get a single anonymous frame
   rather than a `bt = None` that breaks `thread_state`.
 
-Still skipped on darwin (each needs a fresh subsystem):
+All previously-skipped categories now pass serially. Notes per
+category (kept for context — each row used to be a multi-day fix):
 
-* `multithreaded::test_multithreaded_backtrace` — unwind only
-  walks 2 frames (return-addr resolves to `mt::sum1`'s own start
-  instead of climbing into `std::sys::pal::unix::thread::Thread::new::thread_start`).
-  Looks PAC-stripping or eh_frame-on-thread-entry related.
-* `signal::*` — async signals (`kill`) bypass the Mach exception
-  port entirely; the kernel only routes `EXC_SOFT_SIGNAL` for
-  ptrace-attached processes. Needs `PT_ATTACHEXC` on top of the
-  existing `posix_spawn(POSIX_SPAWN_START_SUSPENDED)` flow, or a
-  parent-side kqueue `EVFILT_SIGNAL` watcher.
-* `tokio::*` — depends on TLS resolution (worker discovery reads
-  the per-thread CONTEXT static).
-* `test_read_tls_*` — Mach-O uses TLV descriptors, not
-  glibc-style `__thread`. Needs `_tlv_get_addr`-style resolution:
-  read TPIDRRO_EL0 → pthread_t → tsd[tlv->key] + offset, plus a
-  DWARF-symbol ↔ TLV-descriptor mapping.
-* `test_step_over_for_loop_issue_156` — single-thread step
-  machinery edge case; jumps past the loop body to line 363
-  instead of staying on 359 across iterations.
+* `multithreaded::test_multithreaded_backtrace` — unblocked by
+  the AArch64 frame-pointer fallback in
+  `DwarfUnwinder::fp_walk_into_dwarf`. Frame 0 of a worker
+  parked in libsystem (no DWARF, no entry in the registry)
+  aborted DWARF unwinding; the FP walker reads the saved
+  `[fp, lr]` pair, PAC-strips the LR, and either rebuilds an
+  `UnwindContext` (if the LR lands in a tracked dylib) or pushes
+  an anonymous frame and keeps walking. PAC stripping was
+  already in place via `strip_pac` for the DWARF path; the FP
+  fallback reuses it. Unblocks `test_multithreaded_backtrace`.
+* `signal::*` — handled. `Tracer::ensure_darwin_supervision`
+  registers Mach exception ports first, then calls
+  `ptrace(PT_ATTACHEXC, pid, 0, 0)` so async `kill()` routes
+  through the port as `EXC_SOFTWARE/EXC_SOFT_SIGNAL`. Bootstrap
+  semantics: PT_ATTACHEXC queues an initial SIGSTOP — the first
+  `task_resume` is allowed to fail (suspend count is already 0
+  on some macOS versions); `ptrace(PT_CONTINUE, pid, 1, 0)`
+  releases the ptrace stop and the bootstrap SIGSTOP arrives as
+  `EXC_SOFT_SIGNAL`, consumed silently with `KERN_SUCCESS`.
+  Steady-state resume just task_resumes; ptrace state is driven
+  by Mach exception replies. The `EXC_SOFT_SIGNAL` arm now
+  classifies signals: bootstrap SIGSTOP / `QUIET_SIGNALS_DARWIN`
+  (silent re-inject via `KERN_FAILURE`) / `TRANSPARENT_SIGNALS_DARWIN`
+  (`KERN_SUCCESS`, surface stop, no re-deliver) / normal
+  (`KERN_FAILURE`, surface stop, re-deliver). Teardown clears
+  the Mach exception subscription
+  (`task_set_exception_ports(... MACH_PORT_NULL ...)`) so post-
+  drop BRK / segfaults fall through to the BSD default handler,
+  replies any pending exception with `KERN_FAILURE`, then
+  `ptrace(PT_DETACH)` releases the ptrace half before
+  `kill(SIGKILL)`. All four `signal::*` tests pass sequentially.
+* `tokio::*` — handled. Two fixes:
+  1. `eval.rs::resolve_tls` now uses `task_for_pid_or_proc` so
+     synthetic per-thread Pids fall back to the inferior's task
+     port — the kernel rejects `task_for_pid` on synthetic ids,
+     and tokio's `CONTEXT` is read from worker threads parked
+     deep in libsystem.
+  2. `execute.rs::variable_die_by_selector` walks every loaded
+     debug_info for non-local lookups, so a global TLS variable
+     in the main exec is found even when the focus PC has no
+     tracked debug_info (typical for parked workers).
+* `test_read_tls_*` — handled. Three darwin-specific fixes:
+    - `parser.rs::ValueModifiers::from_identity` now sets
+      `tls_unwrapped` when a `VAL` ident sits under a `{closure#N}`
+      with no `eager` / `lazy` wrapper struct preserved by
+      dsymutil (const-init flatten case).
+    - `parser.rs::ValueParser::parse` wraps a non-TLS-Specialized
+      result in a synthetic `TlsVariable { inner_value, inner_type }`
+      when `tls_unwrapped` fires, matching the
+      `Value::Specialized<Tls>` shape Linux callers expect. The
+      wrap is skipped if the inner parser already produced a TLS
+      specialisation (preserved-wrapper lazy case) so we don't
+      double-wrap.
+    - `variables.rs::test_read_tls_const_variables` normalises
+      `{closure#1}` → `{closure#0}` before comparing against the
+      version_switch'd identity strings (dsymutil renumbers
+      anonymous closures starting at 1).
+* `test_step_over_for_loop_issue_156` — passes serially; the
+  step engine handles the loop iteration correctly.
+* `breakpoints::test_multiple_brkpt_on_addr` — handled.
+  `restart_debugee` now runs the same Mach-port-clear + reply +
+  `PT_DETACH` + `task_resume` dance as `Drop` before
+  `kill(SIGKILL)`, otherwise the queued kill never landed because
+  the inferior was still ptrace-stopped from `PT_ATTACHEXC`. The
+  teardown sequence is shared via
+  `Debugger::darwin_release_inferior_for_kill`. The post-kill
+  `waitpid` loop also tolerates a `Stopped(SIGTRAP)` event from
+  an in-flight BRK that the BSD default handler picks up after
+  we KERN_FAILURE-reply: re-issue SIGCONT + SIGKILL until the
+  process actually exits.
 
 #### LinkerMapFn rendezvous — done via Mach IPC
 
@@ -502,8 +586,29 @@ Recent darwin-specific fixes in this phase:
   `dyld_all_image_infos.notification` and re-walk the image array
   on each fire (the linux equivalent is the `r_brk` rendezvous
   callback).
-* **DAP.** Free once the underlying `Debugger` works end-to-end
-  with the exception-port loop.
+* **DAP.** Working: 75/75 sequential. Two darwin-specific
+  fixes:
+  1. `tests/dap/dap_client.rs::ensure_bs_entitled` re-codesigns
+     the spawned `bs` binary (and the `dap_attach` target)
+     with `tests/darwin.entitlements` before each test run.
+     DAP tests run `bs --dap-remote …` as a subprocess; cargo
+     rebuilds wipe its ad-hoc signature and `task_for_pid`
+     fails with KERN_FAILURE. The attach target additionally
+     needs `get-task-allow` so the unrelated bs process can
+     `task_for_pid` it. Mirrors the test-runner self-sign in
+     `tests/debugger/main.rs`.
+  2. `darwin_mach::dyld_image_list` falls back to a
+     `proc_maps`-based image list when dyld's legacy
+     `infoArray` is empty. dyld 4 (macOS 14+) doesn't always
+     maintain `infoArray` for already-running processes — it's
+     populated during dyld startup but may be cleared in favour
+     of the compact format. The fallback walks the process's
+     VM mappings (proc_pidinfo) and emits one `ImageInfo` per
+     unique `(file, lowest start)`. Main exec is identified
+     via `sysinfo` and returned first to keep
+     `link_map_main()`'s "first entry is main" contract. Any
+     dlopens after attach come through `DyldNotifyPort` so we
+     stay current.
 
 ### Open architectural decisions
 

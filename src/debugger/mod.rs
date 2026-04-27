@@ -740,6 +740,55 @@ impl Debugger {
         Ok(stop_reason)
     }
 
+    /// Darwin-only: clear our Mach exception subscription, reply to any
+    /// pending Mach exception (so the inferior advances past whatever
+    /// trapped it), and detach the ptrace half that `PT_ATTACHEXC` put
+    /// us in. Without this, a subsequent `kill(SIGKILL)` is queued in
+    /// the kernel's signal layer but never delivered because the
+    /// inferior is still ptrace-stopped on its last exception. Used by
+    /// both `restart_debugee` and `Drop` to make `kill(SIGKILL)` actually
+    /// land. Idempotent and tolerant of a vanished inferior (ESRCH).
+    #[cfg(not(target_os = "linux"))]
+    fn darwin_release_inferior_for_kill(&self) {
+        use crate::debugger::darwin_mach::ExceptionPort;
+        use mach2::exception_types::{
+            EXC_MASK_BAD_ACCESS, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE,
+        };
+        use mach2::kern_return::KERN_FAILURE;
+        use mach2::port::MACH_PORT_NULL;
+        use mach2::thread_status::THREAD_STATE_NONE;
+        let pid = self.debugee.tracee_ctl().proc_pid();
+        if let Ok(task) = darwin_mach::task_for_pid(pid) {
+            let mask = EXC_MASK_BREAKPOINT | EXC_MASK_SOFTWARE | EXC_MASK_BAD_ACCESS;
+            // SAFETY: task is a valid task port; MACH_PORT_NULL clears
+            // the subscription so post-teardown BRK / SEGV falls
+            // through to the BSD default handler.
+            unsafe {
+                mach2::task::task_set_exception_ports(
+                    task,
+                    mask,
+                    MACH_PORT_NULL,
+                    0,
+                    THREAD_STATE_NONE,
+                );
+            }
+        }
+        if let Some(state) = self.debugee.tracer().darwin_state()
+            && let Some((remote, id, _retcode)) = state.take_pending_reply()
+        {
+            let _ = ExceptionPort::reply(remote, id, KERN_FAILURE);
+        }
+        // SAFETY: ptrace(PT_DETACH, pid, 0, 0) — addr ignored, data is
+        // the signal to inject (0 = none). ESRCH if the inferior died
+        // first; we don't care.
+        unsafe {
+            libc::ptrace(libc::PT_DETACH, pid.as_raw(), std::ptr::null_mut(), 0);
+        }
+        if let Ok(task) = darwin_mach::task_for_pid(pid) {
+            let _ = darwin_mach::task_resume(task);
+        }
+    }
+
     /// Restart debugee by recreating debugee process, save all user-defined breakpoints.
     /// Return when new debugee stopped or ends.
     ///
@@ -766,11 +815,45 @@ impl Debugger {
 
         if !self.debugee.is_exited() {
             let proc_pid = self.process.pid();
+            // Darwin: with PT_ATTACHEXC active, the inferior is
+            // ptrace-stopped on its last Mach exception. SIGKILL would
+            // queue but not deliver until ptrace is released, so do
+            // the same teardown dance as Drop before kill.
+            #[cfg(not(target_os = "linux"))]
+            self.darwin_release_inferior_for_kill();
             signal::kill(proc_pid, SIGKILL).map_err(|e| Syscall("kill", e))?;
             _ = self
                 .debugee
                 .tracer_mut()
                 .resume(TraceContext::new(&[], &self.watchpoints));
+            // Reap the now-dead inferior so its pid frees up before
+            // we ask the kernel to spawn the next one. On linux this
+            // is implicit via the ptrace state machine; on darwin the
+            // process otherwise lingers as a zombie until the polling
+            // `assert_no_proc!` times out. Poll with `WNOHANG` so we
+            // don't block forever if the kernel never delivers the
+            // terminal event (mirrors the `Drop` teardown).
+            #[cfg(not(target_os = "linux"))]
+            {
+                use nix::sys::wait::WaitPidFlag;
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(1000);
+                while std::time::Instant::now() < deadline {
+                    match waitpid(proc_pid, Some(WaitPidFlag::WNOHANG)) {
+                        Ok(WaitStatus::StillAlive) => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Ok(WaitStatus::Signaled(_, _, _))
+                        | Ok(WaitStatus::Exited(_, _))
+                        | Err(_) => break,
+                        Ok(_) => {
+                            let _ = signal::kill(proc_pid, Signal::SIGCONT);
+                            let _ = signal::kill(proc_pid, Signal::SIGKILL);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    }
+                }
+            }
         }
 
         self.process = self.process.install()?;
@@ -1379,33 +1462,8 @@ impl Drop for Debugger {
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    // Darwin: no ptrace. Two things to do before
-                    // SIGKILL can land:
-                    //   1. Release any thread parked in a Mach
-                    //      exception (BRK / WP fire that the
-                    //      Tracer hasn't replied to yet).
-                    //      Otherwise the kernel keeps the thread
-                    //      stuck and the process can't die.
-                    //   2. Drop the Mach suspend count so the
-                    //      kernel can deliver the signal.
-                    use crate::debugger::darwin_mach::ExceptionPort;
-                    use mach2::kern_return::KERN_SUCCESS;
-                    if let Some(state) = self.debugee.tracer().darwin_state()
-                        && let Some((remote, id, retcode)) = state.take_pending_reply()
-                    {
-                        let _ = ExceptionPort::reply(remote, id, retcode);
-                        let _ = KERN_SUCCESS;
-                    }
-                    // Drop the Mach suspend count so SIGKILL can
-                    // actually be processed (kernel won't deliver
-                    // signals to a fully
-                    // suspended task).
                     let _ = current_tids; // captured for symmetry; unused on darwin
-                    if let Ok(task) =
-                        darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid())
-                    {
-                        let _ = darwin_mach::task_resume(task);
-                    }
+                    self.darwin_release_inferior_for_kill();
                 }
                 // kill debugee process. On darwin, the inferior
                 // may have already exited cleanly (passing through
@@ -1416,29 +1474,67 @@ impl Drop for Debugger {
                 // kill and Exited from waitpid.
                 let kill_pid = self.debugee.tracee_ctl().proc_pid();
                 let _ = signal::kill(kill_pid, Signal::SIGKILL);
-                let wait_result = loop {
-                    let wp = waitpid(Pid::from_raw(-1), None);
+                // Drain wait events. On darwin, KERN_FAILURE'ing a
+                // pending Mach BRK during teardown can cause the BSD
+                // default to surface as a signal-*stop* (SIGTRAP)
+                // before our SIGKILL lands; treat any non-terminal
+                // status as "release-and-retry" (SIGCONT + SIGKILL
+                // clears the stop and finishes the kill).
+                //
+                // Use `WNOHANG` with a short poll deadline rather
+                // than a blocking `waitpid` — if the kernel never
+                // delivers the terminal event (process gone on
+                // another path, signal queued behind a Mach state,
+                // …) we still need to give up rather than hang the
+                // whole test runner.
+                use nix::sys::wait::WaitPidFlag;
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(2000);
+                let mut wait_result = WaitStatus::StillAlive;
+                while std::time::Instant::now() < deadline {
+                    let wp = waitpid(kill_pid, Some(WaitPidFlag::WNOHANG));
                     match wp {
-                        Ok(w) if w.pid() == Some(kill_pid) => break w,
-                        Ok(_) => continue, // some other child; keep waiting
-                        Err(_) => break WaitStatus::StillAlive,
+                        Ok(WaitStatus::StillAlive) => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Ok(w @ (WaitStatus::Signaled(_, _, _) | WaitStatus::Exited(_, _))) => {
+                            wait_result = w;
+                            break;
+                        }
+                        Ok(_) => {
+                            // Stopped / Continued / PtraceEvent — release and retry
+                            let _ = signal::kill(kill_pid, Signal::SIGCONT);
+                            let _ = signal::kill(kill_pid, Signal::SIGKILL);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Err(_) => {
+                            // ECHILD or similar — process is gone (or never was a child)
+                            break;
+                        }
                     }
-                };
+                }
 
-                // On darwin the inferior may also die with SIGTRAP:
-                // when we drop the debugger, the Mach exception port
-                // is torn down. Any in-flight BRK exception (e.g. a
-                // worker thread that hit a software BP between our
-                // last reply and SIGKILL arrival) falls through to
-                // the BSD default handler, which terminates the
-                // process with SIGTRAP. That's still "process is
-                // dead" — the only outcome the test cares about.
+                // On darwin the inferior may die with a variety of
+                // signals during teardown:
+                //   * SIGKILL — our explicit kill landed first.
+                //   * SIGTRAP — an in-flight BRK exception fell
+                //     through to the BSD default handler when the
+                //     Mach exception port was torn down.
+                //   * Any user signal that was queued in the ptrace
+                //     stop at teardown time (e.g. a "transparent"
+                //     SIGINT we consumed in Mach but ptrace had
+                //     already queued for the BSD layer) — when we
+                //     release ptrace via PT_KILL the queued signal
+                //     is delivered, and its default action
+                //     (terminate) wins the race against our
+                //     SIGKILL.
+                // All of these still mean "the inferior is gone",
+                // which is the only thing the surrounding test
+                // suite cares about.
                 debug_assert!(
                     matches!(
                         wait_result,
-                        WaitStatus::Signaled(_, Signal::SIGKILL, _)
-                            | WaitStatus::Signaled(_, Signal::SIGTRAP, _)
-                            | WaitStatus::Exited(_, _)
+                        WaitStatus::Signaled(_, _, _) | WaitStatus::Exited(_, _)
                     ),
                     "unexpected wait result for kill_pid={kill_pid}: {wait_result:?}"
                 );
@@ -1479,8 +1575,12 @@ pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8
     // Log the rich MachError before collapsing to EFAULT — the
     // signature returns nix::Error so we can't propagate the kr
     // upstream; logging keeps the diagnostic recoverable from
-    // `--log` output.
-    let task = darwin_mach::task_for_pid(pid).map_err(|e| {
+    // `--log` output. Use `task_for_pid_or_proc` so synthetic
+    // per-thread Pids (worker threads tracked by
+    // `Tracer::reconcile_threads`) fall back to the inferior
+    // process's task port — memory is process-scoped, the kernel
+    // rejects `task_for_pid` on synthetic ids.
+    let task = darwin_mach::task_for_pid_or_proc(pid).map_err(|e| {
         log::error!(target: "darwin_mach", "read_memory_by_pid task_for_pid({pid}): {e}");
         nix::errno::Errno::EFAULT
     })?;

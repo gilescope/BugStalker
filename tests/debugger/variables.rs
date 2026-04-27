@@ -1119,16 +1119,20 @@ fn test_read_tls_const_variables() {
             "CONSTANT_THREAD_LOCAL",
             false,
         )) => const_tls);
+    // Darwin's dsymutil numbers anonymous closures starting at 1
+    // (Linux rustc emits 0). Same DIE, different index — accept either.
+    let ident = const_tls.identity().to_string();
+    let normalised = ident.replace("{closure#1}", "{closure#0}");
     version_switch!(
         rust_version,
         .. (1 . 80) => {
-            assert_idents!(const_tls => "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::__getit::VAL");
+            assert_eq!(normalised, "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::__getit::VAL");
         },
         (1 . 80) .. (1 . 92) => {
-            assert_idents!(const_tls => "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::{constant#0}::{closure#0}::VAL");
+            assert_eq!(normalised, "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::{constant#0}::{closure#0}::VAL");
         },
         (1 . 92) .. => {
-            assert_idents!(const_tls => "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::{constant#0}::{closure#0}::__RUST_STD_INTERNAL_VAL");
+            assert_eq!(normalised, "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::{constant#0}::{closure#0}::__RUST_STD_INTERNAL_VAL");
         }
     );
     assert_init_tls(const_tls.value(), "i32", |value| {

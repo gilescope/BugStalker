@@ -156,11 +156,15 @@ fn check(kr: kern_return_t) -> Result<(), MachError> {
 /// Entries live until the parent exits; that's fine because the
 /// only callers in this codebase are tests with a 1:1 parent-to-
 /// inferior relationship and the inferior outlives the cache.
+// Module-private pid → task cache. Lifted out of `task_for_pid` so
+// the reverse lookup (`task_to_pid`) used by the proc_maps fallback
+// in `image_list_from_proc_maps` can scan it.
+static TASK_FOR_PID_CACHE: std::sync::Mutex<Option<HashMap<i32, task_t>>> =
+    std::sync::Mutex::new(None);
+
 pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
-    use std::sync::Mutex;
-    static CACHE: Mutex<Option<HashMap<i32, task_t>>> = Mutex::new(None);
     {
-        let guard = CACHE.lock().unwrap();
+        let guard = TASK_FOR_PID_CACHE.lock().unwrap();
         if let Some(map) = guard.as_ref()
             && let Some(&t) = map.get(&pid.as_raw())
         {
@@ -173,9 +177,28 @@ pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
     let kr = unsafe { raw_task_for_pid(mach_task_self(), pid.as_raw(), &mut task) };
     check(kr)?;
     debug_assert!(task != 0, "task_for_pid returned KERN_SUCCESS but null port");
-    let mut guard = CACHE.lock().unwrap();
+    let mut guard = TASK_FOR_PID_CACHE.lock().unwrap();
     guard.get_or_insert_with(HashMap::new).insert(pid.as_raw(), task);
     Ok(task)
+}
+
+/// Resolve a pid (real or synthetic-per-thread) to the owning task.
+///
+/// Synthetic pids (allocated by `Tracer::reconcile_threads` from
+/// `proc_pid + 1_000_000`) aren't real kernel pids — `task_for_pid`
+/// rejects them. Memory- and task-level operations on a worker
+/// thread should target the *process's* task (it's the same task
+/// for every thread in the process). We resolve via the per-pid
+/// thread-port registry: the registered thread port came from
+/// `task_threads()` of the proc's task, so the proc_pid → task
+/// mapping must already be cached. If `pid` is real, falls back to
+/// `task_for_pid` directly.
+pub fn task_for_pid_or_proc(pid: Pid) -> Result<task_t, MachError> {
+    if let Ok(t) = task_for_pid(pid) {
+        return Ok(t);
+    }
+    let proc = synthetic_pid_proc(pid).ok_or(MachError(mach2::kern_return::KERN_INVALID_ARGUMENT))?;
+    task_for_pid(proc)
 }
 
 /// Read `n` bytes from the inferior's address space starting at
@@ -503,6 +526,88 @@ pub fn thread_identity(thread: thread_act_t) -> Result<ThreadIdentity, MachError
     })
 }
 
+/// Resolve a Mach-O TLV access for a stopped thread.
+///
+/// Mach-O thread-locals are accessed via a 16-byte `tlv_descriptor`
+/// in `__DATA,__thread_vars`. The on-disk layout written by recent
+/// linkers + processed by libdyld's `_tlv_get_addr` (verified by
+/// disassembling that helper on macOS 14+):
+///
+/// ```text
+///   off  size  field
+///   0    8     thunk    (void* (*)(TLVDescriptor*))
+///   8    4     key      (uint32_t pthread key)
+///   12   4     offset   (uint32_t offset inside tsd[key] block)
+/// ```
+///
+/// (Older docs on the internet describe key/offset as 8-byte fields;
+/// this is wrong for current dyld. The hot path of `_tlv_get_addr`
+/// is `ldr w16, [x0, #8]` for the key and `ldr w16, [x0, #0xc]` for
+/// the offset — both 32-bit loads from byte offsets 8 and 12.)
+///
+/// After first-touch on a thread, accesses inline to a
+/// `pthread_getspecific(key) + offset`, which on darwin/arm64 is:
+///
+/// ```text
+///   mrs Xn, TPIDRRO_EL0
+///   bic Xn, Xn, #7
+///   ldr Xn, [Xn, #(key * 8)]   ; tsd[key]
+///   add Xn, Xn, #offset
+/// ```
+///
+/// `(TPIDRRO_EL0 & ~7)` matches `thread_handle` returned by
+/// `THREAD_IDENTIFIER_INFO`: the kernel stores `cthread_self`
+/// (libpthread's per-thread TSD base) there and exposes it through
+/// that flavour. We replicate the load remotely:
+///   1. Read the descriptor from inferior memory.
+///   2. Read tsd[key] from inferior pthread.
+///   3. Return tsd[key] + offset, or fail if tsd[key] is null
+///      (i.e. the variable hasn't been first-touched on this thread
+///      yet — replicating `_tlv_bootstrap` would need an inferior
+///      call, which the caller can degrade to "no value" instead).
+pub fn resolve_tlv(
+    task: task_t,
+    thread: thread_act_t,
+    descriptor_runtime_addr: u64,
+) -> Result<u64, MachError> {
+    let descriptor = vm_read_n(task, descriptor_runtime_addr as usize, 16)?;
+    if descriptor.len() < 16 {
+        return Err(MachError(mach2::kern_return::KERN_INVALID_ADDRESS));
+    }
+    let thunk = u64::from_ne_bytes(descriptor[0..8].try_into().unwrap());
+    let key = u32::from_ne_bytes(descriptor[8..12].try_into().unwrap());
+    let var_offset = u32::from_ne_bytes(descriptor[12..16].try_into().unwrap());
+
+    // Sanity-check the descriptor before walking the TSD. A wrong
+    // slide guess produces nonsense fields (commonly all-zero, since
+    // dylibs that don't define this thread_local have zero-padding
+    // at the matching __DATA offset). Real TLV descriptors have:
+    //   * thunk pointing at `_tlv_get_addr` in libdyld (so >= 0x1000),
+    //   * key non-zero and small (pthread key < 1024 in practice),
+    //   * offset within the per-thread storage block (< 16 MB).
+    if thunk < 0x1000 || key == 0 || key >= 0x1000 || var_offset >= 0x100_0000 {
+        return Err(MachError(mach2::kern_return::KERN_INVALID_ARGUMENT));
+    }
+
+    let tid = thread_identity(thread)?;
+    let tsd_base = tid.thread_handle & !0x7u64;
+    if tsd_base == 0 {
+        return Err(MachError(mach2::kern_return::KERN_INVALID_ADDRESS));
+    }
+    let slot_addr = tsd_base
+        .checked_add((key as u64) * 8)
+        .ok_or(MachError(mach2::kern_return::KERN_INVALID_ARGUMENT))?;
+    let slot_bytes = vm_read_n(task, slot_addr as usize, 8)?;
+    let tsd_value = u64::from_ne_bytes(slot_bytes[..8].try_into().unwrap());
+    if tsd_value == 0 {
+        // Uninitialised on this thread. Caller surfaces this as
+        // "no TLS value" rather than running `_tlv_get_addr`'s
+        // lazy-allocate fallback.
+        return Err(MachError(mach2::kern_return::KERN_INVALID_ADDRESS));
+    }
+    Ok(tsd_value + var_offset as u64)
+}
+
 /// Read the aarch64 GP register set for a single Mach thread. Use
 /// `task_threads_vec` to get the thread port; for the typical
 /// "stopped at a breakpoint, only one thread" case the first
@@ -824,6 +929,26 @@ pub fn set_thread_port(pid: Pid, port: thread_act_t) {
     let mut g = THREAD_PORT_BY_PID.lock().unwrap();
     g.get_or_insert_with(HashMap::new).insert(pid.as_raw(), port);
 }
+
+/// Record that `synthetic_pid` (a per-thread Pid manufactured by
+/// `Tracer::reconcile_threads`) belongs to inferior `proc_pid`.
+/// Lookup via `synthetic_pid_proc` lets darwin task / memory APIs
+/// fall back to the proc's task port for synthetic ids.
+pub fn set_synthetic_pid_proc(synthetic: Pid, proc_pid: Pid) {
+    let mut g = SYNTHETIC_PID_PROC.lock().unwrap();
+    g.get_or_insert_with(HashMap::new)
+        .insert(synthetic.as_raw(), proc_pid.as_raw());
+}
+
+pub fn synthetic_pid_proc(pid: Pid) -> Option<Pid> {
+    let g = SYNTHETIC_PID_PROC.lock().unwrap();
+    g.as_ref()
+        .and_then(|m| m.get(&pid.as_raw()).copied())
+        .map(Pid::from_raw)
+}
+
+static SYNTHETIC_PID_PROC: std::sync::Mutex<Option<HashMap<i32, i32>>> =
+    std::sync::Mutex::new(None);
 
 pub fn thread_port_for_pid(pid: Pid) -> Option<thread_act_t> {
     let g = THREAD_PORT_BY_PID.lock().unwrap();
@@ -1578,6 +1703,110 @@ impl Drop for DyldNotifyPort {
     }
 }
 
+/// Fallback for `dyld_image_list` when dyld's legacy `infoArray` is
+/// empty (typical for already-running darwin processes on dyld 4 /
+/// macOS 14+). Walks the inferior's VM mappings and emits one
+/// `ImageInfo` per unique `(file, lowest start)` pair, with the main
+/// executable returned first (so `link_map_main()` keeps its
+/// "first entry is the main image" contract). Returns the same
+/// shape as the dyld-image-walk path so the caller doesn't need to
+/// distinguish.
+fn image_list_from_proc_maps(task: task_t) -> Result<Vec<ImageInfo>, MachError> {
+    use proc_maps::get_process_maps;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    // Find the inferior's pid for proc_maps. We don't have a
+    // task→pid Mach API, but the cache is populated keyed on
+    // pid → task, so we walk the cache. (The cache is the only
+    // persistent task→pid relationship in this crate.)
+    let pid = match task_to_pid(task) {
+        Some(pid) => pid,
+        None => return Ok(Vec::new()),
+    };
+    let maps = match get_process_maps(pid.as_raw()) {
+        Ok(m) => m,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    // Group ranges by filename; for each filename keep the lowest
+    // start address. proc_maps on darwin emits one MapRange per
+    // segment per image, so the lowest-start entry per file is the
+    // mach_header of that image.
+    let mut by_file: HashMap<String, u64> = HashMap::new();
+    for r in &maps {
+        let Some(path) = r.filename() else { continue };
+        let path_s = path.to_string_lossy().to_string();
+        if path_s.is_empty() {
+            continue;
+        }
+        // Skip the kernel-internal special mappings.
+        if path_s.contains("[shared cache]") {
+            continue;
+        }
+        let entry = by_file.entry(path_s).or_insert(u64::MAX);
+        if (r.start() as u64) < *entry {
+            *entry = r.start() as u64;
+        }
+    }
+
+    // Identify the main executable. proc_pidinfo on darwin reports
+    // the main exec's path as the first non-shared-cache region;
+    // the `proc_maps::get_process_maps` order isn't guaranteed, so
+    // we cross-check via `sysinfo`.
+    let main_exec = {
+        use sysinfo::{RefreshKind, System};
+        let sys = System::new_with_specifics(
+            RefreshKind::everything().without_cpu().without_memory(),
+        );
+        sysinfo::System::process(&sys, sysinfo::Pid::from_u32(pid.as_raw() as u32))
+            .and_then(|p| p.exe().map(|p| p.to_string_lossy().to_string()))
+    };
+
+    let mut out: Vec<ImageInfo> = Vec::with_capacity(by_file.len());
+    if let Some(exe) = main_exec.as_deref()
+        && let Some(addr) = by_file.remove(exe)
+    {
+        out.push(ImageInfo {
+            load_addr: addr as usize,
+            path: exe.to_string(),
+        });
+    }
+    // Sort the remaining images by address for stable iteration
+    // order (the rendezvous protocol doesn't promise a specific
+    // order, but tests sometimes assume a stable list).
+    let mut rest: Vec<(String, u64)> = by_file.into_iter().collect();
+    rest.sort_by_key(|(_, addr)| *addr);
+    for (path, addr) in rest {
+        // Skip what's clearly not an image (e.g. anonymous zero-fill
+        // pages can sneak in with arbitrary names).
+        if !Path::new(&path).is_absolute() {
+            continue;
+        }
+        out.push(ImageInfo {
+            load_addr: addr as usize,
+            path,
+        });
+    }
+    Ok(out)
+}
+
+/// Reverse `task_for_pid`: given a `task_t` we previously resolved
+/// from a pid, return that pid. Used by the proc_maps fallback
+/// in `image_list_from_proc_maps` so we can ask `proc_pidinfo` for
+/// the inferior's mappings; there's no Mach API that goes from a
+/// task port back to a pid, so we walk our own cache.
+fn task_to_pid(task: task_t) -> Option<Pid> {
+    let g = TASK_FOR_PID_CACHE.lock().ok()?;
+    let map = g.as_ref()?;
+    for (&p, &t) in map.iter() {
+        if t == task {
+            return Some(Pid::from_raw(p));
+        }
+    }
+    None
+}
+
 /// Walk the dyld image list and return one `ImageInfo` per loaded
 /// image. The first entry is conventionally the main executable.
 pub fn dyld_image_list(task: task_t) -> Result<Vec<ImageInfo>, MachError> {
@@ -1585,7 +1814,15 @@ pub fn dyld_image_list(task: task_t) -> Result<Vec<ImageInfo>, MachError> {
     let header: dyld_all_image_infos_v1 = read_struct(task, infos_addr)?;
     let count = header.info_array_count as usize;
     if count == 0 || header.info_array == 0 {
-        return Ok(Vec::new());
+        // dyld 4 (macOS 14+) doesn't always maintain the legacy
+        // `infoArray` for already-running processes — it's
+        // populated during dyld's startup phase and may be cleared
+        // afterwards in favour of the compact format. Fall back to
+        // walking the process's VM mappings: each unique mach_header
+        // there is an image. The caller's `Rendezvous::link_maps()`
+        // re-walks on every dlopen notification anyway, so any later
+        // loads come through `DyldNotifyPort` regardless.
+        return image_list_from_proc_maps(task);
     }
 
     // Read the whole array in one round-trip.

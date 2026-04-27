@@ -337,6 +337,110 @@ impl<'a> DwarfUnwinder<'a> {
     /// # Arguments
     ///
     /// * pid: thread for unwinding
+    /// AArch64 frame-pointer walk. Used as a fallback when DWARF
+    /// unwinding can't make progress because frame 0 is in an
+    /// untracked dylib (libsystem on darwin, libc on linux). Walks
+    /// the `x29` chain and pushes a frame for each `lr` we read.
+    /// Returns the DWARF [`UnwindContext`] for the first frame
+    /// whose `lr` lands inside a tracked dylib so the caller can
+    /// resume normal DWARF unwinding from there; returns `None` if
+    /// we exhaust the chain without ever reaching a tracked module.
+    ///
+    /// The walk is bounded by `MAX_UNWIND_DEPTH` and a visited-fp
+    /// loop guard.
+    #[cfg(target_arch = "aarch64")]
+    fn fp_walk_into_dwarf(
+        &self,
+        raw_registers: &RegisterMap,
+        bt: &mut Vec<FrameSpan>,
+        visited_ips: &mut HashSet<RelocatedAddress>,
+        pid: Pid,
+    ) -> Result<Option<UnwindContext<'a>>, Error> {
+        let mut fp = raw_registers.value(Register::X29);
+        let mut visited_fps: HashSet<u64> = HashSet::new();
+        while bt.len() < MAX_UNWIND_DEPTH {
+            if fp == 0 || !visited_fps.insert(fp) {
+                return Ok(None);
+            }
+            // Read [saved_fp, saved_lr] = 16 bytes at *fp.
+            let bytes = match debugger::read_memory_by_pid(pid, fp as usize, 16) {
+                Ok(b) if b.len() == 16 => b,
+                _ => return Ok(None),
+            };
+            let next_fp = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
+            let lr = strip_pac(u64::from_ne_bytes(bytes[8..16].try_into().unwrap()));
+            if lr == 0 {
+                return Ok(None);
+            }
+            let lr_addr = RelocatedAddress::from(lr);
+            if !visited_ips.insert(lr_addr) {
+                return Ok(None);
+            }
+
+            // Probe whether `lr` lands in a dylib we have DWARF for.
+            // If yes, build an UnwindContext at that PC and let the
+            // caller continue with DWARF.
+            let location = Location {
+                pc: lr_addr,
+                global_pc: match lr_addr.into_global(self.debugee) {
+                    Ok(g) => g,
+                    Err(_) => {
+                        // Untracked module — push an anonymous frame
+                        // and keep walking.
+                        bt.push(FrameSpan {
+                            ip: lr_addr,
+                            fn_start_ip: None,
+                            func_name: None,
+                            place: None,
+                        });
+                        fp = next_fp;
+                        continue;
+                    }
+                },
+                pid,
+            };
+            // Synthesise registers for the caller frame: x29 = next_fp,
+            // x30 = lr, sp = fp + 16 (caller's sp = our fp record top),
+            // pc = lr.
+            let mut next_regs: DwarfRegisterMap =
+                DwarfRegisterMap::from(raw_registers.clone());
+            let dw_x29 = Register::X29
+                .dwarf_register()
+                .expect("aarch64 x29 has a dwarf register number");
+            let dw_x30 = Register::X30
+                .dwarf_register()
+                .expect("aarch64 x30 has a dwarf register number");
+            let dw_sp = Register::SP
+                .dwarf_register()
+                .expect("aarch64 sp has a dwarf register number");
+            let dw_pc = Register::PC
+                .dwarf_register()
+                .expect("aarch64 pc has a dwarf register number");
+            next_regs.update(dw_x29, next_fp);
+            next_regs.update(dw_x30, lr);
+            next_regs.update(dw_sp, fp + 16);
+            next_regs.update(dw_pc, lr);
+            let ecx_at = ExplorationContext::new(location, bt.len() as u32);
+            match UnwindContext::new(self.debugee, next_regs, &ecx_at) {
+                Ok(Some(u)) => {
+                    bt.push(FrameSpan::new(self.debugee, location)?);
+                    return Ok(Some(u));
+                }
+                Ok(None) | Err(Error::NoDebugInformation(_)) => {
+                    bt.push(FrameSpan {
+                        ip: lr_addr,
+                        fn_start_ip: None,
+                        func_name: None,
+                        place: None,
+                    });
+                    fp = next_fp;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
     pub fn unwind(&self, pid: Pid) -> Result<Backtrace, Error> {
         let frame_0_location = self
             .debugee
@@ -345,15 +449,20 @@ impl<'a> DwarfUnwinder<'a> {
             .location(self.debugee)?;
 
         let mut ecx = ExplorationContext::new(frame_0_location, 0);
+        let raw_registers = RegisterMap::current(ecx.pid_on_focus())?;
         // A thread parked mid-syscall (libsystem_kernel.dylib on
         // darwin, libc.so.6 on linux when ptrace catches a thread
         // mid-`nanosleep`) has no debug-info module covering its
-        // current PC. Treat that as "we can produce frame 0 but can't
-        // unwind further" — emit a single anonymous-frame backtrace
-        // rather than failing the whole `thread_state` call.
+        // current PC. Two ways forward: (a) emit just frame 0 and
+        // stop; (b) follow the AArch64 frame-pointer chain through
+        // the un-DWARF'd region until we land back in a tracked
+        // dylib, then resume DWARF unwinding from there. (b) is
+        // what tokio worker discovery / multithreaded backtrace
+        // need, so we try (b) on darwin and fall through to (a) if
+        // it can't make progress.
         let mb_ucx = match UnwindContext::new(
             self.debugee,
-            DwarfRegisterMap::from(RegisterMap::current(ecx.pid_on_focus())?),
+            DwarfRegisterMap::from(raw_registers.clone()),
             &ecx,
         ) {
             Ok(v) => v,
@@ -364,9 +473,33 @@ impl<'a> DwarfUnwinder<'a> {
         let mut bt = vec![FrameSpan::new(self.debugee, ecx.location())?];
         let mut visited_ips = HashSet::new();
         visited_ips.insert(frame_0_location.pc);
-        let Some(mut ucx) = mb_ucx else {
-            return Ok(bt);
+        let mut ucx = match mb_ucx {
+            Some(u) => u,
+            #[cfg(target_arch = "aarch64")]
+            None => {
+                // Frame-pointer fallback. AArch64 ABI: x29 holds the
+                // current frame's FP, which points to a 16-byte
+                // record `[saved_fp, saved_lr]` at the caller's
+                // stack frame top. Walk it until either:
+                //   * fp == 0 (bottom of stack),
+                //   * lr resolves to a PC inside a tracked dylib —
+                //     re-arm DWARF unwinding from there,
+                //   * loop / depth limit hit.
+                if let Some(u) = self.fp_walk_into_dwarf(
+                    &raw_registers,
+                    &mut bt,
+                    &mut visited_ips,
+                    frame_0_location.pid,
+                )? {
+                    u
+                } else {
+                    return Ok(bt);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            None => return Ok(bt),
         };
+        ecx = ExplorationContext::new(ucx.location, bt.len() as u32 - 1);
 
         // start unwind
         while let Some(return_addr) = ucx.return_address() {

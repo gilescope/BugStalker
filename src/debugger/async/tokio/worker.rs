@@ -264,13 +264,29 @@ pub fn try_as_worker(
         .program_debug_info()?
         .pathname()
         .to_path_buf();
-    for i in 0..thread.bt.as_ref().map(|bt| bt.len()).unwrap_or_default() {
-        let ecx = debugger.ecx();
-        let debug_info = debugger.debugee.debug_info(ecx.location().pc)?;
-        if debug_info.pathname() == main_debug_info {
-            break;
+    // Walk the precomputed backtrace looking for the first frame
+    // whose IP is in the main executable, then set focus there.
+    //
+    // We do *not* call `set_frame_into_focus(i)` for intermediate
+    // frames: on darwin, tokio worker threads are typically parked
+    // in libsystem (e.g. `kevent_qos`, `__psynch_*`), and those
+    // frames have no mapping offset in our registry — focusing
+    // them blows up with `MappingOffsetNotFound`. We just inspect
+    // each frame's IP to test inclusion, and call
+    // `set_frame_into_focus` once when we've found the target.
+    if let Some(bt) = thread.bt.as_ref() {
+        for (i, frame) in bt.iter().enumerate() {
+            let in_main = debugger
+                .debugee
+                .debug_info(frame.ip)
+                .ok()
+                .map(|di| di.pathname() == main_debug_info)
+                .unwrap_or(false);
+            if in_main {
+                debugger.set_frame_into_focus(i as u32)?;
+                break;
+            }
         }
-        debugger.set_frame_into_focus(i as u32)?;
     }
 
     let Some(worker) = WorkerInternal::analyze(context, thread) else {

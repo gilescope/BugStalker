@@ -44,11 +44,85 @@ pub fn ensure_example_binaries() -> anyhow::Result<()> {
         if !status.success() {
             return Err(anyhow!("failed to build example fixtures"));
         }
+        ensure_bs_entitled()?;
         Ok(())
     })()
     .map_err(|err| err.to_string());
     *guard = Some(result.clone());
     result.map_err(|err| anyhow!(err))
+}
+
+/// Darwin: re-sign a binary with the test entitlements plist if
+/// it isn't already signed with the entitlement we need. Used for
+/// the spawned `bs` subprocess (needs `com.apple.security.cs.debugger`
+/// to call `task_for_pid` on the inferior it launches) and for the
+/// `dap_attach` example (needs `com.apple.security.get-task-allow`
+/// so an external `bs` can `task_for_pid` *it*). Cargo rebuilds
+/// wipe ad-hoc signatures, so we re-sign once per build.
+#[cfg(target_os = "macos")]
+fn codesign_with_test_entitlements(
+    binary: &Path,
+    must_have_entitlement: &str,
+) -> anyhow::Result<()> {
+    if !binary.exists() {
+        return Err(anyhow!("binary not found at {}", binary.display()));
+    }
+    let probe = Command::new("codesign")
+        .args(["-d", "--entitlements", "-"])
+        .arg(binary)
+        .output()
+        .context("probe codesign")?;
+    let blob = String::from_utf8_lossy(&probe.stdout).into_owned()
+        + &String::from_utf8_lossy(&probe.stderr);
+    if blob.contains(must_have_entitlement) {
+        return Ok(());
+    }
+    let plist = repo_root().join("tests").join("darwin.entitlements");
+    if !plist.exists() {
+        return Err(anyhow!(
+            "entitlements plist not found at {}",
+            plist.display()
+        ));
+    }
+    let status = Command::new("codesign")
+        .args(["--entitlements"])
+        .arg(&plist)
+        .args(["--force", "--sign", "-"])
+        .arg(binary)
+        .status()
+        .context("codesign binary")?;
+    if !status.success() {
+        return Err(anyhow!(
+            "codesign on {} returned {status}",
+            binary.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_bs_entitled() -> anyhow::Result<()> {
+    let bs = std::env::var("CARGO_BIN_EXE_bs")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| repo_root().join("target").join("debug").join("bs"));
+    codesign_with_test_entitlements(&bs, "com.apple.security.cs.debugger")?;
+    // The `dap_attach` target gets attached to by `bs` (a process
+    // it doesn't share a parent with), so the kernel demands the
+    // *target* carries `get-task-allow` even though the attacher
+    // is entitled with `cs.debugger`. Without this the
+    // `task_for_pid(target)` inside `bs`'s attach path returns
+    // KERN_FAILURE and `Rendezvous::new` collapses with
+    // "rendezvous not found".
+    let dap_attach = example_bin("dap_attach");
+    if dap_attach.exists() {
+        codesign_with_test_entitlements(&dap_attach, "com.apple.security.get-task-allow")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ensure_bs_entitled() -> anyhow::Result<()> {
+    Ok(())
 }
 
 pub fn repo_root() -> PathBuf {

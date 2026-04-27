@@ -56,6 +56,24 @@ static QUIET_SIGNALS: &[Signal] = &[
 #[cfg(target_os = "linux")]
 static TRANSPARENT_SIGNALS: &[Signal] = &[Signal::SIGINT];
 
+/// Darwin equivalents — same intent as the linux lists above, used
+/// by the Mach `EXC_SOFT_SIGNAL` classifier in `Tracer::resume`.
+/// Routed here only because PT_ATTACHEXC enables Mach-routed signal
+/// delivery (`P_LSIGEXC`); the BSD signal layer otherwise handles
+/// these directly.
+#[cfg(not(target_os = "linux"))]
+static QUIET_SIGNALS_DARWIN: &[Signal] = &[
+    Signal::SIGALRM,
+    Signal::SIGURG,
+    Signal::SIGCHLD,
+    Signal::SIGIO,
+    Signal::SIGVTALRM,
+    Signal::SIGPROF,
+];
+
+#[cfg(not(target_os = "linux"))]
+static TRANSPARENT_SIGNALS_DARWIN: &[Signal] = &[Signal::SIGINT];
+
 #[derive(Debug, Clone)]
 pub enum WatchpointHitType {
     /// Hit of the underlying hardware breakpoint cause value changed.
@@ -183,6 +201,17 @@ pub(crate) struct DarwinSupervision {
     /// fail transiently if dyld hasn't installed its notifyPorts
     /// table yet.
     dyld_notify: Option<crate::debugger::darwin_mach::DyldNotifyPort>,
+    /// `PT_ATTACHEXC` queues a `SIGSTOP` to the inferior at attach
+    /// time (xnu uses this to give the debugger a "first-stop" event
+    /// to report). With `P_LSIGEXC` set, that SIGSTOP is delivered as
+    /// `EXC_SOFT_SIGNAL` rather than going to the BSD signal layer —
+    /// so the *first* SIGSTOP we see after attach is the bootstrap
+    /// one and must be consumed (`KERN_SUCCESS`), not forwarded
+    /// (`KERN_FAILURE` would actually stop the inferior). Real
+    /// SIGSTOPs from `kill -SIGSTOP` arriving later are still
+    /// forwarded normally. Cleared the first time we observe and
+    /// consume it.
+    pt_attach_bootstrap_pending: std::cell::Cell<bool>,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -827,6 +856,39 @@ impl Tracer {
             let task = darwin_mach::task_for_pid(pid)?;
             let port = ExceptionPort::allocate()?;
             port.register(task)?;
+            // Route async signals through the exception port so the
+            // engine sees `kill(pid, SIG)` from outside the inferior
+            // as `EXC_SOFTWARE/EXC_SOFT_SIGNAL` rather than the BSD
+            // signal layer silently delivering them. Without this
+            // the kernel only generates EXC_SOFT_SIGNAL for
+            // synchronous signal-like exceptions (e.g. raise()) on a
+            // ptrace-attached process — async kill() goes straight to
+            // the user handler and the debugger never observes it.
+            //
+            // PT_ATTACHEXC is a one-shot enable; we never call
+            // `ptrace(PT_CONTINUE, …)` afterwards. The Mach port is
+            // still the primary stop source — replies via
+            // `pending_reply` (KERN_SUCCESS to consume,
+            // KERN_FAILURE to deliver to the BSD handler) drive the
+            // signal-injection state machine.
+            //
+            // Errors here aren't fatal: if PT_ATTACHEXC fails (e.g.
+            // SIP-protected target, or inferior already exited), we
+            // continue without async-signal capture rather than
+            // failing the whole supervision setup. Synchronous BPs
+            // / watchpoints / EXC_BAD_ACCESS routing still works.
+            // SAFETY: ptrace's signature is `(req, pid, addr, data)`
+            // and PT_ATTACHEXC ignores `addr` and `data`.
+            let pt_rc = unsafe {
+                libc::ptrace(libc::PT_ATTACHEXC, pid.as_raw(), std::ptr::null_mut(), 0)
+            };
+            if pt_rc < 0 {
+                let err = nix::errno::Errno::last();
+                log::warn!(
+                    target: "darwin_tracer",
+                    "PT_ATTACHEXC({pid}) failed: {err} — async signals will not be observable"
+                );
+            }
             // Registering the dyld notify port can fail right after
             // posix_spawn-suspend if dyld hasn't yet built its
             // notifyPorts table. We retry on demand from the resume
@@ -862,6 +924,8 @@ impl Tracer {
                 thread_id_to_pid,
                 pid_to_thread_id,
                 next_synthetic_pid: pid.as_raw().saturating_add(1_000_000),
+                // Set iff PT_ATTACHEXC succeeded — see field doc.
+                pt_attach_bootstrap_pending: std::cell::Cell::new(pt_rc == 0),
             });
         }
         Ok(self.darwin_state.as_mut().expect("just initialised"))
@@ -916,6 +980,12 @@ impl Tracer {
                 state.thread_id_to_pid.insert(id.thread_id, new_pid);
                 state.pid_to_thread_id.insert(new_pid, id.thread_id);
                 darwin_mach::set_thread_port(new_pid, port);
+                // Synthetic pids aren't real kernel pids;
+                // `task_for_pid` rejects them. Record the
+                // synthetic→proc mapping so `task_for_pid_or_proc`
+                // can fall back to the proc's task for memory
+                // reads on this worker thread.
+                darwin_mach::set_synthetic_pid_proc(new_pid, state.proc_pid);
                 self.tracee_ctl.add(new_pid);
                 new_pid
             };
@@ -1022,10 +1092,48 @@ impl Tracer {
                 }
             }
 
-            // Resume the inferior. After Child::install's
-            // spawn-suspend, the task suspend count is 1; this drops
-            // it to 0 and the child runs.
-            darwin_mach::task_resume(state.task)?;
+            // Resume the inferior.
+            //
+            // Two release primitives, used in different states:
+            //   * Mach `task_resume` drops the suspend count from
+            //     `posix_spawn(START_SUSPENDED)` (1 → 0). After
+            //     that, replies to received Mach exceptions release
+            //     individual parked threads — we do *not* need
+            //     `task_resume` between exception receives, the
+            //     count stays at 0.
+            //   * `ptrace(PT_CONTINUE, pid, 1, 0)` releases the
+            //     ptrace stop that PT_ATTACHEXC put us in. Only
+            //     needed once — that bootstrap. Calling it again
+            //     returns EBUSY because the inferior is no longer
+            //     ptrace-stopped.
+            //
+            // The bootstrap iteration is the only place both run.
+            // Subsequent iterations only reply (via the
+            // `pending_reply` arm above) and the kernel resumes the
+            // parked thread.
+            if state.pt_attach_bootstrap_pending.get() {
+                // task_resume failure is tolerated on bootstrap —
+                // PT_ATTACHEXC may have already brought the suspend
+                // count to 0, so the kernel returns KERN_FAILURE.
+                let _ = darwin_mach::task_resume(state.task);
+                // SAFETY: PT_CONTINUE takes `(req, pid, addr, data)`;
+                // addr==1 means "continue from current PC", data==0
+                // is "deliver no signal".
+                let pt_rc = unsafe {
+                    libc::ptrace(libc::PT_CONTINUE, pid.as_raw(), 1 as *mut _, 0)
+                };
+                if pt_rc < 0 {
+                    let err = nix::errno::Errno::last();
+                    if err != nix::errno::Errno::ESRCH {
+                        log::warn!(
+                            target: "darwin_tracer",
+                            "PT_CONTINUE({pid}) bootstrap release failed: {err}"
+                        );
+                    }
+                }
+            } else {
+                darwin_mach::task_resume(state.task)?;
+            }
 
             // Poll the exception port + dyld notify port + waitpid in
             // turn. The Mach exception path covers BRK / WP / signals,
@@ -1194,23 +1302,50 @@ impl Tracer {
                     let signum = exc.codes.get(1).copied().unwrap_or(0) as i32;
                     let signal = nix::sys::signal::Signal::try_from(signum)
                         .unwrap_or(nix::sys::signal::SIGTRAP);
-                    // Forward the soft signal to the BSD signal layer so
-                    // the user's signal handler runs once we resume.
-                    // KERN_SUCCESS would tell the kernel "debugger
-                    // consumed this signal" — silently dropping it.
-                    //
-                    // Note: in practice this arm rarely fires today —
-                    // the kernel only routes async signals (kill())
-                    // through Mach when the inferior has been
-                    // ptrace-attached (PT_ATTACHEXC). Without ptrace
-                    // the signal goes straight to the BSD path and we
-                    // never see it. The arm stays so synchronous
-                    // signal-like exceptions (e.g. raise()) still
-                    // surface as SignalStop, and so the codepath is
-                    // ready when PT_ATTACHEXC lands.
+
+                    // PT_ATTACHEXC's bootstrap SIGSTOP — consume it
+                    // silently. See the `pt_attach_bootstrap_pending`
+                    // doc on `DarwinSupervision` for why.
+                    let bootstrap = self
+                        .darwin_state
+                        .as_ref()
+                        .map(|s| s.pt_attach_bootstrap_pending.get())
+                        .unwrap_or(false)
+                        && signal == nix::sys::signal::SIGSTOP;
+                    if bootstrap {
+                        if let Some(s) = self.darwin_state.as_ref() {
+                            s.pt_attach_bootstrap_pending.set(false);
+                            s.pending_reply
+                                .set(Some((exc.remote_port, exc.msg_id, KERN_SUCCESS)));
+                        }
+                        // Loop back so the next iteration replies + resumes;
+                        // the user never sees this stop.
+                        continue;
+                    }
+
+                    // QUIET signals (timers, child reaping, async I/O)
+                    // are noisy and meaningless to the user; re-inject
+                    // them via KERN_FAILURE and continue without
+                    // surfacing a stop.
+                    if QUIET_SIGNALS_DARWIN.contains(&signal) {
+                        if let Some(s) = self.darwin_state.as_ref() {
+                            s.pending_reply
+                                .set(Some((exc.remote_port, exc.msg_id, KERN_FAILURE)));
+                        }
+                        continue;
+                    }
+
+                    // TRANSPARENT signals (currently SIGINT) surface a
+                    // stop but should NOT be re-delivered on resume —
+                    // the debugger consumes the interrupt itself.
+                    let retcode = if TRANSPARENT_SIGNALS_DARWIN.contains(&signal) {
+                        KERN_SUCCESS
+                    } else {
+                        KERN_FAILURE
+                    };
                     if let Some(s) = self.darwin_state.as_ref() {
                         s.pending_reply
-                            .set(Some((exc.remote_port, exc.msg_id, KERN_FAILURE)));
+                            .set(Some((exc.remote_port, exc.msg_id, retcode)));
                     }
                     Ok(StopReason::SignalStop(pid, signal))
                 }

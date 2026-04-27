@@ -3,7 +3,8 @@ use crate::debugger::debugee::dwarf::eval::EvaluationContext;
 use crate::debugger::debugee::dwarf::r#type::{
     ArrayType, ComplexType, ScalarType, StructureMember, TypeId,
 };
-use crate::debugger::variable::value::specialization::VariableParserExtension;
+use crate::debugger::variable::render::RenderValue;
+use crate::debugger::variable::value::specialization::{TlsVariable, VariableParserExtension};
 use crate::debugger::variable::value::{
     ArrayItem, ArrayValue, CEnumValue, CModifiedValue, Member, PointerValue, RustEnumValue,
     ScalarValue, SpecializedValue, StructValue, SubroutineValue, SupportedScalar, Value,
@@ -30,6 +31,12 @@ pub struct ValueModifiers {
     tls: bool,
     tls_const: bool,
     const_tls_duplicate: bool,
+    /// Darwin-only: the TLS DIE chain has already been unwrapped by
+    /// dsymutil. `parse_tls` would fail (the structural markers it
+    /// looks for — `eager`, `state`, `__getit` — were collapsed
+    /// during DWARF linking), so wrap the parsed value directly as
+    /// the `inner_value` of a synthetic [`TlsVariable`].
+    tls_unwrapped: bool,
 }
 
 impl ValueModifiers {
@@ -43,11 +50,34 @@ impl ValueModifiers {
             this.tls = ident.name.as_deref() == Some("VAL")
                 || ident.name.as_deref() == Some("__RUST_STD_INTERNAL_VAL");
 
-            // This condition protects against duplication of the constant tls variables
-            if ident.namespace.contains(&["thread_local_const_init"])
-                && !ident.namespace.contains(&["{closure#0}"])
-            {
+            // Const-init `thread_local!` produces a parent `VAL`
+            // DIE (under `…::CONSTANT_THREAD_LOCAL::{constant#0}`)
+            // alongside the real one nested inside an init closure.
+            // The parent has no `DW_AT_location`, so reading it is
+            // pointless; drop it here.
+            //
+            // The original heuristic looked for a literal `{closure#0}`
+            // to recognise the real DIE, but rustc/dsymutil don't
+            // always pick `#0`. On darwin/aarch64 we observe
+            // `{closure#1}` for the same construct (the inner
+            // `const { … }` evaluator counts as closure #0, the
+            // lazy-init wrapper as #1, and dsymutil surfaces only
+            // the latter). Match any `{closure#N}` so the check is
+            // robust across rustc/dsymutil minor revisions.
+            let parts = ident.namespace.as_parts();
+            let has_inner_closure = parts.iter().any(|p| p.starts_with("{closure#"));
+            if ident.namespace.contains(&["thread_local_const_init"]) && !has_inner_closure {
                 this.const_tls_duplicate = true;
+            }
+            // Darwin: dsymutil flattens the std `EagerStorage<T>` /
+            // `LazyStorage<T>::Alive` wrapper around the user's TLS
+            // value. The DIE we get is the bare `T` (or `Cell<T>` for
+            // non-const TLS) directly under `{closure#N}`. The
+            // namespace-`["eager"]` / `state` heuristics in
+            // `parse_tls` don't apply, so flag this case for the
+            // value parser to wrap synthetically.
+            if this.tls && has_inner_closure {
+                this.tls_unwrapped = true;
             }
         } else {
             let var_name_is_tls = ident.namespace.contains(&["__getit"])
@@ -686,7 +716,37 @@ impl ValueParser {
             return None;
         }
 
-        self.parse_inner_with_modifiers(pcx, bin_data, pcx.type_graph.root(), modifiers)
+        let parsed =
+            self.parse_inner_with_modifiers(pcx, bin_data, pcx.type_graph.root(), modifiers)?;
+
+        // Darwin: dsymutil flattened the std TLS storage wrapper, so
+        // the value we just parsed is the bare T (or `Cell<T>`).
+        // Wrap it as a synthetic [`TlsVariable`] so callers (and the
+        // test suite) see the same `Value::Specialized<Tls>` shape
+        // they get on Linux. The wrap is skipped if the inner parser
+        // already produced a TLS specialisation (lazy `Storage<T>`
+        // case — dsymutil keeps the wrapper there) so we don't
+        // double-wrap.
+        if modifiers.tls_unwrapped
+            && !matches!(
+                parsed,
+                Value::Specialized {
+                    value: Some(SpecializedValue::Tls(_)),
+                    ..
+                }
+            )
+        {
+            let inner_type = parsed.r#type().clone();
+            return Some(Value::Specialized {
+                value: Some(SpecializedValue::Tls(TlsVariable {
+                    inner_value: Some(Box::new(parsed)),
+                    inner_type,
+                })),
+                original: StructValue::default(),
+            });
+        }
+
+        Some(parsed)
     }
 }
 
