@@ -105,13 +105,64 @@ impl TryFrom<&RustEnumValue> for AsyncFnFuture {
 #[derive(Debug, Clone)]
 pub struct CustomFuture {
     pub name: TypeIdentity,
+    /// Phase 3 Feature D batch D2b — when the awaitee is a
+    /// `Pin<Box<dyn Future>>` / `Box<dyn Future>` / `&dyn Future`,
+    /// Phase 3A's vtable resolver annotates the inner fat-pointer
+    /// struct's `type_ident` with the recovered `[→ Concrete]` tag.
+    /// We surface that string so the await-trace shows the concrete
+    /// future type even when the static type is `dyn`.
+    pub concrete: Option<String>,
 }
 
 impl From<&StructValue> for CustomFuture {
     fn from(repr: &StructValue) -> Self {
         let name = repr.type_ident.clone();
-        Self { name }
+        let concrete = find_trait_object_concrete(&Value::Struct(repr.clone()), 4);
+        Self { name, concrete }
     }
+}
+
+/// Walk a value tree looking for the canonical `dyn Trait`
+/// fat-pointer struct (a two-member struct with `pointer` and
+/// `vtable` fields) and return its (possibly Phase-3A-annotated)
+/// display name. Bounded by `depth` to dodge pathological nesting.
+///
+/// `StructValue::is_trait_object()` also matches by name (anything
+/// containing `"dyn "`), which trips on outer wrappers like
+/// `Pin<Box<dyn Future>>`. We deliberately use only the structural
+/// check here so we always reach the innermost fat pointer — that's
+/// where Phase 3A spliced the `[→ Concrete]` annotation.
+fn find_trait_object_concrete(val: &Value, depth: u32) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    let Value::Struct(s) = val else {
+        return None;
+    };
+    if has_fat_pointer_shape(s) {
+        return s.type_ident.name().map(str::to_string);
+    }
+    for m in &s.members {
+        if let Some(r) = find_trait_object_concrete(&m.value, depth - 1) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+fn has_fat_pointer_shape(s: &StructValue) -> bool {
+    if s.members.len() != 2 {
+        return false;
+    }
+    let m0 = s.members[0].field_name.as_deref();
+    let m1 = s.members[1].field_name.as_deref();
+    matches!(
+        (m0, m1),
+        (Some("pointer"), Some("vtable"))
+            | (Some("data_ptr"), Some("vtable"))
+            | (Some("vtable"), Some("pointer"))
+            | (Some("vtable"), Some("data_ptr"))
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -199,4 +250,96 @@ pub enum Future {
     TokioJoinHandleFuture(TokioJoinHandleFuture),
     Custom(CustomFuture),
     UnknownFuture,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::debugger::variable::value::Member;
+
+    fn dyn_struct(name: &str) -> StructValue {
+        // Two-member fat pointer with the canonical pointer/vtable
+        // shape — `is_trait_object()` returns true for this.
+        StructValue {
+            type_ident: TypeIdentity::no_namespace(name),
+            type_id: None,
+            members: vec![
+                Member {
+                    field_name: Some("pointer".to_string()),
+                    value: Value::CEnum(crate::debugger::variable::value::CEnumValue {
+                        type_ident: TypeIdentity::unknown(),
+                        type_id: None,
+                        value: None,
+                        raw_address: None,
+                    }),
+                },
+                Member {
+                    field_name: Some("vtable".to_string()),
+                    value: Value::CEnum(crate::debugger::variable::value::CEnumValue {
+                        type_ident: TypeIdentity::unknown(),
+                        type_id: None,
+                        value: None,
+                        raw_address: None,
+                    }),
+                },
+            ],
+            type_params: Default::default(),
+            raw_address: None,
+        }
+    }
+
+    fn wrap(outer: &str, inner: StructValue) -> StructValue {
+        StructValue {
+            type_ident: TypeIdentity::no_namespace(outer),
+            type_id: None,
+            members: vec![Member {
+                field_name: Some("__0".to_string()),
+                value: Value::Struct(inner),
+            }],
+            type_params: Default::default(),
+            raw_address: None,
+        }
+    }
+
+    #[test]
+    fn finds_trait_object_at_top_level() {
+        let s = dyn_struct("Box<dyn Future> [→ MyFuture]");
+        assert_eq!(
+            find_trait_object_concrete(&Value::Struct(s), 4).as_deref(),
+            Some("Box<dyn Future> [→ MyFuture]"),
+        );
+    }
+
+    #[test]
+    fn finds_trait_object_nested_in_pin() {
+        let inner = dyn_struct("Box<dyn Future> [→ MyConcreteFuture]");
+        let pin = wrap("Pin<Box<dyn Future>>", inner);
+        assert_eq!(
+            find_trait_object_concrete(&Value::Struct(pin), 4).as_deref(),
+            Some("Box<dyn Future> [→ MyConcreteFuture]"),
+        );
+    }
+
+    #[test]
+    fn returns_none_for_plain_struct() {
+        let s = StructValue {
+            type_ident: TypeIdentity::no_namespace("MyStruct"),
+            type_id: None,
+            members: vec![],
+            type_params: Default::default(),
+            raw_address: None,
+        };
+        assert!(find_trait_object_concrete(&Value::Struct(s), 4).is_none());
+    }
+
+    #[test]
+    fn depth_cap_protects_against_pathological_nesting() {
+        // 6 levels deep, cap = 3 → walker bails before reaching the
+        // trait object.
+        let mut s = dyn_struct("inner [→ X]");
+        for _ in 0..5 {
+            s = wrap("Wrap", s);
+        }
+        assert!(find_trait_object_concrete(&Value::Struct(s), 3).is_none());
+    }
 }

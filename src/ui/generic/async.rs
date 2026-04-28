@@ -50,10 +50,21 @@ fn print_future(backtrace: &AsyncBacktrace, num: u32, future: &Future, printer: 
             }
         }
         Future::Custom(custom_fut) => {
-            printer.println(format!(
-                "#{num} future {}",
-                FutureTypeView::from(custom_fut.name.to_string())
-            ));
+            // Phase 3 Feature D batch D2b — when the awaitee is a
+            // `dyn Future` fat pointer, append the recovered concrete
+            // type. Phase 3A's annotation already lives on the inner
+            // trait-object's name, so we don't double-print it; we
+            // only show the concrete tag when it differs from the
+            // outer name (i.e. there's a layer like `Pin<Box<...>>`
+            // between the awaitee and the dyn struct).
+            let outer = custom_fut.name.to_string();
+            let line = match &custom_fut.concrete {
+                Some(concrete) if concrete != &outer => {
+                    format!("#{num} future {} [→ {concrete}]", FutureTypeView::from(outer))
+                }
+                _ => format!("#{num} future {}", FutureTypeView::from(outer)),
+            };
+            printer.println(line);
         }
         Future::TokioJoinHandleFuture(jh_fut) => {
             let wait_for = backtrace
@@ -240,10 +251,21 @@ pub fn print_await_trace(backtrace: &AsyncBacktrace, printer: &ExternalPrinter) 
                 printer.println(line);
             }
             Future::Custom(custom) => {
-                printer.println(format!(
-                    "  #{i} {} (custom future)",
-                    FutureTypeView::from(custom.name.to_string())
-                ));
+                // Phase 3 Feature D batch D2b — append the recovered
+                // concrete type when the awaitee is a `dyn Future`
+                // fat pointer wrapped inside (e.g.) `Pin<Box<...>>`.
+                let outer = custom.name.to_string();
+                let line = match &custom.concrete {
+                    Some(concrete) if concrete != &outer => format!(
+                        "  #{i} {} [→ {concrete}] (custom future)",
+                        FutureTypeView::from(outer)
+                    ),
+                    _ => format!(
+                        "  #{i} {} (custom future)",
+                        FutureTypeView::from(outer)
+                    ),
+                };
+                printer.println(line);
             }
             Future::TokioJoinHandleFuture(jh) => {
                 let wait_for = backtrace
