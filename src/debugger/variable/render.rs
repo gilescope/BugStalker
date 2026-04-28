@@ -317,18 +317,22 @@ pub fn render_bytes(bytes: &[u8], mode: ByteRenderMode, truncated: bool) -> Stri
     }
 }
 
-/// Phase 3 Feature A — `dyn Trait` annotation. We recognised the
-/// fat-pointer trait-object layout but haven't yet wired the
-/// vtable → symbol → demangle → concrete-type chain (next batch).
-/// Surface the trait identity from the struct's type name plus the
-/// raw data and vtable pointers so the user sees that we noticed,
-/// and so the developer running this can grab the vtable address
-/// for manual `addr2line` / `nm` lookup.
+/// Phase 3 Feature A — `dyn Trait` summary line. The detector
+/// recognises the fat-pointer trait-object layout; the parser-side
+/// resolver (see `parser::resolve_trait_object_concrete_type`) tries
+/// to recover the concrete type behind the vtable and splices the
+/// recovered name into `type_ident` as `… [→ Concrete]`. This
+/// renderer consumes both states:
+///
+/// * **Resolved:** the type name carries `[→ Concrete]` already, so
+///   we render `<full-name> { data: 0x…, vtable: 0x… }` without a
+///   pending marker.
+/// * **Unresolved:** rustc didn't export a vtable symbol, the
+///   binary is stripped, or every method probe missed. We append a
+///   `[concrete type unavailable; …]` hint so the user knows we
+///   detected the trait object even though we can't show the inner.
 fn render_trait_object_summary(s: &crate::debugger::variable::value::StructValue) -> String {
     use crate::debugger::variable::value::Value;
-    // Pull the two pointer values directly off the members. We
-    // accept either rustc-naming convention (`pointer`/`vtable` or
-    // `data_ptr`/`vtable`).
     let mut data_ptr: Option<*const ()> = None;
     let mut vtable_ptr: Option<*const ()> = None;
     for m in &s.members {
@@ -341,9 +345,13 @@ fn render_trait_object_summary(s: &crate::debugger::variable::value::StructValue
         }
     }
     let trait_name = s.type_ident.name().unwrap_or("dyn Trait");
-    match (data_ptr, vtable_ptr) {
-        (Some(d), Some(v)) => format!(
-            "{trait_name} {{ data: {d:p}, vtable: {v:p} }}  [concrete type unavailable; vtable resolution pending — Phase 3A follow-up]"
+    let resolved = trait_name.contains("[→ ");
+    match (data_ptr, vtable_ptr, resolved) {
+        (Some(d), Some(v), true) => {
+            format!("{trait_name} {{ data: {d:p}, vtable: {v:p} }}")
+        }
+        (Some(d), Some(v), false) => format!(
+            "{trait_name} {{ data: {d:p}, vtable: {v:p} }}  [concrete type unavailable; rebuild with `-C symbol-mangling-version=v0` and exported vtable symbols]"
         ),
         _ => format!("{trait_name}  [trait object — pointer fields missing]"),
     }

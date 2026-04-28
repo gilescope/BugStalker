@@ -70,6 +70,14 @@ impl TypeIdentity {
         self.name().unwrap_or("unknown")
     }
 
+    /// Replace the name in place — used by Phase 3 Feature A's
+    /// trait-object resolver to splice the recovered concrete type
+    /// into the displayed identity.
+    #[inline(always)]
+    pub fn set_name(&mut self, name: String) {
+        self.name = Some(name);
+    }
+
     /// Create address type name.
     #[inline(always)]
     pub fn as_address_type(&self) -> TypeIdentity {

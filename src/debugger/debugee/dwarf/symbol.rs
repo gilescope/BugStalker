@@ -74,7 +74,15 @@ struct SymbolVal {
 type Name = String;
 
 #[derive(Debug, Clone)]
-pub(super) struct SymbolTab(HashMap<Name, SymbolVal>);
+pub(super) struct SymbolTab {
+    by_name: HashMap<Name, SymbolVal>,
+    /// Phase 3 Feature A — reverse index for vtable resolution.
+    /// Keys are object-file (link-time, pre-relocation) addresses,
+    /// values are the original *mangled* symbol names so the
+    /// rust-mangle-tree consumer can re-parse and walk to
+    /// `impl_self_type()`.
+    by_address: HashMap<u64, String>,
+}
 
 impl SymbolTab {
     pub(super) fn new<'data, 'file, OBJ>(object_file: &'data OBJ) -> Option<Self>
@@ -83,34 +91,44 @@ impl SymbolTab {
         OBJ: Object<'data, 'file>,
     {
         object_file.symbol_table().as_ref().map(|sym_table| {
-            SymbolTab(
-                sym_table
-                    .symbols()
-                    .map(|symbol| {
-                        let name = symbol.name().unwrap_or_default();
-                        // Phase 2 batch H: drive demangling through
-                        // `rust-mangle-tree`. Falls back to the raw
-                        // mangled string on parse error so a single
-                        // bad symbol can't poison the whole table.
-                        let name = match rust_mangle_tree::parse(name) {
-                            Ok(sym) => sym.to_string(),
-                            Err(_) => name.to_string(),
-                        };
-                        (
-                            name,
-                            SymbolVal {
-                                kind: symbol.kind(),
-                                addr: symbol.address().into(),
-                            },
-                        )
-                    })
-                    .collect::<HashMap<_, _>>(),
-            )
+            let mut by_name: HashMap<Name, SymbolVal> = HashMap::new();
+            let mut by_address: HashMap<u64, String> = HashMap::new();
+            for symbol in sym_table.symbols() {
+                let raw = symbol.name().unwrap_or_default();
+                // Phase 2 batch H: drive demangling through
+                // `rust-mangle-tree`. Falls back to the raw
+                // mangled string on parse error so a single
+                // bad symbol can't poison the whole table.
+                let demangled = match rust_mangle_tree::parse(raw) {
+                    Ok(sym) => sym.to_string(),
+                    Err(_) => raw.to_string(),
+                };
+                by_name.insert(
+                    demangled,
+                    SymbolVal {
+                        kind: symbol.kind(),
+                        addr: symbol.address().into(),
+                    },
+                );
+                // Keep the raw mangled name in the address index —
+                // vtable resolution re-parses it via rust-mangle-tree
+                // and walks to `impl_self_type()`.
+                by_address.insert(symbol.address(), raw.to_string());
+            }
+            SymbolTab { by_name, by_address }
         })
     }
 
+    /// Phase 3 Feature A — exact-address lookup for vtable
+    /// resolution. Returns the *mangled* symbol name at `addr`,
+    /// or `None` if the address has no symbol (typical for
+    /// stripped binaries or compiler-internal anonymous globals).
+    pub fn mangled_at(&self, addr: u64) -> Option<&str> {
+        self.by_address.get(&addr).map(String::as_str)
+    }
+
     pub fn find(&'_ self, regex: &Regex) -> Vec<Symbol<'_>> {
-        let keys = self.0.keys().filter(|key| {
+        let keys = self.by_name.keys().filter(|key| {
             let s = key.as_str();
             if regex.find(s).is_some() {
                 return true;
@@ -130,7 +148,7 @@ impl SymbolTab {
             false
         });
         keys.map(|k| {
-            let s = &self.0[k];
+            let s = &self.by_name[k];
             Symbol {
                 name: k.as_str(),
                 kind: s.kind,

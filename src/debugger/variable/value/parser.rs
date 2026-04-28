@@ -429,8 +429,38 @@ impl ValueParser {
                 name: struct_name,
                 ..
             } => {
-                let struct_var =
+                let mut struct_var =
                     self.parse_struct_variable(pcx, data, type_id, type_params.clone(), members);
+
+                // Phase 3 Feature A batch A2 — `dyn Trait` concrete-
+                // type recovery. The detection heuristic from batch A1
+                // already lives on `StructValue`; here we drive the
+                // resolution chain end to end:
+                //
+                //   1. Read the vtable pointer off the struct.
+                //   2. Look the vtable address up in the symbol table
+                //      to get the *mangled* vtable symbol name
+                //      (strategy 2 — per-vtable symbol matching).
+                //   3. Demangle through `rust-mangle-tree` and walk
+                //      `impl_self_type()` to read the concrete type.
+                //   4. Splice the recovered type name into the
+                //      struct's `type_ident` so the renderer surfaces
+                //      it inline (`Box<dyn Error> [→ MyError]`).
+                //
+                // Strategy 1 (drop-fn pointer at vtable[0]) lands as
+                // a fallback in the same helper.
+                if struct_var.is_trait_object()
+                    && let Some(name) = resolve_trait_object_concrete_type(pcx, &struct_var)
+                {
+                    let original = struct_var
+                        .type_ident
+                        .name()
+                        .unwrap_or("dyn Trait")
+                        .to_string();
+                    struct_var
+                        .type_ident
+                        .set_name(format!("{original} [→ {name}]"));
+                }
 
                 let parser_ext = VariableParserExtension::new(self);
                 // Reinterpret structure if underline data type is:
@@ -1005,4 +1035,200 @@ impl ValueParser {
 fn scalar_from_bytes<T: Copy>(bytes: &Bytes) -> T {
     let ptr = bytes.as_ptr();
     unsafe { std::ptr::read_unaligned::<T>(ptr as *const T) }
+}
+
+/// Phase 3 Feature A batch A2 — vtable → concrete type resolver.
+///
+/// **Strategy 2 (primary):** the `vtable` pointer of a `dyn Trait`
+/// fat pointer points directly at a symbol whose v0 mangled form is
+/// `<Concrete as Trait>::{vtable}` (a [`Path::TraitImpl`] whose
+/// `impl_self_type()` *is* the concrete type). Resolve via the
+/// symbol-table address index, demangle with `rust-mangle-tree`,
+/// walk to the self-type's `Display`. Catches every v0-mangled build.
+///
+/// **Strategy 1 (fallback):** if no symbol sits exactly at the
+/// vtable address (e.g. the linker placed the vtable in an
+/// anonymous `__DATA,__const` block as it does on darwin), read the
+/// first pointer-sized slot of the vtable — that's
+/// `core::ptr::drop_in_place::<Concrete>` — and look *that* address
+/// up. The drop-fn's mangled name carries `Concrete` as a generic
+/// argument. Catches darwin / stripped-vtable-symbol cases.
+///
+/// Returns `None` if neither strategy resolves; the caller falls
+/// back to the bare `[concrete type unavailable]` annotation.
+fn resolve_trait_object_concrete_type(
+    pcx: &ParseContext,
+    struct_var: &StructValue,
+) -> Option<String> {
+    use crate::debugger::variable::value::Value;
+
+    // Pull the vtable pointer off the struct's members.
+    let vtable_addr: u64 = struct_var.members.iter().find_map(|m| {
+        if matches!(
+            m.field_name.as_deref(),
+            Some("vtable") | Some("v_table") | Some("vtbl")
+        )
+            && let Value::Pointer(p) = &m.value
+        {
+            return p.value.map(|raw| raw as u64);
+        }
+        None
+    })?;
+
+    let debugee = pcx.evcx.evaluator.debugee();
+    let dwarf = debugee.debug_info(pcx.evcx.ecx.location().pc).ok()?;
+
+    // Strategy 2: symbol at the vtable address itself. Works on
+    // ELF / linux where rustc exports `<Concrete as Trait>::{vtable}`
+    // as a real symbol; misses on Mach-O / darwin where adhoc-built
+    // binaries place vtables in anonymous `__DATA_CONST,__const`
+    // and don't export individual symbols.
+    if let Some(mangled) = dwarf.mangled_symbol_at(vtable_addr)
+        && let Some(name) = concrete_from_vtable_symbol(mangled)
+    {
+        return Some(name);
+    }
+
+    // Strategy 1: scan the vtable's slots and probe each as a
+    // function-symbol address. The first slot is `drop_in_place`
+    // (which may be null when the concrete type has no `Drop`),
+    // the next two are size/alignment (not pointers), and slots
+    // 3+ are the trait's method pointers. Each method's mangled
+    // name carries the impl shape `<Concrete as Trait>::method`,
+    // so `concrete_from_vtable_symbol` (the same string-surgery
+    // we use for strategy 2) extracts the concrete type from any
+    // of them.
+    //
+    // Rustc emits 8 to ~32 slots depending on trait method count
+    // plus inheritance; 16 covers `Error`, `Display`, `Debug`, and
+    // most of the stdlib traits we care about today.
+    const MAX_PROBE_SLOTS: usize = 16;
+    let probe = crate::debugger::read_memory_by_pid(
+        pcx.evcx.ecx.pid_on_focus(),
+        vtable_addr as usize,
+        MAX_PROBE_SLOTS * std::mem::size_of::<u64>(),
+    )
+    .ok()?;
+    for chunk in probe.chunks_exact(std::mem::size_of::<u64>()) {
+        let slot = u64::from_le_bytes(chunk.try_into().ok()?);
+        if slot == 0 {
+            continue;
+        }
+        let Some(mangled) = dwarf.mangled_symbol_at(slot) else {
+            continue;
+        };
+        // Two extraction strategies for whichever shape the symbol
+        // has: explicit `<X as Trait>::method` (any trait method)
+        // or `core::ptr::drop_in_place::<X>` (the drop slot).
+        if let Some(name) = concrete_from_vtable_symbol(mangled) {
+            return Some(name);
+        }
+        if let Some(name) = concrete_from_drop_in_place_symbol(mangled) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Strategy 2 — extract the concrete type from a vtable symbol's
+/// mangled name. Both v0 and legacy mangling are handled:
+/// * v0: parse → [`Symbol::V0`] → walk to a [`Path`] with
+///   `impl_self_type()` (i.e. an `X` `TraitImpl` or `Y` `TraitAssoc`
+///   anywhere in the spine) and render that self-type.
+/// * legacy: detect a `<X as Y>` segment in the demangled string and
+///   pull `X` out by string surgery — legacy doesn't preserve the
+///   AST structure for us to walk.
+fn concrete_from_vtable_symbol(mangled: &str) -> Option<String> {
+    use rust_mangle_tree::{Symbol as RmSymbol, Type as RmType};
+    let parsed = rust_mangle_tree::parse(mangled).ok()?;
+    match parsed {
+        RmSymbol::V0(path) => {
+            // Walk the path spine looking for any TraitImpl /
+            // TraitAssoc node — that's where the `<Concrete as
+            // Trait>` shape lives. The vtable's path is typically
+            // `Nv...{vtable}` whose ancestor is a TraitImpl.
+            let target = walk_for_impl(&path)?;
+            match target {
+                RmType::Path(p) => Some(p.to_string()),
+                other => Some(format!("{}", DisplayType(&other))),
+            }
+        }
+        RmSymbol::Legacy(_) => {
+            // The demangled legacy string contains `<Concrete as
+            // Trait>`. Carve out the `Concrete` substring.
+            let demangled = format!("{parsed:#}");
+            let lt = demangled.find('<')?;
+            let as_kw = demangled[lt..].find(" as ")?;
+            // Strip the leading `<` from the slice we keep.
+            Some(demangled[lt + 1..lt + as_kw].trim().to_string())
+        }
+        RmSymbol::NotRust(_) => None,
+    }
+}
+
+/// Strategy 1 — extract the concrete type from a `core::ptr::
+/// drop_in_place::<Concrete>` symbol. The generic argument is the
+/// concrete type. Both manglings are handled the same way:
+/// demangle, find the `<` after `drop_in_place`, take the matching
+/// `>`-balanced span.
+fn concrete_from_drop_in_place_symbol(mangled: &str) -> Option<String> {
+    let demangled = match rust_mangle_tree::parse(mangled).ok()? {
+        rust_mangle_tree::Symbol::V0(p) => p.to_string(),
+        rust_mangle_tree::Symbol::Legacy(p) => format!("{p:#}"),
+        rust_mangle_tree::Symbol::NotRust(_) => return None,
+    };
+    let needle = "drop_in_place";
+    let drop_at = demangled.find(needle)?;
+    let after = &demangled[drop_at + needle.len()..];
+    // v0 emits `drop_in_place::<…>`; legacy emits `drop_in_place<…>`.
+    let after = after.strip_prefix("::").unwrap_or(after);
+    let after = after.strip_prefix('<')?;
+    // Take the `>`-balanced span starting here.
+    let mut depth: i32 = 1;
+    for (i, c) in after.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(after[..i].trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Walk a v0 [`Path`] spine looking for the innermost path node
+/// whose `impl_self_type()` resolves — that's the `<Concrete as
+/// Trait>` parent of a `Nv...{vtable}` segment.
+fn walk_for_impl<'a>(path: &'a rust_mangle_tree::Path<'a>) -> Option<rust_mangle_tree::Type<'a>> {
+    use rust_mangle_tree::Path as RmPath;
+    if let Some(t) = path.impl_self_type() {
+        return Some(t.clone());
+    }
+    match path {
+        RmPath::Nested { parent, .. } | RmPath::Generic { parent, .. } => walk_for_impl(parent),
+        _ => None,
+    }
+}
+
+/// Tiny `Display` shim so `walk_for_impl`'s `Type` payload renders
+/// without taking a temporary borrow into a format string at the
+/// call site.
+struct DisplayType<'a>(&'a rust_mangle_tree::Type<'a>);
+
+impl std::fmt::Display for DisplayType<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The crate doesn't yet expose `Type`'s Display; render via
+        // a path indirection if possible.
+        match self.0 {
+            rust_mangle_tree::Type::Path(p) => write!(f, "{p}"),
+            rust_mangle_tree::Type::Primitive(p) => f.write_str(p.as_str()),
+            // Anything more elaborate is rare on the self-type side
+            // of a vtable symbol; render as `<complex>` for now.
+            _ => f.write_str("<complex>"),
+        }
+    }
 }

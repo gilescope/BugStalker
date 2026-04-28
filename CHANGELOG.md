@@ -7,6 +7,40 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- variables (Phase 3 Feature A batch A2 — `dyn Trait` concrete-type
+  recovery):
+  - The `dyn Trait` annotation from batch A1 now carries the
+    recovered concrete type when one can be resolved:
+    `alloc::boxed::Box<dyn core::error::Error, alloc::alloc::Global>
+    [→ vars::phase3_dyn_trait::MyError] { data: 0x…, vtable: 0x… }`.
+    The "impossible" — recovering a hidden type behind a trait
+    object — is now possible.
+  - **Strategy 2 (primary):** the vtable address is looked up in the
+    binary's symbol table. If a `<Concrete as Trait>::{vtable}`
+    symbol sits there (rustc emits these on linux / ELF), it's
+    demangled with `rust-mangle-tree` and `impl_self_type()` walked
+    to render the concrete type. Two-line implementation thanks to
+    Phase 2's parser.
+  - **Strategy 1 (fallback):** when no symbol sits at the vtable
+    address (Mach-O ad-hoc builds, stripped binaries), the resolver
+    reads the first 16 vtable slots and probes each as a function
+    pointer. Slot 0 is `core::ptr::drop_in_place::<Concrete>` (or
+    null when the concrete type has no `Drop`); slots 3+ are the
+    trait's method pointers (`<Concrete as Trait>::method`). The
+    same string-surgery used by strategy 2 extracts `Concrete`
+    from any of them. This is what catches our darwin test
+    fixture today — `MyError` is `Copy` so its drop slot is null,
+    but the `<MyError as Display>::fmt` method pointer is real.
+  - Plumbing: `SymbolTab` now keeps an `address → mangled-name`
+    reverse index (alongside the existing demangled-name map).
+    Exposed as `DebugInformation::mangled_symbol_at(addr)`.
+    `ExpressionEvaluator::debugee()` exposes the `Debugee` so the
+    parser-side resolver can chase the address through the right
+    DWARF unit. `TypeIdentity::set_name` lets the resolver splice
+    the recovered name into the rendered identity.
+  - Test: `tests/debugger/variables.rs::test_dyn_trait_detection`
+    now demands resolution actually fired — `boxed_err` must
+    contain `[→ MyError]`. Test passes on darwin/aarch64.
 - variables (Phase 3 Feature A batch A1 — `dyn Trait` detection):
   - `TypeDeclaration::Structure` carries a new `is_trait_object: bool`
     set during DWARF parsing via the `looks_like_trait_object`

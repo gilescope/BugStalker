@@ -593,6 +593,19 @@ impl DebugInformation {
             .unwrap_or_default()
     }
 
+    /// Phase 3 Feature A — exact-address lookup for vtable
+    /// resolution. Returns the *mangled* symbol name at `addr` —
+    /// the parser's trait-object resolver re-parses it via
+    /// `rust-mangle-tree` and walks to `impl_self_type()` to
+    /// recover the concrete type behind a `dyn Trait`.
+    ///
+    /// Returns `None` for stripped binaries, anonymous /
+    /// compiler-internal symbols, or when no debug-info is loaded
+    /// for the address's module.
+    pub fn mangled_symbol_at(&self, addr: u64) -> Option<&str> {
+        self.symbol_table.as_ref()?.mangled_at(addr)
+    }
+
     pub fn tls_symbol_offset(&self, mangled_name: &str) -> Option<u64> {
         self.tls_symbol_tab.as_ref()?.get_offset(mangled_name)
     }

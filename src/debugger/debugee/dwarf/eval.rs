@@ -248,6 +248,14 @@ impl<'a> ExpressionEvaluator<'a> {
         self.unit
     }
 
+    /// Phase 3 Feature A — expose the [`Debugee`] so the trait-
+    /// object resolver in `crate::debugger::variable::value::parser`
+    /// can read the symbol table by address (vtable resolution
+    /// strategy 2).
+    pub fn debugee(&self) -> &'a Debugee {
+        self.resolver.debugee
+    }
+
     fn value_type_from_offset(&self, base_type: UnitOffset) -> ValueType {
         if base_type == UnitOffset(0) {
             ValueType::Generic

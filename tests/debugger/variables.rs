@@ -2794,13 +2794,17 @@ fn test_dyn_trait_detection() {
     // `Box<dyn Error>` renders as the wrapping struct's two-pointer
     // layout — that's the case our detector catches today.
     let boxed_err = pick("boxed_err");
+    eprintln!("[dyn-trait] boxed_err rendered as: {boxed_err}");
     assert!(
         boxed_err.contains("dyn") && boxed_err.contains("vtable"),
         "boxed_err missing dyn / vtable annotation: {boxed_err:?}"
     );
+    // Phase 3A batch A2 — vtable resolution should now fire on a
+    // standard rustc build; the trait-object summary carries the
+    // recovered concrete type as `… [→ Concrete]`.
     assert!(
-        boxed_err.contains("vtable resolution pending"),
-        "boxed_err missing pending marker: {boxed_err:?}"
+        boxed_err.contains("→") && boxed_err.contains("MyError"),
+        "boxed_err missing concrete-type recovery (`[→ MyError]`): {boxed_err:?}"
     );
     // `Arc<dyn Debug + Send + Sync>` and `&dyn Iterator<…>` route
     // through the smart-pointer / reference-deref paths
