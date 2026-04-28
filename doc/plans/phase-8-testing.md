@@ -71,6 +71,15 @@ project's performance-regression budget — there is no separate
 budget doc; the bench suite is the budget, the CI alert is the
 enforcement.
 
+**Pulled forward in Phase 1 batch T:** the BugStalker render-path
+bench (`benches/render_value.rs`) and the attach-cold bench
+(`benches/attach_cold.rs`) now have real bodies (not Phase 0
+placeholders) plus per-PR regression gating in `earthly +smoke`
+via `Performance has regressed` from criterion. The full nightly
+trailing-7-day-median scheme still lands here in Phase 8; the
+between-PR check exists in the meantime so the project has
+real-numbers regression detection from Phase 1 onward.
+
 ## Cross-cutting infrastructure
 
 ### `cargo nextest` everywhere

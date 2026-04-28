@@ -7,6 +7,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- benches (Phase 1 batch T — pulled forward from Phase 8):
+  - `benches/render_value.rs` — real workload. Spawns the
+    `examples/vars` debuggee through `bs-test-harness`, captures
+    every Phase 1 local at the `phase1_specs_b()` breakpoint, drops
+    the debugger, then times `bugstalker::ui::generic::variable::
+    render_value()` over the captured `Value` set per criterion
+    iteration. Median ≈3 µs on darwin/aarch64 release.
+  - `benches/attach_cold.rs` — real workload. Each iteration
+    spawns the `examples/hello_world` debuggee, installs a
+    `bugstalker::Debugger`, sets a breakpoint, runs to the hit,
+    drops. Median ≈760 ms on darwin/aarch64 release. Sample size
+    reduced to 20 so wall-clock stays inside criterion's `--quick`
+    budget.
+  - `crates/bs-test-harness` grew the `spawn_at_breakpoint` /
+    `capture_locals` / `capture_named` helpers used by both
+    benches (and reusable from any future bench in the workspace).
+  - `+smoke` Earthly target now greps criterion output for
+    `Performance has regressed` and fails CI on a stat-significant
+    slowdown. Criterion's `target/criterion/` baseline persists
+    across Earthly cache mounts so the comparison is meaningful.
+    First-run is a no-op (no baseline to compare against).
 - ci (Phase 1 batch S — acceptance smoke):
   - new `crates/bs-smoke` workspace binary that drives the
     `examples/vars` debuggee through `bugstalker`'s public library

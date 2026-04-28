@@ -637,9 +637,11 @@ Recent darwin-specific fixes in this phase:
 beyond-parity prettification for types nobody handles well.
 Plan: [`doc/plans/phase-1-stdlib-coverage.md`](plans/phase-1-stdlib-coverage.md).
 
-**Status: complete.** Batches A–S landed; 12/12 integration variable
-tests + 28/28 unit tests + 23/23 smoke checks (`earthly +smoke`)
-pass on linux and darwin/aarch64.
+**Status: complete.** Batches A–T landed; 12/12 integration variable
+tests + 28/28 unit tests + 23/23 smoke checks + 2 real benchmarks
+(`render_value`, `attach_cold`) pass on linux and darwin/aarch64.
+`earthly +smoke` runs the lot and gates on
+`Performance has regressed` from criterion.
 
 ### Done (Tier 1)
 

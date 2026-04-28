@@ -48,9 +48,15 @@
 > Batch S: acceptance smoke — `crates/bs-smoke` Rust binary drives
 > the vars debuggee through the library API and asserts 23 Phase 1
 > specialisations render without raw struct fallback. Wired into
-> Earthly `+smoke` (also runs `cargo bench --workspace -- --quick`
-> to catch harness regressions). Real numerical bench gating
-> deferred to Phase 8 once placeholders are replaced.
+> Earthly `+smoke`.
+> Batch T: real bench bodies pulled forward from Phase 8.
+> `benches/render_value.rs` measures rendering of every Phase 1
+> local captured at a fixture breakpoint (median ≈3 µs).
+> `benches/attach_cold.rs` measures debugger setup → first BP hit
+> on hello_world (median ≈760 ms). `+smoke` greps criterion output
+> and fails on `Performance has regressed`. Phase 8 still owns the
+> nightly trailing-7-day-median CI scheme; this gives the project
+> meaningful regression detection between PRs in the meantime.
 > No remaining items. F2 (`char` placeholder) is upstream-tracked
 > (rust-lang/rust#113819) and ships when that issue closes.
 > F4 specs `/p`, `/c`, `/s`, `/y`, `/[N]`, `/[N..M]` deferred —
