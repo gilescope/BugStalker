@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::debugee::dwarf::eval::{AddressKind, EvaluationContext};
 use crate::debugger::debugee::dwarf::unit::DieAddr;
 use crate::debugger::debugee::dwarf::unit::die::Die;
@@ -623,6 +624,17 @@ impl TypeParser {
                 gimli::DW_TAG_array_type => Some(self.parse_array(die_ref)),
                 gimli::DW_TAG_enumeration_type => Some(self.parse_enum(die_ref)),
                 gimli::DW_TAG_pointer_type => Some(self.parse_pointer(die_ref)),
+                // F1 (Phase 1): reference and rvalue-reference type DIEs are
+                // pointer-shaped. rustc currently emits `DW_TAG_pointer_type`
+                // for `&T` / `&mut T`, but reference-type DIEs surface from
+                // C++ debug info reachable via FFI, from non-default rustc
+                // codegen flavours, and from custom DWARF producers.
+                // Treating them as pointers keeps the parser silent and the
+                // rendered type name (`&T` / `&mut T`) preserved as written
+                // by the producer in `DW_AT_name`.
+                gimli::DW_TAG_reference_type | gimli::DW_TAG_rvalue_reference_type => {
+                    Some(self.parse_pointer(die_ref))
+                }
                 gimli::DW_TAG_union_type => Some(self.parse_union(die_ref)),
                 gimli::DW_TAG_subrange_type => Some(self.parse_subroutine(die_ref)),
                 gimli::DW_TAG_typedef => Some(self.parse_typedef(die_ref)),
