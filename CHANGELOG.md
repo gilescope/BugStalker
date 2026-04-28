@@ -7,6 +7,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- variables (Phase 1 batch R — F4 byte-slice overrides):
+  - F4 (slash-suffix format spec): `/utf8` and `/hex` now compose
+    with `var` / `vard` / `arg` / `argd` on byte-slice values
+    (`Vec<u8>`, `VecDeque<u8>`, `[u8; N]`). `/utf8` forces a lossy
+    utf-8 render — invalid byte sequences become `\u{FFFD}` instead
+    of falling through to a hex dump. `/hex` forces the
+    16-bytes-per-row hex dump with ASCII column even when the bytes
+    are valid utf-8. Auto-detect (the default with no spec) is
+    unchanged.
+  - New `pub enum ByteRenderMode { Auto, ForceUtf8, ForceHex }` in
+    `bugstalker::debugger::variable::render` plus a
+    `render_byte_slice_members` entrypoint so future callers (e.g.
+    `&[u8]` not yet wrapped in a `VecValue`) can plug in. The
+    existing `try_byte_string_preview` path stays internal and
+    routes through the new helper with `Auto`.
+  - `FormatSpec` enum gains `Utf8` and `BytesHex` variants;
+    `apply_format_spec` dispatches both through a new
+    `format_byte_slice` shared between the `Vector` / `VecDeque`
+    specialised shapes and bare `Value::Array` of `u8`. Mismatched
+    type-vs-spec combinations log `warn!` and fall back as before.
 - workspace: root `Cargo.toml` is now a `[workspace]` (`members = [".", "crates/*"]`)
   with shared `[workspace.package]` and `[workspace.dependencies]`.
   `examples/` remains a separate workspace.

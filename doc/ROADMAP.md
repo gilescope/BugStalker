@@ -647,9 +647,10 @@ tests + 28/28 unit tests pass on linux and darwin/aarch64.
 * **F3** — `RenderBudget` with `LEN_GUARD` / `CAP_GUARD` defaults;
   every collection / string renderer reports `… N more elided` on
   truncation.
-* **F4** — slash-suffix format spec on `print`/`var`/`argd`: `/x`,
-  `/b`, `/o`, `/d`, `/iso`. (`/p`, `/c`, `/s`, `/y`, `/utf8`,
-  `/hex`, `/[N]`, `/[N..M]` deferred.)
+* **F4** — slash-suffix format spec on `print`/`var`/`argd`:
+  `/x`, `/b`, `/o`, `/d`, `/iso`, `/utf8`, `/hex`. (`/p`, `/c`,
+  `/s`, `/y`, `/[N]`, `/[N..M]` deferred — slice indexing probably
+  belongs in `Dqe` rather than as a print-time format spec.)
 * **S1** — `Mutex<T>` / `RwLock<T>` peel through `UnsafeCell<T>` to
   the inner `T`; `[poisoned]` and `[locked]` (futex backend on
   Linux/Windows/BSD) badges.

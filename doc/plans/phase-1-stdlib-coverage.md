@@ -1,6 +1,6 @@
 # Phase 1 — Stdlib coverage
 
-> **Phase 1 status:** **PHASE 1 COMPLETE — batches A through Q landed.**
+> **Phase 1 status:** **PHASE 1 COMPLETE — batches A through R landed.**
 > Batch A: F1 (reference_type), S3 (atomics), S11 (NonNull).
 > Batch B: S6 (Range family), S7 (Pin).
 > Batch C: S4 (Duration), S5 (SystemTime/Instant render upgrade),
@@ -41,10 +41,15 @@
 > `/iso` GDB-style format specs on `var`/`argd` commands.
 > Batch Q: S1 `[locked]` badge — futex backend on
 > Linux/Windows/BSD; macOS pthread reports false.
-> No remaining items. F2 (`char` placeholder) ships when
-> rust-lang/rust#113819 closes upstream.
-> F2 (`char` placeholder) is upstream-tracked
+> Batch R: F4 byte-slice overrides — `/utf8` (lossy utf-8 force)
+> and `/hex` (hex-dump force) on `Vec<u8>` / `VecDeque<u8>` /
+> `[u8; N]`. Public `ByteRenderMode` enum + `render_byte_slice_members`
+> entrypoint added for future `&[u8]` callers.
+> No remaining items. F2 (`char` placeholder) is upstream-tracked
 > (rust-lang/rust#113819) and ships when that issue closes.
+> F4 specs `/p`, `/c`, `/s`, `/y`, `/[N]`, `/[N..M]` deferred —
+> slice indexing in particular probably belongs in `Dqe` rather
+> than as a print-time format spec.
 
 Plug the obvious holes the rustc Python printers also leave, plus the
 latent `DW_TAG_reference_type` fall-through. No new architecture.
