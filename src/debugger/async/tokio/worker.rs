@@ -321,7 +321,7 @@ pub fn try_as_worker(
             .pop_if_single_el()?;
 
         let task = task_from_header(context.debugger(), task_header_ptr).ok()?;
-        task.backtrace().ok()
+        task.backtrace(context.debugger()).ok()
     };
     let task_bt_standby = active_task_from_frame();
 

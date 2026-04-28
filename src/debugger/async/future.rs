@@ -165,6 +165,78 @@ fn has_fat_pointer_shape(s: &StructValue) -> bool {
     )
 }
 
+/// Phase 3 Feature D step 6 — locator for the deeper dyn-Future
+/// recovery. Identifies the inner fat-pointer struct, lifts its
+/// Phase-3A-recovered concrete type name out of the annotation, and
+/// reads the data-pointer slot. The walker uses this to issue a
+/// `Dqe::DataCast` re-read at the concrete type and recurse into
+/// the resulting state machine.
+#[derive(Debug, Clone)]
+pub struct DynFutureLocator {
+    /// Bare concrete type name (the `Concrete` in `[→ Concrete]`).
+    pub concrete_name: String,
+    /// Address the fat pointer's data slot points at.
+    pub pointer: usize,
+}
+
+/// Walk a value tree (depth-bounded) for the canonical `dyn Trait`
+/// fat-pointer shape and return both the recovered concrete type
+/// name and the data-pointer address. Returns `None` when no fat
+/// pointer is found, or when the annotation is missing, or when the
+/// pointer slot is null.
+pub(crate) fn locate_dyn_future(val: &Value, depth: u32) -> Option<DynFutureLocator> {
+    if depth == 0 {
+        return None;
+    }
+    let Value::Struct(s) = val else {
+        return None;
+    };
+    if has_fat_pointer_shape(s) {
+        let annotated = s.type_ident.name()?;
+        let concrete_name = extract_concrete_from_annotation(annotated)?;
+        let pointer = data_pointer_addr(s)?;
+        return Some(DynFutureLocator {
+            concrete_name,
+            pointer,
+        });
+    }
+    for m in &s.members {
+        if let Some(r) = locate_dyn_future(&m.value, depth - 1) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+fn extract_concrete_from_annotation(name: &str) -> Option<String> {
+    // Phase 3A renders the annotation as `[→ ConcreteType]`. The
+    // arrow is multi-byte UTF-8; use byte slicing via `.find(...)`.
+    let needle = "[→ ";
+    let start = name.find(needle)? + needle.len();
+    let after = &name[start..];
+    let end = after.rfind(']')?;
+    let candidate = after[..end].trim();
+    if candidate.is_empty() {
+        None
+    } else {
+        Some(candidate.to_string())
+    }
+}
+
+fn data_pointer_addr(s: &StructValue) -> Option<usize> {
+    s.members.iter().find_map(|m| {
+        if matches!(
+            m.field_name.as_deref(),
+            Some("pointer") | Some("data_ptr")
+        )
+            && let Value::Pointer(p) = &m.value
+        {
+            return p.value.map(|raw| raw as usize);
+        }
+        None
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct TokioSleepFuture {
     pub name: TypeIdentity,
@@ -351,5 +423,30 @@ mod tests {
             s = wrap("Wrap", s);
         }
         assert!(find_trait_object_concrete(&Value::Struct(s), 3).is_none());
+    }
+
+    #[test]
+    fn extract_concrete_from_annotation_round_trip() {
+        assert_eq!(
+            extract_concrete_from_annotation("Box<dyn Future> [→ MyType]").as_deref(),
+            Some("MyType"),
+        );
+        // No annotation → None.
+        assert!(extract_concrete_from_annotation("Box<dyn Future>").is_none());
+        // Empty annotation → None (don't return an empty string).
+        assert!(extract_concrete_from_annotation("Foo [→ ]").is_none());
+        // Trailing whitespace gets trimmed.
+        assert_eq!(
+            extract_concrete_from_annotation("X [→ Foo  ]").as_deref(),
+            Some("Foo"),
+        );
+    }
+
+    #[test]
+    fn locate_dyn_future_returns_none_without_annotation() {
+        // Fat-pointer shape but no `[→ ...]` annotation → can't
+        // recover concrete type → no locator.
+        let s = dyn_struct("Box<dyn Future>");
+        assert!(locate_dyn_future(&Value::Struct(s), 4).is_none());
     }
 }

@@ -182,10 +182,12 @@ impl Debugger {
                                 "CONTEXT not found",
                             )))?;
 
+                    let owned = OwnedList::try_extract(&analyze_context, context_initialized)?;
+                    let dbg = analyze_context.debugger();
                     tasks = Rc::new(
-                        OwnedList::try_extract(&analyze_context, context_initialized)?
+                        owned
                             .into_iter()
-                            .filter_map(|t| weak_error!(t.backtrace()))
+                            .filter_map(|t| weak_error!(t.backtrace(dbg)))
                             .collect(),
                     );
                     backtrace.tasks = tasks.clone();

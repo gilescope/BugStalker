@@ -29,16 +29,12 @@ impl Task {
         Self { raw_ptr, id, repr }
     }
 
-    pub fn backtrace(self) -> Result<TaskBacktrace, AsyncError> {
+    pub fn backtrace(self, debugger: &Debugger) -> Result<TaskBacktrace, AsyncError> {
         Ok(TaskBacktrace {
             task_id: self.id,
             raw_ptr: self.raw_ptr,
-            futures: self.future_stack()?,
+            futures: build_chain_from_repr(self.repr, Some(debugger)),
         })
-    }
-
-    fn future_stack(self) -> Result<Vec<Future>, AsyncError> {
-        Ok(build_chain_from_repr(self.repr))
     }
 }
 
@@ -52,12 +48,18 @@ const MAX_BRANCH_DEPTH: u32 = 8;
 /// state-machine [`RustEnumValue`]. Walks `__awaitee` for the
 /// single-active-future case and emits a [`Future::Multi`] branch
 /// when the active variant carries 2+ coroutine-shaped fields
-/// (`tokio::join!` / `tokio::select!`-style shapes).
-fn build_chain_from_repr(start: RustEnumValue) -> Vec<Future> {
-    build_chain_from_repr_bounded(start, MAX_BRANCH_DEPTH)
+/// (`tokio::join!` / `tokio::select!`-style shapes). When `debugger`
+/// is `Some`, also attempts Phase 3 step 6's deep dyn-Future recovery
+/// (re-read the awaitee at the recovered concrete TypeId).
+fn build_chain_from_repr(start: RustEnumValue, debugger: Option<&Debugger>) -> Vec<Future> {
+    build_chain_from_repr_bounded(start, MAX_BRANCH_DEPTH, debugger)
 }
 
-fn build_chain_from_repr_bounded(start: RustEnumValue, depth: u32) -> Vec<Future> {
+fn build_chain_from_repr_bounded(
+    start: RustEnumValue,
+    depth: u32,
+    debugger: Option<&Debugger>,
+) -> Vec<Future> {
     let mut result: Vec<Future> = vec![];
 
     if depth == 0 {
@@ -100,7 +102,7 @@ fn build_chain_from_repr_bounded(start: RustEnumValue, depth: u32) -> Vec<Future
         if parallel_branches.len() >= 2 {
             let branches = parallel_branches
                 .into_iter()
-                .map(|seed| build_chain_from_repr_bounded(seed, depth - 1))
+                .map(|seed| build_chain_from_repr_bounded(seed, depth - 1, debugger))
                 .collect();
             result.push(Future::Multi(branches));
         }
@@ -112,18 +114,40 @@ fn build_chain_from_repr_bounded(start: RustEnumValue, depth: u32) -> Vec<Future
             }
             Some(Value::Struct(next_future)) => {
                 let fmt_name = next_future.type_ident.name_fmt();
+                let is_dyn_box = !matches!(fmt_name, "Sleep")
+                    && !fmt_name.contains("JoinHandle");
                 let leaf = if fmt_name == "Sleep" {
-                    weak_error!(TokioSleepFuture::try_from(next_future))
+                    weak_error!(TokioSleepFuture::try_from(next_future.clone()))
                         .map(Future::TokioSleep)
                         .unwrap_or(Future::UnknownFuture)
                 } else if fmt_name.contains("JoinHandle") {
-                    weak_error!(TokioJoinHandleFuture::try_from(next_future))
+                    weak_error!(TokioJoinHandleFuture::try_from(next_future.clone()))
                         .map(Future::TokioJoinHandleFuture)
                         .unwrap_or(Future::UnknownFuture)
                 } else {
                     Future::Custom(CustomFuture::from(&next_future))
                 };
                 result.push(leaf);
+
+                // Phase 3 Feature D step 6 (deeper half) — when the
+                // awaitee is a `Pin<Box<dyn Future>>`-shaped Custom
+                // future and a debugger handle is available, attempt
+                // the concrete-type re-read. D2b's annotation in
+                // `type_ident` already names the recovered concrete
+                // type; this step parses the pointee at that type
+                // and recurses into its state machine if it's a
+                // coroutine.
+                if is_dyn_box && let Some(dbg) = debugger {
+                    let probe = Value::Struct(next_future.clone());
+                    if let Some(loc) =
+                        crate::debugger::r#async::future::locate_dyn_future(&probe, 4)
+                        && let Some(re) = recover_concrete_future(dbg, &loc)
+                    {
+                        let inner =
+                            build_chain_from_repr_bounded(re, depth - 1, debugger);
+                        result.extend(inner);
+                    }
+                }
                 break;
             }
             _ => {}
@@ -131,6 +155,42 @@ fn build_chain_from_repr_bounded(start: RustEnumValue, depth: u32) -> Vec<Future
     }
 
     result
+}
+
+/// Phase 3 Feature D step 6 (deeper half) — given a recovered
+/// concrete type name and the dyn-pointer's data address, look up
+/// the type DIE across every loaded `DebugInformation`, issue a
+/// `Dqe::DataCast` to read the pointee at that type, and return the
+/// resulting `RustEnumValue` if the type is a coroutine state
+/// machine. Any failure (type not found, parse error, non-enum
+/// result) returns `None` so the caller can degrade gracefully to
+/// the bare `Future::Custom` annotation.
+fn recover_concrete_future(
+    dbg: &Debugger,
+    loc: &crate::debugger::r#async::future::DynFutureLocator,
+) -> Option<RustEnumValue> {
+    use crate::debugger::variable::dqe::DataCast;
+
+    let (debug_info, unit_off, die_off) =
+        dbg.debugee.debug_info_all().into_iter().find_map(|di| {
+            let (u, d) = di.find_type_die_ref(&loc.concrete_name)?;
+            Some((di, u, d))
+        })?;
+
+    let dqe = Dqe::DataCast(DataCast::new(
+        loc.pointer,
+        debug_info.pathname(),
+        unit_off,
+        die_off,
+    ));
+
+    let mut results = weak_error!(dbg.read_variable(dqe))?;
+    let qr = results.pop_if_single_el()?;
+    if let Value::RustEnum(re) = qr.into_value() {
+        Some(re)
+    } else {
+        None
+    }
 }
 
 /// Return task header state value and point pair.
