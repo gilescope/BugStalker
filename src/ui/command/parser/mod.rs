@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 pub mod expression;
 
 use super::r#break::BreakpointIdentity;
@@ -161,7 +162,7 @@ pub fn watchpoint_cond<'a>() -> impl chumsky::Parser<'a, &'a str, BreakCondition
 pub fn watchpoint_at_dqe<'a>() -> impl chumsky::Parser<'a, &'a str, WatchpointIdentity, Err<'a>> {
     let source_rewind_parser = any::<_, Err>().repeated().to_slice().rewind();
     source_rewind_parser
-        .then(expression::parser().padded())
+        .then(expression::parser().padded().then_ignore(end()))
         .map(|(source, dqe)| WatchpointIdentity::DQE(source.trim().to_string(), dqe))
 }
 
@@ -268,6 +269,23 @@ impl Command {
         let sub_op = |sym| just(sym).then(ws_req_or_end);
         let sub_op_w_arg = |sym| just(sym).then(ws_req);
 
+        // Phase 1 F4 — optional format-spec suffix on print/var/argd.
+        // Syntax: `/x`, `/b`, `/o`, `/d`, `/iso` (GDB convention).
+        // Requires preceding whitespace (`var x /x`, `argd y /iso`)
+        // because both `:` (collides with `rust_identifier`'s `::`
+        // separator) and `/` (the expression parser doesn't yield on
+        // it) bleed into the expression's tokenisation otherwise.
+        // Composition with path expressions: `var foo.bar /x`.
+        // Mismatched type-vs-spec combinations fall back to the
+        // default render (handled in `print::Handler::handle`).
+        let format_spec = just('/').ignore_then(choice((
+            just("iso").to(print::FormatSpec::Iso),
+            just('x').to(print::FormatSpec::Hex),
+            just('b').to(print::FormatSpec::Bin),
+            just('o').to(print::FormatSpec::Oct),
+            just('d').to(print::FormatSpec::Dec),
+        )));
+
         let print_local_vars = choice((
             op_w_arg(VAR_COMMAND).to(print::RenderMode::Builtin),
             op_w_arg(VAR_DEBUG_COMMAND).to(print::RenderMode::Debug),
@@ -277,6 +295,7 @@ impl Command {
             Command::Print(print::Command::Variable {
                 mode,
                 dqe: Dqe::Variable(Selector::Any),
+                format: None,
             })
         });
         let print_var = choice((
@@ -284,7 +303,10 @@ impl Command {
             op_w_arg(VAR_DEBUG_COMMAND).to(print::RenderMode::Debug),
         ))
         .then(expression::parser())
-        .map(|(mode, dqe)| Command::Print(print::Command::Variable { mode, dqe }));
+        .then(format_spec.or_not())
+        .map(|((mode, dqe), format)| {
+            Command::Print(print::Command::Variable { mode, dqe, format })
+        });
 
         let print_variables = choice((print_local_vars, print_var)).boxed();
 
@@ -297,6 +319,7 @@ impl Command {
             Command::Print(print::Command::Argument {
                 mode,
                 dqe: Dqe::Variable(Selector::Any),
+                format: None,
             })
         });
         let print_arg = choice((
@@ -304,7 +327,10 @@ impl Command {
             op_w_arg(ARG_DEBUG_COMMAND).to(print::RenderMode::Debug),
         ))
         .then(expression::parser())
-        .map(|(mode, dqe)| Command::Print(print::Command::Argument { mode, dqe }));
+        .then(format_spec.or_not())
+        .map(|((mode, dqe), format)| {
+            Command::Print(print::Command::Argument { mode, dqe, format })
+        });
 
         let print_arguments = choice((print_all_args, print_arg)).boxed();
 
@@ -686,6 +712,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Variable {
                 dqe: Dqe::Variable(Selector::Any),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -693,6 +720,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Variable {
                 dqe: Dqe::Variable(Selector::Any),
                 mode: print::RenderMode::Debug,
+                format: None,
             })),
         },
         TestCase {
@@ -702,6 +730,7 @@ fn test_parser() {
                     Dqe::Deref(Dqe::Variable(Selector::by_name("var1", false)).boxed()).boxed(),
                 ),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -709,6 +738,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Variable {
                 dqe: Dqe::Variable(Selector::by_name("locals_var", false)),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -716,6 +746,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Variable {
                 dqe: Dqe::Variable(Selector::by_name("locals_var", false)),
                 mode: print::RenderMode::Debug,
+                format: None,
             })),
         },
         TestCase {
@@ -743,6 +774,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Argument {
                 dqe: Dqe::Variable(Selector::Any),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -750,6 +782,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Argument {
                 dqe: Dqe::Variable(Selector::Any),
                 mode: print::RenderMode::Debug,
+                format: None,
             })),
         },
         TestCase {
@@ -757,6 +790,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Argument {
                 dqe: Dqe::Variable(Selector::by_name("all_arg", false)),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -764,6 +798,56 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Argument {
                 dqe: Dqe::Variable(Selector::by_name("all_arg", false)),
                 mode: print::RenderMode::Debug,
+                format: None,
+            })),
+        },
+        // Phase 1 F4 — colon-suffix format spec parser tests.
+        TestCase {
+            inputs: vec!["var x /x"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("x", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Hex),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var x /b"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("x", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Bin),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var x /o"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("x", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Oct),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var x /d"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("x", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Dec),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var d /iso"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("d", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Iso),
+            })),
+        },
+        TestCase {
+            inputs: vec!["argd y /x"],
+            expected: Expect::Ok(Command::Print(print::Command::Argument {
+                dqe: Dqe::Variable(Selector::by_name("y", false)),
+                mode: print::RenderMode::Debug,
+                format: Some(print::FormatSpec::Hex),
             })),
         },
         TestCase {
@@ -1110,10 +1194,14 @@ fn test_parser() {
             let result = Command::parse(input);
             match case.expected {
                 Expect::Ok(ref expected_cmd) => {
-                    assert!(result.is_ok());
-                    assert_eq!(&result.unwrap(), expected_cmd);
+                    assert!(
+                        result.is_ok(),
+                        "expected Ok for input {input:?}, got Err: {:?}",
+                        result.err()
+                    );
+                    assert_eq!(&result.unwrap(), expected_cmd, "input: {input:?}");
                 }
-                Expect::Err => assert!(result.is_err()),
+                Expect::Err => assert!(result.is_err(), "expected Err for input {input:?}"),
             }
         }
     }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! data query expressions parser.
 use crate::debugger::variable::dqe::{Dqe, Literal, LiteralOrWildcard, PointerCast, Selector};
 use crate::ui::command::parser::{hex, rust_identifier};
@@ -130,7 +131,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a str, Dqe, Err<'a>> {
         .map(|name: &str| Dqe::Variable(Selector::by_name(name, false)))
         .or(ptr_cast());
 
-    let expr = recursive(|expr| {
+    recursive(|expr| {
         let op = |c| just(c).padded();
 
         let atom = base_selector
@@ -181,9 +182,7 @@ pub fn parser<'a>() -> impl Parser<'a, &'a str, Dqe, Err<'a>> {
             .or(op('~').to(Dqe::Canonic as fn(_) -> _))
             .repeated()
             .foldr(expr, |op, rhs| op(Box::new(rhs)))
-    });
-
-    expr.then_ignore(end())
+    })
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::variable::value::Value;
 use std::collections::VecDeque;
 
@@ -215,6 +216,7 @@ mod test {
                                 target_type: None,
                                 target_type_size: None,
                                 raw_address: None,
+                                dereffed: None,
                             }),
                         },
                     ],

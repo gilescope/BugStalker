@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::TypeDeclaration;
 use crate::debugger::debugee::dwarf::eval::EvaluationContext;
 use crate::debugger::debugee::dwarf::r#type::{
@@ -405,6 +406,7 @@ impl ValueParser {
             target_type,
             target_type_size: None,
             raw_address: data.and_then(|d| d.address),
+            dereffed: None,
         }
     }
 
@@ -584,8 +586,21 @@ impl ValueParser {
                     == Some(true)
                     && type_ns_h.contains(&["rc"])
                 {
+                    // Phase 1 S15: route `Weak<T>` to a dedicated
+                    // parser that derefs to read the strong / weak
+                    // counts; `Rc<T>` keeps the existing parse_rc
+                    // pointer-only path.
+                    let value = if struct_name
+                        .as_ref()
+                        .map(|n| n.starts_with("Weak<"))
+                        == Some(true)
+                    {
+                        parser_ext.parse_weak(pcx, &struct_var)
+                    } else {
+                        parser_ext.parse_rc(&struct_var)
+                    };
                     return Some(Value::Specialized {
-                        value: parser_ext.parse_rc(&struct_var),
+                        value,
                         original: struct_var,
                     });
                 };
@@ -596,8 +611,18 @@ impl ValueParser {
                     == Some(true)
                     && type_ns_h.contains(&["sync"])
                 {
+                    // Phase 1 S15 — same Weak split for the sync flavour.
+                    let value = if struct_name
+                        .as_ref()
+                        .map(|n| n.starts_with("Weak<"))
+                        == Some(true)
+                    {
+                        parser_ext.parse_weak(pcx, &struct_var)
+                    } else {
+                        parser_ext.parse_arc(&struct_var)
+                    };
                     return Some(Value::Specialized {
-                        value: parser_ext.parse_arc(&struct_var),
+                        value,
                         original: struct_var,
                     });
                 };
@@ -607,6 +632,59 @@ impl ValueParser {
                 {
                     return Some(Value::Specialized {
                         value: parser_ext.parse_uuid(&struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S3 — every `core::sync::atomic::Atomic*` /
+                // `std::sync::atomic::Atomic*` type. Names: `AtomicI8` …
+                // `AtomicI128`, `AtomicU8` … `AtomicU128`, `AtomicBool`,
+                // `AtomicUsize`, `AtomicIsize`, `AtomicPtr<T>`. We
+                // detect by name prefix + namespace; `parse_atomic`
+                // peels the `UnsafeCell<T>` wrapper.
+                if struct_name
+                    .as_ref()
+                    .map(|name| name.starts_with("Atomic"))
+                    == Some(true)
+                    && type_ns_h.contains(&["sync", "atomic"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_atomic(&struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S11 — `core::ptr::NonNull<T>`.
+                if struct_name.as_ref().map(|name| name.starts_with("NonNull")) == Some(true)
+                    && type_ns_h.contains(&["ptr", "non_null"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_nonnull(&struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S7 — `core::pin::Pin<P>`. Surface the pinnee
+                // directly; the wrapper name keeps the `Pin<…>` framing.
+                if struct_name.as_ref().map(|name| name.starts_with("Pin")) == Some(true)
+                    && type_ns_h.contains(&["pin"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_pin(&struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S6 — every `core::ops::Range*` shape:
+                // `Range`, `RangeInclusive`, `RangeFrom`, `RangeTo`,
+                // `RangeToInclusive`, `RangeFull`. Detection is by
+                // name prefix + namespace; `parse_range` discriminates
+                // among the six layouts on the name itself.
+                if struct_name.as_ref().map(|name| name.starts_with("Range")) == Some(true)
+                    && type_ns_h.contains(&["ops", "range"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_range(struct_name.as_deref().unwrap_or(""), &struct_var),
                         original: struct_var,
                     });
                 };
@@ -625,6 +703,144 @@ impl ValueParser {
                 {
                     return Some(Value::Specialized {
                         value: parser_ext.parse_sys_time(&struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S4 — `core::time::Duration` /
+                // `std::time::Duration`. The type lives in `time` for
+                // both core and std re-exports; we accept either by
+                // matching the bare namespace component.
+                if struct_name.as_deref() == Some("Duration")
+                    && type_ns_h.contains(&["time"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_duration(&struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S12 — `alloc::ffi::c_str::CString`. Detect by
+                // exact name plus the `ffi` namespace component.
+                if struct_name.as_deref() == Some("CString")
+                    && type_ns_h.contains(&["ffi"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_cstring(pcx, &struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S13 — `std::ffi::OsString`. The `ffi`
+                // namespace is shared with `CString`, so we
+                // discriminate on the type name alone.
+                if struct_name.as_deref() == Some("OsString")
+                    && type_ns_h.contains(&["ffi"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_os_string(pcx, &struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S14 — `std::path::PathBuf`. Wraps `OsString`
+                // wraps `Buf` wraps `Vec<u8>`; the BFS-based parser
+                // walks all four layers.
+                if struct_name.as_deref() == Some("PathBuf")
+                    && type_ns_h.contains(&["path"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_os_string(pcx, &struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S12/S13/S14 DST companions — `&CStr`,
+                // `&OsStr`, `&Path`. rustc materialises these fat
+                // references as structs with `data_ptr` + `length`.
+                // The CStr / OsString parsers BFS for those fields,
+                // so we can route by the wrapper-name suffix.
+                if let Some(name) = struct_name.as_deref() {
+                    if name.ends_with("c_str::CStr")
+                        || name == "&CStr"
+                        || name.ends_with("::CStr")
+                    {
+                        return Some(Value::Specialized {
+                            value: parser_ext.parse_cstring(pcx, &struct_var),
+                            original: struct_var,
+                        });
+                    }
+                    if name.ends_with("os_str::OsStr")
+                        || name == "&OsStr"
+                        || name.ends_with("::OsStr")
+                        || name.ends_with("path::Path")
+                        || name == "&Path"
+                        || name.ends_with("::Path")
+                    {
+                        return Some(Value::Specialized {
+                            value: parser_ext.parse_os_string(pcx, &struct_var),
+                            original: struct_var,
+                        });
+                    }
+                }
+
+                // Phase 1 S10 — `core::mem::MaybeUninit<T>` may emit
+                // as a Structure on some rustc versions even though
+                // libcore declares it `pub union`. Some producers
+                // include the type parameters in the name string
+                // (`MaybeUninit<i32>`) so match by prefix. The name
+                // is unique to libcore so we don't gate on namespace.
+                if struct_name
+                    .as_ref()
+                    .map(|n| n.starts_with("MaybeUninit"))
+                    == Some(true)
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_maybe_uninit(&struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S2 — lock guards: `MutexGuard<T>`,
+                // `RwLockReadGuard<T>`, `RwLockWriteGuard<T>`,
+                // `MappedMutexGuard<T>` etc. Detected by the `Guard`
+                // suffix on the type name + the `sync` namespace.
+                // Must be tested BEFORE `Mutex`/`RwLock` because
+                // `MutexGuard<i32>` matches `starts_with("Mutex")`.
+                if struct_name
+                    .as_ref()
+                    .map(|n| {
+                        n.starts_with("MutexGuard")
+                            || n.starts_with("MappedMutexGuard")
+                            || n.starts_with("RwLockReadGuard")
+                            || n.starts_with("RwLockWriteGuard")
+                            || n.starts_with("MappedRwLockReadGuard")
+                            || n.starts_with("MappedRwLockWriteGuard")
+                    })
+                    == Some(true)
+                    && type_ns_h.contains(&["sync"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_lock_guard(pcx, &struct_var),
+                        original: struct_var,
+                    });
+                };
+
+                // Phase 1 S1 — `std::sync::Mutex<T>` / `std::sync::RwLock<T>`.
+                // Both have the same layout shape (data: UnsafeCell<T>);
+                // share `parse_mutex`. The `sync` namespace component
+                // distinguishes from `parking_lot`-style alternates
+                // which would have a different layout. DWARF embeds
+                // type parameters into the name (`Mutex<i32>`), so we
+                // match by prefix.
+                if struct_name
+                    .as_ref()
+                    .map(|n| n.starts_with("Mutex") || n.starts_with("RwLock"))
+                    == Some(true)
+                    && type_ns_h.contains(&["sync"])
+                {
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_mutex(&struct_var),
                         original: struct_var,
                     });
                 };
@@ -656,12 +872,47 @@ impl ValueParser {
                 discr_type.as_ref().map(|t| t.as_ref()),
                 enumerators,
             ))),
-            TypeDeclaration::Pointer { target_type, .. } => Some(Value::Pointer(
-                self.parse_pointer(pcx, data, type_id, *target_type),
-            )),
-            TypeDeclaration::Union { members, .. } => {
+            TypeDeclaration::Pointer { target_type, .. } => {
+                let mut ptr = self.parse_pointer(pcx, data, type_id, *target_type);
+                // Phase 1 S9 — `alloc::boxed::Box<T>` smart-deref.
+                // `Box<T>` arrives here as a `Pointer` (rustc emits a
+                // `DW_TAG_pointer_type` with the Box-flavoured name);
+                // deref eagerly so the renderer can show the pointee
+                // inline. Trait-object boxes (`Box<dyn Trait>`) need
+                // vtable resolution from Phase 3 — for now they
+                // round-trip as a fat-pointer struct via the parent
+                // type-graph walk and don't reach this branch.
+                let name = ptr.type_ident.name_fmt();
+                if name.starts_with("alloc::boxed::Box<") {
+                    ptr.dereffed = ptr.deref(pcx).map(Box::new);
+                }
+                Some(Value::Pointer(ptr))
+            }
+            TypeDeclaration::Union {
+                members,
+                name: union_name,
+                ..
+            } => {
                 let struct_var =
                     self.parse_struct_variable(pcx, data, type_id, IndexMap::new(), members);
+                // Phase 1 S10 — `core::mem::MaybeUninit<T>` lives on
+                // the Union dispatch path. The DWARF namespace for it
+                // is producer-dependent (older rustc emitted
+                // `core::mem`, newer `core::mem::maybe_uninit`); the
+                // type name `MaybeUninit` is unique to libcore so we
+                // match on it alone with a fallback `mem` namespace
+                // sanity check.
+                if union_name
+                    .as_ref()
+                    .map(|n| n.starts_with("MaybeUninit"))
+                    == Some(true)
+                {
+                    let parser_ext = VariableParserExtension::new(self);
+                    return Some(Value::Specialized {
+                        value: parser_ext.parse_maybe_uninit(&struct_var),
+                        original: struct_var,
+                    });
+                }
                 Some(Value::Struct(struct_var))
             }
             TypeDeclaration::Subroutine { return_type, .. } => {

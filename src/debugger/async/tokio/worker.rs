@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::types::TaskIdValue;
 use crate::debugger::TypeDeclaration;
 use crate::debugger::r#async::context::TokioAnalyzeContext;
@@ -310,6 +311,7 @@ pub fn try_as_worker(
 
     let active_task_from_frame = || -> Option<TaskBacktrace> {
         let task_header_ptr_dqe = expression::parser()
+            .then_ignore(chumsky::prelude::end())
             .parse("task.__0.raw.ptr.pointer")
             .into_output()?;
         let task_header_ptr = context

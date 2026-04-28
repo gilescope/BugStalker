@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::TypeDeclaration;
 use crate::debugger::debugee::dwarf::r#type::{CModifier, TypeId, TypeIdentity};
 use crate::debugger::variable::ObjectBinaryRepr;
@@ -261,6 +262,11 @@ pub struct PointerValue {
     pub target_type: Option<TypeId>,
     pub target_type_size: Option<u64>,
     pub raw_address: Option<usize>,
+    /// Phase 1 S9 — populated at parse time for smart pointers like
+    /// `Box<T>` so the renderer can surface the pointee inline. For
+    /// raw `*const T` / `&T` / `&mut T` references this stays
+    /// `None` and rendering falls back to address-only display.
+    pub dereffed: Option<Box<Value>>,
 }
 
 impl PointerValue {
@@ -502,6 +508,35 @@ impl Value {
                     ))
                 }
                 SpecializedValue::Instant(_) => None,
+                // Atomic delegates to its inner scalar/pointer literal.
+                SpecializedValue::Atomic(inner) => inner.as_literal(),
+                // NonNull is address-shaped, like Rc/Arc above.
+                SpecializedValue::NonNull(ptr) => Some(Literal::Address(ptr.raw_address?)),
+                // Pin delegates to the pinnee.
+                SpecializedValue::Pin(inner) => inner.as_literal(),
+                // Range as a literal — surface the rendered form as a
+                // string. Useful for DAP `evaluate` where the client
+                // wants something it can show inline.
+                SpecializedValue::Range(r) => Some(Literal::String(r.render())),
+                // Duration: surface the (secs, nanos) pair as a
+                // 2-element Array literal so users can pattern-match
+                // on it. Mirrors how `SystemTime` does it just above.
+                SpecializedValue::Duration(_) => None,
+                // CString: surface the rendered display form.
+                SpecializedValue::CString(s) => Some(Literal::String(s.value.clone())),
+                // OsString / PathBuf: same shape as CString.
+                SpecializedValue::OsString(s) => Some(Literal::String(s.value.clone())),
+                // MaybeUninit: surface the inner literal — the
+                // [possibly uninit] caveat lives on the rendered text
+                // path, not the literal one (clients pattern-matching
+                // on the value want the raw literal).
+                SpecializedValue::MaybeUninit(inner) => inner.as_literal(),
+                // Mutex/RwLock: surface the guarded payload's literal.
+                SpecializedValue::Mutex { inner, .. } => inner.as_literal(),
+                // Lock guards: surface the guarded payload's literal.
+                SpecializedValue::LockGuard(inner) => inner.as_literal(),
+                // Weak: surface the allocation address as a literal.
+                SpecializedValue::Weak { ptr, .. } => Some(Literal::Address(ptr.raw_address?)),
             },
             Value::CModifiedVariable(val) => Some(val.value.as_ref()?.as_literal()?),
         }
@@ -632,6 +667,14 @@ impl Value {
                 value: Some(SpecializedValue::Arc(ptr)),
                 ..
             } => ptr.deref(pcx),
+            // Phase 1 S15: Weak — deref still works (reads RcBox /
+            // ArcInner) so the existing `weak.deref(pcx)` test path
+            // keeps working alongside the new `(strong=N, weak=M)`
+            // render output.
+            Value::Specialized {
+                value: Some(SpecializedValue::Weak { ptr, .. }),
+                ..
+            } => ptr.deref(pcx),
             Value::Specialized {
                 value: Some(SpecializedValue::Tls(tls_var)),
                 ..
@@ -660,6 +703,7 @@ impl Value {
                 .and_then(|t| pcx.type_graph.type_size_in_bytes(pcx.evcx, t)),
             raw_address: None,
             type_id: None,
+            dereffed: None,
         }))
     }
 
@@ -1033,6 +1077,7 @@ mod test {
         Value::Specialized {
             value: Some(SpecializedValue::Str(StrVariable {
                 value: val.to_string(),
+                elided: None,
             })),
             original: StructValue {
                 ..Default::default()
@@ -1044,6 +1089,7 @@ mod test {
         Value::Specialized {
             value: Some(SpecializedValue::String(StringVariable {
                 value: val.to_string(),
+                elided: None,
             })),
             original: StructValue {
                 ..Default::default()
@@ -1080,6 +1126,7 @@ mod test {
                 type_params: IndexMap::default(),
                 raw_address: None,
             },
+            elided: None,
         }
     }
 
@@ -1106,6 +1153,7 @@ mod test {
             value: Some(SpecializedValue::HashSet(HashSetVariable {
                 type_ident: TypeIdentity::no_namespace("hashset"),
                 items,
+                elided: None,
             })),
             original: StructValue {
                 ..Default::default()
@@ -1118,6 +1166,7 @@ mod test {
             value: Some(SpecializedValue::BTreeSet(HashSetVariable {
                 type_ident: TypeIdentity::no_namespace("btreeset"),
                 items,
+                elided: None,
             })),
             original: StructValue {
                 ..Default::default()
@@ -1193,6 +1242,7 @@ mod test {
                     value: Some(123usize as *const ()),
                     raw_address: None,
                     target_type_size: None,
+                    dereffed: None,
                 }),
                 eq_literal: Literal::Address(123),
                 neq_literals: vec![Literal::Address(124), Literal::Int(123)],
@@ -1205,6 +1255,7 @@ mod test {
                     value: Some(123usize as *const ()),
                     raw_address: None,
                     target_type_size: None,
+                    dereffed: None,
                 }),
                 eq_literal: Literal::Address(123),
                 neq_literals: vec![Literal::Address(124), Literal::Int(123)],

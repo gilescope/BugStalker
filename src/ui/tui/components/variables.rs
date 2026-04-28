@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::register::debug::BreakCondition;
 use crate::debugger::variable::dqe::{Dqe, Selector};
 use crate::debugger::variable::execute::{QueryResult, QueryResultKind};
@@ -267,6 +268,7 @@ impl Variables {
                 .handle(command::print::Command::Variable {
                     mode: command::print::RenderMode::Builtin,
                     dqe: expr,
+                    format: None,
                 })
                 .unwrap_or_default()
                 .into_iter()
@@ -304,6 +306,7 @@ impl Variables {
                 .handle(command::print::Command::Argument {
                     mode: command::print::RenderMode::Builtin,
                     dqe: expr,
+                    format: None,
                 })
                 .unwrap_or_default()
                 .into_iter()
