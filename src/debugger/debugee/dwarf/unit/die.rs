@@ -156,15 +156,29 @@ impl<'a> Die<'a> {
         |_, die: GimliDie| { die.attr(DW_AT_frame_base).cloned() }
     );
 
-    // Phase 3 Feature D — (file_index, line) pair from
-    // DW_AT_decl_file/DW_AT_decl_line. On variant-member DIEs of a
-    // coroutine state-machine enum these point at the corresponding
-    // .await source location (the Cliff Biffle technique).
-    impl_no_virt!(decl_file_line, Option<(u64, u64)>, |_, die: GimliDie| {
-        let file_idx = die.attr(DW_AT_decl_file).and_then(|a| a.udata_value())?;
-        let line = die.attr(DW_AT_decl_line).and_then(|a| a.udata_value())?;
-        Some((file_idx, line))
-    });
+    /// `(file_index, line)` pair read from this DIE's
+    /// `DW_AT_decl_file` / `DW_AT_decl_line` attributes (returns
+    /// `None` if either is absent).
+    ///
+    /// Resolve `file_index` against
+    /// [`super::BsUnit::files`] to get a `PathBuf`.
+    ///
+    /// Phase 3 Feature D uses this on the captured-locals member DIEs
+    /// of a coroutine state-machine enum's `Suspend` variants, where
+    /// rustc emits the source position of the corresponding `.await`
+    /// (the technique demonstrated in Cliff Biffle's `lildb`).
+    ///
+    /// Panics on virtual DIEs.
+    pub fn decl_file_line(&self) -> Option<(u64, u64)> {
+        match self {
+            Die::Virtual { .. } => unimplemented!(),
+            Die::Dwarf { die, .. } => {
+                let file_idx = die.attr(DW_AT_decl_file).and_then(|a| a.udata_value())?;
+                let line = die.attr(DW_AT_decl_line).and_then(|a| a.udata_value())?;
+                Some((file_idx, line))
+            }
+        }
+    }
 
     pub fn for_each_children_t<T>(&self, mut f: impl FnMut(Die<'a>) -> Option<T>) -> Option<T> {
         match self {

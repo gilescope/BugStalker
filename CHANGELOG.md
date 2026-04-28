@@ -7,6 +7,35 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- variables (Phase 3 Feature D batch D1 — async `.await` source coords):
+  - On a coroutine state-machine enum (`async fn` body), rustc emits
+    `DW_AT_decl_file` / `DW_AT_decl_line` on the captured-locals fields
+    of each `Suspend` variant; those coords are the source position of
+    the `.await` the future is paused at (the Cliff Biffle technique).
+    BugStalker now reads them.
+  - New plumbing:
+    - `Die::decl_file_line()` exposes the attribute pair on any DIE.
+    - `StructureMember::decl_file_line: Option<(u64, u64)>` stores it
+      for every member at parse time.
+    - `RustEnumValue::await_location: Option<(PathBuf, u64)>` is filled
+      at parse time when the active variant's inner struct (or the
+      enumerator member itself) carries the attributes; the unit's
+      file table resolves `(file_idx, line) → PathBuf`.
+    - `AsyncFnFuture::await_location` carries the coords through to
+      the renderer.
+  - User-visible: `async backtrace` now appends a `at FILE:LINE`
+    suffix to the "suspended at await point N" line whenever source
+    coords are recoverable. Stripped binaries and pre-`.await` states fall back
+    cleanly to the bare "await point N" form.
+  - Test: `tests/debugger/tokio.rs::test_async_await_location_recovered`
+    asserts every `Suspend(_)` `AsyncFn` in the ticker app reports
+    `examples/tokiotiker/src/main.rs:5` — the only `.await` in the
+    example.
+  - Phase 3D batches D2 (dedicated `await-trace` command,
+    `Pin<Box<dyn Future>>` resolution via the Phase 3A vtable path,
+    full chain traversal) and D3 (DAP `bs/awaitTrace` request,
+    `tokio::select!` / `join!` test cases) follow in subsequent
+    commits — see `doc/plans/phase-3-dyn-trait-and-async.md`.
 - variables (Phase 3 Feature C — Rc/Arc cycle detection):
   - `Rc<T>` / `Arc<T>` now eagerly deref so `var some_rc_node`
     surfaces the inner allocation inline (data, fields, recursive

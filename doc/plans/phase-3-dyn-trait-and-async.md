@@ -162,6 +162,22 @@ why is it `Rc`?
 Render the async call stack alongside the synchronous call stack when
 stopped inside a runtime poll.
 
+### Status
+
+- **D1 (landed, commit `98b6c18`)** — steps 3 (active-variant decode,
+  already wired by Phase 1's `RustEnumValue` path) and 4 (source-coord
+  recovery from `DW_AT_decl_file`/`DW_AT_decl_line` on variant member
+  DIEs). `RustEnumValue.await_location` and `AsyncFnFuture.await_location`
+  are populated; the existing `async backtrace` output now appends
+  an `at FILE:LINE` suffix to "suspended at await point N" lines.
+- **D2 (pending)** — steps 1, 5, 6, 7: dedicated coroutine-type
+  detection, awaitee-chain walker, vtable cross-resolution for
+  `Pin<Box<dyn Future>>`, and the dedicated `await-trace` console
+  command + TUI panel.
+- **D3 (pending)** — DAP `bs/awaitTrace` request + the test plan in
+  `tests/debugger/async_await.rs` (simple / chained / dyn_future /
+  select / join cases).
+
 ### Background
 
 `async fn` bodies compile to a synthesised generator/coroutine enum.
