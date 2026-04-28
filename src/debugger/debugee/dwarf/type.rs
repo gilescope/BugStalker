@@ -1071,3 +1071,81 @@ fn looks_like_trait_object(name: Option<&str>, members: &[StructureMember]) -> b
     }
     false
 }
+
+/// Phase 3 Feature D step 1 — heuristic detector for the rustc
+/// coroutine state-machine type. The synthesised type name for the
+/// body of an `async fn` (or any generator/coroutine) carries one of
+/// three suffixes depending on rustc version:
+///
+/// * `{async_fn_env#N}` — historical
+/// * `{coroutine_env#N}` — current (post `coroutine` rename)
+/// * `{generator_env#N}` — pre-`coroutine` legacy
+///
+/// where `N` is a per-compilation-unit disambiguator. This helper is
+/// used for intent-clear prefilters and richer diagnostics — the
+/// existing `AsyncFnFuture::try_from` already pattern-matches on the
+/// active variant's *state* name (`Suspend{N}` / `Unresumed` / …),
+/// which is what actually drives correctness; the type-name check
+/// is the diagnostics layer that lets the renderer say "this is a
+/// coroutine but its state name didn't decode" rather than
+/// silently returning a parse error.
+pub fn looks_like_coroutine_type_name(name: &str) -> bool {
+    name.contains("{async_fn_env#")
+        || name.contains("{coroutine_env#")
+        || name.contains("{generator_env#")
+}
+
+#[cfg(test)]
+mod coroutine_type_name_tests {
+    use super::looks_like_coroutine_type_name;
+
+    #[test]
+    fn matches_async_fn_env_pattern() {
+        assert!(looks_like_coroutine_type_name(
+            "tokio_simple_await::worker_task::{async_fn_env#0}"
+        ));
+        assert!(looks_like_coroutine_type_name(
+            "my_app::nested::module::deep::handler::{async_fn_env#7}"
+        ));
+    }
+
+    #[test]
+    fn matches_coroutine_env_pattern() {
+        // Current rustc post the `coroutine` rename.
+        assert!(looks_like_coroutine_type_name(
+            "my_app::handler::{coroutine_env#0}"
+        ));
+    }
+
+    #[test]
+    fn matches_generator_env_legacy_pattern() {
+        // Pre-`coroutine` rustc.
+        assert!(looks_like_coroutine_type_name(
+            "my_app::handler::{generator_env#0}"
+        ));
+    }
+
+    #[test]
+    fn rejects_ordinary_enum_names() {
+        assert!(!looks_like_coroutine_type_name("Option<i32>"));
+        assert!(!looks_like_coroutine_type_name(
+            "core::result::Result<u32, std::io::Error>"
+        ));
+        // Closure environment, not a coroutine — must not match.
+        assert!(!looks_like_coroutine_type_name(
+            "my_app::handler::{closure_env#0}"
+        ));
+    }
+
+    #[test]
+    fn rejects_partial_substring_matches() {
+        // The marker uses braces; a stray substring without them
+        // (very unlikely but cheap to guard against) should not
+        // light up. Note: this is a sanity check; the contains()
+        // check is intentionally permissive about surrounding
+        // context because rustc may decorate the name (generic
+        // instantiation, monomorphisation suffixes, …).
+        assert!(!looks_like_coroutine_type_name("async_fn_env"));
+        assert!(!looks_like_coroutine_type_name("coroutine_env_v2"));
+    }
+}

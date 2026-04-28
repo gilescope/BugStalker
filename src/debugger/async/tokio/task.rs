@@ -193,6 +193,17 @@ fn collect_coroutine_seeds(
         }
         match &m.value {
             Value::RustEnum(re) => {
+                // Source of truth is the variant *state-name* parse
+                // performed by `AsyncFnFuture::try_from`. Step 1's
+                // `is_coroutine()` (a type-name check) is
+                // *deliberately not* used as a prefilter here — a
+                // future rustc could rename the synthesised type
+                // and silently drop matches; the state-name parse
+                // is robust against that. `is_coroutine()` is
+                // available as a separate diagnostic if a renderer
+                // needs to distinguish "ordinary RustEnum that
+                // happens to have an `Unresumed`-like variant" from
+                // "real coroutine".
                 if AsyncFnFuture::try_from(re).is_ok() {
                     found.push(re.clone());
                 }

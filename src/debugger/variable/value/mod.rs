@@ -286,6 +286,20 @@ pub struct RustEnumValue {
     pub await_location: Option<(std::path::PathBuf, u64)>,
 }
 
+impl RustEnumValue {
+    /// Phase 3 Feature D step 1 — `true` when the enum's DWARF type
+    /// name marks it as a rustc coroutine state machine (the body of
+    /// an `async fn` or any generator). Cheap inspection — no extra
+    /// storage, no plumbing. Used for intent-clear prefilters in the
+    /// async walker and for richer diagnostics when state-name
+    /// parsing fails.
+    pub fn is_coroutine(&self) -> bool {
+        self.type_ident
+            .name()
+            .is_some_and(crate::debugger::debugee::dwarf::r#type::looks_like_coroutine_type_name)
+    }
+}
+
 /// Raw pointers, references, Box.
 #[derive(Clone, PartialEq)]
 pub struct PointerValue {
@@ -1089,6 +1103,44 @@ impl Value {
             }
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod rust_enum_value_tests {
+    use super::*;
+
+    fn enum_named(name: &str) -> RustEnumValue {
+        RustEnumValue {
+            type_ident: TypeIdentity::no_namespace(name),
+            type_id: None,
+            value: None,
+            raw_address: None,
+            await_location: None,
+        }
+    }
+
+    #[test]
+    fn is_coroutine_matches_async_fn_env() {
+        assert!(enum_named("my_app::handler::{async_fn_env#0}").is_coroutine());
+    }
+
+    #[test]
+    fn is_coroutine_matches_coroutine_env() {
+        assert!(enum_named("my_app::handler::{coroutine_env#3}").is_coroutine());
+    }
+
+    #[test]
+    fn is_coroutine_rejects_ordinary_enums() {
+        assert!(!enum_named("Option<i32>").is_coroutine());
+        assert!(!enum_named("MyAppError").is_coroutine());
+    }
+
+    #[test]
+    fn is_coroutine_rejects_closure_env() {
+        // Plain `{closure_env#}` is not a coroutine — only the
+        // async/coroutine/generator env markers count.
+        assert!(!enum_named("my_app::handler::{closure_env#0}").is_coroutine());
     }
 }
 
