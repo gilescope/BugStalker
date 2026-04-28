@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::VARS_APP;
 use crate::common::TestHooks;
 use crate::common::{TestInfo, rust_version};
@@ -206,6 +207,61 @@ fn assert_vec_deque(val: &Value, exp_type: &str, exp_cap: usize, with_buf: impl 
     with_buf(&vector.structure.members[0].value);
 }
 
+/// Phase 1 S7 helper: assert a `Pin<P>` peeled to its pinnee, with
+/// the wrapper type-identity preserved.
+fn assert_pin(val: &Value, exp_outer_type: &str, with_inner: impl FnOnce(&Value)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Pin(inner)),
+        ..
+    } = val
+    else {
+        panic!("not a Pin spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    with_inner(inner.as_ref());
+}
+
+/// Phase 1 S11 helper: assert a `NonNull<T>` rendered as the bare
+/// inner pointer with the wrapper type-identity preserved.
+fn assert_nonnull_pointer(val: &Value, exp_outer_type: &str, exp_inner_type: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::NonNull(ptr)),
+        ..
+    } = val
+    else {
+        panic!("not a NonNull spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    assert_pointer(&Value::Pointer(ptr.clone()), exp_inner_type);
+}
+
+/// Phase 1 S3 helper: assert an `Atomic*` rendered as a bare scalar
+/// with the wrapper type-identity preserved.
+fn assert_atomic_scalar(val: &Value, exp_outer_type: &str, exp_inner_type: &str, exp_val: SupportedScalar) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Atomic(inner)),
+        ..
+    } = val
+    else {
+        panic!("not an Atomic spec value");
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    assert_scalar(inner.as_ref(), exp_inner_type, Some(exp_val));
+}
+
+/// Phase 1 S3 helper: assert an `AtomicPtr<T>` rendered as a bare pointer.
+fn assert_atomic_pointer(val: &Value, exp_outer_type: &str, exp_inner_type: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Atomic(inner)),
+        ..
+    } = val
+    else {
+        panic!("not an Atomic spec value");
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    assert_pointer(inner.as_ref(), exp_inner_type);
+}
+
 fn assert_cell(val: &Value, exp_type: &str, with_value: impl FnOnce(&Value)) {
     let Value::Specialized {
         value: Some(SpecializedValue::Cell(value)),
@@ -261,6 +317,26 @@ fn assert_arc(val: &Value, exp_type: &str) {
         panic!("not an arc");
     };
     assert_eq!(val.r#type().name_fmt(), exp_type);
+}
+
+/// Phase 1 S15 helper: assert a Weak with expected strong/weak counts.
+fn assert_weak(val: &Value, exp_type: &str, exp_strong: u64, exp_weak: u64) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Weak { strong, weak, .. }),
+        ..
+    } = val
+    else {
+        panic!(
+            "not a Weak spec value: type={:?}",
+            val.r#type().name_fmt()
+        );
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_type);
+    assert_eq!(
+        *strong, exp_strong,
+        "strong count mismatch for {exp_type}"
+    );
+    assert_eq!(*weak, exp_weak, "weak count mismatch for {exp_type}");
 }
 
 fn assert_uuid(val: &Value, exp_type: &str) {
@@ -686,6 +762,26 @@ fn test_read_pointers() {
     );
     let deref = box_d.clone().modify_value(|pcx, v| v.deref(pcx));
     assert_scalar(deref.unwrap().value(), "i32", Some(SupportedScalar::I32(2)));
+    // Phase 1 S9 — `Box<T>` smart-deref: the renderer surfaces the
+    // pointee inline via `Wrapped(inner)` rather than the bare
+    // address. Confirm the hook fired (a raw `*const i32` pointer
+    // would render `Referential`).
+    use bugstalker::debugger::variable::render::ValueLayout;
+    let box_layout = box_d.value().value_layout().expect("box_d layout missing");
+    match box_layout {
+        ValueLayout::Wrapped(inner) => {
+            assert_scalar(inner, "i32", Some(SupportedScalar::I32(2)));
+        }
+        other => panic!(
+            "expected Wrapped(inner) for Box<T> smart-deref, got {other:?}"
+        ),
+    }
+    // Raw `*const i32` should still be Referential.
+    let ptr_a_layout = ptr_a.value().value_layout().expect("ptr_a layout missing");
+    assert!(
+        matches!(ptr_a_layout, ValueLayout::Referential(_)),
+        "raw *const i32 should render as Referential, got {ptr_a_layout:?}"
+    );
     assert_struct(f.value(), "Foo", |i, member| match i {
         0 => assert_member(member, "bar", |val| {
             assert_scalar(val, "i32", Some(SupportedScalar::I32(1)))
@@ -1315,6 +1411,34 @@ fn test_arguments() {
             _ => panic!("3 items expected"),
         })
     });
+
+    // Phase 1 S16: the Vec<u8> render goes through the byte-preview
+    // path. Bytes 3/4/5 are valid utf-8 (1-byte ASCII control chars),
+    // so the format is `b"<debug-escaped-string>"`. We check the
+    // shape (PreRendered + `b"` prefix) rather than the exact
+    // escape sequence to keep the test robust to Rust's debug-format
+    // tweaks.
+    use bugstalker::debugger::variable::render::ValueLayout;
+    let layout = vec.value().value_layout().expect("Vec<u8> layout missing");
+    let rendered = match layout {
+        ValueLayout::PreRendered(s) => s.into_owned(),
+        other => panic!("expected byte-preview PreRendered, got {other:?}"),
+    };
+    assert!(
+        rendered.starts_with("b\""),
+        "byte-preview should start with `b\"`, got {rendered:?}"
+    );
+    // Rust's {:?} formatter escapes control bytes as `\u{N}`. Bytes
+    // 3, 4, 5 land as `\u{3}`, `\u{4}`, `\u{5}`. We assert each is
+    // present so a future formatter change (e.g. switching to
+    // `\xNN`) shows up as a failed assertion rather than a silent
+    // shape change.
+    for hex in ["\\u{3}", "\\u{4}", "\\u{5}"] {
+        assert!(
+            rendered.contains(hex),
+            "preview missing {hex}: {rendered:?}"
+        );
+    }
 
     assert_struct(
         box_arr.value(),
@@ -2113,36 +2237,518 @@ fn test_read_atomic() {
     read_locals!(debugger => int32_atomic, _int32, int32_atomic_ptr);
     assert_idents!(int32_atomic => "int32_atomic", int32_atomic_ptr => "int32_atomic_ptr");
 
-    assert_struct(int32_atomic.value(), "AtomicI32", |i, member| match i {
-        0 => assert_member(member, "v", |val| {
-            assert_struct(val, "UnsafeCell<i32>", |i, member| match i {
-                0 => assert_member(member, "value", |val| {
-                    assert_scalar(val, "i32", Some(SupportedScalar::I32(1)))
-                }),
-                _ => panic!("1 members expected"),
-            })
-        }),
-        _ => panic!("1 members expected"),
+    // Phase 1 S3: AtomicI32 is now rendered as the bare scalar payload
+    // (peeling the outer Atomic wrapper and the UnsafeCell wrapper).
+    // The wrapper type identity is preserved on `Value::r#type()`.
+    assert_atomic_scalar(int32_atomic.value(), "AtomicI32", "i32", SupportedScalar::I32(1));
+
+    // AtomicPtr<i32> peels to the inner *mut i32 pointer.
+    assert_atomic_pointer(int32_atomic_ptr.value(), "AtomicPtr<i32>", "*mut i32");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S6 helper: assert a Range-family value rendered to text.
+fn assert_range_text(val: &Value, exp_outer_type: &str, exp_text: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Range(r)),
+        ..
+    } = val
+    else {
+        panic!("not a Range spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    assert_eq!(r.render(), exp_text);
+}
+
+/// Phase 1 S2 helper: assert a lock guard peeled to the guarded T.
+fn assert_lock_guard_inner(val: &Value, with_inner: impl FnOnce(&Value)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::LockGuard(inner)),
+        ..
+    } = val
+    else {
+        panic!("not a LockGuard spec value: {:?}", val.r#type().name_fmt());
+    };
+    with_inner(inner.as_ref());
+}
+
+/// Phase 1 S2 — `MutexGuard<T>` and `RwLockReadGuard<T>` peel
+/// through their `lock` reference and the parent's
+/// `data: UnsafeCell<T>` field to surface the guarded T directly.
+#[test]
+#[serial]
+fn test_read_lock_guards() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_lock_guard_inner(pick("mtx_guard").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(123)));
+    });
+    assert_lock_guard_inner(pick("rwl_read").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(456)));
     });
 
-    assert_struct(
-        int32_atomic_ptr.value(),
-        "AtomicPtr<i32>",
-        |i, member| match i {
-            0 => assert_member(member, "p", |val| {
-                assert_struct(val, "UnsafeCell<*mut i32>", |i, member| match i {
-                    0 => assert_member(member, "value", |val| assert_pointer(val, "*mut i32")),
-                    _ => panic!("1 members expected"),
-                })
-            }),
-            _ => panic!("1 members expected"),
-        },
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S1 helper: assert a Mutex/RwLock peeled to its inner T.
+fn assert_mutex_inner(val: &Value, with_inner: impl FnOnce(&Value)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Mutex { inner, .. }),
+        ..
+    } = val
+    else {
+        panic!("not a Mutex/RwLock spec value: {:?}", val.r#type().name_fmt());
+    };
+    with_inner(inner.as_ref());
+}
+
+/// Phase 1 S1 (poison) helper: assert poison flag matches expectation.
+fn assert_mutex_poisoned(val: &Value, exp_poisoned: bool) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Mutex { poisoned, .. }),
+        ..
+    } = val
+    else {
+        panic!("not a Mutex/RwLock spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(*poisoned, exp_poisoned);
+}
+
+/// Phase 1 S1 (locked) helper: assert lock-state matches expectation.
+/// Note: the futex backend (Linux, modern Windows, etc.) reports
+/// accurate state; macOS / Win7 always report `false`.
+fn assert_mutex_locked(val: &Value, exp_locked: bool) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Mutex { locked, .. }),
+        ..
+    } = val
+    else {
+        panic!("not a Mutex/RwLock spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(*locked, exp_locked);
+}
+
+/// Phase 1 S1 — `Mutex<T>` and `RwLock<T>` peel through their `data:
+/// UnsafeCell<T>` field to surface the inner T directly.
+#[test]
+#[serial]
+fn test_read_mutex_rwlock() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_mutex_inner(pick("mtx").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(123)));
+    });
+    assert_mutex_inner(pick("rwl").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(456)));
+    });
+    // Phase 1 S1 (poison): a freshly-constructed mutex/rwlock is
+    // not poisoned. Future fixtures with deliberately-poisoned
+    // locks would assert `true` here.
+    assert_mutex_poisoned(pick("mtx").value(), false);
+    assert_mutex_poisoned(pick("rwl").value(), false);
+    // Phase 1 S1 (locked): mtx and rwl are not held when the
+    // breakpoint fires (their `lock()`/`read()` calls happen
+    // afterwards). On macOS the futex backend isn't used so
+    // locked is always false there too.
+    assert_mutex_locked(pick("mtx").value(), false);
+    assert_mutex_locked(pick("rwl").value(), false);
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S10 helper: assert a MaybeUninit peeled to its inner T.
+fn assert_maybe_uninit_inner(val: &Value, with_inner: impl FnOnce(&Value)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::MaybeUninit(inner)),
+        ..
+    } = val
+    else {
+        panic!("not a MaybeUninit spec value: {:?}", val.r#type().name_fmt());
+    };
+    with_inner(inner.as_ref());
+}
+
+/// Phase 1 S10 — `MaybeUninit<T>` peels through the union's `value`
+/// arm and `ManuallyDrop` wrapper to surface the inner T directly.
+#[test]
+#[serial]
+fn test_read_maybe_uninit() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_maybe_uninit_inner(pick("mu_init").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(99)));
+    });
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S12/S13/S14 DST companions — `&CStr`, `&OsStr`, `&Path`
+/// route through the same parsers as their owned counterparts.
+#[test]
+#[serial]
+fn test_read_dst_refs() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    let dst_cs = pick("dst_cs").value();
+    let Value::Specialized {
+        value: Some(SpecializedValue::CString(s)),
+        ..
+    } = dst_cs
+    else {
+        panic!(
+            "dst_cs not a CString-spec value: {:?}",
+            dst_cs.r#type().name_fmt()
+        );
+    };
+    assert_eq!(s.value, "c\"hi\"");
+
+    let dst_os = pick("dst_os").value();
+    let Value::Specialized {
+        value: Some(SpecializedValue::OsString(s)),
+        ..
+    } = dst_os
+    else {
+        panic!(
+            "dst_os not an OsString-spec value: {:?}",
+            dst_os.r#type().name_fmt()
+        );
+    };
+    assert_eq!(s.value, "\"hi\"");
+
+    let dst_pa = pick("dst_pa").value();
+    let Value::Specialized {
+        value: Some(SpecializedValue::OsString(s)),
+        ..
+    } = dst_pa
+    else {
+        panic!(
+            "dst_pa not an OsString-spec value: {:?}",
+            dst_pa.r#type().name_fmt()
+        );
+    };
+    assert_eq!(s.value, "\"/etc\"");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S13/S14 helper: assert an OsString/PathBuf rendered to a
+/// particular pre-rendered string form.
+fn assert_os_string(val: &Value, exp_outer_type_contains: &str, exp_text: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::OsString(s)),
+        ..
+    } = val
+    else {
+        panic!("not an OsString spec value: {:?}", val.r#type().name_fmt());
+    };
+    let actual_type = val.r#type().name_fmt();
+    assert!(
+        actual_type.contains(exp_outer_type_contains),
+        "expected type to contain {exp_outer_type_contains:?}, got {actual_type:?}"
+    );
+    assert_eq!(s.value, exp_text);
+}
+
+/// Phase 1 S13/S14 — `OsString` and `PathBuf` peel through their
+/// wrapper chain to the underlying `Vec<u8>` and render as a quoted
+/// utf-8 string (or hex preview when not utf-8).
+#[test]
+#[serial]
+fn test_read_os_string_pathbuf() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_os_string(pick("os_str").value(), "OsString", "\"hello\"");
+    assert_os_string(pick("pb").value(), "PathBuf", "\"/tmp/foo\"");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S12 helper: assert a CString rendered to a particular
+/// pre-rendered string form.
+fn assert_cstring(val: &Value, exp_outer_type_contains: &str, exp_text: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::CString(s)),
+        ..
+    } = val
+    else {
+        panic!("not a CString spec value: {:?}", val.r#type().name_fmt());
+    };
+    let actual_type = val.r#type().name_fmt();
+    assert!(
+        actual_type.contains(exp_outer_type_contains),
+        "expected type to contain {exp_outer_type_contains:?}, got {actual_type:?}"
+    );
+    assert_eq!(s.value, exp_text);
+}
+
+/// Phase 1 S12 — `CString` renders as `c"…"` (utf-8) or `c"\\xNN…"`
+/// hex preview when not valid utf-8.
+#[test]
+#[serial]
+fn test_read_cstring() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_cstring(pick("cs_hello").value(), "CString", "c\"hello\"");
+    assert_cstring(pick("cs_empty").value(), "CString", "c\"\"");
+    // 0x68 0x69 0x80 0xff — the 0x80 0xff bytes break utf-8, expect
+    // hex preview that begins with the literal escape pattern.
+    let cs_bytes = pick("cs_bytes").value();
+    let Value::Specialized {
+        value: Some(SpecializedValue::CString(s)),
+        ..
+    } = cs_bytes
+    else {
+        panic!("cs_bytes not a CString")
+    };
+    assert!(
+        s.value.starts_with("c\"\\x"),
+        "expected hex-preview prefix, got {:?}",
+        s.value
     );
 
-    let deref = int32_atomic_ptr
-        .clone()
-        .modify_value(|pcx, v| v.field("p").unwrap().field("value").unwrap().deref(pcx));
-    assert_scalar(deref.unwrap().value(), "i32", Some(SupportedScalar::I32(2)));
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S4 helper: assert a `Duration` peeled to (secs, nanos).
+fn assert_duration(val: &Value, exp: (u64, u32)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Duration(got)),
+        ..
+    } = val
+    else {
+        panic!("not a Duration spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(*got, exp);
+}
+
+/// Phase 1 S4 — `core::time::Duration` peels to `(secs, nanos)` and
+/// renders human-readable via `format_duration`.
+#[test]
+#[serial]
+fn test_read_duration() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_duration(pick("d_zero").value(), (0, 0));
+    assert_duration(pick("d_ms").value(), (1, 500_000_000));
+    assert_duration(pick("d_s").value(), (7, 0));
+    assert_duration(pick("d_h").value(), (3661, 500_000_000));
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S6 — `core::ops::Range*` family renders to canonical
+/// Rust source form (`a..b`, `a..=b`, `a..`, `..b`).
+#[test]
+#[serial]
+fn test_read_ranges() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_range_text(pick("r1").value(), "Range<i32>", "0..10");
+    assert_range_text(pick("r2").value(), "RangeInclusive<i32>", "0..=10");
+    assert_range_text(pick("r3").value(), "RangeFrom<i32>", "5..");
+    assert_range_text(pick("r4").value(), "RangeTo<i32>", "..10");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S7 — `Pin<P>` peels to the pinnee.
+#[test]
+#[serial]
+fn test_read_pin() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside `phase1_specs_b` —
+    // see `examples/vars/src/vars.rs`. If you renumber that function,
+    // update this constant in lockstep.
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pinned_box = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("pinned_box"))
+        .expect("pinned_box not in locals");
+    let pinned_ref = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("pinned_ref"))
+        .expect("pinned_ref not in locals");
+
+    // Pin<Box<i32>> peels to a Box (still a pointer-shaped Value).
+    assert_pin(pinned_box.value(), "Pin<alloc::boxed::Box<i32, alloc::alloc::Global>>", |inner| {
+        assert!(matches!(inner, Value::Pointer(_)),
+            "pinned_box pinnee should be a pointer; got {:?}", inner.r#type().name_fmt());
+    });
+
+    // Pin<&mut i32> peels to a &mut i32 reference (also pointer-shaped).
+    assert_pin(pinned_ref.value(), "Pin<&mut i32>", |inner| {
+        assert!(matches!(inner, Value::Pointer(_)),
+            "pinned_ref pinnee should be a pointer; got {:?}", inner.r#type().name_fmt());
+    });
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S11 — `NonNull<T>` is rendered as the bare inner pointer.
+#[test]
+#[serial]
+fn test_read_nonnull() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside `phase1_specs` —
+    // see `examples/vars/src/vars.rs`. If you renumber that function,
+    // update this constant in lockstep.
+    debugger.set_breakpoint_at_line("vars.rs", 698).unwrap();
+
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(698));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let nn = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("nn"))
+        .unwrap_or_else(|| panic!("`nn` not in {:?}", vars.iter().map(|v| v.identity().to_string()).collect::<Vec<_>>()));
+
+    assert_nonnull_pointer(nn.value(), "NonNull<i32>", "*const i32");
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);
@@ -2253,7 +2859,13 @@ fn test_shared_ptr() {
         _ => panic!("3 members expected"),
     });
 
-    assert_rc(weak_rc2.value(), "Weak<i32, alloc::alloc::Global>");
+    // Phase 1 S15: Weak now reports strong/weak counts.
+    assert_weak(
+        weak_rc2.value(),
+        "Weak<i32, alloc::alloc::Global>",
+        2, // strong
+        2, // weak (rc1 + weak_rc2)
+    );
     let deref = weak_rc2.clone().modify_value(|pcx, v| v.deref(pcx));
     assert_struct(deref.unwrap().value(), deref_type, |i, member| match i {
         0 => assert_member(member, "strong", |val| {
@@ -2278,29 +2890,12 @@ fn test_shared_ptr() {
         deref.unwrap().value(),
         "ArcInner<i32>",
         |i, member| match i {
+            // Phase 1 S3: AtomicUsize is now a peeled scalar.
             0 => assert_member(member, "strong", |val| {
-                assert_struct(val, "AtomicUsize", |i, member| match i {
-                    0 => assert_member(member, "v", |val| {
-                        assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                            assert_member(member, "value", |val| {
-                                assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                            })
-                        })
-                    }),
-                    _ => panic!("1 member expected"),
-                })
+                assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
             }),
             1 => assert_member(member, "weak", |val| {
-                assert_struct(val, "AtomicUsize", |i, member| match i {
-                    0 => assert_member(member, "v", |val| {
-                        assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                            assert_member(member, "value", |val| {
-                                assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                            })
-                        })
-                    }),
-                    _ => panic!("1 member expected"),
-                })
+                assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
             }),
             2 => assert_member(member, "data", |val| {
                 assert_scalar(val, "i32", Some(SupportedScalar::I32(2)))
@@ -2315,29 +2910,12 @@ fn test_shared_ptr() {
         deref.unwrap().value(),
         "ArcInner<i32>",
         |i, member| match i {
+            // Phase 1 S3: AtomicUsize is now a peeled scalar.
             0 => assert_member(member, "strong", |val| {
-                assert_struct(val, "AtomicUsize", |i, member| match i {
-                    0 => assert_member(member, "v", |val| {
-                        assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                            assert_member(member, "value", |val| {
-                                assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                            })
-                        })
-                    }),
-                    _ => panic!("1 member expected"),
-                })
+                assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
             }),
             1 => assert_member(member, "weak", |val| {
-                assert_struct(val, "AtomicUsize", |i, member| match i {
-                    0 => assert_member(member, "v", |val| {
-                        assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                            assert_member(member, "value", |val| {
-                                assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                            })
-                        })
-                    }),
-                    _ => panic!("1 member expected"),
-                })
+                assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
             }),
             2 => assert_member(member, "data", |val| {
                 assert_scalar(val, "i32", Some(SupportedScalar::I32(2)))
@@ -2346,35 +2924,24 @@ fn test_shared_ptr() {
         },
     );
 
-    assert_arc(weak_arc2.value(), "Weak<i32, alloc::alloc::Global>");
+    // Phase 1 S15: Weak (sync flavour) reports strong/weak counts.
+    assert_weak(
+        weak_arc2.value(),
+        "Weak<i32, alloc::alloc::Global>",
+        2, // strong
+        2, // weak (arc1 + weak_arc2)
+    );
     let deref = weak_arc2
         .clone()
         .modify_value(|pcx, v| v.deref(pcx))
         .unwrap();
     assert_struct(deref.value(), "ArcInner<i32>", |i, member| match i {
+        // Phase 1 S3: AtomicUsize is now a peeled scalar.
         0 => assert_member(member, "strong", |val| {
-            assert_struct(val, "AtomicUsize", |i, member| match i {
-                0 => assert_member(member, "v", |val| {
-                    assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                        assert_member(member, "value", |val| {
-                            assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                        })
-                    })
-                }),
-                _ => panic!("1 member expected"),
-            })
+            assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
         }),
         1 => assert_member(member, "weak", |val| {
-            assert_struct(val, "AtomicUsize", |i, member| match i {
-                0 => assert_member(member, "v", |val| {
-                    assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                        assert_member(member, "value", |val| {
-                            assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                        })
-                    })
-                }),
-                _ => panic!("1 member expected"),
-            })
+            assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
         }),
         2 => assert_member(member, "data", |val| {
             assert_scalar(val, "i32", Some(SupportedScalar::I32(2)))
@@ -2868,6 +3435,47 @@ fn test_read_time() {
     assert_idents!(system_time => "system_time", instant => "instant");
     assert_system_time(system_time.value(), (0, 0));
     assert_instant(instant.value());
+
+    // Phase 1 S5: SystemTime renders as ISO-8601 / RFC3339 UTC.
+    // The debugee constructs `SystemTime::UNIX_EPOCH` so the format
+    // is fixed across platforms: "1970-01-01T00:00:00Z".
+    use bugstalker::debugger::variable::render::ValueLayout;
+    let st_layout = system_time
+        .value()
+        .value_layout()
+        .expect("SystemTime layout missing");
+    match st_layout {
+        ValueLayout::PreRendered(s) => {
+            assert_eq!(s.as_ref(), "1970-01-01T00:00:00Z");
+        }
+        other => panic!("expected PreRendered ISO-8601, got {other:?}"),
+    }
+
+    // Phase 1 S5: Instant renders as `now ± HH:MM:SS.mmm`. The
+    // direction sign and digit-shape are stable; the wall-clock
+    // delta against `now` isn't, so we just check the prefix +
+    // shape (`now ` + sign + 8-digit time + 4-digit fractional).
+    let inst_layout = instant
+        .value()
+        .value_layout()
+        .expect("Instant layout missing");
+    match inst_layout {
+        ValueLayout::PreRendered(s) => {
+            let s = s.as_ref();
+            assert!(
+                s.starts_with("now + ") || s.starts_with("now - "),
+                "Instant should render as `now ± …`, got {s:?}"
+            );
+            // After `now ± `, expect "HH:MM:SS.mmm" — 12 chars.
+            let suffix = &s[6..];
+            assert_eq!(
+                suffix.len(),
+                12,
+                "Instant time format should be 12 chars (HH:MM:SS.mmm), got {suffix:?}"
+            );
+        }
+        other => panic!("expected PreRendered Instant delta, got {other:?}"),
+    }
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);

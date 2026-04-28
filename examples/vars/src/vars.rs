@@ -685,4 +685,66 @@ pub fn main() {
         "one".to_string(),
         vec!["two".to_string(), "three".to_string()],
     );
+    phase1_specs();
+    phase1_specs_b();
+}
+
+fn phase1_specs() {
+    use std::ptr::NonNull;
+    let mut x: i32 = 42;
+    let nn: NonNull<i32> = NonNull::from(&mut x);
+    let _y = unsafe { nn.as_ref() };
+
+    let nop: Option<u8> = None;
+}
+
+fn phase1_specs_b() {
+    use std::pin::Pin;
+    let pinned_box: Pin<Box<i32>> = Box::pin(7);
+    let mut x: i32 = 13;
+    let pinned_ref: Pin<&mut i32> = Pin::new(&mut x);
+
+    let r1 = 0i32..10;
+    let r2 = 0i32..=10;
+    let r3 = 5i32..;
+    let r4 = ..10i32;
+
+    use std::time::Duration;
+    let d_zero = Duration::new(0, 0);
+    let d_ms = Duration::from_millis(1500);
+    let d_s = Duration::from_secs(7);
+    let d_h = Duration::new(3661, 500_000_000);
+
+    use std::ffi::CString;
+    let cs_hello: CString = CString::new("hello").unwrap();
+    let cs_empty: CString = CString::new("").unwrap();
+    let cs_bytes: CString = CString::new(vec![0x68u8, 0x69, 0x80, 0xff]).unwrap();
+
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    let os_str: OsString = OsString::from("hello");
+    let pb: PathBuf = PathBuf::from("/tmp/foo");
+
+    use std::mem::MaybeUninit;
+    let mu_init: MaybeUninit<i32> = MaybeUninit::new(99);
+
+    use std::sync::{Mutex, RwLock};
+    let mtx: Mutex<i32> = Mutex::new(123);
+    let rwl: RwLock<i32> = RwLock::new(456);
+    let mtx_guard = mtx.lock().unwrap();
+    let rwl_read = rwl.read().unwrap();
+
+    // DST companions to S12/S13/S14: &CStr, &OsStr, &Path.
+    use std::ffi::{CStr, OsStr};
+    use std::path::Path;
+    let dst_cs: &CStr = CStr::from_bytes_with_nul(b"hi\0").unwrap();
+    let dst_os: &OsStr = OsStr::new("hi");
+    let dst_pa: &Path = Path::new("/etc");
+    // Keep them live across the breakpoint by using them in
+    // observable side effects.
+    std::hint::black_box(dst_cs);
+    std::hint::black_box(dst_os);
+    std::hint::black_box(dst_pa);
+
+    let nop: Option<u8> = None;
 }
