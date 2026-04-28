@@ -152,6 +152,28 @@ bench:
         --mount=type=cache,target=/bs/target \
         cargo bench --workspace -- --quick
 
+# Phase 1 acceptance smoke. Drives `bugstalker` against the
+# `examples/vars` debuggee through the library API and asserts every
+# Phase 1 stdlib type renders via its specialised path. Includes a
+# bench --quick pass so a regression that breaks the bench harness
+# (panic / compile error) fails CI alongside the smoke check.
+# Numerical bench-regression gating lands in Phase 8 once real bench
+# bodies replace the Phase 0 placeholders in `benches/`.
+smoke:
+    FROM +build-examples
+    # `examples/target` may be a (broken) symlink on hosts that redirect
+    # cargo target dirs out of the source tree — strip it before recreating.
+    RUN rm -rf examples/target && \
+        mkdir -p examples/target && \
+        mv examples/_built/debug examples/target/debug
+    RUN --privileged \
+        --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        cargo run -p bs-smoke -- --vars examples/target/debug/vars
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        cargo bench --workspace -- --quick
+
 # `cargo deny check` enforces the licence allow-list and surfaces
 # advisories. Configured in `deny.toml`.
 deny:
