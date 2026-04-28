@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 use crate::dap::yadap::protocol::DapRequest;
 use crate::dap::yadap::session::ThreadFocusByPid;
+use crate::debugger::r#async::{AsyncFnFutureState, Future, TaskBacktrace};
 use anyhow::{Context, anyhow};
 use nix::unistd::Pid;
 use regex::escape as regex_escape;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 
@@ -285,6 +286,149 @@ impl super::DebugSession {
         }
 
         self.send_success_body(req, json!({ "targets": targets }))
+    }
+
+    /// Phase 3 Feature D batch D3 — `bs/awaitTrace` custom DAP request.
+    ///
+    /// Returns the awaitee chain for the requested thread's task as a
+    /// list of frames. Optional `threadId` argument selects a specific
+    /// task; absent ⇒ the currently-focused task.
+    ///
+    /// Frame shape:
+    ///
+    /// ```jsonc
+    /// {
+    ///   "kind": "asyncFn" | "sleep" | "joinHandle" | "custom" | "unknown",
+    ///   "name": "<function or type name>",
+    ///   "source": { "path": "..." },   // present iff D1 recovered (file, line)
+    ///   "line": 42,                     //  "
+    ///   "state": "suspend"|"unresumed"|"returned"|"panicked"|"ok",  // asyncFn only
+    ///   "awaitPoint": 3,                // asyncFn Suspend only
+    ///   "concrete": "MyConcreteFuture", // custom only — Phase 3 D2b
+    ///   "waitingForTaskId": 12          // joinHandle only
+    /// }
+    /// ```
+    pub(super) fn handle_await_trace(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let dbg = self
+            .debugger
+            .as_mut()
+            .ok_or_else(|| anyhow!("bs/awaitTrace: debugger not initialized"))?;
+
+        let backtrace = dbg
+            .async_backtrace()
+            .map_err(|e| anyhow!("bs/awaitTrace: {e}"))?;
+
+        // Pick the task: explicit `threadId` selects the worker on
+        // that pid; otherwise fall back to the focused task. We keep
+        // both paths so external clients can poll any thread without
+        // having to focus it first.
+        let requested_thread_id = req.arguments.get("threadId").and_then(|v| v.as_i64());
+
+        let task: Option<&TaskBacktrace> = if let Some(thread_id) = requested_thread_id {
+            let pid = Pid::from_raw(thread_id as i32);
+            backtrace
+                .workers
+                .iter()
+                .find(|w| w.thread.pid == pid)
+                .and_then(|w| {
+                    w.active_task
+                        .and_then(|tid| backtrace.tasks.iter().find(|t| t.task_id == tid))
+                        .or(w.active_task_standby.as_ref())
+                })
+                .or_else(|| {
+                    backtrace
+                        .block_threads
+                        .iter()
+                        .find(|bt| bt.thread.pid == pid)
+                        .map(|bt| &bt.bt)
+                })
+        } else {
+            backtrace.current_task()
+        };
+
+        let Some(task) = task else {
+            return self.send_err(req, "bs/awaitTrace: no task on the requested thread");
+        };
+
+        let frames: Vec<Value> = task
+            .futures
+            .iter()
+            .map(|f| self.serialize_await_frame(&backtrace, f))
+            .collect();
+
+        self.send_success_body(
+            req,
+            json!({
+                "taskId": task.task_id,
+                "frames": frames,
+            }),
+        )
+    }
+
+    fn serialize_await_frame(
+        &self,
+        backtrace: &crate::debugger::r#async::AsyncBacktrace,
+        f: &Future,
+    ) -> Value {
+        match f {
+            Future::AsyncFn(af) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("kind".into(), json!("asyncFn"));
+                obj.insert("name".into(), json!(af.async_fn));
+                obj.insert(
+                    "state".into(),
+                    json!(match af.state {
+                        AsyncFnFutureState::Suspend(_) => "suspend",
+                        AsyncFnFutureState::Unresumed => "unresumed",
+                        AsyncFnFutureState::Returned => "returned",
+                        AsyncFnFutureState::Panicked => "panicked",
+                        AsyncFnFutureState::Ok => "ok",
+                    }),
+                );
+                if let AsyncFnFutureState::Suspend(n) = af.state {
+                    obj.insert("awaitPoint".into(), json!(n));
+                }
+                if let Some((file, line)) = &af.await_location {
+                    let target_path = file.to_string_lossy().to_string();
+                    let client_path = self.source_map.map_target_to_client(&target_path);
+                    obj.insert("source".into(), json!({ "path": client_path }));
+                    obj.insert("line".into(), json!(*line as i64));
+                }
+                Value::Object(obj)
+            }
+            Future::Custom(custom) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("kind".into(), json!("custom"));
+                obj.insert("name".into(), json!(custom.name.to_string()));
+                if let Some(concrete) = &custom.concrete {
+                    obj.insert("concrete".into(), json!(concrete));
+                }
+                Value::Object(obj)
+            }
+            Future::TokioSleep(s) => {
+                json!({
+                    "kind": "sleep",
+                    "name": s.name.to_string(),
+                    "deadlineSec": s.instant.0,
+                    "deadlineNsec": s.instant.1,
+                })
+            }
+            Future::TokioJoinHandleFuture(jh) => {
+                let waiting_id = backtrace
+                    .tasks
+                    .iter()
+                    .find(|t| t.raw_ptr == jh.wait_for_task)
+                    .map(|t| t.task_id);
+                let mut obj = serde_json::Map::new();
+                obj.insert("kind".into(), json!("joinHandle"));
+                obj.insert("name".into(), json!(jh.name.to_string()));
+                if let Some(id) = waiting_id {
+                    obj.insert("waitingForTaskId".into(), json!(id));
+                }
+                Value::Object(obj)
+            }
+            Future::UnknownFuture => json!({ "kind": "unknown" }),
+        }
     }
 }
 
