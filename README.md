@@ -1,7 +1,7 @@
 # BugStalker
 
 <p align="center">
-    <img src="website/static/img/biglogo.png" width="300"></a>
+    <img src="website/static/img/biglogo.png" width="300" alt="BugStalker logo">
     <br>
 </p>
 
@@ -17,22 +17,22 @@
 <div align="center">
 
 <a href="https://github.com/godzie44/BugStalker/releases">
-    <img src="https://img.shields.io/github/v/release/godzie44/BugStalker?style=for-the-badge">
+    <img src="https://img.shields.io/github/v/release/godzie44/BugStalker?style=for-the-badge" alt="latest release">
 </a>
 
 <a href="https://crates.io/crates/bugstalker/">
-    <img src="https://img.shields.io/crates/v/bugstalker?style=for-the-badge">
+    <img src="https://img.shields.io/crates/v/bugstalker?style=for-the-badge" alt="crates.io">
 </a>
 
 <a href="https://github.com/godzie44/BugStalker/actions">
-    <img src="https://img.shields.io/github/actions/workflow/status/godzie44/BugStalker/ci.yml?style=for-the-badge&label=test">
+    <img src="https://img.shields.io/github/actions/workflow/status/godzie44/BugStalker/ci.yml?style=for-the-badge&label=test" alt="CI status">
 </a>
 
 <a href="https://docs.rs/bugstalker/">
-    <img src="https://img.shields.io/docsrs/bugstalker?style=for-the-badge">
+    <img src="https://img.shields.io/docsrs/bugstalker?style=for-the-badge" alt="docs.rs">
 </a>
 
-<img src="https://img.shields.io/crates/l/BugStalker?style=for-the-badge">
+<img src="https://img.shields.io/crates/l/BugStalker?style=for-the-badge" alt="MIT licensed">
 
 </div>
 
@@ -46,7 +46,6 @@
 
 ---
 
-
 ## Features
 
 * **Rust-native**: Built in Rust specifically for Rust development, with a focus on simplicity
@@ -57,7 +56,11 @@
 * **Advanced runtime inspection:**
   * Full multithreaded application support
   * Data query expressions
-  * Deep Rust type system integration (collections, smart pointers, thread locals, etc.), not only for printing but also for interaction
+  * Deep Rust type system integration — collections, smart pointers (`Box`, `Rc`, `Arc`, `Weak`),
+    sync primitives (`Mutex`/`RwLock` with `[locked]`/`[poisoned]` badges, `Atomic*`),
+    time (`Duration` as `1h 1m 1.500s`, `SystemTime`/`Instant` as RFC3339 / now-relative),
+    ranges, `Pin`, `MaybeUninit`, `NonNull`, `CString`, `OsString`/`PathBuf`, `&[u8]` utf-8 probe
+  * Slash-suffix format specs on `print`/`var`/`argd`: `/x`, `/b`, `/o`, `/d`, `/iso`
   * Variable rendering using core::fmt::Debug trait
 * **Flexible interfaces:**
   * Switch between console and TUI modes at any time
@@ -83,7 +86,6 @@ Feel free to suggest changes, ask a question or implement a new feature.
 Any contributions are very welcome.
 
 [How to contribute](https://github.com/godzie44/BugStalker/blob/master/CONTRIBUTING.md).
-
 
 ## Copyright
 

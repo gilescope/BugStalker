@@ -451,21 +451,21 @@ category (kept for context — each row used to be a multi-day fix):
      in the main exec is found even when the focus PC has no
      tracked debug_info (typical for parked workers).
 * `test_read_tls_*` — handled. Three darwin-specific fixes:
-    - `parser.rs::ValueModifiers::from_identity` now sets
-      `tls_unwrapped` when a `VAL` ident sits under a `{closure#N}`
-      with no `eager` / `lazy` wrapper struct preserved by
-      dsymutil (const-init flatten case).
-    - `parser.rs::ValueParser::parse` wraps a non-TLS-Specialized
-      result in a synthetic `TlsVariable { inner_value, inner_type }`
-      when `tls_unwrapped` fires, matching the
-      `Value::Specialized<Tls>` shape Linux callers expect. The
-      wrap is skipped if the inner parser already produced a TLS
-      specialisation (preserved-wrapper lazy case) so we don't
-      double-wrap.
-    - `variables.rs::test_read_tls_const_variables` normalises
-      `{closure#1}` → `{closure#0}` before comparing against the
-      version_switch'd identity strings (dsymutil renumbers
-      anonymous closures starting at 1).
+  * `parser.rs::ValueModifiers::from_identity` now sets
+    `tls_unwrapped` when a `VAL` ident sits under a `{closure#N}`
+    with no `eager` / `lazy` wrapper struct preserved by
+    dsymutil (const-init flatten case).
+  * `parser.rs::ValueParser::parse` wraps a non-TLS-Specialized
+    result in a synthetic `TlsVariable { inner_value, inner_type }`
+    when `tls_unwrapped` fires, matching the
+    `Value::Specialized<Tls>` shape Linux callers expect. The
+    wrap is skipped if the inner parser already produced a TLS
+    specialisation (preserved-wrapper lazy case) so we don't
+    double-wrap.
+  * `variables.rs::test_read_tls_const_variables` normalises
+    `{closure#1}` → `{closure#0}` before comparing against the
+    version_switch'd identity strings (dsymutil renumbers
+    anonymous closures starting at 1).
 * `test_step_over_for_loop_issue_156` — passes serially; the
   step engine handles the loop iteration correctly.
 * `breakpoints::test_multiple_brkpt_on_addr` — handled.
@@ -613,6 +613,78 @@ Recent darwin-specific fixes in this phase:
 ### Open architectural decisions
 
 * **Codesigning of `bs`.** `task_for_pid` requires
+  `com.apple.security.cs.debugger`. We can either (a) ship
+  pre-signed release binaries via `cargo dist` + a Developer ID
+  certificate, (b) document a `codesign --entitlements …`
+  one-liner in the install instructions, or (c) both. (a) is what
+  LLDB does; (b) is what `rust-gdb` users do. Pick before the POC
+  ships.
+* **SIP-protected debuggees.** Standard user binaries are fine.
+  System binaries (anything in `/System`) need SIP partial-disable
+  (`csrutil enable --without debug` from recovery). Document but
+  don't try to work around.
+* **Backend abstraction.** The current cfg-gated approach (parallel
+  `#[cfg(target_os = …)]` impls per function) gets us to the POC
+  fastest. Once both backends are real, refactor to a `Backend`
+  trait so a third backend (e.g. *BSD, or a record-and-replay
+  backend for time-travel) is a clean addition rather than
+  another arm of every cfg.
+
+## Phase 1 — Stdlib value-rendering coverage
+
+**Goal:** parity with `rustc`'s `lldb_providers.py` /
+`gdb_providers.py` for every stdlib type they cover, plus
+beyond-parity prettification for types nobody handles well.
+Plan: [`doc/plans/phase-1-stdlib-coverage.md`](plans/phase-1-stdlib-coverage.md).
+
+**Status: complete.** Batches A–Q landed; 12/12 integration variable
+tests + 28/28 unit tests pass on linux and darwin/aarch64.
+
+### Done (Tier 1)
+
+* **F1** — `DW_TAG_reference_type` / `DW_TAG_rvalue_reference_type`
+  no longer fall through with `warn!`; treated as pointer-shaped.
+* **F3** — `RenderBudget` with `LEN_GUARD` / `CAP_GUARD` defaults;
+  every collection / string renderer reports `… N more elided` on
+  truncation.
+* **F4** — slash-suffix format spec on `print`/`var`/`argd`: `/x`,
+  `/b`, `/o`, `/d`, `/iso`. (`/p`, `/c`, `/s`, `/y`, `/utf8`,
+  `/hex`, `/[N]`, `/[N..M]` deferred.)
+* **S1** — `Mutex<T>` / `RwLock<T>` peel through `UnsafeCell<T>` to
+  the inner `T`; `[poisoned]` and `[locked]` (futex backend on
+  Linux/Windows/BSD) badges.
+* **S2** — `MutexGuard<T>` / `RwLockReadGuard<T>` /
+  `RwLockWriteGuard<T>` peel to the guarded `T`.
+* **S3** — every `Atomic*` (including `AtomicPtr<T>`) renders as the
+  bare scalar / `*T`.
+* **S4** — `Duration` renders human-readable (`1h 1m 1.500s`,
+  `250µs`, `7ns`).
+* **S5** — `SystemTime` → ISO-8601 / RFC3339; `Instant` →
+  `now ± HH:MM:SS.mmm`.
+* **S6** — `Range<T>` / `RangeInclusive<T>` / `RangeFrom<T>` /
+  `RangeTo<T>` / `RangeFull` render `start..end`-style.
+* **S7** — `Pin<P>` peels to the pinnee; wrapper identity preserved
+  on the rendered type.
+* **S9** — `Box<T>` smart-deref via `PointerValue::dereffed`;
+  pointee shows inline.
+* **S10** — `MaybeUninit<T>` peels through `value: ManuallyDrop<T>`.
+* **S11** — `NonNull<T>` renders as a plain `*T`.
+* **S12** — `CString` / `&CStr` utf-8 probe with hex-preview
+  fallback, bounded 64 KiB read.
+* **S13** — `OsString` / `&OsStr` utf-8 probe.
+* **S14** — `PathBuf` / `&Path` delegate through S13.
+* **S15** — `Weak<T>` reports `(strong=N, weak=M)` plus `[dropped]`.
+* **S16** — `Vec<u8>` / `VecDeque<u8>` utf-8 probe with
+  16-bytes-per-row hex-dump fallback.
+
+### Deferred / upstream-tracked
+
+* **F2** — `parser.rs` `'?'` placeholder for invalid `char` bit
+  patterns ships when
+  [rust-lang/rust#113819](https://github.com/rust-lang/rust/issues/113819)
+  closes upstream.
+* **S8** — `Cow` promotion dropped; the default `RustEnum` path
+  already renders correctly.
   `com.apple.security.cs.debugger`. We can either (a) ship
   pre-signed release binaries via `cargo dist` + a Developer ID
   certificate, (b) document a `codesign --entitlements …`

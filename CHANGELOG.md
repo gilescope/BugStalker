@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD001 MD022 MD025 MD032 MD012 -->
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -6,6 +7,224 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- workspace: root `Cargo.toml` is now a `[workspace]` (`members = [".", "crates/*"]`)
+  with shared `[workspace.package]` and `[workspace.dependencies]`.
+  `examples/` remains a separate workspace.
+- crate: `crates/bs-test-harness/` — empty stub member. Phase 8 will port
+  the launch-debuggee → set-breakpoint → render → assert flow currently
+  inlined in `tests/debugger/variables.rs` into this crate.
+- licensing: `// SPDX-License-Identifier: MIT` headers on every source
+  file (`scripts/add-spdx.py` is the regenerator; preserves shebangs).
+- licensing: `deny.toml` — cargo-deny config enforcing the licence
+  allow-list listed in `doc/plans/phase-0-preflight.md`.
+- bench: criterion scaffolding under `benches/`
+  (`render_value.rs`, `attach_cold.rs`) wired into root `Cargo.toml` as
+  `[[bench]]` entries. Per-crate benches land as later phases add the
+  hot-path crates.
+- ci: `.github/workflows/ci-nightly.yml`, `ci-bench.yml`, `ci-fuzz.yml`,
+  `ci-soak.yml` — scheduled workflow stubs. New `cargo deny` and
+  `test-macos` (macos-14) jobs in `ci.yml`.
+- build: `Earthfile` `+lint`, `+bench`, `+deny`, `+fuzz` targets.
+- build: `Makefile` `nt` / `nt-int` (cargo nextest), `lint`, `bench`,
+  `deny`, `fuzz` targets.
+- doc: `doc/logging.md` describing the `tracing` convention for
+  workspace crates.
+- variables (Phase 1 batch Q — stdlib coverage):
+  - S1 (`[locked]` badge): `Mutex<T>` and `RwLock<T>` now report
+    lock state on the futex backend (Linux, Android, FreeBSD,
+    OpenBSD, DragonflyBSD, modern Windows, Hermit, wasm-atomics).
+    Detection is structural: BFS the `inner` member for the first
+    `u32` scalar (the futex's atomic state — peeled by S3) and
+    treat non-zero as locked. macOS / iOS pthread backends and
+    Win7 SRWLock conservatively report `locked = false` (no
+    field-name match). Renderer prepends `[locked]` when set.
+- variables (Phase 1 batch P — stdlib coverage):
+  - F4 (format-spec grammar, minimum-viable cut): `/x`, `/b`, `/o`,
+    `/d`, `/iso` colon-suffix specs on `var` / `vard` / `arg` /
+    `argd` commands. Syntax: `var x /x`, `argd y /iso`. Spec is
+    parsed as part of the print command (option A from the design
+    review), not embedded in `Dqe`. Applies to top-level scalar
+    integers (hex/bin/oct/dec) and to `Duration` / `SystemTime`
+    (ISO-8601). `Instant` has no calendar form so `/iso` falls
+    back. Type-vs-spec mismatches log a `warn!` and use the
+    default render. Five unit tests on `format_iso_duration` plus
+    six new parser test cases.
+  - F4 syntax note: GDB-style `/x` rather than the originally
+    proposed `:x` because `:` collides with `rust_identifier`'s
+    `::` namespace separator inside the chumsky expression
+    parser. `/[xbod]` matches GDB's existing `print/x` convention.
+  - `expression::parser()` no longer hard-codes
+    `then_ignore(end())`; the four existing callers keep that
+    behaviour explicitly, and the print parser composes the
+    optional format-spec suffix without it.
+  - Deferred: `/p`, `/c`, `/s`, `/y`, `/utf8`, `/hex`, `/[N]`,
+    `/[N..M]` — slice indexing in particular is really a sub-
+    expression and probably belongs in `Dqe` rather than as a
+    print-time format spec.
+- variables (Phase 1 batch O — stdlib coverage):
+  - S12/S13/S14 DST companions: `&CStr`, `&OsStr`, `&Path`. rustc
+    materialises these fat references as structures with
+    `data_ptr` and `length` fields, identical in shape to the
+    owned counterparts' BFS targets. Routing them through the
+    existing `parse_cstring` / `parse_os_string` helpers gives
+    `c"hi"` / `"hi"` / `"/etc"` rendering with no new parser
+    code; only the dispatcher gets new arms (suffix-matched on
+    `::CStr` / `::OsStr` / `::Path` to tolerate naming variations
+    across rustc versions).
+- variables (Phase 1 batch N — stdlib coverage):
+  - S1 (`[poisoned]` badge): `Mutex<T>` and `RwLock<T>` now read
+    the `poison: poison::Flag` field (an `AtomicBool` peeled by
+    S3) and surface a `[poisoned]` trailer when the lock has been
+    poisoned by a panic in a previously-held critical section. The
+    `SpecializedValue::Mutex` variant gained a `poisoned: bool`
+    field; renderer prepends `[poisoned]` to the rendered text
+    when set. The `[locked]` badge remains deferred (needs
+    platform-specific `sys::Mutex` knowledge).
+- variables (Phase 1 batch M — stdlib coverage):
+  - F3 follow-up: truncation surfacing extended to `HashMap`,
+    `HashSet`, `BTreeMap`, `BTreeSet`. New `elided: Option<u64>`
+    on `HashMapVariable` / `HashSetVariable`. Iterator collects
+    everything (existing behaviour) but the renderer truncates
+    to `LEN_GUARD` items and surfaces a
+    `[N entries] (… M more elided)` summary line for over-budget
+    collections. BTreeSet inherits its inner BTreeMap's elision
+    count (a BTreeSet is just a BTreeMap with discarded values).
+- variables (Phase 1 batch L — stdlib coverage):
+  - F3 (RenderBudget): truncation count is now surfaced in the
+    rendered output. `String`, `&str`, `Vec<T>`, and the byte-string
+    preview path append `(… N more elided)` when the underlying
+    length exceeded the 10 000-element guard. Three-piece API: a
+    new `pub struct RenderBudget` with `Default::default()`,
+    `pub const LEN_GUARD` / `CAP_GUARD` (promoted from private),
+    and a `guard_len_with_truncation` helper that returns
+    `(clamped, Option<elided_count>)`. New fields `elided:
+    Option<u64>` on `VecValue`, `StringVariable`, `StrVariable`.
+    `HashMap` / `HashSet` / `BTreeMap` / `BTreeSet` truncation
+    surfacing deferred (same shape, different parsers).
+- variables (Phase 1 batch K — stdlib coverage):
+  - S15: `alloc::rc::Weak<T>` and `alloc::sync::Weak<T>` now carry
+    the strong / weak reference counts read out of `RcBox` /
+    `ArcInner` at parse time. The renderer surfaces
+    `0xADDR (strong=N, weak=M)` plus a `[dropped]` annotation when
+    `strong == 0` (the underlying T has been dropped but the
+    allocation is alive because at least one Weak handle remains).
+    Detection is a name-prefix split off from the existing Rc/Arc
+    dispatch; `Rc<T>` and `Arc<T>` keep their existing
+    pointer-only render. `weak.deref(pcx)` continues to walk to
+    the RcBox/ArcInner so structural assertions in test_shared_ptr
+    still pass.
+- variables (Phase 1 batch J — stdlib coverage):
+  - S9: `alloc::boxed::Box<T>` smart-deref. Box arrives via the
+    pointer dispatch path (rustc emits `DW_TAG_pointer_type` with a
+    `Box<…>` name), so we enrich `PointerValue` with an optional
+    `dereffed: Option<Box<Value>>` populated at parse time when the
+    type identity starts with `alloc::boxed::Box<`. The renderer
+    returns `ValueLayout::Wrapped(inner)` for boxes (pointee shown
+    inline) and the existing `Referential(ptr)` for raw `*const T` /
+    `&T` references. `box_d.deref(pcx)` continues to work
+    independently for users who want explicit deref. Trait-object
+    boxes (`Box<dyn Trait>`) defer to Phase 3 vtable resolution.
+- variables (Phase 1 batch I — stdlib coverage):
+  - S2: `MutexGuard<T>`, `RwLockReadGuard<T>`, `RwLockWriteGuard<T>`,
+    and their `Mapped*` cousins peel through the guard's parent
+    reference (or `data: NonNull<T>` for the read-guard shape) and
+    surface the guarded T directly. The dispatcher is ordered so
+    `MutexGuard<i32>` matches the guard arm before falling through
+    to the `Mutex<…>` arm. The two libstd layouts are handled
+    in one helper: read-guards use `data: NonNull<T>` directly,
+    write-guards / mutex-guards walk through `lock: &Mutex<T>` →
+    `data: UnsafeCell<T>` → T.
+- variables (Phase 1 batch H — stdlib coverage):
+  - S1 (minimum viable): `std::sync::Mutex<T>` and
+    `std::sync::RwLock<T>` peel through their `data: UnsafeCell<T>`
+    field to surface the inner T directly. We do not acquire the
+    lock — the read may show torn state if another thread is
+    mid-write, which is the expected behaviour for a debugger peek.
+    `[locked]` and `[poisoned]` badges are queued for a follow-up
+    batch (lock-state requires platform-specific `sys::Mutex`
+    layout knowledge). DWARF emits parameterized names
+    (`Mutex<i32>`) so the dispatcher matches by prefix.
+- variables (Phase 1 batch G — stdlib coverage):
+  - S10: `core::mem::MaybeUninit<T>` peels through the union's
+    `value` arm and the transparent `ManuallyDrop` wrapper to surface
+    the underlying `T` directly. Detection covers both shapes rustc
+    can emit (`DW_TAG_union_type` and `DW_TAG_structure_type`); the
+    DWARF name carries type parameters (`MaybeUninit<i32>`) so the
+    match uses `starts_with` rather than equality. The renderer
+    delegates to the inner T's layout; the `MaybeUninit<…>` wrapper
+    name on the value's type identity carries the "possibly uninit"
+    framing.
+- variables (Phase 1 batch F — stdlib coverage):
+  - S13/S14: `std::ffi::OsString` and `std::path::PathBuf` peel
+    through their wrapper chain (PathBuf → OsString → Buf → Vec\<u8\>)
+    to surface the underlying bytes. Valid utf-8 → plain quoted
+    string (`"/tmp/foo"`); invalid → `b"\xNN…"` hex preview capped at
+    32 bytes. Uses the same BFS-find length+pointer probe as S12;
+    bound by `LEN_GUARD` and a 64 KiB `MAX_READ` ceiling. OsStr and
+    Path (DST companions) deferred to a later batch alongside CStr —
+    they need a different dispatcher hook for fat-pointer DSTs.
+- variables (Phase 1 batch E — stdlib coverage):
+  - S16: `Vec<u8>` / `VecDeque<u8>` (and any vector with `u8`
+    elements) gets a render-layer preview: utf-8 → `b"hello"` when the
+    first 1 KiB decodes cleanly, hex dump (`xx xx xx … |...hi|` rows
+    of 16 bytes with ASCII column) when not. Underlying
+    `SpecializedValue::Vector` is unchanged so structural test
+    assertions (e.g. `test_arguments` walking the inner items by
+    index) still work. Four unit tests on `try_byte_string_preview`
+    cover empty / utf-8 / hex / non-u8-returns-None.
+- variables (Phase 1 batch D — stdlib coverage):
+  - S12: `alloc::ffi::c_str::CString` is rendered as `c"…"` when the
+    inner bytes (sans trailing NUL) are valid utf-8, or as a
+    `c"\xNN\xNN …"` hex preview (capped at 32 bytes, with a trailing
+    `…` continuation marker) when not. The read length is bounded by both
+    the existing 10 000-element `guard_len` clamp and a new 64 KiB
+    `MAX_READ` ceiling so a corrupted length field can't drive a huge
+    inferior-memory read. CStr (DST) and OsString/PathBuf (S13/S14)
+    deferred to batch E.
+- variables (Phase 1 batch C — stdlib coverage):
+  - S4: `core::time::Duration` / `std::time::Duration` peels to
+    `(secs, nanos)` and renders human-readable: `0s` for zero,
+    `1.500ms` / `250µs` / `7ns` for sub-second, `7s` / `1m 0s` /
+    `1h 1m 1.500s` for whole-second-and-above. Eight unit tests
+    cover the format-shape edges.
+  - S5: `SystemTime` now renders as ISO-8601 / RFC3339 UTC
+    (`2026-04-27T19:48:30Z` for whole seconds, `…30.123Z` for
+    millis, `…30.123456789Z` only when sub-microsecond precision is
+    actually present — `chrono`'s `AutoSi` suppresses trailing zeros)
+    instead of the prior `%Y-%m-%d %H:%M:%S` form.
+    `Instant` renders as a wall-clock
+    delta `now ± HH:MM:SS.mmm`; recovering the program-local
+    monotonic-clock epoch is deferred until a TLS/symbol hook
+    lands.
+- doc: `src/debugger/darwin_mach.rs:564-565` — `tsd[key]` notation
+  in prose comments now wrapped in backticks; was tripping
+  `cargo rustdoc -- -D rustdoc::broken_intra_doc_links`.
+- variables (Phase 1 batch B — stdlib coverage):
+  - S6: `core::ops::Range`, `RangeInclusive`, `RangeFrom`, `RangeTo`,
+    `RangeToInclusive`, `RangeFull` are rendered to canonical Rust
+    source form (`a..b`, `a..=b`, `a..`, `..b`, `..=b`, `..`).
+    `RangeInclusive` ranges that have already drained get an
+    `[exhausted]` suffix.
+  - S7: `core::pin::Pin<P>` is peeled to its pinnee. The wrapper type
+    identity (`Pin<Box<T>>`, `Pin<&mut T>`) is preserved on the value;
+    the rendered layout is the inner `P`'s layout. Critical-path for
+    Phase 3's async stack inspection.
+- variables (Phase 1 batch A — stdlib coverage):
+  - F1: `DW_TAG_reference_type` and `DW_TAG_rvalue_reference_type` now
+    route through the pointer parser instead of being warn-and-skipped.
+    Reference-typed DIEs surface from C++ debug info reachable via FFI
+    and from non-default rustc codegen flavours.
+  - S3: `core::sync::atomic::Atomic*` (every `AtomicI*`/`AtomicU*` plus
+    `AtomicBool`/`AtomicUsize`/`AtomicIsize`/`AtomicPtr<T>`) is now
+    rendered as the bare scalar/pointer payload, peeling the outer
+    wrapper and the `UnsafeCell` indirection. The `AtomicI32` / etc.
+    type identity is preserved on the value.
+  - S11: `core::ptr::NonNull<T>` is rendered as a plain `*T`,
+    preserving the `NonNull<T>` type identity.
+- spdx: example fixture sources under `examples/` are excluded from
+  the SPDX header scope. Test breakpoints there are pinned by line
+  number; a header would shift every breakpoint by one. The script
+  `scripts/add-spdx.py` enforces the exclusion.
 - debugger: experimental Linux/aarch64 support. Software breakpoints
   (`BRK #0`), general-purpose register read/write via `PTRACE_GETREGSET` +
   `NT_PRSTATUS`, and DWARF unwinding are functional. Hardware watchpoints,
