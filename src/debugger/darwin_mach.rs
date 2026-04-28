@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Mach kernel shims for the macOS debuggee backend.
 //!
 //! `task_for_pid` returns the Mach task port of the (ptraced) child
@@ -560,8 +561,8 @@ pub fn thread_identity(thread: thread_act_t) -> Result<ThreadIdentity, MachError
 /// (libpthread's per-thread TSD base) there and exposes it through
 /// that flavour. We replicate the load remotely:
 ///   1. Read the descriptor from inferior memory.
-///   2. Read tsd[key] from inferior pthread.
-///   3. Return tsd[key] + offset, or fail if tsd[key] is null
+///   2. Read `tsd[key]` from inferior pthread.
+///   3. Return `tsd[key] + offset`, or fail if `tsd[key]` is null
 ///      (i.e. the variable hasn't been first-touched on this thread
 ///      yet — replicating `_tlv_bootstrap` would need an inferior
 ///      call, which the caller can degrade to "no value" instead).
