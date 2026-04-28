@@ -7,6 +7,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- ci (Phase 1 batch S — acceptance smoke):
+  - new `crates/bs-smoke` workspace binary that drives the
+    `examples/vars` debuggee through `bugstalker`'s public library
+    API (no PTY, no rustyline races) and asserts every Phase 1
+    stdlib type renders via its specialised path. 23 checks: Pin
+    (boxed + ref), Range/RangeInclusive/RangeFrom/RangeTo,
+    Duration (zero, ms-rounded-to-s, whole-seconds, h:m:s.ms),
+    CString (utf-8, empty, hex-preview), OsString, PathBuf,
+    MaybeUninit, Mutex/RwLock peel, MutexGuard/RwLockReadGuard,
+    DST companions (`&CStr`, `&OsStr`, `&Path`).
+  - new `+smoke` Earthfile target. Builds the workspace, runs the
+    smoke binary, then runs `cargo bench --workspace -- --quick`
+    so a regression that breaks the bench harness (panic / build
+    error) fails CI alongside the smoke check. Numerical bench-
+    regression gating waits for Phase 8 once real bench bodies
+    replace the Phase 0 placeholders.
 - variables (Phase 1 batch R — F4 byte-slice overrides):
   - F4 (slash-suffix format spec): `/utf8` and `/hex` now compose
     with `var` / `vard` / `arg` / `argd` on byte-slice values

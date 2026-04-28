@@ -45,6 +45,12 @@
 > and `/hex` (hex-dump force) on `Vec<u8>` / `VecDeque<u8>` /
 > `[u8; N]`. Public `ByteRenderMode` enum + `render_byte_slice_members`
 > entrypoint added for future `&[u8]` callers.
+> Batch S: acceptance smoke — `crates/bs-smoke` Rust binary drives
+> the vars debuggee through the library API and asserts 23 Phase 1
+> specialisations render without raw struct fallback. Wired into
+> Earthly `+smoke` (also runs `cargo bench --workspace -- --quick`
+> to catch harness regressions). Real numerical bench gating
+> deferred to Phase 8 once placeholders are replaced.
 > No remaining items. F2 (`char` placeholder) is upstream-tracked
 > (rust-lang/rust#113819) and ships when that issue closes.
 > F4 specs `/p`, `/c`, `/s`, `/y`, `/[N]`, `/[N..M]` deferred —
