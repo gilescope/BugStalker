@@ -230,13 +230,17 @@ stopped inside a runtime poll.
   walker reaches a `Custom` leaf, so the deeper closure-buried
   shapes are reachable from either entry point.
 
-### Remaining open items
+- **Step 1 (landed, commit `90fd3bf`)** — `looks_like_coroutine_
+  type_name` helper + `RustEnumValue::is_coroutine()` method
+  recognising all three rustc-emitted markers
+  (`{async_fn_env#N}` / `{coroutine_env#N}` / `{generator_env#N}`).
+  Deliberately additive: the variant-state-name parse remains the
+  source of truth so a future rustc rename can't silently drop
+  matches.
 
-- **Step 1** (explicit coroutine-type detection by name pattern
-  `{async_fn_env#0}` / `{coroutine_env#0}`) — the existing
-  `RustEnumValue` path already pattern-matches on `Suspend<N>`
-  variant names so this is more about diagnostics than correctness.
-  The only remaining honest gap.
+### Phase 3 — done
+
+All scoped batches landed; no outstanding open items. Closing.
 
 ### Background
 

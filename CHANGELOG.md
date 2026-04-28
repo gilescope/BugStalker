@@ -37,6 +37,22 @@ All notable changes to this project will be documented in this file.
     recovered concrete TypeId so the chain *continues through* the
     dyn box) — are tracked in
     `doc/plans/phase-3-dyn-trait-and-async.md`.
+- async (Phase 3 Feature D step 1 — explicit coroutine type-name detection):
+  - New `looks_like_coroutine_type_name(name: &str) -> bool` helper
+    in `src/debugger/debugee/dwarf/type.rs` recognising all three
+    rustc-emitted markers across the language's history:
+    `{async_fn_env#N}`, `{coroutine_env#N}`, `{generator_env#N}`.
+  - New `RustEnumValue::is_coroutine()` method (cheap, no extra
+    storage) for renderers and tooling that want the type-level
+    signal. Deliberately additive to — not a replacement for —
+    `AsyncFnFuture::try_from`'s variant-state-name parse, which
+    remains the correctness source-of-truth so a future rustc rename
+    of the synthesised type can't silently drop matches.
+  - 9 unit tests across two `#[cfg(test)]` modules cover every
+    emitted pattern, ordinary enums, closure envs, and the
+    partial-substring rejection edge.
+  - **This closes Phase 3 (`dyn Trait` + niche-resilient enums +
+    Rc/Arc cycles + async await-trace) substantively.**
 - async (Phase 3 Feature D `poll_fn`-closure walker):
   - tokio's `select!` and `join!` macros wrap captured branch
     futures inside `poll_fn(|cx| {...})` whose closure environment
