@@ -249,6 +249,16 @@ pub enum Future {
     TokioSleep(TokioSleepFuture),
     TokioJoinHandleFuture(TokioJoinHandleFuture),
     Custom(CustomFuture),
+    /// Phase 3 Feature D step 5 — parallel awaitee branches.
+    ///
+    /// Emitted when the active variant's inner struct carries
+    /// multiple coroutine-shaped fields rather than a single
+    /// `__awaitee`. Each entry in `branches` is the chain rooted at
+    /// one of those parallel futures (rendered as a sub-trace). The
+    /// canonical caller is `tokio::join!` / `tokio::select!`-style
+    /// shapes, but the detector is generic — any struct that
+    /// captures 2+ futures triggers it.
+    Multi(Vec<Vec<Future>>),
     UnknownFuture,
 }
 

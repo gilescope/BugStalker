@@ -117,6 +117,21 @@ fn print_future(backtrace: &AsyncBacktrace, num: u32, future: &Future, printer: 
         Future::UnknownFuture => {
             printer.println(format!("#{num} undefined future",));
         }
+        Future::Multi(branches) => {
+            // Phase 3 Feature D step 5 — the active variant carries
+            // multiple parallel branches (e.g. tokio::join!). Render
+            // each branch as a sub-trace, indented one level.
+            printer.println(format!(
+                "#{num} parallel branches ({} active):",
+                branches.len()
+            ));
+            for (b, branch) in branches.iter().enumerate() {
+                printer.println(format!("  branch {b}:"));
+                for (i, fut) in branch.iter().enumerate() {
+                    print_future(backtrace, i as u32, fut, printer);
+                }
+            }
+        }
     }
 }
 
@@ -290,6 +305,57 @@ pub fn print_await_trace(backtrace: &AsyncBacktrace, printer: &ExternalPrinter) 
             }
             Future::UnknownFuture => {
                 printer.println(format!("  #{i} <unknown future>"));
+            }
+            Future::Multi(branches) => {
+                // Phase 3 Feature D step 5 — render parallel
+                // branches as a numbered sub-trace under the join /
+                // select frame's slot.
+                printer.println(format!(
+                    "  #{i} parallel branches ({} active):",
+                    branches.len()
+                ));
+                for (b, branch) in branches.iter().enumerate() {
+                    printer.println(format!("    branch {b}:"));
+                    for (j, fut) in branch.iter().enumerate() {
+                        // Indent the inner frames a further two
+                        // spaces so the visual hierarchy reads.
+                        match fut {
+                            Future::AsyncFn(af) => {
+                                let fn_view =
+                                    FutureFunctionView::from(&af.async_fn).to_string();
+                                let line = match (&af.state, &af.await_location) {
+                                    (AsyncFnFutureState::Suspend(n), Some((file, line))) => {
+                                        format!(
+                                            "      #{j} {fn_view} at {}:{line} (await point {n})",
+                                            file.display()
+                                        )
+                                    }
+                                    (AsyncFnFutureState::Suspend(n), None) => {
+                                        format!(
+                                            "      #{j} {fn_view} (await point {n}, no source coords)"
+                                        )
+                                    }
+                                    (AsyncFnFutureState::Unresumed, _) => {
+                                        format!("      #{j} {fn_view} (just created)")
+                                    }
+                                    (AsyncFnFutureState::Returned, _) => {
+                                        format!("      #{j} {fn_view} (returned)")
+                                    }
+                                    (AsyncFnFutureState::Panicked, _) => {
+                                        format!("      #{j} {fn_view} (panicked)")
+                                    }
+                                    (AsyncFnFutureState::Ok, _) => {
+                                        format!("      #{j} {fn_view} (completed)")
+                                    }
+                                };
+                                printer.println(line);
+                            }
+                            other => {
+                                printer.println(format!("      #{j} {other:?}"));
+                            }
+                        }
+                    }
+                }
             }
         }
     }

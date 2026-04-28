@@ -38,57 +38,99 @@ impl Task {
     }
 
     fn future_stack(self) -> Result<Vec<Future>, AsyncError> {
-        const AWAITEE_FIELD: &str = "__awaitee";
+        Ok(build_chain_from_repr(self.repr))
+    }
+}
 
-        let mut result = vec![];
+const AWAITEE_FIELD: &str = "__awaitee";
+/// Phase 3 Feature D step 5 — depth cap on the recursive
+/// chain-builder. Each `Multi` branch counts as a recursion step;
+/// pathological nesting bails out with a leaf `UnknownFuture`.
+const MAX_BRANCH_DEPTH: u32 = 8;
 
-        let mut next_future_repr = Some(self.repr);
-        while let Some(next_future) = next_future_repr.take() {
-            let future = AsyncFnFuture::try_from(&next_future)?;
-            result.push(Future::AsyncFn(future));
+/// Build the linear future chain starting from a coroutine
+/// state-machine [`RustEnumValue`]. Walks `__awaitee` for the
+/// single-active-future case and emits a [`Future::Multi`] branch
+/// when the active variant carries 2+ coroutine-shaped fields
+/// (`tokio::join!` / `tokio::select!`-style shapes).
+fn build_chain_from_repr(start: RustEnumValue) -> Vec<Future> {
+    build_chain_from_repr_bounded(start, MAX_BRANCH_DEPTH)
+}
 
-            let Some(member) = next_future.value else {
-                break;
-            };
-            let Value::Struct(val) = member.value else {
-                break;
-            };
+fn build_chain_from_repr_bounded(start: RustEnumValue, depth: u32) -> Vec<Future> {
+    let mut result: Vec<Future> = vec![];
 
-            let awaitee = val.field(AWAITEE_FIELD);
-            match awaitee {
-                Some(Value::RustEnum(next_future)) => {
-                    next_future_repr = Some(next_future);
+    if depth == 0 {
+        result.push(Future::UnknownFuture);
+        return result;
+    }
+
+    let mut next_future_repr = Some(start);
+    while let Some(next_future) = next_future_repr.take() {
+        let Ok(future) = AsyncFnFuture::try_from(&next_future) else {
+            break;
+        };
+        result.push(Future::AsyncFn(future));
+
+        let Some(member) = next_future.value else {
+            break;
+        };
+        let Value::Struct(val) = member.value else {
+            break;
+        };
+
+        // Phase 3 Feature D step 5 — collect every coroutine-shaped
+        // field of the active variant (excluding the canonical
+        // `__awaitee`). When two or more exist, the variant is
+        // capturing parallel branches and we emit `Future::Multi`
+        // *in addition to* the linear `__awaitee` chain (if any).
+        let parallel_branches: Vec<RustEnumValue> = val
+            .members
+            .iter()
+            .filter_map(|m| {
+                if m.field_name.as_deref() == Some(AWAITEE_FIELD) {
+                    return None;
                 }
-                Some(Value::Struct(next_future)) => {
-                    let type_ident = &next_future.type_ident;
-                    let fmt_name = type_ident.name_fmt();
-                    match fmt_name {
-                        "Sleep" => {
-                            let future = weak_error!(TokioSleepFuture::try_from(next_future))
-                                .map(Future::TokioSleep)
-                                .unwrap_or(Future::UnknownFuture);
-                            result.push(future);
-                        }
-                        _ if fmt_name.contains("JoinHandle") => {
-                            let future = weak_error!(TokioJoinHandleFuture::try_from(next_future))
-                                .map(Future::TokioJoinHandleFuture)
-                                .unwrap_or(Future::UnknownFuture);
-                            result.push(future);
-                        }
-                        _ => {
-                            let future: CustomFuture = CustomFuture::from(&next_future);
-                            result.push(Future::Custom(future));
-                        }
-                    }
-
-                    break;
+                if let Value::RustEnum(re) = &m.value {
+                    return Some(re.clone());
                 }
-                _ => {}
-            }
+                None
+            })
+            .collect();
+        if parallel_branches.len() >= 2 {
+            let branches = parallel_branches
+                .into_iter()
+                .map(|seed| build_chain_from_repr_bounded(seed, depth - 1))
+                .collect();
+            result.push(Future::Multi(branches));
         }
 
-        Ok(result)
+        let awaitee = val.field(AWAITEE_FIELD);
+        match awaitee {
+            Some(Value::RustEnum(next_future)) => {
+                next_future_repr = Some(next_future);
+            }
+            Some(Value::Struct(next_future)) => {
+                let fmt_name = next_future.type_ident.name_fmt();
+                let leaf = if fmt_name == "Sleep" {
+                    weak_error!(TokioSleepFuture::try_from(next_future))
+                        .map(Future::TokioSleep)
+                        .unwrap_or(Future::UnknownFuture)
+                } else if fmt_name.contains("JoinHandle") {
+                    weak_error!(TokioJoinHandleFuture::try_from(next_future))
+                        .map(Future::TokioJoinHandleFuture)
+                        .unwrap_or(Future::UnknownFuture)
+                } else {
+                    Future::Custom(CustomFuture::from(&next_future))
+                };
+                result.push(leaf);
+                break;
+            }
+            _ => {}
+        }
     }
+
+    result
 }
 
 /// Return task header state value and point pair.

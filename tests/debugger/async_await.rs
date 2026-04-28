@@ -152,7 +152,14 @@ fn test_await_trace_select() {
     if let Some(Future::AsyncFn(root)) = racer.futures.first()
         && matches!(root.state, AsyncFnFutureState::Suspend(_))
     {
-        let names: Vec<_> = racer
+        // Phase 3 Feature D step 5 — when the multi-branch walker
+        // recognises the select! shape, a `Future::Multi` frame
+        // surfaces every branch's chain. We assert *either* a
+        // direct `fast`/`slow` frame OR a Multi containing them,
+        // because tokio's macro layers an inner `poll_fn` closure
+        // that may or may not expose the captured futures depending
+        // on rustc version.
+        let direct_names: Vec<_> = racer
             .futures
             .iter()
             .filter_map(|f| match f {
@@ -160,9 +167,30 @@ fn test_await_trace_select() {
                 _ => None,
             })
             .collect();
+        let multi_branch_names: Vec<String> = racer
+            .futures
+            .iter()
+            .filter_map(|f| {
+                if let Future::Multi(branches) = f {
+                    Some(branches.iter().flatten().filter_map(|fut| match fut {
+                        Future::AsyncFn(af) => Some(af.async_fn.clone()),
+                        _ => None,
+                    }))
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        let any_branch_visible = direct_names
+            .iter()
+            .any(|n| n.ends_with("fast") || n.ends_with("slow"))
+            || multi_branch_names
+                .iter()
+                .any(|n| n.ends_with("fast") || n.ends_with("slow"));
         assert!(
-            names.iter().any(|n| n.ends_with("fast") || n.ends_with("slow")),
-            "select active-branch frame missing — futures = {names:?}",
+            any_branch_visible,
+            "select active-branch frame missing — direct={direct_names:?} multi={multi_branch_names:?}",
         );
     }
 }
@@ -187,9 +215,11 @@ fn test_await_trace_join() {
     if let Some(Future::AsyncFn(root)) = joiner.futures.first()
         && matches!(root.state, AsyncFnFutureState::Suspend(_))
     {
-        // tokio::join! polls every branch on every wake; at least
-        // one of branch_a/b/c should be in the awaitee chain.
-        let names: Vec<_> = joiner
+        // tokio::join! captures all branches as parallel sub-futures.
+        // Step 5 should surface them as a `Future::Multi` (preferred)
+        // or, if the macro buries them under a poll_fn, as a single
+        // direct `branch_*` frame. Accept either shape.
+        let direct_names: Vec<_> = joiner
             .futures
             .iter()
             .filter_map(|f| match f {
@@ -197,11 +227,30 @@ fn test_await_trace_join() {
                 _ => None,
             })
             .collect();
+        let multi_branch_names: Vec<String> = joiner
+            .futures
+            .iter()
+            .filter_map(|f| {
+                if let Future::Multi(branches) = f {
+                    Some(branches.iter().flatten().filter_map(|fut| match fut {
+                        Future::AsyncFn(af) => Some(af.async_fn.clone()),
+                        _ => None,
+                    }))
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect();
+        let any_branch_visible = direct_names
+            .iter()
+            .chain(multi_branch_names.iter().map(|s| s.as_str()))
+            .any(|n| {
+                n.ends_with("branch_a") || n.ends_with("branch_b") || n.ends_with("branch_c")
+            });
         assert!(
-            names
-                .iter()
-                .any(|n| n.ends_with("branch_a") || n.ends_with("branch_b") || n.ends_with("branch_c")),
-            "join active-branch frame missing — futures = {names:?}",
+            any_branch_visible,
+            "join active-branch frame missing — direct={direct_names:?} multi={multi_branch_names:?}",
         );
     }
 }

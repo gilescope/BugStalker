@@ -428,6 +428,27 @@ impl super::DebugSession {
                 Value::Object(obj)
             }
             Future::UnknownFuture => json!({ "kind": "unknown" }),
+            Future::Multi(branches) => {
+                // Phase 3 Feature D step 5 — render parallel
+                // branches as a nested JSON array. Each branch is
+                // serialized via the same recursive helper so all
+                // frame kinds (asyncFn / sleep / joinHandle /
+                // custom / unknown / multi) compose uniformly.
+                let serialized_branches: Vec<Value> = branches
+                    .iter()
+                    .map(|branch| {
+                        let frames: Vec<Value> = branch
+                            .iter()
+                            .map(|f| self.serialize_await_frame(backtrace, f))
+                            .collect();
+                        Value::Array(frames)
+                    })
+                    .collect();
+                json!({
+                    "kind": "multi",
+                    "branches": serialized_branches,
+                })
+            }
         }
     }
 }
