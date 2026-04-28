@@ -731,3 +731,26 @@ tests + 28/28 unit tests + 23/23 smoke checks + 2 real benchmarks
   trait so a third backend (e.g. *BSD, or a record-and-replay
   backend for time-travel) is a clean addition rather than
   another arm of every cfg.
+
+## Phase 9 — AI-bot-friendly scripting surface
+
+**Goal:** make BugStalker driveable by an AI agent (or any non-
+interactive caller) over a stable, structured, machine-parseable
+transport — without retiring the human console or DAP server.
+The console keeps colour and rustyline; DAP keeps VSCode. The new
+surface adds a JSON-RPC 2.0 endpoint (`bugstalker --script`),
+a self-describing `--describe-commands` schema dump, and a single
+`StructuredCommand` core that all three front-ends can sit on top
+of. Plan: [`doc/plans/phase-9-ai-bot-scripting.md`](plans/phase-9-ai-bot-scripting.md).
+
+**Status:** design only. Four batches scoped:
+
+* **A** structured-command core (read-only commands first)
+* **B** stateful commands + stop-reason envelope
+* **C** transport (`--script` JSON-RPC, `--describe-commands`,
+  streaming events)
+* **D** docs + checked-in JSON Schema + conformance crate
+
+The DAP server's BugStalker-specific `customRequest`s
+(starting with Phase 3D's `bs/awaitTrace`) become thin shims over
+the structured-command core, proving the layering is right.
