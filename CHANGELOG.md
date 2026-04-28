@@ -31,11 +31,48 @@ All notable changes to this project will be documented in this file.
     asserts every `Suspend(_)` `AsyncFn` in the ticker app reports
     `examples/tokiotiker/src/main.rs:5` — the only `.await` in the
     example.
-  - Phase 3D batches D2 (dedicated `await-trace` command,
-    `Pin<Box<dyn Future>>` resolution via the Phase 3A vtable path,
-    full chain traversal) and D3 (DAP `bs/awaitTrace` request,
-    `tokio::select!` / `join!` test cases) follow in subsequent
-    commits — see `doc/plans/phase-3-dyn-trait-and-async.md`.
+  - Phase 3D batch D3 (DAP `bs/awaitTrace` request, dedicated
+    `tests/debugger/async_await.rs` covering simple / chained /
+    `dyn_future` / `select!` / `join!` cases) still to come — see
+    `doc/plans/phase-3-dyn-trait-and-async.md`.
+- ui (Phase 3 Feature D batch D2a — `async await-trace` / `async at`):
+  - New console subcommand that prints the current task's awaitee
+    chain as a stack-frame list, source-coords-first. Mirrors how
+    `bt` reads for synchronous frames so the user can transfer
+    their mental model directly. Renders one frame per element of
+    the futures stack:
+
+    ```text
+    await-trace (task id: 7):
+      #0 my_app::handler at src/handler.rs:42 (await point 3)
+      #1 tokio::time::Sleep (deadline 1715000000s.000000000)
+    ```
+
+  - Plumbing: `r#async::Command::AwaitTrace`,
+    `AsyncCommandResult::AwaitTrace`, `print_await_trace` in
+    `src/ui/generic/async.rs`, parser tokens
+    `ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND` (`await-trace`) and
+    `ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND_SHORT` (`at`),
+    completion-hint entry, `HELP_ASYNC_AWAIT_TRACE_SUBCOMMAND` help
+    page, parser test.
+- async (Phase 3 Feature D batch D2b — `dyn Future` awaitee concrete
+  type lift):
+  - When the awaitee is `Pin<Box<dyn Future>>`, `Box<dyn Future>`,
+    `&dyn Future`, etc., Phase 3A's vtable resolver has already
+    spliced the recovered `[→ Concrete]` annotation into the inner
+    fat-pointer struct's `type_ident`. D2b walks through the
+    wrapping layers (depth-bounded) to find that annotation and
+    surfaces it on `CustomFuture::concrete: Option<String>`.
+  - Both `async backtrace` and `async await-trace` now append a
+    `[→ Concrete]` suffix to `Custom` future frames whenever the
+    concrete differs from the outer type — no double-print when
+    the awaitee itself is the dyn fat pointer.
+  - Walker uses the canonical fat-pointer member shape (`pointer` +
+    `vtable`) rather than `is_trait_object()`'s by-name match,
+    because the latter trips on outer wrappers like `Pin<Box<...>>`
+    and stops the walk before reaching the inner annotated struct.
+  - 4 unit tests in `src/debugger/async/future.rs::tests` cover the
+    walker (top-level / nested-in-Pin / plain struct / depth-cap).
 - variables (Phase 3 Feature C — Rc/Arc cycle detection):
   - `Rc<T>` / `Arc<T>` now eagerly deref so `var some_rc_node`
     surfaces the inner allocation inline (data, fields, recursive

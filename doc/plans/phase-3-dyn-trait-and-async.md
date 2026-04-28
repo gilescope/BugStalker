@@ -170,13 +170,28 @@ stopped inside a runtime poll.
   DIEs). `RustEnumValue.await_location` and `AsyncFnFuture.await_location`
   are populated; the existing `async backtrace` output now appends
   an `at FILE:LINE` suffix to "suspended at await point N" lines.
-- **D2 (pending)** — steps 1, 5, 6, 7: dedicated coroutine-type
-  detection, awaitee-chain walker, vtable cross-resolution for
-  `Pin<Box<dyn Future>>`, and the dedicated `await-trace` console
-  command + TUI panel.
+- **D2a (landed, commit `12fe611`)** — step 7: dedicated `async
+  await-trace` / `async at` console command. Renders the current
+  task's awaitee chain as a stack-frame list, source-coords-first
+  (`#0 my_app::handler at src/handler.rs:42 (await point 3)`).
+  Built on top of the existing `async_backtrace()` machinery, so no
+  new walker logic — just a focused renderer.
+- **D2b (landed, commit `51c9f78`)** — step 6, lightweight half:
+  surfaces the recovered concrete type for `dyn Future` awaitees by
+  walking the awaitee value tree (depth-bounded) for the canonical
+  fat-pointer shape and lifting the inner trait-object's
+  Phase-3A-annotated `type_ident` onto `CustomFuture::concrete`.
+  Both `async backtrace` and `async await-trace` then append a
+  `[→ Concrete]` suffix. The deeper half of step 6 (re-reading the
+  pointee at the recovered concrete type so the chain *continues
+  through* the dyn box) is intentionally deferred — it requires
+  parsing the awaitee data at a TypeId looked up by string name,
+  which is a meaningful addition. Tracked separately.
 - **D3 (pending)** — DAP `bs/awaitTrace` request + the test plan in
   `tests/debugger/async_await.rs` (simple / chained / dyn_future /
-  select / join cases).
+  select / join cases). Step 1 (explicit coroutine-type detection)
+  and step 5 (multi-level awaitee-chain walker beyond the existing
+  `__awaitee` follow) also still pending.
 
 ### Background
 
