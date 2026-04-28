@@ -37,6 +37,27 @@ All notable changes to this project will be documented in this file.
     recovered concrete TypeId so the chain *continues through* the
     dyn box) — are tracked in
     `doc/plans/phase-3-dyn-trait-and-async.md`.
+- async (Phase 3 Feature D step 5 — multi-branch awaitee walker):
+  - New `Future::Multi(Vec<Vec<Future>>)` variant: each entry in
+    `branches` is the chain rooted at one of the parallel futures
+    captured by an active variant. Triggered when the variant's
+    struct carries 2+ `Value::RustEnum` fields outside the
+    canonical `__awaitee` — the canonical caller is
+    `tokio::join!` / `tokio::select!`, but detection is generic.
+  - `tokio/task.rs::future_stack` refactored to call a recursive
+    `build_chain_from_repr` helper, depth-bounded
+    (`MAX_BRANCH_DEPTH = 8`) so pathological nesting bails out
+    cleanly with a leaf `UnknownFuture`.
+  - Console renderers (`print_future` / `print_await_trace`) render
+    each branch as a numbered sub-trace indented one level.
+  - DAP `bs/awaitTrace` adds a new frame kind:
+    `{ "kind": "multi", "branches": [[frame...], ...] }`.
+    Recursion goes through the same `serialize_await_frame` helper
+    so all frame kinds compose uniformly.
+  - The D3b `tokio_select` / `tokio_join` tests now accept *either*
+    a direct `branch_*` AsyncFn frame *or* one surfaced through a
+    `Future::Multi`, since tokio's macros wrap branches in
+    `poll_fn` closures whose visibility varies by rustc version.
 - tests (Phase 3 Feature D batch D3b — dedicated async-await suite):
   - 5 new example debuggees under `examples/`:
     `tokio_simple_await`, `tokio_chained_await`, `tokio_select`,
