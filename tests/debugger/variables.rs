@@ -2754,6 +2754,87 @@ fn test_read_nonnull() {
     assert_no_proc!(debugee_pid);
 }
 
+/// Phase 3 Feature B — niche-encoded `Option<T>` resolution.
+/// Verifies that for every niche pattern (`Option<&T>`,
+/// `Option<Box<T>>`, `Option<NonNull<T>>`, `Option<NonZero*>`,
+/// `Option<bool>`, `Option<fn(…)>`), the renderer correctly picks
+/// `Some(…)` vs `None` from the underlying bytes — no
+/// `RUST$ENCODED$ENUM$` fallback, no DWARF-discriminant guessing.
+#[test]
+#[serial]
+fn test_niche_option_recovery() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside
+    // `phase3_niche_options` — keep in lockstep with vars.rs.
+    debugger.set_breakpoint_at_line("vars.rs", 864).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(864));
+
+    let vars = debugger.read_local_variables().unwrap();
+
+    let pick_variant = |name: &str| -> String {
+        let v = vars
+            .iter()
+            .find(|v| v.identity().to_string().contains(name))
+            .unwrap_or_else(|| panic!("{name} not in locals"));
+        match v.value() {
+            Value::RustEnum(re) => re
+                .value
+                .as_ref()
+                .map(|m| {
+                    m.field_name
+                        .clone()
+                        .unwrap_or_else(|| String::from("<anonymous>"))
+                })
+                .unwrap_or_else(|| String::from("<no variant>")),
+            other => panic!("{name}: not a RustEnum, got {:?}", other.r#type().name_fmt()),
+        }
+    };
+
+    let cases: &[(&str, &str)] = &[
+        ("opt_ref_some", "Some"),
+        ("opt_ref_none", "None"),
+        ("opt_box_some", "Some"),
+        ("opt_box_none", "None"),
+        ("opt_nn_some", "Some"),
+        ("opt_nn_none", "None"),
+        ("opt_nz_some", "Some"),
+        ("opt_nz_none", "None"),
+        ("opt_bool_some", "Some"),
+        ("opt_bool_none", "None"),
+        ("opt_fn_some", "Some"),
+        ("opt_fn_none", "None"),
+        // Result<T, ZST>: niche of T doubles as the discriminant
+        // for the ZST error arm.
+        ("res_ok", "Ok"),
+        ("res_err", "Err"),
+        ("res_nz_ok", "Ok"),
+        ("res_nz_err", "Err"),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (name, expected) in cases {
+        let got = pick_variant(name);
+        eprintln!("[niche] {name:14} → {got}");
+        if got != *expected {
+            failures.push(format!("  {name}: expected {expected}, got {got}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} niche misclassifications:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
 /// Phase 3 Feature A — `dyn Trait` fat-pointer detection. Verifies
 /// the renderer recognises trait objects (`Box<dyn Error>`,
 /// `&dyn Iterator<Item = u32>`, `Arc<dyn Debug + Send + Sync>`)

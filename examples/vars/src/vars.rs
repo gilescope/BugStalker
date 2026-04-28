@@ -686,7 +686,7 @@ pub fn main() {
         vec!["two".to_string(), "three".to_string()],
     );
     phase1_specs();
-    phase1_specs_b(); phase3_dyn_trait();
+    phase1_specs_b(); phase3_dyn_trait(); phase3_niche_options();
 }
 
 fn phase1_specs() {
@@ -792,6 +792,74 @@ fn phase3_dyn_trait() {
     }
     std::hint::black_box(&arc_obj);
     std::hint::black_box(&boxed_err);
+
+    let nop: Option<u8> = None;
+}
+
+/// Phase 3 Feature B — niche-encoded Option / Result fixtures.
+/// Rust uses the inner type's invalid bit-patterns (null pointer,
+/// zero `NonZero*`, byte ≥ 2 for `bool`, …) to encode `None`
+/// without an extra discriminant byte. DWARF can't unambiguously
+/// describe these enums; the debugger applies the language rules
+/// directly.
+fn phase3_niche_options() {
+    use std::num::NonZeroU32;
+    use std::ptr::NonNull;
+
+    // Option<&T>: null pointer = None, anything else = Some(&T).
+    let host: i32 = 99;
+    let opt_ref_some: Option<&i32> = Some(&host);
+    let opt_ref_none: Option<&i32> = None;
+
+    // Option<Box<T>>: same niche — null inner pointer = None.
+    let opt_box_some: Option<Box<i32>> = Some(Box::new(7));
+    let opt_box_none: Option<Box<i32>> = None;
+
+    // Option<NonNull<T>>: same niche.
+    let mut x: i32 = 13;
+    let opt_nn_some: Option<NonNull<i32>> = NonNull::new(&mut x);
+    let opt_nn_none: Option<NonNull<i32>> = None;
+
+    // Option<NonZeroU32>: zero = None, anything else = Some(N).
+    let opt_nz_some: Option<NonZeroU32> = NonZeroU32::new(42);
+    let opt_nz_none: Option<NonZeroU32> = None;
+
+    // Option<bool>: niche is `byte ≥ 2 = None`.
+    let opt_bool_some: Option<bool> = Some(true);
+    let opt_bool_none: Option<bool> = None;
+
+    // Option<fn(i32) -> i32>: null fn pointer = None.
+    fn double_it(x: i32) -> i32 {
+        x.wrapping_mul(2)
+    }
+    let opt_fn_some: Option<fn(i32) -> i32> = Some(double_it);
+    let opt_fn_none: Option<fn(i32) -> i32> = None;
+
+    // Result<&T, ()>: ZST error arm; the niche of `&T` doubles as
+    // the discriminant for `Err(())`.
+    let res_ok: Result<&i32, ()> = Ok(&host);
+    let res_err: Result<&i32, ()> = Err(());
+
+    // Result<NonZeroU32, ()>: same shape, ZST error arm.
+    let res_nz_ok: Result<NonZeroU32, ()> = Ok(NonZeroU32::new(7).unwrap());
+    let res_nz_err: Result<NonZeroU32, ()> = Err(());
+
+    std::hint::black_box(&opt_ref_some);
+    std::hint::black_box(&opt_ref_none);
+    std::hint::black_box(&opt_box_some);
+    std::hint::black_box(&opt_box_none);
+    std::hint::black_box(&opt_nn_some);
+    std::hint::black_box(&opt_nn_none);
+    std::hint::black_box(&opt_nz_some);
+    std::hint::black_box(&opt_nz_none);
+    std::hint::black_box(&opt_bool_some);
+    std::hint::black_box(&opt_bool_none);
+    std::hint::black_box(&opt_fn_some);
+    std::hint::black_box(&opt_fn_none);
+    std::hint::black_box(&res_ok);
+    std::hint::black_box(&res_err);
+    std::hint::black_box(&res_nz_ok);
+    std::hint::black_box(&res_nz_err);
 
     let nop: Option<u8> = None;
 }

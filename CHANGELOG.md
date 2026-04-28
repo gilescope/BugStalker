@@ -7,6 +7,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- variables (Phase 3 Feature B — niche-resilient Option / Result):
+  - 16 fixtures + integration test
+    (`tests/debugger/variables.rs::test_niche_option_recovery`) cover
+    every niche pattern the plan calls out:
+    `Option<&T>`, `Option<Box<T>>`, `Option<NonNull<T>>`,
+    `Option<NonZero*>`, `Option<bool>`, `Option<fn(...)>` plus
+    `Result<&T, ()>` and `Result<NonZero*, ()>` (one-ZST-arm
+    Results). All resolve to the correct `Some`/`None` /
+    `Ok`/`Err` variant.
+  - Discovery: modern rustc emits a usable
+    `DW_TAG_variant_part` with an artificial `u64`-typed
+    discriminant member and explicit `DW_AT_discr_value` for the
+    `None` arm, even for niche-encoded layouts. The existing
+    `parse_rust_enum` path already reads it correctly via
+    `enumerators.get(&Some(value)).or_else(||
+     enumerators.get(&None))`. The plan's worry about
+    "rust-lang/rust#62839 leaving consumers to guess" turned out
+    to be partially out of date for our supported rustc range —
+    no new niche-detection code was needed.
+  - The integration test stays as a permanent regression guard:
+    if a future rustc churn re-introduces ambiguity in the
+    DWARF emit, this test catches it on every PR and the
+    follow-up patch (apply the language rules directly per the
+    plan) will land here.
 - variables (Phase 3 Feature A batch A2 — `dyn Trait` concrete-type
   recovery):
   - The `dyn Trait` annotation from batch A1 now carries the
