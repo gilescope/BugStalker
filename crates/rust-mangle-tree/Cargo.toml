@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "rust-mangle-tree"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "Parsed AST for Rust v0 (RFC 2603) and legacy mangled symbols. Designed for debuggers, profilers, and any tool that needs programmatic access to the structure of a Rust symbol — generic args, impl self-type, closure coordinates — rather than a flat Display string."
+repository = "https://github.com/godzie44/BugStalker"
+keywords = ["debugger", "demangle", "rust", "v0", "symbols"]
+categories = ["development-tools::debugging", "no-std"]
+publish = false
+
+[lib]
+path = "src/lib.rs"
+# No bench targets yet. Disable libtest's bench harness so
+# `cargo bench --workspace -- --quick` can pass criterion-only flags.
+bench = false
+
+[features]
+# `std` enables `std::error::Error` impls and pulls in dependent
+# helpers. Disable to build no_std (alloc only).
+default = ["std"]
+std = []
+
+[dev-dependencies]
+proptest = { workspace = true }
+arbitrary = { workspace = true }
+# Differential-test oracle. Pinned because we compare Display output
+# byte-for-byte; a bump can break tests if rustc-demangle's
+# whitespace conventions change.
+rustc-demangle = "=0.1.27"
