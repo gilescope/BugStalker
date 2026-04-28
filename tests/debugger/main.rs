@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: MIT
 mod common;
 
+// Phase 3 Feature D batch D3b — async await-trace tests rely on
+// tokio runtime introspection, which is currently Linux-only. The
+// existing `tokio.rs` module is in the same boat and is already a
+// known-fail on Darwin; we gate the new dedicated suite explicitly
+// so local Darwin test runs stay clean while Linux CI exercises it.
+#[cfg(target_os = "linux")]
+mod async_await;
 mod breakpoints;
 mod io;
 mod multithreaded;
@@ -208,6 +215,18 @@ const FIZZBUZZ_APP: &str = "./examples/target/debug/fizzbuzz";
 #[cfg(target_arch = "x86_64")]
 const CALCULATIONS_APP: &str = "./examples/target/debug/calculations";
 const TOKIO_TICKER_APP: &str = "./examples/target/debug/tokioticker";
+// Phase 3 D3b debuggees — only consumed by `mod async_await`,
+// which is itself Linux-gated.
+#[cfg(target_os = "linux")]
+const TOKIO_SIMPLE_AWAIT_APP: &str = "./examples/target/debug/tokio_simple_await";
+#[cfg(target_os = "linux")]
+const TOKIO_CHAINED_AWAIT_APP: &str = "./examples/target/debug/tokio_chained_await";
+#[cfg(target_os = "linux")]
+const TOKIO_SELECT_APP: &str = "./examples/target/debug/tokio_select";
+#[cfg(target_os = "linux")]
+const TOKIO_JOIN_APP: &str = "./examples/target/debug/tokio_join";
+#[cfg(target_os = "linux")]
+const TOKIO_DYN_FUTURE_APP: &str = "./examples/target/debug/tokio_dyn_future";
 const CALLS_APP: &str = "./examples/target/debug/calls";
 
 #[test]

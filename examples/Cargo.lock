@@ -1511,6 +1511,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio_chained_await"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "tokio_dyn_future"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "tokio_join"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "tokio_select"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "tokio_simple_await"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "tokioticker"
 version = "0.0.0"
 dependencies = [
