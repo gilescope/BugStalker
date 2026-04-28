@@ -209,17 +209,23 @@ stopped inside a runtime poll.
   inside `poll_fn` closures whose visibility varies by rustc
   version.
 
+- **Step 6, deeper half (landed, commit `04a25ff`)** — the
+  concrete-TypeId re-read. `locate_dyn_future` extracts
+  `(concrete_name, pointer)` from a `Pin<Box<dyn Future>>` shape;
+  `recover_concrete_future` looks the concrete type up across every
+  loaded `DebugInformation` and issues a `Dqe::DataCast` to parse
+  the pointee. When the result is a `RustEnumValue`,
+  `build_chain_from_repr` recurses and the chain *continues through*
+  the dyn box. All failure modes (type not found, null pointer,
+  parse error, non-enum pointee) degrade cleanly to the existing
+  `[→ Concrete]` annotation.
+
 ### Remaining open items
 
 - **Step 1** (explicit coroutine-type detection by name pattern
   `{async_fn_env#0}` / `{coroutine_env#0}`) — the existing
   `RustEnumValue` path already pattern-matches on `Suspend<N>`
   variant names so this is more about diagnostics than correctness.
-- **Step 6, deeper half** (re-reading the awaitee at the recovered
-  concrete TypeId so the chain *continues through* the dyn box) —
-  D2b lifts the concrete *name*; the deeper step parses the pointee
-  data at the recovered TypeId and recurses. Requires a
-  string-name → TypeId index + `Dqe::PtrCast`-style re-read.
 - **`poll_fn`-closure environment walker** — tokio's `select!` and
   `join!` macros wrap captured branch futures inside `poll_fn(|cx|
   {...})` closures. Step 5's generic detector recognises *any*

@@ -37,6 +37,27 @@ All notable changes to this project will be documented in this file.
     recovered concrete TypeId so the chain *continues through* the
     dyn box) — are tracked in
     `doc/plans/phase-3-dyn-trait-and-async.md`.
+- async (Phase 3 Feature D step 6 deeper — concrete-TypeId re-read):
+  - When the awaitee is a `Pin<Box<dyn Future>>` (or sibling), the
+    await-trace now walks *through* the dyn box into the concrete
+    future's state machine instead of stopping at the bare
+    `[→ Concrete]` annotation D2b lifted.
+  - New `DynFutureLocator` + `locate_dyn_future` walker in
+    `src/debugger/async/future.rs`: descends (depth-bounded) for the
+    canonical fat-pointer shape, parses `Concrete` out of the
+    annotation, and reads the data-pointer slot.
+  - `tokio/task.rs::recover_concrete_future` looks up the concrete
+    type across every loaded `DebugInformation` via
+    `find_type_die_ref`, issues a `Dqe::DataCast` to read the
+    pointee, and recurses into `build_chain_from_repr` when the
+    result is a `RustEnumValue`.
+  - `Task::backtrace` now takes `&Debugger`; three call sites
+    updated (mod.rs OwnedList loop, tokio/park.rs, tokio/worker.rs).
+    The `Option<&Debugger>` plumbed into the walker means callers
+    without a handle still get the linear chain.
+  - All failure modes degrade cleanly to the existing `Future::Custom`
+    annotation: type not found, null pointer slot, parse failure,
+    or non-coroutine pointee.
 - async (Phase 3 Feature D step 5 — multi-branch awaitee walker):
   - New `Future::Multi(Vec<Vec<Future>>)` variant: each entry in
     `branches` is the chain rooted at one of the parallel futures
