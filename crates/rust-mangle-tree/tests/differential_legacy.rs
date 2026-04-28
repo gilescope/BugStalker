@@ -10,9 +10,10 @@
 use rust_mangle_tree::{Symbol, parse};
 
 /// Each row: a real `_ZN…E` symbol that an actual rustc-built binary
-/// emits for the indicated source path. Pulled from `nm` over a
-/// `cargo build` artifact and a couple of synthetic ones for the
-/// escape table.
+/// emits for the indicated source path. Hand-picked for variety
+/// across the escape table, hash presence, and trailing-suffix
+/// shapes; the bigger corpus extracted from real binaries is
+/// covered by `corpus_legacy_real_binary` below.
 const CORPUS: &[&str] = &[
     // Bare two-segment.
     "_ZN3foo3barE",
@@ -30,6 +31,13 @@ const CORPUS: &[&str] = &[
     "_ZN4core3fmt5write17h0123456789abcdefE",
     // Crate name with a digit.
     "_ZN8nom_v7_a3lexE",
+    // Real example: synthetic `<&mut Foo as Bar>::method` segment
+    // with the leading-`_` placeholder rule.
+    "_ZN100_$LT$$RF$mut$u20$serde_json..ser..Serializer$LT$W$C$F$GT$$u20$as$u20$serde_core..ser..Serializer$GT$13serialize_str17h9dcaf790e2c4b86aE",
+    // Trailing LLVM thunk decoration after `E`.
+    "_ZN103_$LT$std..sys..thread_local..abort_on_dtor_unwind..DtorUnwindGuard$u20$as$u20$core..ops..drop..Drop$GT$4drop17h103d66072492bb20E.2043",
+    // `{{vtable.shim}}` — literal period inside `$u7b$$u7b$…$u7d$$u7d$`.
+    "_ZN4core3ops8function6FnOnce40call_once$u7b$$u7b$vtable.shim$u7d$$u7d$17h1a440162a384b96dE",
 ];
 
 #[test]
@@ -64,4 +72,48 @@ fn no_panic_on_garbage() {
     ] {
         let _ = parse(input); // must not panic
     }
+}
+
+/// Real-world corpus: 200 legacy symbols pulled from `nm` over the
+/// release `bs` binary. CI re-runs this on every change so a future
+/// edit to the escape table or the leading-`_` placeholder rule
+/// can't silently regress against rustc-demangle.
+///
+/// Sampled rather than exhaustive (the full 6938-symbol corpus is
+/// comfortable in CI but unnecessary noise here; the tool used to
+/// build it lives in `crates/rust-mangle-tree/scripts/`).
+#[test]
+fn corpus_legacy_real_binary() {
+    let raw = include_str!("corpus/legacy_real_binary.txt");
+    let mut total = 0usize;
+    let mut mismatches: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        total += 1;
+        let theirs = format!("{:#}", rustc_demangle::demangle(s));
+        let ours = match parse(s) {
+            Ok(Symbol::Legacy(p)) => format!("{p}"),
+            // We may also see NotRust here for `_R…` symbols that
+            // slipped through — skip them, they're v0's problem.
+            Ok(_) => continue,
+            Err(_) => continue,
+        };
+        if theirs != ours {
+            if mismatches.len() < 5 {
+                mismatches.push(format!("\n  in={s}\n  ours={ours}\n  thrs={theirs}"));
+            } else {
+                mismatches.push(String::new());
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} mismatches over {} symbols (first 5 shown):{}",
+        mismatches.iter().filter(|m| !m.is_empty()).count(),
+        total,
+        mismatches.iter().take(5).cloned().collect::<String>()
+    );
 }

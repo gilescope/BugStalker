@@ -34,6 +34,11 @@ pub struct LegacyPath<'a> {
     /// `len` prefix but with the leading `h` retained (e.g.
     /// `"h0123456789abcdef"`).
     pub(crate) hash: Option<&'a str>,
+    /// Trailing LLVM thunk decoration after the `E` terminator.
+    /// rustc / llvm sometimes append `.123` or `.llvm.456` to
+    /// distinguish multiple monomorphisations of the same fn that
+    /// the linker must keep separate. Empty string when absent.
+    pub(crate) suffix: &'a str,
 }
 
 impl<'a> LegacyPath<'a> {
@@ -63,6 +68,9 @@ impl fmt::Display for LegacyPath<'_> {
                 f.write_str("::")?;
             }
             decode_segment_into(seg, f)?;
+        }
+        if !self.suffix.is_empty() {
+            f.write_str(self.suffix)?;
         }
         Ok(())
     }
@@ -142,11 +150,10 @@ pub(crate) fn parse(s: &str) -> Result<LegacyPath<'_>, ParseError> {
         segments.push(segment);
     }
 
-    // Trailing input (unlikely on a real symbol — most callers feed
-    // exactly one mangled name): rustc allows `$hash$` and `.<n>`
-    // suffixes after the `E`. We tolerate them but don't surface
-    // them.
-    let _trailing = pos;
+    // Trailing LLVM thunk decoration: `.<n>` or `.llvm.<n>` after
+    // `E`. Carry it through so `Display` can re-emit it byte-for-
+    // byte.
+    let suffix = &body[pos..];
 
     // Promote the final `17h<16hex>` segment to `hash` when it
     // matches. Older compilers omit the hash entirely; that's a
@@ -156,7 +163,11 @@ pub(crate) fn parse(s: &str) -> Result<LegacyPath<'_>, ParseError> {
         _ => None,
     };
 
-    Ok(LegacyPath { segments, hash })
+    Ok(LegacyPath {
+        segments,
+        hash,
+        suffix,
+    })
 }
 
 /// `17h<16 hex digits>` is the rustc per-mono hash signature.
@@ -172,7 +183,20 @@ fn is_legacy_hash(seg: &str) -> bool {
 /// output looks like the source. Mirrors the rules in
 /// `rustc-demangle::legacy::demangle` so our Display matches it
 /// byte-for-byte.
+///
+/// One subtlety: rustc inserts a syntactic `_` at the start of
+/// synthetic segments that begin with a non-identifier character
+/// (typical example: `<&mut Foo as Bar>::method` segments mangle
+/// to `_$LT$$RF$mut$u20$Foo…$GT$`). The leading `_` is a placeholder
+/// — it has no source meaning — so we strip it to match
+/// rustc-demangle.
 fn decode_segment_into(seg: &str, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let bytes = seg.as_bytes();
+    // Detect and skip the leading-`_` placeholder: present when the
+    // segment starts with `_$` (escape immediately following the
+    // underscore).
+    let start = if bytes.starts_with(b"_$") { 1 } else { 0 };
+    let seg = &seg[start..];
     let mut iter = seg.bytes().enumerate().peekable();
     while let Some((i, b)) = iter.next() {
         match b {
@@ -202,12 +226,16 @@ fn decode_segment_into(seg: &str, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("$")?;
             }
             b'.' => {
-                // `..` → `::`; lone `.` → `-`.
+                // `..` → `::`; lone `.` is a literal period in
+                // modern legacy output (rustc-demangle preserves
+                // it). The legacy `.` → `-` mapping only applied
+                // to very old rustc; rustc-demangle dropped it
+                // years ago and we match.
                 if let Some(&(_, b'.')) = iter.peek() {
                     iter.next();
                     f.write_str("::")?;
                 } else {
-                    f.write_str("-")?;
+                    f.write_str(".")?;
                 }
             }
             _ => {
