@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 on: [push, pull_request]
 
 name: CI
@@ -92,6 +93,18 @@ jobs:
         uses: cachix/install-nix-action@ab739621df7a23f52766f9ccc97f38da6b7af14f  # v31.10.5
       - run: nix flake check
 
+  # Per `doc/plans/phase-0-preflight.md`: enforce the licence allow-list
+  # and surface upstream advisories on every PR. Config in `deny.toml`.
+  deny:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: EmbarkStudios/cargo-deny-action@a4d2d701318fdc1c6ae17ba8cea8f329c5110eb2  # v2.0.17
+        with:
+          command: check licenses bans sources advisories
+
   # Linux/aarch64 build: catch regressions in the aarch64 port without
   # needing local Earthly. We run the latest supported rustc only — full
   # rustc-matrix coverage already exists for x86_64 above; aarch64 is
@@ -135,3 +148,21 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run cargo clippy
         run: cargo clippy -- -D warnings
+
+  # Darwin/aarch64 smoke. The full debugger test suite needs codesign
+  # entitlements for `task_for_pid` (see `tests/darwin.entitlements`
+  # and `project_darwin_codesign` memory), so on hosted GHA macOS we
+  # restrict this job to a build + lib-tests pass. Codesign-gated
+  # functional tests run locally (and in `ci-nightly.yml`).
+  test-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install "$LRV"
+          rustup default "$LRV"
+      - name: cargo check (workspace)
+        run: cargo check --workspace --all-targets
+      - name: cargo test (lib only)
+        run: cargo test --workspace --lib

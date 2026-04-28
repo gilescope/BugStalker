@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "bs-test-harness"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Stub for the BugStalker test harness extracted from tests/debugger/. Phase 0 placeholder; Phase 8 ports the launch→breakpoint→render→assert flow into this crate."
+
+[lib]
+path = "src/lib.rs"
+# Stub crate has no bench targets. Disable libtest's bench harness so
+# `cargo bench --workspace -- --quick` can pass criterion-only flags
+# without the libtest harness rejecting them.
+bench = false
+
+[dependencies]
+tracing.workspace = true

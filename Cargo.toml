@@ -1,3 +1,33 @@
+[workspace]
+members = [".", "crates/*"]
+# examples/ is its own workspace (separate Cargo.lock); never pull it in.
+exclude = ["examples", "examples/target", "fuzz"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89.0"
+license = "MIT"
+repository = "https://github.com/godzie44/BugStalker"
+authors = ["Derevtsov Konstantin <godzie@yandex.ru>"]
+
+# Shared deps for new workspace crates. Versions track the root crate so
+# the lockfile stays single-resolved. Root [dependencies] keep their
+# explicit versions until per-dep migration to `.workspace = true` lands.
+[workspace.dependencies]
+gimli = "=0.33.0"
+object = "0.32.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"
+arbitrary = { version = "1", features = ["derive"] }
+rustix = "0.38"
+thiserror = "1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+criterion = "0.5"
+
 [package]
 name = "bugstalker"
 version = "0.4.5"
@@ -12,12 +42,19 @@ repository = "https://github.com/godzie44/BugStalker"
 keywords = ["debugger", "debug", "gdb"]
 categories = ["command-line-utilities", "development-tools::debugging"]
 build = "build.rs"
-exclude = ["/.github", "/doc", "/website", "/extension"]
+exclude = ["/.github", "/doc", "/website", "/extension", "/crates", "/fuzz"]
 
 [[bin]]
 bench = false
 path = "src/main.rs"
 name = "bs"
+
+# Library doesn't ship benchmarks of its own; the workspace bench
+# scaffolding lives under `benches/` (see `[[bench]]` entries below).
+# Disabling the libtest bench harness keeps `cargo bench -- --quick`
+# usable across the workspace without libtest rejecting the flag.
+[lib]
+bench = false
 
 [profile.release]
 codegen-units = 1
@@ -105,8 +142,23 @@ mach2 = "0.6"
 
 [dev-dependencies]
 serial_test = "3.2.0"
+criterion = { workspace = true }
 
 [features]
 default = []
 nightly = []
 int_test = ["nightly"]
+
+# Phase 0 bench scaffolding. Each bench seeds a Criterion baseline so
+# `ci-bench.yml` can flag >10 % regressions vs the trailing 7-day
+# median (see `doc/plans/phase-0-preflight.md`). Bodies are placeholders
+# until the real workloads land in Phase 1+.
+[[bench]]
+name = "render_value"
+path = "benches/render_value.rs"
+harness = false
+
+[[bench]]
+name = "attach_cold"
+path = "benches/attach_cold.rs"
+harness = false

@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: MIT
+# cargo-deny configuration for BugStalker.
+# Phase 0 deliverable: enforce the licence allow-list and surface known
+# advisories on every PR. Schema reference: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Match all targets BugStalker actually ships on. Keep this list in sync
+# with `.github/workflows/ci.yml` and the Earthfile.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+version = 2
+yanked = "warn"
+ignore = []
+
+[licenses]
+version = 2
+# The allow-list per `doc/plans/phase-0-preflight.md`. Anything outside
+# this set blocks the build and must be approved explicitly via
+# `exceptions` before being added here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+    "BSL-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.93
+
+# `dev-dependencies` may need GPL or other restrictive licences for
+# differential testing (e.g. a pinned `rr` build as a CI oracle). When
+# such a need arises, add the crate name here with a justification.
+exceptions = []
+
+[bans]
+# Many duplicate-version entries today come from the TUI stack
+# (`crossterm`/`bitflags`) and `syntect` pulling an old `base64`. Tighten
+# this to `warn` once the TUI stack converges on a single major.
+multiple-versions = "allow"
+# `thread_db` is fetched by git rev with no version specifier — cargo-deny
+# classifies that as a wildcard. The crate itself is explicitly allowed in
+# `[sources].allow-git` (single pinned fork). Tighten back to "deny" once
+# that fork has aarch64 support upstreamed and we can pin to crates.io.
+wildcards = "warn"
+highlight = "all"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# `thread_db` is fetched from a personal fork until aarch64 support
+# upstreams. Pinned by rev in Cargo.toml — see the comment there.
+allow-git = ["https://github.com/gilescope/thread_db"]

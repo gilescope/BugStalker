@@ -23,8 +23,10 @@ common:
 
 source:
     FROM +common
-    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml ./
-    COPY --dir src tests ./
+    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml ./
+    # `crates/` hosts the workspace member crates introduced in Phase 0;
+    # `benches/` hosts the criterion bench scaffolding.
+    COPY --dir src tests crates benches ./
 
 examples-source:
     FROM +source
@@ -135,6 +137,39 @@ all:
     BUILD +check
     BUILD +clippy
     BUILD +fmt-check
+
+# Phase 0 single-shot lint target. Composes clippy + fmt-check.
+lint:
+    BUILD +clippy
+    BUILD +fmt-check
+
+# Phase 0 bench placeholder — runs the criterion suites in --quick mode.
+# Real benches land per-crate as the workspace grows; see
+# `benches/render_value.rs`, `benches/attach_cold.rs`.
+bench:
+    FROM +source
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target \
+        cargo bench --workspace -- --quick
+
+# `cargo deny check` enforces the licence allow-list and surfaces
+# advisories. Configured in `deny.toml`.
+deny:
+    FROM +common
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        cargo install cargo-deny --locked
+    COPY Cargo.toml Cargo.lock deny.toml ./
+    COPY --dir src tests crates ./
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        cargo deny check
+
+# Phase 0 fuzz placeholder. `cargo fuzz` targets are introduced in
+# Phase 8; this target exists so the CI matrix has a stable surface.
+fuzz:
+    FROM +source
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        cargo install cargo-fuzz --locked || true
+    RUN echo "fuzz: no targets registered yet — see doc/plans/phase-8-testing.md"
 
 # Repeat a single test N times (default 20). Useful for hunting flakes.
 flake-hunt:
