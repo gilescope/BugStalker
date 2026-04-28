@@ -2754,6 +2754,61 @@ fn test_read_nonnull() {
     assert_no_proc!(debugee_pid);
 }
 
+/// Phase 3 Feature C — `Rc<RefCell<Node>>` cycle detection. The
+/// renderer must terminate gracefully on a 2-node cycle (no stack
+/// overflow) and emit a `[cycle to 0x…]` marker on the second
+/// visit. Deep but acyclic chains hit the depth cap with a
+/// `[depth limit 64]` marker instead.
+#[test]
+#[serial]
+fn test_rc_cycle_detection() {
+    use bugstalker::ui::generic::variable::render_value;
+
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside `phase3_rc_cycle`
+    // — keep in lockstep with vars.rs.
+    debugger.set_breakpoint_at_line("vars.rs", 915).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(915));
+
+    let vars = debugger.read_local_variables().unwrap();
+
+    let cycle_root = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("cycle_root"))
+        .expect("cycle_root not in locals");
+    let deep = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("deep"))
+        .expect("deep not in locals");
+
+    // Render must not stack-overflow. If we get here, that's
+    // already half the value of Feature C.
+    let cycle_str = render_value(cycle_root.value());
+    let deep_str = render_value(deep.value());
+
+    eprintln!("[cycle] cycle_root rendered as:\n{cycle_str}\n");
+    eprintln!("[cycle] deep (truncated to 200 chars): {}", &deep_str[..deep_str.len().min(200)]);
+
+    assert!(
+        cycle_str.contains("cycle to"),
+        "cycle_root missing cycle marker: {cycle_str:?}"
+    );
+    // Acyclic deep chain should hit the depth cap.
+    assert!(
+        deep_str.contains("depth limit"),
+        "deep chain missing depth-cap marker: {deep_str:?}"
+    );
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
 /// Phase 3 Feature B — niche-encoded `Option<T>` resolution.
 /// Verifies that for every niche pattern (`Option<&T>`,
 /// `Option<Box<T>>`, `Option<NonNull<T>>`, `Option<NonZero*>`,

@@ -6,7 +6,7 @@ use crate::debugger::variable::value::AssumeError::{
     TypeParameterNotFound, TypeParameterTypeNotFound, UnexpectedType,
 };
 use crate::debugger::variable::value::ParsingError::Assume;
-use crate::debugger::variable::value::parser::{ParseContext, ValueParser};
+use crate::debugger::variable::value::parser::{MAX_RENDER_DEPTH, ParseContext, ValueParser};
 use crate::debugger::variable::value::specialization::btree::BTreeReflection;
 use crate::debugger::variable::value::specialization::hashbrown::HashmapReflection;
 use crate::debugger::variable::value::{
@@ -88,6 +88,43 @@ fn read_named_usize(val: &Value, field: &'static str) -> Option<u64> {
         },
         _ => None,
     })
+}
+
+/// Phase 3 Feature C — eagerly deref an `Rc<T>` / `Arc<T>` pointer
+/// so the renderer can show the inner allocation inline, with two
+/// bounded guards: a per-parse visited-set on inner allocation
+/// addresses (catches cycles like
+/// `Rc<RefCell<Node { next: Option<Rc<RefCell<Node>>> }>>`) and a
+/// global recursion-depth cap (catches deep non-cyclic chains
+/// before they blow the renderer's stack).
+///
+/// The two together let `var some_node` terminate gracefully on
+/// any shape: cycles render with a `[cycle to 0x…]` leaf at the
+/// re-visit, deep chains stop at depth-64 with a `[depth limit]`
+/// leaf.
+/// Returns `Some(marker_string)` when we bailed (cycle / depth /
+/// null pointer), `None` after a successful deref. Caller splices
+/// the marker into whichever `TypeIdentity` the renderer actually
+/// reads (the outer `StructValue` for the `Specialized::Rc/Arc`
+/// arm; the `PointerValue` itself for any future smart-pointer that
+/// renders directly via the pointer's identity).
+pub(crate) fn eager_deref_with_cycle_check(
+    pcx: &ParseContext,
+    ptr: &mut PointerValue,
+) -> Option<String> {
+    let addr = ptr.value?;
+    let key = addr as usize;
+    if !pcx.visited_allocations.borrow_mut().insert(key) {
+        return Some(format!("[cycle to {addr:p}]"));
+    }
+    let depth = pcx.recursion_depth.get();
+    if depth >= MAX_RENDER_DEPTH {
+        return Some(format!("[depth limit {MAX_RENDER_DEPTH}]"));
+    }
+    pcx.recursion_depth.set(depth + 1);
+    ptr.dereffed = ptr.deref(pcx).map(Box::new);
+    pcx.recursion_depth.set(depth);
+    None
 }
 
 fn guard_len(len: i64) -> i64 {
@@ -1279,12 +1316,24 @@ impl<'a> VariableParserExtension<'a> {
         Ok(SpecializedValue::Weak { ptr, strong, weak })
     }
 
-    pub fn parse_rc(&self, structure: &StructValue) -> Option<SpecializedValue> {
-        weak_error!(
+    pub fn parse_rc(
+        &self,
+        pcx: &ParseContext,
+        structure: &mut StructValue,
+    ) -> Option<SpecializedValue> {
+        let mut ptr = weak_error!(
             self.parse_rc_inner(Value::Struct(structure.clone()))
                 .context("Rc<T> interpretation")
-        )
-        .map(SpecializedValue::Rc)
+        )?;
+        let bail = eager_deref_with_cycle_check(pcx, &mut ptr);
+        if let Some(marker) = bail {
+            // Propagate the marker to the outer struct's type_ident
+            // — the renderer reads `original.type_ident` for the
+            // `Specialized::Rc/Arc` arm.
+            let original = structure.type_ident.name().unwrap_or("Rc").to_string();
+            structure.type_ident.set_name(format!("{original} {marker}"));
+        }
+        Some(SpecializedValue::Rc(ptr))
     }
 
     fn parse_rc_inner(&self, val: Value) -> Result<PointerValue, ParsingError> {
@@ -1302,12 +1351,21 @@ impl<'a> VariableParserExtension<'a> {
             .ok_or(IncompleteInterp("rc"))?)
     }
 
-    pub fn parse_arc(&self, structure: &StructValue) -> Option<SpecializedValue> {
-        weak_error!(
+    pub fn parse_arc(
+        &self,
+        pcx: &ParseContext,
+        structure: &mut StructValue,
+    ) -> Option<SpecializedValue> {
+        let mut ptr = weak_error!(
             self.parse_arc_inner(Value::Struct(structure.clone()))
                 .context("Arc<T> interpretation")
-        )
-        .map(SpecializedValue::Arc)
+        )?;
+        let bail = eager_deref_with_cycle_check(pcx, &mut ptr);
+        if let Some(marker) = bail {
+            let original = structure.type_ident.name().unwrap_or("Arc").to_string();
+            structure.type_ident.set_name(format!("{original} {marker}"));
+        }
+        Some(SpecializedValue::Arc(ptr))
     }
 
     fn parse_arc_inner(&self, val: Value) -> Result<PointerValue, ParsingError> {

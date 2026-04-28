@@ -672,8 +672,18 @@ impl RenderValue for Value {
                     cell.value_layout()?
                 }
                 SpecializedValue::Rc(ptr) | SpecializedValue::Arc(ptr) => {
-                    let ptr = ptr.value?;
-                    ValueLayout::Referential(ptr)
+                    // Phase 3 Feature C — eagerly-deref Rc/Arc surfaces
+                    // the inner allocation inline. When parse-time
+                    // detected a cycle or hit the depth cap, the
+                    // PointerValue's `type_ident` carries a
+                    // `[cycle to 0x…]` or `[depth limit N]` marker
+                    // and `dereffed` is `None`; we fall back to the
+                    // raw address layout.
+                    if let Some(inner) = ptr.dereffed.as_deref() {
+                        ValueLayout::Wrapped(inner)
+                    } else {
+                        ValueLayout::Referential(ptr.value?)
+                    }
                 }
                 SpecializedValue::Uuid(bytes) => {
                     let uuid = uuid::Uuid::from_slice(bytes).expect("infallible");

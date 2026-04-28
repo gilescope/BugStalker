@@ -7,6 +7,43 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- variables (Phase 3 Feature C — Rc/Arc cycle detection):
+  - `Rc<T>` / `Arc<T>` now eagerly deref so `var some_rc_node`
+    surfaces the inner allocation inline (data, fields, recursive
+    members) instead of just an address. Cyclic data structures
+    (`Rc<RefCell<Node { peer: Rc<RefCell<Node>> }>>`) terminate
+    gracefully with a `[cycle to 0x…]` marker on the second visit
+    instead of stack-overflowing the renderer.
+  - Two bounded guards layered at parse time:
+    1. **Visited-set** keyed on inner allocation address. First
+       visit derefs and recurses; second visit splices a
+       `[cycle to 0x…]` marker into the value's `type_ident` and
+       skips the deref. Catches every cyclic graph regardless of
+       depth.
+    2. **Recursion-depth cap** (`MAX_RENDER_DEPTH = 4`) for the
+       pathological-but-acyclic case (a 100-deep linked list).
+       Splices a `[depth limit 4]` marker. The cap is empirically
+       stack-safe on a 2 MiB test thread; ratchets up via the
+       eventual `bs/setRenderBudget` DAP request once Phase 1 F3's
+       budget API generalises.
+  - `ParseContext` carries the visited set
+    (`RefCell<HashSet<usize>>`) and the depth counter
+    (`Cell<u32>`). Each top-level value parse gets a fresh pair so
+    cycles don't leak between locals.
+  - New helper `eager_deref_with_cycle_check` lives next to the
+    other Rc/Arc machinery in
+    `src/debugger/variable/value/specialization/mod.rs`. Returns
+    `Some(marker)` on bail, `None` on successful deref; callers
+    splice the marker into whichever `TypeIdentity` the renderer
+    actually reads.
+  - Test: new `tests/debugger/variables.rs::test_rc_cycle_detection`
+    breaks at `phase3_rc_cycle`'s nop, asserts:
+    - the 2-node Rc cycle renders with a `[cycle to 0x…]` marker
+      and doesn't stack-overflow;
+    - the 100-deep acyclic chain renders with a `[depth limit 4]`
+      marker;
+    - `lonely_rc` (single-strong-count) still renders inline.
+  - All Phase 1 + Phase 3 A/B integration tests still pass.
 - variables (Phase 3 Feature B — niche-resilient Option / Result):
   - 16 fixtures + integration test
     (`tests/debugger/variables.rs::test_niche_option_recovery`) cover

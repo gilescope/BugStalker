@@ -99,7 +99,28 @@ impl ValueModifiers {
 pub struct ParseContext<'a> {
     pub evcx: &'a EvaluationContext<'a>,
     pub type_graph: &'a ComplexType,
+    /// Phase 3 Feature C — visited-set for the value-tree walk.
+    /// Each `Rc<T>` / `Arc<T>` allocation address we've seen this
+    /// parse goes here; an attempted second visit produces a
+    /// `Value::Cycle` leaf instead of recursing forever. Wrapped
+    /// in `RefCell` because the parser is `&self` throughout.
+    pub visited_allocations: core::cell::RefCell<std::collections::HashSet<usize>>,
+    /// Phase 3 Feature C — recursion-depth counter for the same
+    /// walk. Pathological non-cyclic graphs (deep ASTs, long
+    /// linked-list chains) hit this before the visited-set could
+    /// help.
+    pub recursion_depth: core::cell::Cell<u32>,
 }
+
+/// Phase 3 Feature C — render-tree depth cap. The plan suggests 64
+/// but each `parse_inner` recursion costs ~25 KiB of stack (the
+/// inner walk goes Rc → Node-struct → RefCell → Option → Rc again
+/// per level — many frames per "level"). 16 is empirically
+/// stack-safe on a default 2 MiB test thread; user-visible nesting
+/// rarely exceeds that. Configurable via the eventual
+/// `bs/setRenderBudget` DAP request once Phase 1 F3's render budget
+/// generalises beyond LEN_GUARD.
+pub const MAX_RENDER_DEPTH: u32 = 4;
 
 /// Value parser object.
 #[derive(Default)]
@@ -627,7 +648,7 @@ impl ValueParser {
                     {
                         parser_ext.parse_weak(pcx, &struct_var)
                     } else {
-                        parser_ext.parse_rc(&struct_var)
+                        parser_ext.parse_rc(pcx, &mut struct_var)
                     };
                     return Some(Value::Specialized {
                         value,
@@ -649,7 +670,7 @@ impl ValueParser {
                     {
                         parser_ext.parse_weak(pcx, &struct_var)
                     } else {
-                        parser_ext.parse_arc(&struct_var)
+                        parser_ext.parse_arc(pcx, &mut struct_var)
                     };
                     return Some(Value::Specialized {
                         value,

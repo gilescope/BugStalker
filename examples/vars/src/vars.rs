@@ -686,7 +686,7 @@ pub fn main() {
         vec!["two".to_string(), "three".to_string()],
     );
     phase1_specs();
-    phase1_specs_b(); phase3_dyn_trait(); phase3_niche_options();
+    phase1_specs_b(); phase3_dyn_trait(); phase3_niche_options(); phase3_rc_cycle();
 }
 
 fn phase1_specs() {
@@ -860,6 +860,57 @@ fn phase3_niche_options() {
     std::hint::black_box(&res_err);
     std::hint::black_box(&res_nz_ok);
     std::hint::black_box(&res_nz_err);
+
+    let nop: Option<u8> = None;
+}
+
+/// Phase 3 Feature C — cyclic Rc<RefCell<…>> graph and a deep
+/// non-cyclic Rc chain. The debugger should terminate gracefully on
+/// each instead of stack-overflowing the renderer.
+fn phase3_rc_cycle() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Tiny doubly-linked-ish node. `next` is owned; `peer` is a
+    /// back-edge that closes the cycle when populated.
+    struct Node {
+        data: i32,
+        peer: RefCell<Option<Rc<Node>>>,
+    }
+
+    // Build a 2-node cycle: a ↔ b.
+    let a = Rc::new(Node {
+        data: 1,
+        peer: RefCell::new(None),
+    });
+    let b = Rc::new(Node {
+        data: 2,
+        peer: RefCell::new(Some(a.clone())),
+    });
+    *a.peer.borrow_mut() = Some(b.clone());
+    let cycle_root = a.clone();
+
+    // Acyclic single-strong-count Rc — the [strong=1] diagnostic
+    // candidate (see plan: "not shared, so why is it `Rc`?").
+    let lonely_rc: Rc<i32> = Rc::new(99);
+
+    // Deep but acyclic chain. 100 levels is enough to verify the
+    // depth cap fires before stack-overflowing the renderer; the
+    // cap is configurable but defaults to 64.
+    let mut deep: Rc<Node> = Rc::new(Node {
+        data: 0,
+        peer: RefCell::new(None),
+    });
+    for i in 1..100 {
+        deep = Rc::new(Node {
+            data: i,
+            peer: RefCell::new(Some(deep)),
+        });
+    }
+
+    std::hint::black_box(&cycle_root);
+    std::hint::black_box(&lonely_rc);
+    std::hint::black_box(&deep);
 
     let nop: Option<u8> = None;
 }

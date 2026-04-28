@@ -103,7 +103,12 @@ impl QueryResult<'_> {
         let value = self.value.take().expect("should be `Some`");
         let type_graph = self.type_graph();
         let eval_cb = |evcx: &EvaluationContext| {
-            let pcx = &ParseContext { evcx, type_graph };
+            let pcx = &ParseContext {
+                evcx,
+                type_graph,
+                visited_allocations: Default::default(),
+                recursion_depth: Default::default(),
+            };
             cb(pcx, value)
         };
         let new_value = self.evcx_builder.with_evcx(eval_cb)?;
@@ -319,6 +324,8 @@ impl<'dbg> DqeExecutor<'dbg> {
                 let pcx = &ParseContext {
                     evcx,
                     type_graph: &r#type,
+                    visited_allocations: Default::default(),
+                    recursion_depth: Default::default(),
                 };
                 let modifiers = &ValueModifiers::from_identity(pcx, Identity::from_die(die_ref));
                 parser.parse(pcx, data, modifiers)
@@ -386,6 +393,8 @@ impl<'dbg> DqeExecutor<'dbg> {
             let pcx = &ParseContext {
                 evcx,
                 type_graph: &r#type,
+                visited_allocations: Default::default(),
+                recursion_depth: Default::default(),
             };
             parser.parse(pcx, Some(data), &ValueModifiers::default())
         });
@@ -441,6 +450,8 @@ impl<'dbg> DqeExecutor<'dbg> {
             let pcx = &ParseContext {
                 evcx,
                 type_graph: &r#type,
+                visited_allocations: Default::default(),
+                recursion_depth: Default::default(),
             };
             parser.parse(pcx, Some(data), &ValueModifiers::default())
         });
