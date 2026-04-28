@@ -177,6 +177,35 @@ pub struct StructValue {
 }
 
 impl StructValue {
+    /// Phase 3 Feature A — `true` when this struct is the
+    /// fat-pointer representation of a `dyn Trait`. Detected at
+    /// render time from the type name plus the canonical
+    /// `pointer`/`vtable` member shape rustc emits. Cheap inspection
+    /// — no extra storage, no plumbing through every constructor.
+    pub fn is_trait_object(&self) -> bool {
+        let name_match = self
+            .type_ident
+            .name()
+            .is_some_and(|n| n.contains("dyn "));
+        if name_match {
+            return true;
+        }
+        if self.members.len() == 2 {
+            let m0 = self.members[0].field_name.as_deref();
+            let m1 = self.members[1].field_name.as_deref();
+            return matches!(
+                (m0, m1),
+                (Some("pointer"), Some("vtable"))
+                    | (Some("data_ptr"), Some("vtable"))
+                    | (Some("vtable"), Some("pointer"))
+                    | (Some("vtable"), Some("data_ptr"))
+            );
+        }
+        false
+    }
+}
+
+impl StructValue {
     pub fn field(self, field_name: &str) -> Option<Value> {
         self.members.into_iter().find_map(|member| {
             if member.field_name.as_deref() == Some(field_name) {

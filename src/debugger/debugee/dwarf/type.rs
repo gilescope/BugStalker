@@ -337,6 +337,13 @@ pub enum TypeDeclaration {
         byte_size: Option<u64>,
         members: Vec<StructureMember>,
         type_params: IndexMap<String, Option<TypeId>>,
+        /// Phase 3 Feature A — true when this struct is the
+        /// fat-pointer representation of a `dyn Trait`. Detected
+        /// by name pattern (`<… dyn …>`) plus the canonical
+        /// `pointer`/`vtable` member shape rustc emits. Used by
+        /// the renderer to annotate the value and (eventually)
+        /// drive vtable → concrete-type resolution.
+        is_trait_object: bool,
     },
     Union {
         namespaces: NamespaceHierarchy,
@@ -775,12 +782,14 @@ impl TypeParser {
             .into_iter()
             .collect::<IndexMap<_, _>>();
 
+        let is_trait_object = looks_like_trait_object(name.as_deref(), &members);
         TypeDeclaration::Structure {
             namespaces: die_ref.namespace(),
             name,
             byte_size: die.byte_size(),
             members,
             type_params,
+            is_trait_object,
         }
     }
 
@@ -1013,3 +1022,36 @@ impl TypeParser {
 /// A cache structure for types.
 /// Every type identified by its `TypeId` and DWARF unit uuid.
 pub type TypeCache = HashMap<(Uuid, TypeId), Rc<ComplexType>>;
+
+/// Phase 3 Feature A — heuristic detector for the rustc
+/// fat-pointer representation of a `dyn Trait`.
+///
+/// Two independent signals; either is sufficient:
+///
+/// * **Name pattern** — rustc emits the wrapping struct's
+///   `DW_AT_name` containing `dyn ` (e.g.
+///   `alloc::boxed::Box<dyn core::error::Error, alloc::alloc::Global>`).
+/// * **Member shape** — exactly two members named `pointer` and
+///   `vtable` (or `data_ptr` and `vtable` in some versions).
+///
+/// The two-signal approach is robust against rustc renaming the
+/// struct on us — if the name changes, the member shape still
+/// catches it; if the member shape changes, the name still does.
+fn looks_like_trait_object(name: Option<&str>, members: &[StructureMember]) -> bool {
+    if name.is_some_and(|n| n.contains("dyn ")) {
+        return true;
+    }
+    if members.len() == 2 {
+        let m0 = members[0].name.as_deref();
+        let m1 = members[1].name.as_deref();
+        let pair = (m0, m1);
+        return matches!(
+            pair,
+            (Some("pointer"), Some("vtable"))
+                | (Some("data_ptr"), Some("vtable"))
+                | (Some("vtable"), Some("pointer"))
+                | (Some("vtable"), Some("data_ptr"))
+        );
+    }
+    false
+}

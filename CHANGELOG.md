@@ -7,6 +7,33 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- variables (Phase 3 Feature A batch A1 — `dyn Trait` detection):
+  - `TypeDeclaration::Structure` carries a new `is_trait_object: bool`
+    set during DWARF parsing via the `looks_like_trait_object`
+    heuristic (struct name contains a `dyn` token OR the canonical
+    `pointer`/`vtable` member shape rustc emits).
+  - `StructValue::is_trait_object()` is the read-side equivalent;
+    the renderer calls it to detect trait-object structs without
+    extra plumbing through every constructor.
+  - When detected, the renderer emits a single-line summary
+    `<trait-name> { data: 0x…, vtable: 0x… }
+    [concrete type unavailable; vtable resolution pending — Phase
+    3A follow-up]` so the user knows we recognised the trait
+    object even though we can't yet recover the concrete type.
+  - New integration test `tests/debugger/variables.rs::
+    test_dyn_trait_detection` breaks at `phase3_dyn_trait()` and
+    asserts a `Box<dyn Error>` renders with the dyn / vtable /
+    pending markers. `examples/vars/src/vars.rs` gains a
+    `phase3_dyn_trait()` fixture with `Box<dyn Error>`,
+    `&dyn Iterator<Item = u32>`, and `Arc<dyn Debug + Send + Sync>`.
+  - The `Arc<dyn …>` and `&dyn …` shapes route through the smart-
+    pointer / reference-deref render paths and need a follow-up
+    batch to surface their detection — the current batch covers
+    only the direct `Box<dyn …>` case, which is the headline
+    fat-pointer struct.
+  - Concrete type recovery itself (vtable address → drop-fn
+    symbol → demangle → impl_self_type → TypeId resolution) is
+    the next batch.
 - crate (Phase 2 — rust-mangle-tree, batches A–H):
   - new workspace crate `crates/rust-mangle-tree` parsing Rust v0
     (RFC 2603) and legacy Itanium-style mangled symbols into a

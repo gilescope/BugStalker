@@ -317,6 +317,38 @@ pub fn render_bytes(bytes: &[u8], mode: ByteRenderMode, truncated: bool) -> Stri
     }
 }
 
+/// Phase 3 Feature A — `dyn Trait` annotation. We recognised the
+/// fat-pointer trait-object layout but haven't yet wired the
+/// vtable → symbol → demangle → concrete-type chain (next batch).
+/// Surface the trait identity from the struct's type name plus the
+/// raw data and vtable pointers so the user sees that we noticed,
+/// and so the developer running this can grab the vtable address
+/// for manual `addr2line` / `nm` lookup.
+fn render_trait_object_summary(s: &crate::debugger::variable::value::StructValue) -> String {
+    use crate::debugger::variable::value::Value;
+    // Pull the two pointer values directly off the members. We
+    // accept either rustc-naming convention (`pointer`/`vtable` or
+    // `data_ptr`/`vtable`).
+    let mut data_ptr: Option<*const ()> = None;
+    let mut vtable_ptr: Option<*const ()> = None;
+    for m in &s.members {
+        if let Value::Pointer(p) = &m.value {
+            match m.field_name.as_deref() {
+                Some("vtable") => vtable_ptr = p.value,
+                Some("pointer") | Some("data_ptr") => data_ptr = p.value,
+                _ => {}
+            }
+        }
+    }
+    let trait_name = s.type_ident.name().unwrap_or("dyn Trait");
+    match (data_ptr, vtable_ptr) {
+        (Some(d), Some(v)) => format!(
+            "{trait_name} {{ data: {d:p}, vtable: {v:p} }}  [concrete type unavailable; vtable resolution pending — Phase 3A follow-up]"
+        ),
+        _ => format!("{trait_name}  [trait object — pointer fields missing]"),
+    }
+}
+
 /// Phase 1 S5 — `SystemTime` rendered as ISO-8601 / RFC3339 UTC.
 /// `chrono`'s `AutoSi` format suppresses trailing zeros: whole
 /// seconds render as `…30Z`, millis as `…30.123Z`, nanos only when
@@ -511,7 +543,18 @@ impl RenderValue for Value {
             Value::Scalar(scalar) => {
                 ValueLayout::PreRendered(Cow::Owned(scalar.value.as_ref()?.to_string()))
             }
-            Value::Struct(r#struct) => ValueLayout::Structure(r#struct.members.as_ref()),
+            Value::Struct(r#struct) => {
+                // Phase 3 Feature A — annotate `dyn Trait` fat-pointer
+                // structs so the user knows the renderer recognised
+                // the trait-object layout. Concrete-type recovery
+                // (vtable → symbol → demangle → TypeId) is a follow-
+                // up batch; this hop is detection + tagging only.
+                if r#struct.is_trait_object() {
+                    let body = render_trait_object_summary(r#struct);
+                    return Some(ValueLayout::PreRendered(Cow::Owned(body)));
+                }
+                ValueLayout::Structure(r#struct.members.as_ref())
+            }
             Value::Array(array) => ValueLayout::IndexedList(array.items.as_deref()?),
             Value::CEnum(r#enum) => ValueLayout::PreRendered(Cow::Borrowed(r#enum.value.as_ref()?)),
             Value::RustEnum(r#enum) => {

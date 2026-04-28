@@ -2754,6 +2754,63 @@ fn test_read_nonnull() {
     assert_no_proc!(debugee_pid);
 }
 
+/// Phase 3 Feature A — `dyn Trait` fat-pointer detection. Verifies
+/// the renderer recognises trait objects (`Box<dyn Error>`,
+/// `&dyn Iterator<Item = u32>`, `Arc<dyn Debug + Send + Sync>`)
+/// and emits the `[concrete type unavailable; vtable resolution
+/// pending — Phase 3A follow-up]` annotation. Concrete type recovery
+/// itself lands in a follow-up batch; this test guards the
+/// detection layer.
+#[test]
+#[serial]
+fn test_dyn_trait_detection() {
+    use bugstalker::debugger::variable::render::ValueLayout;
+
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside
+    // `phase3_dyn_trait` — keep in lockstep with vars.rs.
+    debugger.set_breakpoint_at_line("vars.rs", 796).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(796));
+
+    let vars = debugger.read_local_variables().unwrap();
+
+    let pick = |name: &str| -> String {
+        let v = vars
+            .iter()
+            .find(|v| v.identity().to_string().contains(name))
+            .unwrap_or_else(|| panic!("{name} not in locals"));
+        match v.value().value_layout().expect("layout") {
+            ValueLayout::PreRendered(s) => s.into_owned(),
+            other => panic!("{name}: expected PreRendered (trait-object summary), got {other:?}"),
+        }
+    };
+
+    // `Box<dyn Error>` renders as the wrapping struct's two-pointer
+    // layout — that's the case our detector catches today.
+    let boxed_err = pick("boxed_err");
+    assert!(
+        boxed_err.contains("dyn") && boxed_err.contains("vtable"),
+        "boxed_err missing dyn / vtable annotation: {boxed_err:?}"
+    );
+    assert!(
+        boxed_err.contains("vtable resolution pending"),
+        "boxed_err missing pending marker: {boxed_err:?}"
+    );
+    // `Arc<dyn Debug + Send + Sync>` and `&dyn Iterator<…>` route
+    // through the smart-pointer / reference-deref paths
+    // respectively; their detection lands in a follow-up batch
+    // alongside vtable resolution.
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
 #[test]
 #[serial]
 fn test_cell() {

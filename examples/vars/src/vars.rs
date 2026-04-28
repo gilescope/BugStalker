@@ -686,7 +686,7 @@ pub fn main() {
         vec!["two".to_string(), "three".to_string()],
     );
     phase1_specs();
-    phase1_specs_b();
+    phase1_specs_b(); phase3_dyn_trait();
 }
 
 fn phase1_specs() {
@@ -745,6 +745,53 @@ fn phase1_specs_b() {
     std::hint::black_box(dst_cs);
     std::hint::black_box(dst_os);
     std::hint::black_box(dst_pa);
+
+    let nop: Option<u8> = None;
+}
+
+/// Phase 3 Feature A — `dyn Trait` recovery fixtures. The debugger
+/// should resolve each fat-pointer trait object back to its concrete
+/// type via the vtable symbol.
+fn phase3_dyn_trait() {
+    use std::error::Error;
+
+    // Concrete error type the trait object holds — we expect the
+    // debugger to recover this name from the vtable symbol.
+    #[derive(Debug)]
+    struct MyError {
+        code: i32,
+        msg: &'static str,
+    }
+    impl std::fmt::Display for MyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "MyError(code={}, msg={:?})", self.code, self.msg)
+        }
+    }
+    impl Error for MyError {}
+
+    let boxed_err: Box<dyn Error> = Box::new(MyError {
+        code: 42,
+        msg: "boom",
+    });
+
+    // &dyn Iterator over a small concrete iterator type.
+    let owned: Vec<u32> = vec![10, 20, 30];
+    let iter_obj: &dyn Iterator<Item = u32> = &owned.iter().copied();
+    // Force iter_obj to actually live across the breakpoint.
+    std::hint::black_box(iter_obj);
+
+    // Arc<dyn Send + Sync> — multi-bound trait object, distinct
+    // dyn-bound layout.
+    use std::sync::Arc;
+    struct Counter(u32);
+    let arc_obj: Arc<dyn std::fmt::Debug + Send + Sync> = Arc::new(Counter(7));
+    impl std::fmt::Debug for Counter {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Counter({})", self.0)
+        }
+    }
+    std::hint::black_box(&arc_obj);
+    std::hint::black_box(&boxed_err);
 
     let nop: Option<u8> = None;
 }
