@@ -217,6 +217,9 @@ dependencies = [
 name = "bs-test-harness"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "bugstalker",
+ "os_pipe",
  "tracing",
 ]
 
@@ -228,6 +231,7 @@ dependencies = [
  "ariadne",
  "base64 0.22.1",
  "bit_field",
+ "bs-test-harness",
  "bytes",
  "capstone",
  "chrono",

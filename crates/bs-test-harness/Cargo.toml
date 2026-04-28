@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 publish = false
-description = "Stub for the BugStalker test harness extracted from tests/debugger/. Phase 0 placeholder; Phase 8 ports the launch→breakpoint→render→assert flow into this crate."
+description = "Test- and bench-side helpers for spawning a debuggee under `bugstalker` and capturing values at a breakpoint. Phase 8 will move the rest of `tests/debugger/`'s scaffolding here; Phase 1 seeded the crate with the bench-side `spawn_at_breakpoint` / `capture_locals` helpers used by `benches/render_value.rs` and `benches/attach_cold.rs`."
 
 [lib]
 path = "src/lib.rs"
@@ -18,4 +18,7 @@ path = "src/lib.rs"
 bench = false
 
 [dependencies]
+anyhow.workspace = true
+bugstalker = { path = "../.." }
+os_pipe = "1"
 tracing.workspace = true

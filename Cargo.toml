@@ -143,16 +143,20 @@ mach2 = "0.6"
 [dev-dependencies]
 serial_test = "3.2.0"
 criterion = { workspace = true }
+bs-test-harness = { path = "crates/bs-test-harness" }
 
 [features]
 default = []
 nightly = []
 int_test = ["nightly"]
 
-# Phase 0 bench scaffolding. Each bench seeds a Criterion baseline so
+# Bench scaffolding. Each bench seeds a Criterion baseline so
 # `ci-bench.yml` can flag >10 % regressions vs the trailing 7-day
-# median (see `doc/plans/phase-0-preflight.md`). Bodies are placeholders
-# until the real workloads land in Phase 1+.
+# median (see `doc/plans/phase-0-preflight.md`). Bodies pulled
+# forward from Phase 8 — `render_value` measures the Phase 1
+# specialised renderer over a captured set of stdlib values;
+# `attach_cold` measures debugger setup → first breakpoint hit on
+# `examples/hello_world`.
 [[bench]]
 name = "render_value"
 path = "benches/render_value.rs"
