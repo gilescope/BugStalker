@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 import pexpect
 import re
 
@@ -7,18 +8,18 @@ import psutil
 class Debugger:
     def __init__(self, path=None, process=None, oracles=None):
         self._external_debugee_process = None
-        base = './target/release/bs -t none'
+        base = "./target/release/bs -t none"
         if oracles is None:
             oracles = []
         for oracle in oracles:
-            base = f'{base} --oracle {oracle}'
+            base = f"{base} --oracle {oracle}"
         if path:
-            self._process = pexpect.spawn(f'{base} {path}')
+            self._process = pexpect.spawn(f"{base} {path}")
         if process:
             self._external_debugee_process = process
             pid = self._external_debugee_process.pid
-            self._process = pexpect.spawn(f'{base} -p {pid}')
-        self._process.expect_exact('BugStalker greets')
+            self._process = pexpect.spawn(f"{base} -p {pid}")
+        self._process.expect_exact("BugStalker greets")
 
     def cmd(self, cmd, *should_see):
         self._process.sendline(cmd)
@@ -60,6 +61,6 @@ class Debugger:
 
     def expect_in_output(self, text, timeout=-1):
         self._process.expect_exact(text, timeout)
-        
+
     def expect_in_output_re(self, regex, timeout=-1):
         self._process.expect(regex, timeout)
