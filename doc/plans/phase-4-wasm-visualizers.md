@@ -361,8 +361,104 @@ Two channels, in this priority order:
 2. **Local config dir.** `~/.config/bugstalker/visualizers/*.wasm`
    for ad-hoc and forked visualisers. Loaded on debugger startup.
 
-Discovery order: embedded first (crate-shipped), then local. Local
-overrides embedded for the same `matches()` predicate, with a warning.
+3. **Companion crates on crates.io** (Phase 4 follow-up). A
+   visualiser-only crate `bs-viz-foo` can ship its wasm as a build
+   artifact and be picked up automatically when an end-user adds it
+   as a dev-dependency. See "Distribution & packaging" below for
+   the four viable models and the chosen one.
+
+Discovery order: embedded → companion crate → local config dir.
+Later sources override earlier ones for the same `matches()`
+predicate, with a warning.
+
+## Distribution & packaging
+
+The on-disk / on-binary format for a visualiser is **raw wasm
+bytes** — no hex, no base64, no JSON wrapping. `include_bytes!`
+reads the `.wasm` file at compile time and the linker copies it
+verbatim into the chosen ELF/Mach-O section. This is the smallest
+representation an embedded visualiser can have: byte-for-byte the
+wasm module itself.
+
+### Why not hex / base64?
+
+A hex-encoded module is 2× the size, base64 is 1.33×. Either also
+forces a decode pass at attach time. The custom-section approach
+costs neither.
+
+### Companion-crate distribution model
+
+End users want `cargo add bs-viz-mymap` and have visualisers light
+up without modifying the parent crate. Four candidate models, with
+the chosen recommendation called out:
+
+1. **Build-script that copies into the parent's section.** Each
+   `bs-viz-*` crate's `build.rs` emits a `cargo:rustc-link-arg` to
+   inject its wasm bytes into the host binary's `.bs_visualizer_
+   wasm` section. Heavy — Cargo doesn't expose a clean way to
+   merge multiple sources into one section, so you end up with
+   N parallel sections (`.bs_visualizer_wasm.0`, `.1`, …) which
+   BugStalker would have to enumerate. Fragile across linkers.
+2. **`pub static` exposed by the viz crate.** The viz crate
+   defines `#[link_section] pub static WASM: &[u8] = include_
+   bytes!(...)` itself, *as part of normal compilation*. The wasm
+   ends up in the parent binary because the linker picks up the
+   static when any code references it. The viz crate ships a
+   tiny `inventory`-style registration call that runs on first
+   use; BugStalker scans the binary's section. **This is the
+   recommended primary model** — no build-script gymnastics, no
+   custom Cargo metadata, just normal Rust dependency mechanics.
+3. **`package.metadata.bugstalker.visualizer = "path/to.wasm"`**
+   Cargo-metadata key. BugStalker reads `Cargo.toml` (via the
+   `cargo_metadata` crate at attach time) and sideloads any
+   advertised wasm files. Decouples the wasm from compilation but
+   makes the "where do the bytes physically live" story messier
+   — visualiser authors would need to publish the wasm as part of
+   the crate tarball, then BugStalker has to find the on-disk
+   path of an installed crate (`~/.cargo/registry/src/...`).
+   Useful as a *secondary* discovery channel for visualisers that
+   don't want to be linked in.
+4. **Separate registry / GitHub releases.** A central index
+   (`viz.bugstalker.dev`) of visualisers, fetched on demand by
+   crate name. Attractive long-term (no parent-crate dep, can be
+   installed without recompilation) but is a whole secondary
+   ecosystem. Out of scope for Phase 4; revisit once model 2 has
+   been in the field for a release cycle.
+
+Models 2 and 3 compose: a visualiser crate can both link itself
+into the parent binary (model 2, the fast path) *and* publish its
+wasm as a crate file (model 3, for the case where the parent
+wasn't recompiled with the viz dep but the user still wants the
+viz to apply at debug time).
+
+### Even-more-efficient host-side caching: AOT (`.cwasm`)
+
+The on-binary bytes stay raw wasm. Once BugStalker has loaded a
+module, wasmtime can serialise the AOT-compiled artifact via
+`Module::serialize`; the result is ~3× the raw wasm size but loads
+in single-digit microseconds vs. ~200 µs for fresh compilation.
+We cache compiled modules at:
+
+```text
+~/.cache/bugstalker/cwasm/<wasmtime-version>/<host-triple>/<wasm-sha256>.cwasm
+```
+
+Cache key includes the wasmtime version and host triple so a
+wasmtime upgrade or a cross-compile invalidates cleanly. The
+cache is opportunistic — first attach pays full instantiation
+cost, subsequent attaches read the AOT artifact. Total Phase 4
+cold-attach cost target unchanged at < 100 ms for a binary with
+10 visualisers.
+
+### Compression
+
+Not used today. Wasm typically compresses 30–50 % under zstd, but
+the section is in-binary anyway and the cost is borne once at
+build time; binary-size growth from `register_wasm!` is roughly
+the wasm module size, which is already small (~30–80 KB for a
+typical visualiser). If real-world visualisers grow into the
+megabytes, revisit by adding a `register_wasm_zstd!` macro that
+stores a compressed blob and decompresses at first use.
 
 ## Capability sandbox
 
