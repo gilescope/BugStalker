@@ -154,11 +154,17 @@ bench:
 
 # Phase 1 acceptance smoke. Drives `bugstalker` against the
 # `examples/vars` debuggee through the library API and asserts every
-# Phase 1 stdlib type renders via its specialised path. Includes a
-# bench --quick pass so a regression that breaks the bench harness
-# (panic / compile error) fails CI alongside the smoke check.
-# Numerical bench-regression gating lands in Phase 8 once real bench
-# bodies replace the Phase 0 placeholders in `benches/`.
+# Phase 1 stdlib type renders via its specialised path. Then runs the
+# bench suite in --quick mode and fails on `Performance has
+# regressed` (criterion compares against the baseline saved under
+# `target/criterion/` from the previous run; cargo cache persists
+# across Earthly invocations of this target so the comparison is
+# meaningful in CI).
+#
+# First-run behaviour: criterion has no baseline yet, so the
+# regression-grep matches nothing and the bench step passes
+# unconditionally. Subsequent runs gate on >=5 % stat-significant
+# slowdown (criterion's default thresholds).
 smoke:
     FROM +build-examples
     # `examples/target` may be a (broken) symlink on hosts that redirect
@@ -172,7 +178,12 @@ smoke:
         cargo run -p bs-smoke -- --vars examples/target/debug/vars
     RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --mount=type=cache,target=/bs/target,sharing=locked \
-        cargo bench --workspace -- --quick
+        bash -c 'set -o pipefail; \
+            cargo bench --workspace -- --quick 2>&1 | tee /tmp/bench.log; \
+            if grep -q "Performance has regressed" /tmp/bench.log; then \
+                echo "[bs/smoke] benchmark regression detected — see /tmp/bench.log"; \
+                exit 1; \
+            fi'
 
 # `cargo deny check` enforces the licence allow-list and surfaces
 # advisories. Configured in `deny.toml`.
