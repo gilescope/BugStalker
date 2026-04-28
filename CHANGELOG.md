@@ -31,10 +31,25 @@ All notable changes to this project will be documented in this file.
     asserts every `Suspend(_)` `AsyncFn` in the ticker app reports
     `examples/tokiotiker/src/main.rs:5` — the only `.await` in the
     example.
-  - Phase 3D batch D3 (DAP `bs/awaitTrace` request, dedicated
-    `tests/debugger/async_await.rs` covering simple / chained /
-    `dyn_future` / `select!` / `join!` cases) still to come — see
+  - Phase 3D batch D3b (dedicated `tests/debugger/async_await.rs`
+    covering simple / chained / `dyn_future` / `select!` / `join!`
+    cases) still to come — see
     `doc/plans/phase-3-dyn-trait-and-async.md`.
+- dap (Phase 3 Feature D batch D3a — `bs/awaitTrace` custom request):
+  - New BugStalker-specific JSON-RPC method exposing the same
+    await-trace data the console renders, so VSCode (and any future
+    scripting front-end — see Phase 9 plan) can render it in a
+    parallel panel without scraping text output.
+  - Optional `threadId` argument selects a specific worker / blocking
+    thread; absent ⇒ the currently-focused task.
+  - Response body: `{ taskId, frames: [...] }` where each frame is
+    one of `kind: "asyncFn" | "sleep" | "joinHandle" | "custom" |
+    "unknown"` carrying the relevant per-kind fields (state /
+    awaitPoint / source.path + line for asyncFn; deadlineSec/Nsec
+    for sleep; waitingForTaskId for joinHandle; concrete for
+    custom). `source.path` runs through the existing
+    `SourceMap::map_target_to_client` so it lines up with
+    `stackTrace` paths.
 - ui (Phase 3 Feature D batch D2a — `async await-trace` / `async at`):
   - New console subcommand that prints the current task's awaitee
     chain as a stack-frame list, source-coords-first. Mirrors how

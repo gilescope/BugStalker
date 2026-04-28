@@ -187,11 +187,18 @@ stopped inside a runtime poll.
   through* the dyn box) is intentionally deferred — it requires
   parsing the awaitee data at a TypeId looked up by string name,
   which is a meaningful addition. Tracked separately.
-- **D3 (pending)** — DAP `bs/awaitTrace` request + the test plan in
-  `tests/debugger/async_await.rs` (simple / chained / dyn_future /
-  select / join cases). Step 1 (explicit coroutine-type detection)
-  and step 5 (multi-level awaitee-chain walker beyond the existing
-  `__awaitee` follow) also still pending.
+- **D3a (landed, commit `574766a`)** — DAP `bs/awaitTrace` custom
+  request. Returns `{ taskId, frames: [...] }` with `kind`-tagged
+  frame objects so VSCode / future scripting front-ends can render
+  the await-trace alongside the synchronous call stack without
+  scraping the console's text output.
+- **D3b (pending)** — dedicated `tests/debugger/async_await.rs` and
+  the matching example debuggees (`simple` / `chained` /
+  `dyn_future` / `select!` / `join!`). Linux CI only at the moment
+  since Darwin tokio runtime introspection is incomplete. Step 1
+  (explicit coroutine-type detection) and step 5 (multi-level
+  awaitee-chain walker beyond the existing `__awaitee` follow)
+  still pending.
 
 ### Background
 
