@@ -65,3 +65,42 @@ fn no_panic_on_v0_garbage() {
         let _ = parse(input); // must not panic
     }
 }
+
+/// Real-world corpus: 100 v0 symbols pulled from `nm` over a v0-mangled
+/// release build of `examples/vars` (`RUSTFLAGS="-C symbol-mangling-version=v0"
+/// cargo build --release`). CI re-runs this on every change so a
+/// future edit to the grammar / Display / disambiguator rule can't
+/// silently regress against rustc-demangle.
+#[test]
+fn corpus_v0_real_binary() {
+    let raw = include_str!("corpus/v0_real_binary.txt");
+    let mut total = 0usize;
+    let mut mismatches: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        total += 1;
+        let theirs = format!("{:#}", rustc_demangle::demangle(s));
+        let ours = match parse(s) {
+            Ok(Symbol::V0(p)) => format!("{p}"),
+            Ok(_) => continue,
+            Err(_) => continue,
+        };
+        if theirs != ours {
+            if mismatches.len() < 5 {
+                mismatches.push(format!("\n  in={s}\n  ours={ours}\n  thrs={theirs}"));
+            } else {
+                mismatches.push(String::new());
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "{} mismatches over {} symbols (first 5 shown):{}",
+        mismatches.iter().filter(|m| !m.is_empty()).count(),
+        total,
+        mismatches.iter().take(5).cloned().collect::<String>()
+    );
+}

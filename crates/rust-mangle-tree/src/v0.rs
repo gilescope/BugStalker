@@ -190,30 +190,57 @@ impl fmt::Display for Path<'_> {
     }
 }
 
-/// Display helper. `inside_generic` controls when we add `::` before
-/// the next segment (suppressed for `<T as Trait>` cases the
-/// rustc-demangle output handles slightly differently).
-fn write_path(p: &Path<'_>, f: &mut fmt::Formatter<'_>, _inside_generic: bool) -> fmt::Result {
+/// Display helper. `in_type` is `true` when we're rendering inside a
+/// type position (generic argument, ref/array/tuple inner, etc.) and
+/// generic args attach via `<…>`; otherwise we're at a value position
+/// (free fn, method, const) and use `::<…>`. Mirrors
+/// `rustc-demangle`'s convention exactly.
+fn write_path(p: &Path<'_>, f: &mut fmt::Formatter<'_>, in_type: bool) -> fmt::Result {
     match p {
         Path::CrateRoot { name, .. } => f.write_str(name.as_str()),
         Path::Nested {
-            parent, name, ..
+            namespace,
+            parent,
+            disambiguator,
+            name,
         } => {
-            write_path(parent, f, false)?;
-            if !name.is_empty() {
-                f.write_str("::")?;
-                f.write_str(name.as_str())?;
-            } else {
-                // Closures / shims often carry an empty name; emit
-                // a placeholder like rustc-demangle does.
-                f.write_str("::{closure}")?;
+            // Unknown lowercase namespaces with empty names are
+            // compiler-internal nesting markers (e.g. `k` for some
+            // promoted constant contexts) — rustc-demangle elides
+            // them entirely, leaving just the parent path. We do
+            // the same so our output stays in lockstep.
+            if !matches!(*namespace, b'C' | b'S' | b'v' | b't') && name.is_empty() {
+                return write_path(parent, f, in_type);
+            }
+            write_path(parent, f, in_type)?;
+            f.write_str("::")?;
+            // Closure / shim namespaces wrap the segment in `{…}`
+            // markers per rustc-demangle. The disambiguator surfaces
+            // as `#N` inside the markers. rustc-demangle's display
+            // convention:
+            //   • absent (no `s` prefix)  → `#0`
+            //   • `s_`   (empty body, raw 0) → `#1`
+            //   • `s0_`  (body "0", raw 1)   → `#2`
+            // So we add 1 when the disambiguator was present, and
+            // render `0` when it wasn't.
+            let disc = disambiguator.map(|d| d.saturating_add(1)).unwrap_or(0);
+            match (*namespace, name.is_empty()) {
+                (b'C', _) => write!(f, "{{closure#{disc}}}")?,
+                (b'S', true) => write!(f, "{{shim#{disc}}}")?,
+                (b'S', false) => write!(f, "{{shim:{}#{disc}}}", name.as_str())?,
+                (_, false) => f.write_str(name.as_str())?,
+                (_, true) => write!(f, "{{nested#{disc}}}")?,
             }
             Ok(())
         }
         Path::Generic { parent, args } => {
-            write_path(parent, f, true)?;
+            write_path(parent, f, in_type)?;
             if !args.is_empty() {
-                f.write_str("::<")?;
+                if in_type {
+                    f.write_str("<")?;
+                } else {
+                    f.write_str("::<")?;
+                }
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
@@ -224,27 +251,17 @@ fn write_path(p: &Path<'_>, f: &mut fmt::Formatter<'_>, _inside_generic: bool) -
             }
             Ok(())
         }
-        Path::InherentImpl {
-            parent, self_type, ..
-        } => {
+        Path::InherentImpl { self_type, .. } => {
+            // The impl's parent path is contextual mangling info
+            // (which module the `impl` block sits in); rustc-demangle
+            // renders only `<self_type>` because the self-type's own
+            // path already names where the type was *defined*, which
+            // is what users care about.
             f.write_str("<")?;
             write_type(self_type, f)?;
-            f.write_str(">")?;
-            // Parent path is rendered as `::path` after the impl,
-            // matching rustc-demangle's output shape. If the parent
-            // is a bare crate root the segment is suppressed
-            // because `<i32>::core::fmt::write` reads strangely;
-            // rustc-demangle pulls the parent's segments inline.
-            // For now, our simpler form: append `::parent_path`
-            // when the parent isn't a crate root.
-            if !matches!(parent.as_ref(), Path::CrateRoot { .. }) {
-                f.write_str("::")?;
-                write_path(parent, f, false)?;
-            }
-            Ok(())
+            f.write_str(">")
         }
         Path::TraitImpl {
-            parent,
             self_type,
             trait_path,
             ..
@@ -252,13 +269,8 @@ fn write_path(p: &Path<'_>, f: &mut fmt::Formatter<'_>, _inside_generic: bool) -
             f.write_str("<")?;
             write_type(self_type, f)?;
             f.write_str(" as ")?;
-            write_path(trait_path, f, false)?;
-            f.write_str(">")?;
-            if !matches!(parent.as_ref(), Path::CrateRoot { .. }) {
-                f.write_str("::")?;
-                write_path(parent, f, false)?;
-            }
-            Ok(())
+            write_path(trait_path, f, true)?;
+            f.write_str(">")
         }
         Path::TraitAssoc {
             self_type,
@@ -267,7 +279,7 @@ fn write_path(p: &Path<'_>, f: &mut fmt::Formatter<'_>, _inside_generic: bool) -
             f.write_str("<")?;
             write_type(self_type, f)?;
             f.write_str(" as ")?;
-            write_path(trait_path, f, false)?;
+            write_path(trait_path, f, true)?;
             f.write_str(">")
         }
     }
@@ -311,10 +323,61 @@ fn write_lifetime(l: Lifetime, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     }
 }
 
+/// Render a single `dyn` bound. Generic args and assoc-type
+/// bindings get merged into a single `<args, AssocName = T, …>`
+/// block, mirroring rustc-demangle: `Iterator<Item = u32>` not
+/// `Iterator<><Item = u32>`. When the trait path's outermost node
+/// is `Generic`, we splice the assoc bindings into the existing
+/// `<…>`; otherwise we open a fresh `<…>` for them.
+fn write_dyn_bound(b: &crate::DynBound<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match &b.trait_path {
+        Path::Generic { parent, args } => {
+            // Trait path with generic args — open one block holding
+            // both the args and the assoc bindings.
+            write_path(parent, f, true)?;
+            if args.is_empty() && b.assoc.is_empty() {
+                return Ok(());
+            }
+            f.write_str("<")?;
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write_generic_arg(a, f)?;
+            }
+            for (i, a) in b.assoc.iter().enumerate() {
+                if i > 0 || !args.is_empty() {
+                    f.write_str(", ")?;
+                }
+                f.write_str(a.name)?;
+                f.write_str(" = ")?;
+                write_type(&a.ty, f)?;
+            }
+            f.write_str(">")
+        }
+        other => {
+            write_path(other, f, true)?;
+            if !b.assoc.is_empty() {
+                f.write_str("<")?;
+                for (i, a) in b.assoc.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(a.name)?;
+                    f.write_str(" = ")?;
+                    write_type(&a.ty, f)?;
+                }
+                f.write_str(">")?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn write_type(t: &Type<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match t {
         Type::Primitive(p) => f.write_str(p.as_str()),
-        Type::Path(p) => write_path(p, f, false),
+        Type::Path(p) => write_path(p, f, true),
         Type::Ref {
             mutability,
             lifetime,
@@ -369,19 +432,7 @@ fn write_type(t: &Type<'_>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 if i > 0 {
                     f.write_str(" + ")?;
                 }
-                write_path(&b.trait_path, f, false)?;
-                if !b.assoc.is_empty() {
-                    f.write_str("<")?;
-                    for (j, a) in b.assoc.iter().enumerate() {
-                        if j > 0 {
-                            f.write_str(", ")?;
-                        }
-                        f.write_str(a.name)?;
-                        f.write_str(" = ")?;
-                        write_type(&a.ty, f)?;
-                    }
-                    f.write_str(">")?;
-                }
+                write_dyn_bound(b, f)?;
             }
             if *lifetime != Lifetime::ANON {
                 f.write_str(" + ")?;
@@ -556,8 +607,21 @@ impl<'a> Parser<'a> {
         let len_start = self.pos;
         let mut len: usize = 0;
         let mut got_digit = false;
+        // v0 disallows leading zeros on the length prefix: `0` is
+        // exactly length 0 (a single digit), `10` is length ten,
+        // and `00` is malformed (or, in practice, two consecutive
+        // zero-length identifiers). Reading greedily here would
+        // swallow nested closures' names that all happen to be
+        // empty.
         while let Some(b) = self.peek() {
             if !b.is_ascii_digit() {
+                break;
+            }
+            // Single leading `0` ⇒ length 0; stop immediately so the
+            // caller doesn't misinterpret subsequent zeros.
+            if !got_digit && b == b'0' {
+                got_digit = true;
+                self.pos += 1;
                 break;
             }
             got_digit = true;
