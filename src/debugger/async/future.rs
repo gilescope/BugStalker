@@ -41,6 +41,12 @@ pub struct AsyncFnFuture {
     pub async_fn: String,
     /// Async function state.
     pub state: AsyncFnFutureState,
+    /// Phase 3 Feature D — `(file, line)` of the `.await` the future
+    /// is suspended at, recovered from `DW_AT_decl_file`/
+    /// `DW_AT_decl_line` on the active variant's captured-locals
+    /// fields. `None` when the variant has no decl coords (e.g.
+    /// `Unresumed`/`Returned`/`Panicked`/`Ok`, or a stripped binary).
+    pub await_location: Option<(std::path::PathBuf, u64)>,
 }
 
 impl TryFrom<&RustEnumValue> for AsyncFnFuture {
@@ -91,6 +97,7 @@ impl TryFrom<&RustEnumValue> for AsyncFnFuture {
             async_fn,
             name,
             state,
+            await_location: repr.await_location.clone(),
         })
     }
 }

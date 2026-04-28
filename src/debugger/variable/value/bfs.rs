@@ -191,6 +191,7 @@ mod test {
                                                 }),
                                             })),
                                             raw_address: None,
+                                            await_location: None,
                                         }),
                                     },
                                     Member {

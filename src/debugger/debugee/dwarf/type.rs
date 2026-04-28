@@ -147,6 +147,13 @@ pub struct StructureMember {
     pub in_struct_location: Option<MemberLocation>,
     pub name: Option<String>,
     pub type_ref: Option<TypeId>,
+    /// Phase 3 Feature D — `(file_index, line)` pair from the member's
+    /// `DW_AT_decl_file`/`DW_AT_decl_line` attributes, when present.
+    /// rustc emits these on the member fields of a coroutine state-
+    /// machine enum's variants, where they encode the source location
+    /// of the corresponding `.await` point. The renderer uses them to
+    /// drive Phase 3 D's await-trace.
+    pub decl_file_line: Option<(u64, u64)>,
 }
 
 impl StructureMember {
@@ -823,6 +830,7 @@ impl TypeParser {
             in_struct_location,
             name: die.name(),
             type_ref: mb_type_ref,
+            decl_file_line: die.decl_file_line(),
         }
     }
 

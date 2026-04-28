@@ -24,7 +24,16 @@ fn print_future(backtrace: &AsyncBacktrace, num: u32, future: &Future, printer: 
             ));
             match fn_fut.state {
                 AsyncFnFutureState::Suspend(await_num) => {
-                    printer.println(format!("\tsuspended at await point {await_num}"));
+                    // Phase 3 Feature D — append source coords when the
+                    // active variant carried DW_AT_decl_file/decl_line.
+                    // Falls back to "await point N" alone for stripped
+                    // binaries or pre-await states.
+                    let loc = fn_fut
+                        .await_location
+                        .as_ref()
+                        .map(|(file, line)| format!(" at {}:{line}", file.display()))
+                        .unwrap_or_default();
+                    printer.println(format!("\tsuspended at await point {await_num}{loc}"));
                 }
                 AsyncFnFutureState::Panicked => {
                     printer.println("\tpanicked!");

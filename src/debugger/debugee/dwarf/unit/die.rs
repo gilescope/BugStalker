@@ -8,10 +8,10 @@ use crate::{
 };
 use gimli::{
     Attribute, AttributeValue, DW_AT_byte_size, DW_AT_const_value, DW_AT_count,
-    DW_AT_data_member_location, DW_AT_discr, DW_AT_discr_value, DW_AT_encoding, DW_AT_frame_base,
-    DW_AT_linkage_name, DW_AT_location, DW_AT_lower_bound, DW_AT_name, DW_AT_type,
-    DW_AT_upper_bound,
-    DebuggingInformationEntry, DwAt, DwTag, Dwarf, Range, Reader, Unit, UnitOffset,
+    DW_AT_data_member_location, DW_AT_decl_file, DW_AT_decl_line, DW_AT_discr, DW_AT_discr_value,
+    DW_AT_encoding, DW_AT_frame_base, DW_AT_linkage_name, DW_AT_location, DW_AT_lower_bound,
+    DW_AT_name, DW_AT_type, DW_AT_upper_bound, DebuggingInformationEntry, DwAt, DwTag, Dwarf,
+    Range, Reader, Unit, UnitOffset,
 };
 use std::collections::VecDeque;
 
@@ -155,6 +155,16 @@ impl<'a> Die<'a> {
         Option<Attribute<EndianArcSlice>>,
         |_, die: GimliDie| { die.attr(DW_AT_frame_base).cloned() }
     );
+
+    // Phase 3 Feature D — (file_index, line) pair from
+    // DW_AT_decl_file/DW_AT_decl_line. On variant-member DIEs of a
+    // coroutine state-machine enum these point at the corresponding
+    // .await source location (the Cliff Biffle technique).
+    impl_no_virt!(decl_file_line, Option<(u64, u64)>, |_, die: GimliDie| {
+        let file_idx = die.attr(DW_AT_decl_file).and_then(|a| a.udata_value())?;
+        let line = die.attr(DW_AT_decl_line).and_then(|a| a.udata_value())?;
+        Some((file_idx, line))
+    });
 
     pub fn for_each_children_t<T>(&self, mut f: impl FnMut(Die<'a>) -> Option<T>) -> Option<T> {
         match self {

@@ -278,6 +278,12 @@ pub struct RustEnumValue {
     /// Variable IR representation of selected variant.
     pub value: Option<Box<Member>>,
     pub raw_address: Option<usize>,
+    /// Phase 3 Feature D — `(file, line)` of the active variant's
+    /// captured-locals fields, as emitted by rustc on the variant
+    /// struct's members. For coroutine state-machine enums this is
+    /// the source position of the corresponding `.await` point and
+    /// drives the await-trace renderer. `None` for ordinary enums.
+    pub await_location: Option<(std::path::PathBuf, u64)>,
 }
 
 /// Raw pointers, references, Box.
@@ -1325,6 +1331,7 @@ mod test {
                         }),
                     })),
                     raw_address: None,
+                    await_location: None,
                 }),
                 eq_literal: Literal::EnumVariant(
                     "Variant1".to_string(),

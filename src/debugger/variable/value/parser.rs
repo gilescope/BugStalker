@@ -383,10 +383,36 @@ impl ValueParser {
             None
         });
 
-        let enumerator =
+        let active_enumerator =
             discr_value.and_then(|v| enumerators.get(&Some(v)).or_else(|| enumerators.get(&None)));
 
-        let enumerator = enumerator.and_then(|member| {
+        // Phase 3 Feature D — for the active variant, find a DIE that
+        // carried `DW_AT_decl_file`/`DW_AT_decl_line`. On a coroutine
+        // state-machine enum this is rustc's source location for the
+        // `.await` we are paused at. We try (in order) the captured-
+        // locals fields inside the variant struct, then the enumerator
+        // member itself — rustc has used both shapes across versions.
+        let await_decl = active_enumerator
+            .and_then(|m| m.type_ref)
+            .and_then(|var_ty| {
+                if let Some(TypeDeclaration::Structure { members, .. }) =
+                    pcx.type_graph.types.get(&var_ty)
+                {
+                    members.iter().find_map(|m| m.decl_file_line)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| active_enumerator.and_then(|m| m.decl_file_line));
+
+        let await_location = await_decl.and_then(|(file_idx, line)| {
+            let unit = pcx.evcx.evaluator.unit();
+            unit.files()
+                .get(file_idx as usize)
+                .map(|p| (p.clone(), line))
+        });
+
+        let enumerator = active_enumerator.and_then(|member| {
             Some(Box::new(self.parse_struct_member(
                 pcx,
                 member,
@@ -399,6 +425,7 @@ impl ValueParser {
             type_ident: pcx.type_graph.identity(type_id),
             value: enumerator,
             raw_address: data.and_then(|d| d.address),
+            await_location,
         }
     }
 
