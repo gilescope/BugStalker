@@ -31,10 +31,27 @@ All notable changes to this project will be documented in this file.
     asserts every `Suspend(_)` `AsyncFn` in the ticker app reports
     `examples/tokiotiker/src/main.rs:5` — the only `.await` in the
     example.
-  - Phase 3D batch D3b (dedicated `tests/debugger/async_await.rs`
-    covering simple / chained / `dyn_future` / `select!` / `join!`
-    cases) still to come — see
+  - The remaining open items on Phase 3D — step 5 (multi-level
+    awaitee-chain walker beyond the existing `__awaitee` follow)
+    and the deeper half of step 6 (re-reading the awaitee at the
+    recovered concrete TypeId so the chain *continues through* the
+    dyn box) — are tracked in
     `doc/plans/phase-3-dyn-trait-and-async.md`.
+- tests (Phase 3 Feature D batch D3b — dedicated async-await suite):
+  - 5 new example debuggees under `examples/`:
+    `tokio_simple_await`, `tokio_chained_await`, `tokio_select`,
+    `tokio_join`, `tokio_dyn_future`. Each exercises one specific
+    `.await` shape called out in the plan.
+  - 5 matching tests in `tests/debugger/async_await.rs`. Each
+    breaks at a `marker()` call right after the relevant `.await`
+    and asserts the expected fn names appear in the futures stack
+    when the root AsyncFn is `Suspend(_)`. Assertions are
+    deliberately lenient about running-vs-suspended state since the
+    tokio runtime picks which task to poll non-deterministically.
+  - The new test module is `#[cfg(target_os = "linux")]`-gated;
+    tokio runtime introspection isn't operational on Darwin (same
+    limitation as the existing `tokio.rs` suite). Linux CI is the
+    source of truth.
 - dap (Phase 3 Feature D batch D3a — `bs/awaitTrace` custom request):
   - New BugStalker-specific JSON-RPC method exposing the same
     await-trace data the console renders, so VSCode (and any future

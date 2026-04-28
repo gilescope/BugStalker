@@ -192,13 +192,31 @@ stopped inside a runtime poll.
   frame objects so VSCode / future scripting front-ends can render
   the await-trace alongside the synchronous call stack without
   scraping the console's text output.
-- **D3b (pending)** — dedicated `tests/debugger/async_await.rs` and
-  the matching example debuggees (`simple` / `chained` /
-  `dyn_future` / `select!` / `join!`). Linux CI only at the moment
-  since Darwin tokio runtime introspection is incomplete. Step 1
-  (explicit coroutine-type detection) and step 5 (multi-level
-  awaitee-chain walker beyond the existing `__awaitee` follow)
-  still pending.
+- **D3b (landed, commit `753edfd`)** — dedicated
+  `tests/debugger/async_await.rs` and 5 matching example debuggees
+  (`tokio_simple_await`, `tokio_chained_await`, `tokio_select`,
+  `tokio_join`, `tokio_dyn_future`). Linux-CI-only (Darwin tokio
+  runtime introspection still incomplete).
+
+### Remaining open items
+
+- **Step 1** (explicit coroutine-type detection by name pattern
+  `{async_fn_env#0}` / `{coroutine_env#0}`) — the existing
+  `RustEnumValue` path already pattern-matches on `Suspend<N>`
+  variant names so this is more about diagnostics than correctness.
+- **Step 5** (multi-level awaitee-chain walker beyond the single
+  `__awaitee` follow) — when an awaitee struct has multiple inner
+  futures (e.g. `select!` / `join!` desugared shapes carry several
+  inner futures rather than a single chain), only one is followed
+  today. A breadth-first walker that surfaces every active branch
+  is the natural next step; D3b's `select!` / `join!` tests assert
+  on the *first* matching branch they find, which works today but
+  understates what the runtime is actually waiting on.
+- **Step 6, deeper half** (re-reading the awaitee at the recovered
+  concrete TypeId so the chain *continues through* the dyn box) —
+  D2b lifts the concrete *name*; the deeper step parses the pointee
+  data at the recovered TypeId and recurses. Requires a
+  string-name → TypeId index + `Dqe::PtrCast`-style re-read.
 
 ### Background
 
