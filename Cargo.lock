@@ -204,6 +204,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs-smoke"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bugstalker",
+ "nix 0.30.1",
+ "os_pipe",
+]
+
+[[package]]
 name = "bs-test-harness"
 version = "0.0.0"
 dependencies = [
