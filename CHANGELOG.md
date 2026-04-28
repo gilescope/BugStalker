@@ -7,6 +7,41 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- crate (Phase 2 — rust-mangle-tree, batches A–H):
+  - new workspace crate `crates/rust-mangle-tree` parsing Rust v0
+    (RFC 2603) and legacy Itanium-style mangled symbols into a
+    borrowed AST. `no_std + alloc`, zero runtime deps, MSRV 1.70,
+    dual `MIT OR Apache-2.0`. Public API: `parse(s) -> Result<
+    Symbol<'_>, ParseError>` plus the AST types `Symbol`, `Path`
+    (with `CrateRoot` / `InherentImpl` / `TraitImpl` / `TraitAssoc`
+    / `Nested` / `Generic` arms), `LegacyPath`, `Type`,
+    `GenericArg`, `Const`, `FnSig`, `DynBound`, `AssocBinding`,
+    `ClosureCoords`, `Lifetime`, `Mutability`, `Primitive`.
+  - **Legacy parser** byte-for-byte against `rustc_demangle::
+    demangle` over a 12 416-symbol corpus pulled from `nm` over
+    the release `bs` binary and `ripgrep`. Two real-world fixes
+    along the way: leading-`_` placeholder stripping for
+    synthetic `_<…>` segments, and trailing LLVM thunk-decoration
+    (`.<n>`, `.llvm.<n>`) preservation. Dropped the legacy
+    `.` → `-` mapping (modern rustc-demangle preserves `.`).
+  - **V0 parser** single-pass with back-reference offset table,
+    256-deep recursion limit, RFC 3492 modified Punycode decoder.
+    `Path` enum mirrors v0 productions; `Type` handles all the
+    type productions (`R` / `Q` / `P` / `O` / `A` / `S` / `T` /
+    `F` / `D` plus the primitive table); `Const` handles numeric
+    (with `n`-prefix for negative), `b` bool, `c` char, `e` str,
+    `p` placeholder, `B` back-ref.
+  - **Fuzz**: 5 proptest cases (~10k random inputs per
+    `cargo test` run) enforce the no-panic invariant.
+    `crates/rust-mangle-tree/fuzz/` carries the cargo-fuzz scaffold
+    for the nightly libFuzzer soak; Phase 8's `ci-fuzz.yml` will
+    automate the run.
+  - **BugStalker integration** at the two call sites the plan
+    calls out: bulk demangle in `symbol::SymbolTab::new` and the
+    `NamespaceHierarchy::from_mangled` rewrite. `rustc-demangle`
+    is no longer a runtime dependency of the root crate (kept
+    as a dev-dep on `crates/rust-mangle-tree` for differential
+    testing only).
 - benches (Phase 1 batch T — pulled forward from Phase 8):
   - `benches/render_value.rs` — real workload. Spawns the
     `examples/vars` debuggee through `bs-test-harness`, captures

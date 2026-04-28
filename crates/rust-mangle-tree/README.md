@@ -14,14 +14,14 @@ the rendered string.
 Phase 2 in [`BugStalker`](https://github.com/godzie44/BugStalker)'s
 roadmap. Current progress:
 
-| Batch | Scope                                                 | Status     |
-| :---- | :---------------------------------------------------- | :--------- |
-| A     | crate skeleton, public types, stub parser             | ✅ landed  |
-| B     | legacy Itanium-style `_ZN…E` parser                   | ✅ landed  |
-| C+D   | v0 grammar core + Punycode + back-references          | ✅ landed  |
-| E+F   | Display byte-matching `rustc-demangle`, real-binary corpus | ✅ landed  |
-| G     | proptest fuzz + `cargo fuzz` scaffold                 | ✅ landed  |
-| H     | BugStalker integration (3 call sites)                 | ⏳ pending |
+| Batch | Scope                                                 | Status    |
+| :---- | :---------------------------------------------------- | :-------- |
+| A     | crate skeleton, public types, stub parser             | ✅ landed |
+| B     | legacy Itanium-style `_ZN…E` parser                   | ✅ landed |
+| C+D   | v0 grammar core + Punycode + back-references          | ✅ landed |
+| E+F   | Display byte-matching `rustc-demangle`, real corpus   | ✅ landed |
+| G     | proptest fuzz + `cargo fuzz` scaffold                 | ✅ landed |
+| H     | BugStalker integration (symbol-load + namespace path) | ✅ landed |
 
 Legacy parsing is byte-for-byte against `rustc-demangle` over a
 12 000+ symbol corpus pulled from `nm` over real release binaries

@@ -630,6 +630,32 @@ Recent darwin-specific fixes in this phase:
   backend for time-travel) is a clean addition rather than
   another arm of every cfg.
 
+## Phase 2 — `rust-mangle-tree`
+
+**Goal:** standalone workspace crate parsing Rust v0 (RFC 2603)
+and legacy Itanium-style mangled symbols into a borrowed AST.
+Plan: [`doc/plans/phase-2-rust-mangle-tree.md`](plans/phase-2-rust-mangle-tree.md).
+
+**Status: complete.** Batches A–H landed. Legacy parser is byte-
+for-byte against `rustc-demangle` over a 12 000+ symbol corpus
+pulled from real release binaries (`bs`, `ripgrep`); v0 parser
+covers the grammar core including back-references and Punycode.
+proptest panic-free guarantee + `cargo fuzz` scaffold for the
+nightly soak. BugStalker's symbol-load path and
+`NamespaceHierarchy::from_mangled` are switched over;
+`rustc-demangle` is no longer a runtime dependency of the root
+crate.
+
+### Done
+
+* **A** crate skeleton, `no_std + alloc`, public AST types
+* **B** legacy `_ZN…E` parser
+* **C+D** v0 grammar core + Punycode + back-references
+* **E+F** Display byte-matching `rustc-demangle` over real-binary
+  corpus
+* **G** proptest fuzz + `cargo fuzz` scaffold
+* **H** BugStalker integration
+
 ## Phase 1 — Stdlib value-rendering coverage
 
 **Goal:** parity with `rustc`'s `lldb_providers.py` /

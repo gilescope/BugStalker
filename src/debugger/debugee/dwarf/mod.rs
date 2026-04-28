@@ -1108,8 +1108,17 @@ impl NamespaceHierarchy {
     /// * `linkage_name`: mangled subroutine name
     #[inline(always)]
     pub fn from_mangled(linkage_name: &str) -> (Self, String) {
-        let demangled = rustc_demangle::demangle(linkage_name);
-        let demangled = format!("{demangled:#}");
+        // Phase 2 batch H: drive demangling through `rust-mangle-tree`.
+        // The crate's `Display` already produces the short form (no
+        // trailing per-mono hash) so we don't need a separate `:#`
+        // step. On parse error, fall back to the raw mangled string —
+        // splitting that on `::` will yield a one-element list, which
+        // matches the existing test for unrecognised inputs like
+        // `"poll"`.
+        let demangled = match rust_mangle_tree::parse(linkage_name) {
+            Ok(sym) => sym.to_string(),
+            Err(_) => linkage_name.to_string(),
+        };
         let mut parts: Vec<_> = demangled.split("::").map(ToString::to_string).collect();
         debug_assert!(!parts.is_empty());
         let fn_name = parts.pop().expect("function name must exists");

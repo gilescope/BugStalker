@@ -88,7 +88,14 @@ impl SymbolTab {
                     .symbols()
                     .map(|symbol| {
                         let name = symbol.name().unwrap_or_default();
-                        let name = rustc_demangle::demangle(name).to_string();
+                        // Phase 2 batch H: drive demangling through
+                        // `rust-mangle-tree`. Falls back to the raw
+                        // mangled string on parse error so a single
+                        // bad symbol can't poison the whole table.
+                        let name = match rust_mangle_tree::parse(name) {
+                            Ok(sym) => sym.to_string(),
+                            Err(_) => name.to_string(),
+                        };
                         (
                             name,
                             SymbolVal {
