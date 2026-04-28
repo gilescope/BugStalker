@@ -4,7 +4,7 @@ use log::warn;
 use crate::debugger::call::fmt::DebugFormattable;
 use crate::debugger::variable::dqe::Dqe;
 use crate::debugger::variable::execute::QueryResult;
-use crate::debugger::variable::render::RenderValue;
+use crate::debugger::variable::render::{ByteRenderMode, RenderValue};
 use crate::debugger::variable::value::{SpecializedValue, SupportedScalar, Value};
 use crate::debugger::{self, Debugger};
 use crate::ui::command;
@@ -20,14 +20,17 @@ pub enum RenderMode {
 /// type-vs-spec combinations fall back to the default render with a
 /// `tracing::warn!` rather than erroring.
 ///
-/// Recognised today (per the recommended scope from the design Q):
+/// Recognised today:
 /// - `/x`, `/b`, `/o`, `/d` — integer base for scalar integers.
 /// - `/iso` — RFC3339/ISO-8601 form for `Duration` /
 ///   `SystemTime` / `Instant` (currently a no-op for SystemTime
 ///   since the default render is already RFC3339).
+/// - `/utf8`, `/hex` — byte-slice S16 overrides. `/utf8` forces a
+///   lossy utf-8 render (invalid bytes → `\u{FFFD}`); `/hex` forces
+///   the 16-bytes-per-row hex dump with ASCII column.
 ///
 /// Deferred to a future batch:
-/// - `/p`, `/c`, `/s`, `/y`, `/utf8`, `/hex`, `/[N]`, `/[N..M]`.
+/// - `/p`, `/c`, `/s`, `/y`, `/[N]`, `/[N..M]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FormatSpec {
     Hex,
@@ -35,6 +38,13 @@ pub enum FormatSpec {
     Oct,
     Dec,
     Iso,
+    /// Phase 1 S16 — force utf-8 byte-slice rendering with lossy
+    /// decode. Invalid utf-8 sequences are substituted with
+    /// `\u{FFFD}` rather than falling through to a hex dump.
+    Utf8,
+    /// Phase 1 S16 — force hex-dump byte-slice rendering even when
+    /// the bytes are valid utf-8.
+    BytesHex,
 }
 
 /// One parsed `print`-family command. `Variable` covers `var`/`vard`,
@@ -146,7 +156,7 @@ impl<'a> Handler<'a> {
     }
 }
 
-/// Phase 1 F4 — apply a colon-suffix format spec to the top-level
+/// Phase 1 F4 — apply a slash-suffix format spec to the top-level
 /// of a value. Returns `None` when the spec doesn't match the value
 /// shape (caller falls back to the default render with a warning).
 fn apply_format_spec(val: &Value, spec: FormatSpec) -> Option<String> {
@@ -156,6 +166,57 @@ fn apply_format_spec(val: &Value, spec: FormatSpec) -> Option<String> {
         FormatSpec::Oct => format_int_with_radix(val, 8, "0o"),
         FormatSpec::Dec => format_int_with_radix(val, 10, ""),
         FormatSpec::Iso => format_iso(val),
+        FormatSpec::Utf8 => format_byte_slice(val, ByteRenderMode::ForceUtf8),
+        FormatSpec::BytesHex => format_byte_slice(val, ByteRenderMode::ForceHex),
+    }
+}
+
+/// Phase 1 S16 / F4 — pull the byte-slice members out of any of the
+/// shapes that hold `[u8]` data and run them through the byte-preview
+/// renderer with the caller-chosen mode. Recognises `Vec<u8>` /
+/// `VecDeque<u8>` (specialised), `Box<[u8]>` (the `data_ptr`/`length`
+/// fat-pointer struct can't be re-read here without the parser
+/// context, so we accept the in-line `[u8; N]` arrays only) and bare
+/// `[u8; N]` arrays. Falls back to `None` for non-byte shapes;
+/// the print handler logs a `warn!` and uses the default render.
+fn format_byte_slice(val: &Value, mode: ByteRenderMode) -> Option<String> {
+    use crate::debugger::variable::value::SupportedScalar;
+    use crate::debugger::variable::value::ArrayValue;
+    let render_array = |arr: &ArrayValue| -> Option<String> {
+        let items = arr.items.as_ref()?;
+        if items.is_empty() {
+            return Some("b\"\"".to_string());
+        }
+        match &items[0].value {
+            Value::Scalar(s) if matches!(s.value, Some(SupportedScalar::U8(_))) => {}
+            _ => return None,
+        }
+        let mut bytes: Vec<u8> = Vec::with_capacity(items.len().min(1024));
+        for item in items.iter().take(1024) {
+            let Value::Scalar(s) = &item.value else {
+                return None;
+            };
+            match s.value {
+                Some(SupportedScalar::U8(b)) => bytes.push(b),
+                _ => return None,
+            }
+        }
+        let truncated = items.len() > 1024;
+        Some(crate::debugger::variable::render::render_bytes(
+            &bytes, mode, truncated,
+        ))
+    };
+    match val {
+        Value::Specialized {
+            value: Some(SpecializedValue::Vector(vec))
+            | Some(SpecializedValue::VecDeque(vec)),
+            ..
+        } => crate::debugger::variable::render::render_byte_slice_members(
+            vec.structure.members.as_ref(),
+            mode,
+        ),
+        Value::Array(arr) => render_array(arr),
+        _ => None,
     }
 }
 
@@ -277,5 +338,48 @@ mod format_spec_tests {
     #[test]
     fn iso_with_nanos() {
         assert_eq!(format_iso_duration(3, 500_000_000), "PT3.500000000S");
+    }
+}
+
+#[cfg(test)]
+mod byte_format_spec_tests {
+    use crate::debugger::variable::render::{ByteRenderMode, render_bytes};
+
+    #[test]
+    fn force_utf8_lossy_substitutes_replacement_char() {
+        // 0xff is invalid as utf-8; lossy decode replaces with U+FFFD.
+        let rendered = render_bytes(&[b'a', 0xff, b'b'], ByteRenderMode::ForceUtf8, false);
+        assert!(rendered.starts_with("b\""), "got {rendered:?}");
+        assert!(
+            rendered.contains("\\u{fffd}") || rendered.contains('\u{FFFD}'),
+            "expected replacement char in {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn force_hex_renders_hex_dump_for_valid_utf8() {
+        // "hi" is valid utf-8 — Auto would render `b"hi"`. ForceHex
+        // bypasses the probe and emits the dump anyway.
+        let rendered = render_bytes(b"hi", ByteRenderMode::ForceHex, false);
+        assert!(rendered.contains("68 69"), "expected hex `68 69` in {rendered:?}");
+        assert!(rendered.contains("|hi|"), "expected ASCII column in {rendered:?}");
+    }
+
+    #[test]
+    fn auto_keeps_existing_behaviour_for_valid_utf8() {
+        let rendered = render_bytes(b"hi", ByteRenderMode::Auto, false);
+        assert_eq!(rendered, "b\"hi\"");
+    }
+
+    #[test]
+    fn auto_falls_to_hex_dump_for_invalid_utf8() {
+        let rendered = render_bytes(&[0xff, 0xfe], ByteRenderMode::Auto, false);
+        assert!(rendered.contains("ff fe"), "got {rendered:?}");
+    }
+
+    #[test]
+    fn truncated_marker_present() {
+        let rendered = render_bytes(b"abc", ByteRenderMode::Auto, true);
+        assert!(rendered.ends_with(" …"), "expected trailing ellipsis in {rendered:?}");
     }
 }

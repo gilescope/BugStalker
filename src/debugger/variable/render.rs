@@ -206,6 +206,22 @@ mod duration_tests {
     }
 }
 
+/// Phase 1 S16 — picks between utf-8 preview and hex dump for a
+/// byte-slice render. `Auto` is the default behaviour: try utf-8,
+/// fall back to hex dump on invalid bytes. The forced variants drive
+/// the F4 `/utf8` and `/hex` format specs, which override the
+/// auto-detect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByteRenderMode {
+    /// Try utf-8 first; fall back to hex dump on invalid utf-8.
+    Auto,
+    /// Force utf-8 with lossy decode (invalid sequences become
+    /// `\u{FFFD}` replacement characters in the output).
+    ForceUtf8,
+    /// Always render the hex dump regardless of byte content.
+    ForceHex,
+}
+
 /// Phase 1 S16 — when a `Vec<T>` / `VecDeque<T>` carries `u8` items,
 /// surface a utf-8 preview (`b"hello"`) when the first 1 KiB of bytes
 /// decodes cleanly, or a 16-bytes-per-row hex dump (with ASCII column
@@ -213,6 +229,16 @@ mod duration_tests {
 /// aren't all u8 scalars — caller falls through to the default
 /// `Structure` layout.
 fn try_byte_string_preview(structure_members: &[Member]) -> Option<String> {
+    render_byte_slice_members(structure_members, ByteRenderMode::Auto)
+}
+
+/// Phase 1 S16 — entrypoint that honours an explicit [`ByteRenderMode`].
+/// Used by the F4 `/utf8` and `/hex` format-spec dispatch in
+/// `crate::ui::command::print` to override the auto-detect default.
+pub fn render_byte_slice_members(
+    structure_members: &[Member],
+    mode: ByteRenderMode,
+) -> Option<String> {
     use crate::debugger::variable::value::SupportedScalar;
     let buf = structure_members.first()?;
     let Value::Array(arr) = &buf.value else {
@@ -222,8 +248,6 @@ fn try_byte_string_preview(structure_members: &[Member]) -> Option<String> {
     if items.is_empty() {
         return Some("b\"\"".to_string());
     }
-    // Bail early if the first element is not u8 — saves us from
-    // walking a multi-million-element Vec<i64> just to discover it.
     match &items[0].value {
         Value::Scalar(s) if matches!(s.value, Some(SupportedScalar::U8(_))) => {}
         _ => return None,
@@ -239,38 +263,58 @@ fn try_byte_string_preview(structure_members: &[Member]) -> Option<String> {
         }
     }
     let truncated = items.len() > 1024;
-    if let Ok(s) = std::str::from_utf8(&bytes) {
-        let mut out = format!("b{:?}", s);
+    Some(render_bytes(&bytes, mode, truncated))
+}
+
+/// Phase 1 S16 — the actual rendering, factored so a future caller
+/// (e.g. `&[u8]` not yet wrapped in a `VecValue`) can plug in.
+pub fn render_bytes(bytes: &[u8], mode: ByteRenderMode, truncated: bool) -> String {
+    let utf8_form = |bytes: &[u8], lossy: bool| -> String {
+        let s: std::borrow::Cow<'_, str> = if lossy {
+            String::from_utf8_lossy(bytes)
+        } else {
+            std::str::from_utf8(bytes)
+                .expect("caller must check validity")
+                .into()
+        };
+        let mut out = format!("b{s:?}");
         if truncated {
             out.push_str(" …");
         }
-        return Some(out);
+        out
+    };
+    let hex_form = |bytes: &[u8]| -> String {
+        let mut out = String::new();
+        for (row_idx, chunk) in bytes.chunks(16).enumerate() {
+            if row_idx > 0 {
+                out.push('\n');
+            }
+            for b in chunk {
+                out.push_str(&format!("{b:02x} "));
+            }
+            for _ in chunk.len()..16 {
+                out.push_str("   ");
+            }
+            out.push(' ');
+            out.push('|');
+            for b in chunk {
+                out.push(if (0x20..=0x7e).contains(b) { *b as char } else { '.' });
+            }
+            out.push('|');
+        }
+        if truncated {
+            out.push_str("\n…");
+        }
+        out
+    };
+    match mode {
+        ByteRenderMode::Auto => match std::str::from_utf8(bytes) {
+            Ok(_) => utf8_form(bytes, false),
+            Err(_) => hex_form(bytes),
+        },
+        ByteRenderMode::ForceUtf8 => utf8_form(bytes, true),
+        ByteRenderMode::ForceHex => hex_form(bytes),
     }
-    // 16-bytes-per-row hex dump with ASCII column.
-    let mut out = String::new();
-    for (row_idx, chunk) in bytes.chunks(16).enumerate() {
-        if row_idx > 0 {
-            out.push('\n');
-        }
-        // hex
-        for b in chunk {
-            out.push_str(&format!("{b:02x} "));
-        }
-        // pad short last row so the ASCII column lines up
-        for _ in chunk.len()..16 {
-            out.push_str("   ");
-        }
-        out.push(' ');
-        out.push('|');
-        for b in chunk {
-            out.push(if (0x20..=0x7e).contains(b) { *b as char } else { '.' });
-        }
-        out.push('|');
-    }
-    if truncated {
-        out.push_str("\n…");
-    }
-    Some(out)
 }
 
 /// Phase 1 S5 — `SystemTime` rendered as ISO-8601 / RFC3339 UTC.

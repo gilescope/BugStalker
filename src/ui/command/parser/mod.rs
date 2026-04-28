@@ -278,8 +278,16 @@ impl Command {
         // Composition with path expressions: `var foo.bar /x`.
         // Mismatched type-vs-spec combinations fall back to the
         // default render (handled in `print::Handler::handle`).
+        // Multi-character specs (`utf8`, `iso`, `hex`) are tried
+        // before single-character specs so the longest match wins
+        // (`/hex` must not be parsed as `/h` followed by `ex` — the
+        // single-char arm doesn't exist for `h` so chumsky already
+        // gets it right, but ordering keeps the grammar predictable
+        // for future single-char additions like `/c`, `/s`).
         let format_spec = just('/').ignore_then(choice((
+            just("utf8").to(print::FormatSpec::Utf8),
             just("iso").to(print::FormatSpec::Iso),
+            just("hex").to(print::FormatSpec::BytesHex),
             just('x').to(print::FormatSpec::Hex),
             just('b').to(print::FormatSpec::Bin),
             just('o').to(print::FormatSpec::Oct),
@@ -848,6 +856,23 @@ fn test_parser() {
                 dqe: Dqe::Variable(Selector::by_name("y", false)),
                 mode: print::RenderMode::Debug,
                 format: Some(print::FormatSpec::Hex),
+            })),
+        },
+        // Phase 1 S16 byte-slice overrides.
+        TestCase {
+            inputs: vec!["var v /utf8"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("v", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Utf8),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var v /hex"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("v", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::BytesHex),
             })),
         },
         TestCase {
