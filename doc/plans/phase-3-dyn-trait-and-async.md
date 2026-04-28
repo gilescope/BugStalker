@@ -220,21 +220,23 @@ stopped inside a runtime poll.
   parse error, non-enum pointee) degrade cleanly to the existing
   `[→ Concrete]` annotation.
 
+- **`poll_fn`-closure environment walker (landed, commit `d68dce3`)** —
+  the active-variant scan now recurses through wrapper structs
+  (depth-bounded, with a non-coroutine-enum filter) so tokio's
+  `select!` / `join!` macros — which wrap captured branch futures
+  inside `poll_fn(|cx| {...})` closure environments — surface
+  their parallel branches via `Future::Multi`. The same recursive
+  scan also fires on the awaitee struct itself when the linear
+  walker reaches a `Custom` leaf, so the deeper closure-buried
+  shapes are reachable from either entry point.
+
 ### Remaining open items
 
 - **Step 1** (explicit coroutine-type detection by name pattern
   `{async_fn_env#0}` / `{coroutine_env#0}`) — the existing
   `RustEnumValue` path already pattern-matches on `Suspend<N>`
   variant names so this is more about diagnostics than correctness.
-- **`poll_fn`-closure environment walker** — tokio's `select!` and
-  `join!` macros wrap captured branch futures inside `poll_fn(|cx|
-  {...})` closures. Step 5's generic detector recognises *any*
-  variant with 2+ direct `RustEnum` fields, but the closure
-  environment shape it would need to descend through to expose
-  tokio-macro-captured branches has not been characterised. The
-  D3b tests accept either the direct or Multi shape so they pass
-  on both rustc versions, but ideally the macros would be
-  recognised explicitly.
+  The only remaining honest gap.
 
 ### Background
 

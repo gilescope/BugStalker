@@ -37,6 +37,26 @@ All notable changes to this project will be documented in this file.
     recovered concrete TypeId so the chain *continues through* the
     dyn box) — are tracked in
     `doc/plans/phase-3-dyn-trait-and-async.md`.
+- async (Phase 3 Feature D `poll_fn`-closure walker):
+  - tokio's `select!` and `join!` macros wrap captured branch
+    futures inside `poll_fn(|cx| {...})` whose closure environment
+    carries the futures as captured locals. Step 5's
+    variant-only scan stopped at the `PollFn` wrapper and missed
+    them; this batch replaces the immediate scan with a recursive
+    `collect_coroutine_seeds(struct, depth)` helper.
+  - The helper skips the canonical `__awaitee` field, only admits
+    `RustEnumValue`s that pass `AsyncFnFuture::try_from` (so
+    non-coroutine enums captured as locals don't pollute the
+    branch list), and is depth-bounded
+    (`COROUTINE_SCAN_DEPTH = 6`).
+  - Used in two spots: the active-variant scan (Step 5's entry
+    point) now recurses; the `__awaitee = Value::Struct(...)` leaf
+    branch *also* runs the scan on the awaitee struct itself, so a
+    `Future::Multi` is appended after the `Custom`/dyn-box-recover
+    frames when 2+ branches are found nested inside.
+  - 4 new unit tests in `tokio/task.rs::tests` cover the helper:
+    `__awaitee` skip, non-coroutine-enum filter, PollFn-style
+    descent, depth cap.
 - async (Phase 3 Feature D step 6 deeper — concrete-TypeId re-read):
   - When the awaitee is a `Pin<Box<dyn Future>>` (or sibling), the
     await-trace now walks *through* the dyn box into the concrete
