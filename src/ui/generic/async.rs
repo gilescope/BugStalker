@@ -184,6 +184,95 @@ pub fn print_backtrace_full(backtrace: &AsyncBacktrace, printer: &ExternalPrinte
     }
 }
 
+/// Phase 3 Feature D batch D2a — render the current task's awaitee
+/// chain as a stack-frame list, source-coords-first. Mirrors how
+/// `bt`/`backtrace` reads for synchronous frames so the user can
+/// transfer their mental model directly.
+///
+/// Layout:
+///
+/// ```text
+/// await-trace (task id: 7):
+///   #0 my_app::handler at src/handler.rs:42
+///   #1 my_app::middleware::auth::check at src/auth.rs:18
+///   #2 tokio::time::Sleep (sleeping for 3s)
+/// ```
+///
+/// Each frame is one element of the futures stack. Source coords
+/// come from D1's `await_location`. When unavailable (Unresumed /
+/// Returned / Panicked / Ok states, or stripped binaries) the frame
+/// shows just the function name and the state.
+pub fn print_await_trace(backtrace: &AsyncBacktrace, printer: &ExternalPrinter) {
+    let Some(task) = backtrace.current_task() else {
+        printer.println(ErrorView::from(
+            "no active task found for current worker, or no active worker found",
+        ));
+        return;
+    };
+
+    printer.println(format!("await-trace (task id: {}):", task.task_id).bold());
+
+    if task.futures.is_empty() {
+        printer.println("\t<empty future stack>");
+        return;
+    }
+
+    for (i, fut) in task.futures.iter().enumerate() {
+        match fut {
+            Future::AsyncFn(af) => {
+                let fn_view = FutureFunctionView::from(&af.async_fn).to_string();
+                let line = match (&af.state, &af.await_location) {
+                    (AsyncFnFutureState::Suspend(n), Some((file, line))) => {
+                        format!("  #{i} {fn_view} at {}:{line} (await point {n})", file.display())
+                    }
+                    (AsyncFnFutureState::Suspend(n), None) => {
+                        format!("  #{i} {fn_view} (await point {n}, no source coords)")
+                    }
+                    (AsyncFnFutureState::Unresumed, _) => {
+                        format!("  #{i} {fn_view} (just created, not yet polled)")
+                    }
+                    (AsyncFnFutureState::Returned, _) => {
+                        format!("  #{i} {fn_view} (already resolved)")
+                    }
+                    (AsyncFnFutureState::Panicked, _) => format!("  #{i} {fn_view} (panicked)"),
+                    (AsyncFnFutureState::Ok, _) => format!("  #{i} {fn_view} (completed)"),
+                };
+                printer.println(line);
+            }
+            Future::Custom(custom) => {
+                printer.println(format!(
+                    "  #{i} {} (custom future)",
+                    FutureTypeView::from(custom.name.to_string())
+                ));
+            }
+            Future::TokioJoinHandleFuture(jh) => {
+                let wait_for = backtrace
+                    .tasks
+                    .iter()
+                    .find(|t| t.raw_ptr == jh.wait_for_task)
+                    .map(|t| format!(" (waiting for task id={})", t.task_id))
+                    .unwrap_or_default();
+                printer.println(format!(
+                    "  #{i} {}{}",
+                    FutureTypeView::from(jh.name.to_string()),
+                    wait_for,
+                ));
+            }
+            Future::TokioSleep(sleep) => {
+                printer.println(format!(
+                    "  #{i} {} (tokio::time::Sleep, deadline {}s.{:09})",
+                    FutureTypeView::from(sleep.name.to_string()),
+                    sleep.instant.0,
+                    sleep.instant.1,
+                ));
+            }
+            Future::UnknownFuture => {
+                printer.println(format!("  #{i} <unknown future>"));
+            }
+        }
+    }
+}
+
 pub fn print_task_ex(backtrace: &AsyncBacktrace, printer: &ExternalPrinter, regex: Option<&str>) {
     if let Some(regex) = regex {
         let re = regex::Regex::new(regex).unwrap();

@@ -9,6 +9,9 @@ pub enum Command {
     CurrentTask(Option<String>),
     StepOver,
     StepOut,
+    /// Phase 3 Feature D batch D2a — focused current-task `.await`
+    /// chain rendered as a stack-frame list with source coords first.
+    AwaitTrace,
 }
 
 pub enum AsyncCommandResult<'a> {
@@ -17,6 +20,7 @@ pub enum AsyncCommandResult<'a> {
     ShortBacktrace(AsyncBacktrace),
     FullBacktrace(AsyncBacktrace),
     CurrentTask(AsyncBacktrace, Option<&'a str>),
+    AwaitTrace(AsyncBacktrace),
 }
 
 pub struct Handler<'a> {
@@ -47,6 +51,7 @@ impl<'a> Handler<'a> {
                 self.dbg.async_step_out()?;
                 AsyncCommandResult::StepOut
             }
+            Command::AwaitTrace => AsyncCommandResult::AwaitTrace(self.dbg.async_backtrace()?),
         };
         Ok(result)
     }

@@ -82,6 +82,11 @@ pub const ASYNC_COMMAND_STEP_OVER_SUBCOMMAND: &str = "stepover";
 pub const ASYNC_COMMAND_STEP_OVER_SUBCOMMAND_SHORT: &str = "next";
 pub const ASYNC_COMMAND_STEP_OUT_SUBCOMMAND: &str = "stepout";
 pub const ASYNC_COMMAND_STEP_OUT_SUBCOMMAND_SHORT: &str = "finish";
+/// Phase 3 Feature D batch D2a — `async await-trace` / `async at`
+/// renders the current task's awaitee chain with source-coord-first
+/// formatting (file:line per `.await`).
+pub const ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND: &str = "await-trace";
+pub const ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND_SHORT: &str = "at";
 pub const TRIGGER_COMMAND: &str = "trigger";
 pub const TRIGGER_COMMAND_ANY_TRIGGER_SUBCOMMAND: &str = "any";
 pub const TRIGGER_COMMAND_BRKPT_TRIGGER_SUBCOMMAND: &str = "b";
@@ -550,6 +555,13 @@ impl Command {
                     ASYNC_COMMAND_STEP_OUT_SUBCOMMAND_SHORT,
                 )
                 .to(Command::Async(r#async::Command::StepOut)),
+                // Phase 3 Feature D batch D2a — accepts both
+                // `await-trace` and the short alias `at`.
+                sub_op2(
+                    ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND,
+                    ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND_SHORT,
+                )
+                .to(Command::Async(r#async::Command::AwaitTrace)),
             )))
             .boxed();
 
@@ -1147,6 +1159,10 @@ fn test_parser() {
         TestCase {
             inputs: vec!["async stepout", " async   finish "],
             expected: Expect::Ok(Command::Async(r#async::Command::StepOut)),
+        },
+        TestCase {
+            inputs: vec!["async await-trace", " async   at  "],
+            expected: Expect::Ok(Command::Async(r#async::Command::AwaitTrace)),
         },
         TestCase {
             inputs: vec!["async task abc.*", " async   task abc.*  "],

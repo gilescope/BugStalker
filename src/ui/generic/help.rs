@@ -27,6 +27,7 @@ thread info|current|switch <number>         -- show list of threads or current (
 sharedlib info                              -- show list of shared libraries
 source asm|fn|<bounds>                      -- show source code or assembly instructions for current (in focus) function
 async backtrace|backtrace all|task          -- commands for async rust
+async await-trace, async at                 -- print current task's awaitee chain with .await source coords
 trigger info|any|<>|b <number>|w <number>   -- define a list of commands that will be executed when a certain event is triggered
 call <function name> <arguments>            -- call a function from debuggee program
 oracle <oracle> <>|<subcommand>             -- execute a specific oracle
@@ -466,6 +467,16 @@ async task <async_fn_regex> - show active task (active task means a task that is
 or show task list with async functions matched by regular expression
 async next, async stepover - perform a stepover within the context of the current task. If the task moves into a completed state, the application will stop too
 async finish, async stepout - execute the program until the current task moves into the completed state
+async at, async await-trace - print the current task's awaitee chain with .await source coords (file:line per frame)
+";
+
+pub const HELP_ASYNC_AWAIT_TRACE_SUBCOMMAND: &str = "\
+\x1b[32;1masync await-trace, async at\x1b[0m
+Print the current task's awaitee chain as a stack-frame list, source-coords-first.
+Each frame shows `<async fn> at <file>:<line>` for `.await` points where rustc
+emitted DW_AT_decl_file/decl_line on the captured-locals fields of the active
+Suspend variant. Falls back to function name + state when source coords are
+unrecoverable (e.g. stripped binaries, pre-await states).
 ";
 
 pub const HELP_ASYNC_BACKTRACE_SUBCOMMAND: &str = "\
@@ -703,6 +714,10 @@ impl Helper {
                     HELP_ASYNC_NEXT_STEPOVER_SUBCOMMANDS
                 }
                 Some(parser::ASYNC_COMMAND_TASK_SUBCOMMAND) => HELP_ASYNC_TASK_SUBCOMMAND,
+                Some(parser::ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND)
+                | Some(parser::ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND_SHORT) => {
+                    HELP_ASYNC_AWAIT_TRACE_SUBCOMMAND
+                }
                 _ => HELP_UNKNOWN_SUBCOMMAND,
             },
             Some(parser::TRIGGER_COMMAND) => match sub_command {

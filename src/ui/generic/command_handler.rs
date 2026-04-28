@@ -25,6 +25,7 @@ use crate::ui::command::{Command, run};
 use crate::ui::command::{
     CommandError, r#break, source_code, step_instruction, step_into, step_out, step_over,
 };
+use crate::ui::generic::r#async::print_await_trace;
 use crate::ui::generic::r#async::print_backtrace;
 use crate::ui::generic::r#async::print_backtrace_full;
 use crate::ui::generic::r#async::print_task_ex;
@@ -463,6 +464,9 @@ impl<Y: YesQuestion, C: Completer, U: ProgramTaker> CommandHandler<'_, Y, C, U> 
                         _ = self
                             .complete_handler
                             .update_completer_variables(self.debugger);
+                    }
+                    AsyncCommandResult::AwaitTrace(bt) => {
+                        print_await_trace(&bt, self.printer);
                     }
                 }
             }
