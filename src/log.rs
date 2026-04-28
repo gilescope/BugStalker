@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use log::{LevelFilter, Log, Metadata, Record};
 use once_cell::sync::Lazy;
 use std::sync::{Arc, RwLock};

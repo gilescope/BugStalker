@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::debugee::dwarf::{
     NamespaceHierarchy,
     unit::die_ref::{FatDieRef, Hint},

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::ui::DebugeeOutReader;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};

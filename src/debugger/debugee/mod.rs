@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 mod disasm;
 pub mod dwarf;
 mod ldd;

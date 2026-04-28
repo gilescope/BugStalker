@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use gimli::{DebugInfoOffset, UnitOffset};
 use itertools::Itertools;
 use std::collections::HashMap;

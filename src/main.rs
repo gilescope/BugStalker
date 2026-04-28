@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Debugger application entry point.
 
 use bugstalker::dap;

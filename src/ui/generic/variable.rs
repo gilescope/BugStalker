@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::address::RelocatedAddress;
 use crate::debugger::variable::execute::{QueryResult, QueryResultKind};
 use crate::debugger::variable::render::{RenderValue, ValueLayout};

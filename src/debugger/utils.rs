@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use proc_maps::MapRange;
 
 /// Types can implement this trait for include cache functionality.

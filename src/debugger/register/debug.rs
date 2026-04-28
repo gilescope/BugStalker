@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Debug registers and watchpoint primitives.
 //!
 //! The logical enums (`BreakCondition`, `BreakSize`, `DebugRegisterNumber`,

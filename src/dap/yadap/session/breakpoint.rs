@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::dap::yadap::protocol::{DapRequest, InternalEvent};
 use crate::dap::yadap::session::DebugSession;
 use crate::debugger;

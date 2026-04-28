@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #[macro_export]
 macro_rules! nightly {
     ($printer: expr, $do: block) => {

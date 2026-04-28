@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::dap::transport::DapTransport;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

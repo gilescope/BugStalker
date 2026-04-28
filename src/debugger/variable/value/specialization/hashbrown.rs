@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger;
 use fallible_iterator::FallibleIterator;
 use nix::unistd::Pid;

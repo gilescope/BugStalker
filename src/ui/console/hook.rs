@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::super::generic::trigger::TriggerRegistry;
 use super::print::style::AsyncTaskView;
 use crate::debugger::PlaceDescriptor;

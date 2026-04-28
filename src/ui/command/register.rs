@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::register::RegisterMap;
 use crate::debugger::{Debugger, register};
 use crate::ui::command;

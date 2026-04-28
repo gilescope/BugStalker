@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::Tracee;
 use crate::debugger::{Debugger, ThreadSnapshot};
 use crate::ui::command;

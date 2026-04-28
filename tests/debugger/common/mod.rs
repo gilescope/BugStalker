@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use bugstalker::debugger::address::RelocatedAddress;
 use bugstalker::debugger::register::debug::BreakCondition;
 use bugstalker::debugger::variable::value::Value;

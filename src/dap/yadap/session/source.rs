@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::dap::yadap::protocol::DapRequest;
 use crate::dap::yadap::sourcemap::SourceMap;
 use crate::debugger;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::oracle::Oracle;
 use crate::oracle::builtin::nop::NopOracle;
 use crate::oracle::builtin::tokio::TokioOracle;

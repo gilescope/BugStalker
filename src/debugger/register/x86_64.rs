@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::error::Error;
 use crate::debugger::error::Error::{Ptrace, RegisterNotFound};
 use gimli::Register as DwarfRegister;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 pub mod park;
 pub mod task;
 pub mod types;

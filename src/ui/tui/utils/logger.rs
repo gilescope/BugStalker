@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use chrono::Local;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::sync;

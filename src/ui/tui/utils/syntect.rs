@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /// Translate syntect styled text to [`tuirealm::props::TextSpan`]
 use anyhow::anyhow;
 use tuirealm::props::TextSpan;

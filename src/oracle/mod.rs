@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Oracles system.
 //! Oracle is an optional plugin for debugger. Oracles use `watch points` for analyse
 //! debug information and visualize it. As example - tokio oracle can can keep track of active

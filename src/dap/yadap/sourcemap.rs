@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use serde_json::Value;
 
 #[derive(Debug, Default, Clone)]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::Debugger;
 use crate::debugger::address::{Address, RelocatedAddress};
 use crate::debugger::debugee::Debugee;

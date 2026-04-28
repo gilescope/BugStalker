@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::debugee::dwarf::EndianArcSlice;
 use crate::debugger::error::Error;
 use gimli::{

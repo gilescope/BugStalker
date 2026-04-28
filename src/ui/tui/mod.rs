@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::process::{Child, Installed};
 use crate::debugger::{BreakpointViewOwned, Debugger, DebuggerBuilder, WatchpointViewOwned};
 use crate::ui::proto::{Request, exchanger};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::address::RelocatedAddress;
 use crate::debugger::debugee::dwarf::{DebugInformation, EndianArcSlice};
 use crate::debugger::error::Error;

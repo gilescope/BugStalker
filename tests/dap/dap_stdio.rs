@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! DAP stdio transport tests
 //! Tests for DAP in stdio mode (--dap-local)
 

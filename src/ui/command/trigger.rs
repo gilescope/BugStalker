@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]

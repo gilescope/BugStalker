@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::dap_client;
 
 use base64::Engine as _;

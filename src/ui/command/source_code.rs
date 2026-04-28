@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::{Debugger, Error, FunctionAssembly, FunctionRange};
 
 #[derive(Debug, Clone, PartialEq)]

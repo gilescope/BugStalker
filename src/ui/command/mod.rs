@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! An interface to a debugger.
 //! This is the most preferred way to use a debugger functional from UI layer.
 //!

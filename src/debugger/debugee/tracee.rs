@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::address::RelocatedAddress;
 use crate::debugger::debugee::tracee::StopType::Interrupt;
 use crate::debugger::debugee::tracee::TraceeStatus::Stopped;

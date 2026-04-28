@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! End-to-end smoke test for the darwin/aarch64 backend.
 //!
 //! Drives the lowest layer of the macOS port: spawn a small

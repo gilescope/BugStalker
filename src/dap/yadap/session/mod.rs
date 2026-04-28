@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! DAP session implementation (handlers, state machine, and integration with debugger).
 
 use crate::dap::transport::DapTransport;

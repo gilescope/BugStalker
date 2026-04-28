@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 pub mod die;
 pub mod die_ref;
 mod parser;

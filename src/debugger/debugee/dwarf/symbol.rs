@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::address::GlobalAddress;
 use object::{Object, ObjectSymbol, ObjectSymbolTable, SymbolKind};
 use regex::Regex;

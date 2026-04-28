@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::ThreadFocusByPid;
 use crate::dap::yadap::protocol::DapRequest;
 use crate::debugger;

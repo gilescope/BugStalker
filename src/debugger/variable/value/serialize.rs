@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::debugee::dwarf::r#type::{
     ArrayType, ComplexType, MemberLocation, StructureMember, TypeDeclaration, TypeId,
 };

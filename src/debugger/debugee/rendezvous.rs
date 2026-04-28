@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+// SPDX-License-Identifier: MIT
 
 use crate::debugger::address::RelocatedAddress;
 use nix::unistd::Pid;

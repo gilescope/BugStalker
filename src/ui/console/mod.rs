@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::command::r#async::Command as AsyncCommand;
 use super::generic::trigger::TriggerRegistry;
 use crate::debugger::process::{Child, Installed};

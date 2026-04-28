@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::super::command::r#async::AsyncCommandResult;
 use super::super::command::trigger::TriggerEvent;
 use super::trigger::TriggerRegistry;

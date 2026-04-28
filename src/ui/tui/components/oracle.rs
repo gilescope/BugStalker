@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::oracle::Oracle;
 use crate::ui;
 use crate::ui::tui::utils::tab::TabWindow;

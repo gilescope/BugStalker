@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 fn main() {
     let linux_gnu = cfg!(target_os = "linux")
         && cfg!(target_env = "gnu")

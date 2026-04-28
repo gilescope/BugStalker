@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Architecture shim for the `thread_db` crate.
 //!
 //! `thread_db` binds glibc's `libthread_db`, supported on x86_64 and aarch64.

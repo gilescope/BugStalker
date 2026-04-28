@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Target-architecture register API.
 //!
 //! The hand-written register file is arch-specific; callers should keep

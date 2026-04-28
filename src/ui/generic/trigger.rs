@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::ui::command::{self, trigger::TriggerEvent};
 use std::cell::{Cell, RefCell};
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::error::Error;
 use nix::unistd::Pid;
 use os_pipe::PipeWriter;

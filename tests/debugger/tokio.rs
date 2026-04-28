@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::common::TestHooks;
 use crate::{TOKIO_TICKER_APP, prepare_debugee_process};
 use bugstalker::debugger::DebuggerBuilder;

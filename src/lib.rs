@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 pub mod dap;
 pub mod debugger;
 pub mod log;

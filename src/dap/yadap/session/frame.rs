@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use anyhow::{Context, anyhow};
 use nix::unistd::Pid;
 use serde_json::{Value, json};

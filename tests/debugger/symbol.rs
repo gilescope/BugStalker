@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::common::TestHooks;
 use crate::prepare_debugee_process;
 use crate::{HW_APP, assert_no_proc};
