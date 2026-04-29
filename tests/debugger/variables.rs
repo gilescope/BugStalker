@@ -25,7 +25,18 @@ fn assert_struct(val: &Value, exp_type: &str, for_each_member: impl Fn(usize, &M
     let Value::Struct(structure) = val else {
         panic!("not a struct");
     };
-    assert_eq!(val.r#type().name_fmt(), exp_type);
+    // Phase 3A annotates `dyn Trait` fat-pointer structs with a
+    // `[→ Concrete]` suffix on the type name when the vtable
+    // resolves. The annotation is render-only metadata; for the
+    // canonical type-name check we strip it before comparing so
+    // these tests don't have to know whether vtable resolution
+    // succeeded for the build under test.
+    let actual = val.r#type().name_fmt().to_string();
+    let actual_canonical = actual
+        .split_once(" [→ ")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(&actual);
+    assert_eq!(actual_canonical, exp_type);
     for (i, member) in structure.members.iter().enumerate() {
         for_each_member(i, member)
     }

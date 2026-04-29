@@ -14,6 +14,12 @@ mod multithreaded;
 mod signal;
 mod steps;
 mod symbol;
+// Tokio runtime introspection on Darwin needs the TLS resolver to
+// land first (per project_darwin_status.md). Gated on Linux until
+// then so the suite stays clean — Linux CI runs the full
+// `tokio.rs` set, including `test_async0` and the Phase 3D
+// `test_async_await_location_recovered`.
+#[cfg(target_os = "linux")]
 mod tokio;
 mod unwind;
 mod variables;
@@ -214,6 +220,9 @@ const SLEEPER_APP: &str = "./examples/target/debug/sleeper";
 const FIZZBUZZ_APP: &str = "./examples/target/debug/fizzbuzz";
 #[cfg(target_arch = "x86_64")]
 const CALCULATIONS_APP: &str = "./examples/target/debug/calculations";
+// `mod tokio` is Linux-only on Darwin (TLS not yet resolved); gate
+// the path constant likewise so darwin builds stay warning-clean.
+#[cfg(target_os = "linux")]
 const TOKIO_TICKER_APP: &str = "./examples/target/debug/tokioticker";
 // Phase 3 D3b debuggees — only consumed by `mod async_await`,
 // which is itself Linux-gated.
