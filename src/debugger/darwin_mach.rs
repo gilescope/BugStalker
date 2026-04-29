@@ -315,6 +315,25 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
     };
     check(kr)?;
 
+    // Apple Silicon has split D/I caches with weak coherency for
+    // self-modifying code. `mach_vm_write` updates the D-cache but
+    // the inferior's I-cache may still hold the pre-write
+    // instruction, so the BRK we just placed never executes —
+    // subsequent loop iterations sail past it. Force the I-cache
+    // line back in sync by invalidating the range we just wrote
+    // *in the inferior's address space*. `sys_icache_invalidate`
+    // operates on the calling task's address space, so we map a
+    // small read-only window of the inferior's text into our own
+    // address space, invalidate from there, then unmap.
+    //
+    // Cheaper, equivalent path: ARMv8's `dc cvau` + `ic ivau` +
+    // `dsb ish` + `isb` sequence executed in the *inferior*. We
+    // can't do that without injecting code, so we use the host
+    // `sys_icache_invalidate` against a temporary mapping. On
+    // x86_64 macOS the call is a no-op (caches are coherent), so
+    // the same path is safe to compile unconditionally.
+    let _ = invalidate_inferior_icache(task, addr, len as usize);
+
     // Restore protection. See `restore_prot` selection above.
     let _ = unsafe {
         mach_vm_protect(
@@ -339,6 +358,51 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
 /// executable). `max_protection` reflects what the page is *for*:
 /// `R+X` for text loaded from disk, `R+W` for an anonymous
 /// `mmap(PROT_READ | PROT_WRITE)`, etc.
+/// Invalidate the inferior's instruction-cache lines covering
+/// `[addr, addr+len)` so the BRK we just wrote via `mach_vm_write`
+/// is actually fetched on the inferior's next execute.
+///
+/// Apple Silicon's I-cache is incoherent with the D-cache; without
+/// this, the inferior keeps executing the cached pre-write
+/// instructions and our breakpoints are silently no-ops on every
+/// path that's already been into I-cache. Symptom: a step_over
+/// inside a tight loop body (where the BP at the body's stmt-PC
+/// has been disabled-and-restored) advances past the loop instead
+/// of stopping on the next iteration's body — a stale I-cache
+/// line, modified D-side and never invalidated, holds the
+/// disabled (no-BRK) opcode.
+///
+/// `mach_vm_machine_attribute` with `MATTR_CACHE` +
+/// `MATTR_VAL_ICACHE_FLUSH` is the Mach-level primitive lldb uses
+/// for the same job. It operates on the *target task's* address
+/// space, so we don't need to map the inferior's pages into our
+/// own to use `sys_icache_invalidate`.
+///
+/// On x86_64 this is a no-op at the kernel level (caches are
+/// hardware-coherent) so the call is safe to compile for any
+/// macOS arch.
+fn invalidate_inferior_icache(
+    task: task_t,
+    addr: usize,
+    len: usize,
+) -> Result<(), MachError> {
+    use mach2::vm::mach_vm_machine_attribute;
+    use mach2::vm_attributes::{
+        MATTR_CACHE, MATTR_VAL_ICACHE_FLUSH, vm_machine_attribute_val_t,
+    };
+    let mut value: vm_machine_attribute_val_t = MATTR_VAL_ICACHE_FLUSH;
+    let kr = unsafe {
+        mach_vm_machine_attribute(
+            task as mach2::mach_types::vm_task_entry_t,
+            addr as mach2::vm_types::mach_vm_address_t,
+            len as mach2::vm_types::mach_vm_size_t,
+            MATTR_CACHE,
+            &mut value as *mut _,
+        )
+    };
+    check(kr)
+}
+
 fn vm_region_protections(task: task_t, addr: usize) -> Option<(vm_prot_t, vm_prot_t)> {
     let mut region_addr = addr as mach_vm_address_t;
     let mut region_size: mach_vm_size_t = 0;

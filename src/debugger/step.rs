@@ -330,10 +330,26 @@ impl Debugger {
                     continue;
                 }
 
-                // guard against a step at inlined function body
-                let in_inline_range = place.address.in_ranges(&inline_ranges);
+                // Guard against a step landing inside an inlined
+                // function body — but only the *interior* of the
+                // body. The first PC of an inline range is the call
+                // site itself; that's a legitimate step boundary
+                // and we want a BP there. dsymutil on darwin tends
+                // to emit inline ranges starting *at* the call-site
+                // PC (rustc on linux often emits them starting one
+                // instruction higher), so the naive
+                // `addr >= begin && addr < end` test wrongly
+                // excludes the call site on darwin and a step over
+                // a `for` loop body that contains an inlined call
+                // (`Iterator::next`, `BTreeMap::insert`, …) jumps
+                // straight past the loop. Only skip when strictly
+                // inside the body.
+                let in_inline_interior = inline_ranges
+                    .iter()
+                    .any(|r| u64::from(place.address) > r.begin
+                          && u64::from(place.address) < r.end);
 
-                if !in_inline_range && place.is_stmt {
+                if !in_inline_interior && place.is_stmt {
                     let load_addr = place
                         .address
                         .relocate_to_segment_by_pc(&self.debugee, current_location.pc)?;
