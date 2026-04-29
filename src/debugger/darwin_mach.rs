@@ -111,19 +111,28 @@ impl std::error::Error for MachError {}
 
 impl From<MachError> for Error {
     fn from(e: MachError) -> Self {
-        // The closest existing variant — the caller failed to poke
-        // the inferior. The wrapped `Errno::EFAULT` is the most
-        // honest mapping for "Mach denied access". We log the
-        // detailed kr+description at error level so callers grep'ing
-        // logs see what actually went wrong rather than a bare
-        // EFAULT. Set `BS_DARWIN_DEBUG=1` to also print a stderr
-        // backtrace at the conversion site — useful when the
+        // We log the detailed kr+description at error level
+        // unconditionally so anyone grep'ing the adapter log sees
+        // the Mach detail. Set `BS_DARWIN_DEBUG=1` to also print a
+        // stderr backtrace at the conversion site — useful when the
         // caller surfaces a bare `Ptrace(EFAULT)` and you need to
         // see which Mach call started the chain.
         log::error!(target: "darwin_mach", "{}", e);
         if std::env::var_os("BS_DARWIN_DEBUG").is_some() {
             eprintln!("[darwin_mach->Error] {}", e);
             eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
+        // KERN_FAILURE on darwin almost always means the *caller*
+        // (us) lacks the debugger entitlement — `task_for_pid`
+        // returns this even when the inferior is our own child.
+        // Surface that distinct case as a richer error variant so
+        // the DAP layer's response.message contains the actual
+        // remediation steps instead of a bare `Ptrace(EFAULT)`.
+        // Other Mach failures keep the historical mapping.
+        if e.0 == 5 {
+            return Error::DarwinDebuggerEntitlementMissing {
+                mach: e.to_string(),
+            };
         }
         Ptrace(Errno::EFAULT)
     }

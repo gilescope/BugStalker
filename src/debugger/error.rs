@@ -66,6 +66,14 @@ pub enum Error {
     Waitpid(nix::Error),
     #[error("ptrace syscall error: {0}")]
     Ptrace(nix::Error),
+    #[error(
+        "macOS denied debugger access ({mach}). Re-sign the bs/bugstalker \
+         binary with the `com.apple.security.cs.debugger` entitlement \
+         (see tests/darwin.entitlements). \
+         `codesign -s - --entitlements tests/darwin.entitlements --force \
+         <path-to-binary>`"
+    )]
+    DarwinDebuggerEntitlementMissing { mach: String },
     #[error("{0} syscall error: {1}")]
     Syscall(&'static str, nix::Error),
     #[error("multiple syscall errors {0:?}")]
@@ -206,6 +214,10 @@ impl Error {
             Error::MappingNotFound(_) => false,
             Error::Waitpid(_) => false,
             Error::Ptrace(_) => false,
+            // Missing debugger entitlement on darwin is fatal —
+            // every subsequent ptrace/task_for_pid call will fail
+            // for the same reason. Surface it once and stop.
+            Error::DarwinDebuggerEntitlementMissing { .. } => true,
             Error::MultipleErrors(_) => false,
             Error::DebugIDFormat => false,
             Error::VariableParsing(_) => false,
