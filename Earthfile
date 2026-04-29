@@ -223,3 +223,39 @@ flake-hunt:
             ./target/debug/deps/debugger-* --test-threads=1 --exact $TEST \
                 || { echo "[flake-hunt] FAILED at iteration $i"; exit 1; }; \
         done
+
+# macOS-only convenience: cargo-install `bs`, codesign with the
+# debugger entitlements, and alias `bugstalker` -> `bs` so the VS
+# Code extension's default executable name resolves on PATH.
+#
+# *Adhoc* sign without Hardened Runtime — that's the combination
+# that lets the `com.apple.security.cs.debugger` entitlement
+# actually take effect for `task_for_pid` on a dev machine. With
+# Hardened Runtime (`-o runtime`) macOS treats `cs.debugger` as a
+# restricted entitlement and silently drops it from an adhoc
+# signature; the binary then gets KERN_FAILURE at attach time.
+# A real release build would use a Developer ID signature plus
+# notarization, which can carry restricted entitlements under
+# Hardened Runtime — that path is `+install-darwin-release`,
+# not this one.
+#
+# Runs LOCALLY — codesign needs the host's keychain + Apple toolchain
+# and has no container equivalent.
+#
+# Usage:  earthly +install-darwin
+install-darwin:
+    LOCALLY
+    RUN test "$(uname)" = Darwin || \
+        { echo "+install-darwin: macOS only (host is $(uname))"; exit 1; }
+    RUN cargo install --path . --bin bs --force
+    RUN codesign -s - --force \
+            --entitlements tests/darwin.entitlements \
+            "$HOME/.cargo/bin/bs"
+    # Verify the entitlement actually landed. If this fails the
+    # most common cause is a stale signature surviving --force on
+    # some macOS versions; re-run after `codesign --remove-signature`.
+    RUN codesign -d --entitlements - "$HOME/.cargo/bin/bs" 2>&1 \
+        | grep -q 'com.apple.security.cs.debugger' || \
+        { echo "+install-darwin: cs.debugger entitlement missing after codesign"; exit 1; }
+    RUN ln -sf bs "$HOME/.cargo/bin/bugstalker"
+    RUN echo "+install-darwin: bs installed at \$HOME/.cargo/bin/bs (adhoc-signed with cs.debugger), bugstalker symlink in place"
