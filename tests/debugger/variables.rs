@@ -130,7 +130,6 @@ fn assert_init_tls(val: &Value, exp_type: &str, with_inner: impl FnOnce(&Value))
     with_inner(tls.inner_value.as_ref().unwrap());
 }
 
-#[cfg(not(target_os = "macos"))]
 fn assert_uninit_tls(val: &Value, exp_type: &str) {
     let Value::Specialized {
         value: Some(SpecializedValue::Tls(tls)),
@@ -1166,15 +1165,6 @@ fn test_read_tls_variables() {
     debugger.continue_debugee().unwrap();
     assert_eq!(info.line.take(), Some(199));
 
-    // Darwin gap: distinguishing init from uninit needs reading the
-    // `Storage<T, F>::state` discriminant (Cell<DtorState> in some
-    // rustc versions, AtomicU8 in others). dsymutil keeps the
-    // `state` field but the encoding of "Uninitialized" varies by
-    // rustc version, so `parse_with_modifiers_or_inner`'s synthetic
-    // wrap currently always emits a `Specialized<Tls>` with whatever
-    // bytes happened to be at the per-thread slot. The init case
-    // works (verified above); uninit detection is its own batch.
-    #[cfg(not(target_os = "macos"))]
     version_switch!(
             rust_version,
             .. (1 . 80) => {

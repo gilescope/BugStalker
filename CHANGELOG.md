@@ -628,6 +628,12 @@ All notable changes to this project will be documented in this file.
   `--BS_PLATFORM=linux/arm64` (default) or `--BS_PLATFORM=linux/amd64`.
 - error: new `Error::WatchpointUnsupported` variant (returned on
   architectures where hardware watchpoints are not yet wired up).
+- error: new `Error::DarwinDebuggerEntitlementMissing` variant.
+  Surfaced when `task_for_pid` returns `KERN_FAILURE` from a
+  binary that lacks `com.apple.security.cs.debugger`. The
+  message names the offending binary and gives the exact
+  `codesign -s - --entitlements tests/darwin.entitlements` line
+  to fix it, instead of leaking the cryptic Mach error code.
 
 ### Changed
 
@@ -702,12 +708,15 @@ All notable changes to this project will be documented in this file.
   lands at index 0. Pre-existing on every platform but only
   reachable via the darwin Debug::fmt path that was previously
   short-circuiting before the lookup.
-- The integration suite reaches **62 passed / 0 failed / 1
-  ignored / 12 filtered out (75 runnable)** on darwin with
-  `--skip multithreaded --skip tokio --skip signal --skip
-  test_step_over_for_loop_issue_156 --skip test_read_tls`. The
-  skipped categories (multithreading, signals, TLS, the
-  loop-step edge case) are tracked in the roadmap.
+- The integration suite reaches **86 passed / 0 failed / 1 skipped
+  (`mod tokio` Linux-gated)** on darwin/aarch64 sequentially. All
+  previously-skipped categories — multi-thread, signals, TLS init
+  *and* uninit, loop-step (issue #156), and full Phase-3 dyn /
+  niche / async / cycles — now pass. Earlier intermediate state
+  (62/75 with broad `--skip`) reached after the `task_for_pid`
+  cache landed; superseded by the I-cache invalidation +
+  signal-port hybrid + TLS uninit-state decoder finishes that
+  followed.
 
 ### Fixed
 

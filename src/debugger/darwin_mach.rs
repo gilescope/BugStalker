@@ -358,6 +358,7 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
 /// executable). `max_protection` reflects what the page is *for*:
 /// `R+X` for text loaded from disk, `R+W` for an anonymous
 /// `mmap(PROT_READ | PROT_WRITE)`, etc.
+
 /// Invalidate the inferior's instruction-cache lines covering
 /// `[addr, addr+len)` so the BRK we just wrote via `mach_vm_write`
 /// is actually fetched on the inferior's next execute.

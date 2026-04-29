@@ -165,9 +165,13 @@ memory, read registers, install breakpoints).
 
 **Status: parity achieved (2026-04-29).** Full
 `--test debugger` suite is **86/86 passing** on darwin/aarch64
-(1 skipped — `mod tokio` Linux-gated until the TLS uninit-state
-decoder lands; see "Remaining" below). 75/75 on `--test dap`
-including attach. 72/72 on `--lib`.
+(1 skipped — `mod tokio` Linux-gated; tokio runtime introspection
+still needs a worker-registry walker beyond TLS, see "Remaining"
+below). 147/147 on `--test dap` including attach. 72/72 on
+`--lib`. TLS uninit detection landed: `parser.rs` now reads the
+`Storage<T,D>::state` discriminant byte directly, so
+`test_read_tls_variables` (uninit clause) passes alongside the
+init clause.
 
 The decisive fix was **I-cache coherency for breakpoint writes**
 (commit `4459ef8`): Apple Silicon has split D/I caches with weak
@@ -383,9 +387,14 @@ state).
 ### Status — `tests/debugger` on darwin/aarch64
 
 Running `cargo nextest run --test debugger --test-threads 1`
-serially: **74 passed, 0 failed, 1 skipped (75 runnable)**. The
-single skipped case is the rust-version-gated arm in
-`test_read_tls_const_variables` for toolchains that don't apply.
+serially: **86 passed, 0 failed, 1 skipped (87 runnable)**. The
+single skipped item is `mod tokio` (Linux-gated until tokio's
+worker-registry walk lands on Darwin — see "Remaining" below).
+All Phase-3 features (dyn / niche / cycles / async), the
+multi-thread suite, signals, the loop-step issue #156 case, and
+TLS init *and* uninit clauses all pass. Earlier intermediate
+markers in this document (62/75, 74/75) are historical — the
+final numbers are the ones above.
 
 Parallel runs (`--test-threads N`) currently flake on a few tests
 (`io::*`, `signal::*` under contention) — the per-test
@@ -641,20 +650,16 @@ All five items below landed; the suite is 86/86 on darwin.
 
 ### Remaining (one item)
 
-* **TLS uninit-state discriminant decoder.** dsymutil keeps
-  `LazyStorage<T, F>::state` (the `Cell<DtorState>` /
-  `AtomicU8` byte that tracks whether T has been initialised on
-  this thread) but our synthetic-wrap path always emits a
-  `Specialized<Tls>` regardless of state. Reading state and
-  short-circuiting to `None` when state == Uninitialized would:
-  1. Make `assert_uninit_tls` clauses pass (currently
-     `#[cfg(not(target_os = "macos"))]`-gated in
-     `tests/debugger/variables.rs`).
-  2. Unblock both tokio tests (tokio's worker discovery reads
-     its own per-thread CONTEXT TLS — currently misclassified
-     as init on every worker, breaking the discovery walk).
-  Encoding varies by rustc version (`Cell<DtorState>` in some,
-  `AtomicU8` in others). ~1 week of focused work.
+* **Tokio runtime introspection.** With the TLS resolver and
+  uninit-state decoder both landed, the per-thread CONTEXT slot
+  reads correctly on Darwin. Walking from there into tokio's
+  worker registry still hits a wall — the current `tokio.rs`
+  test suite reports `assertion failed: !async_bt.workers.is_empty()`
+  / `no suspended async fns found`. The smoking gun is somewhere
+  in the futures-stack walk (vtable PAC strip, async-fn
+  name-mangling under dsymutil, or both). `mod tokio` stays
+  `#[cfg(target_os = "linux")]` until a focused tokio-on-Darwin
+  batch lands.
 
 ## Phase 2 — `rust-mangle-tree`
 

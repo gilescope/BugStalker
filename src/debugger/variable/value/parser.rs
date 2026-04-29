@@ -1078,6 +1078,28 @@ impl ValueParser {
                 }
             )
         {
+            // Darwin uninit detection. dsymutil keeps the
+            // `Storage<T, D>::state` field intact even though it
+            // strips the `LazyStorage::Alive` discriminant on the
+            // outer enum. We can read the byte directly: rust std's
+            // `enum State<D> { Uninitialized = 0, Alive = 1,
+            // Destroyed(D) = 2 }` has a stable u8 discriminant on the
+            // architectures we run on. Anything other than `Alive`
+            // means there is no live `T` to surface — return `None`
+            // so `read_variable` yields an empty vec, matching the
+            // Linux `parse_tls_inner` short-circuit.
+            //
+            // The eager path has no `state` field; the helper returns
+            // `None` and the peel proceeds.
+            if let Some(state_addr) = tls_storage_state_address(&parsed) {
+                let pid = pcx.evcx.ecx.pid_on_focus();
+                let byte = crate::debugger::read_memory_by_pid(pid, state_addr, 1)
+                    .ok()
+                    .and_then(|v| v.first().copied());
+                if byte != Some(STATE_ALIVE) {
+                    return None;
+                }
+            }
             let peeled = peel_tls_storage_wrappers(parsed);
             let inner_type = peeled.r#type().clone();
             return Some(Value::Specialized {
@@ -1091,6 +1113,31 @@ impl ValueParser {
 
         Some(parsed)
     }
+}
+
+/// Discriminant byte for `std::sys::thread_local::native::lazy::State::Alive`.
+/// `enum State<D> { Uninitialized = 0, Alive = 1, Destroyed(D) = 2 }` —
+/// stable across the rustc versions we target.
+const STATE_ALIVE: u8 = 1;
+
+/// Darwin TLS uninit detection. If `parsed` is the
+/// `LazyStorage<T, D>` / `Storage<T, D>` struct (the lazy TLS shape),
+/// return the runtime address of its `state` discriminant byte so the
+/// caller can read it via `read_memory_by_pid`. Returns `None` for
+/// the eager shape (which has no `state`) or any other value.
+fn tls_storage_state_address(val: &Value) -> Option<usize> {
+    let Value::Struct(s) = val else {
+        return None;
+    };
+    let name = s.type_ident.name().unwrap_or("");
+    if !(name.starts_with("Storage") || name.starts_with("LazyStorage")) {
+        return None;
+    }
+    let state = s
+        .members
+        .iter()
+        .find(|m| m.field_name.as_deref() == Some("state"))?;
+    state.value.in_memory_location()
 }
 
 /// Darwin TLS wrapper-peeling. Walks down through every
