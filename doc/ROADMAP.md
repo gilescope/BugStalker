@@ -163,16 +163,22 @@ opcode, AAPCS64 calling convention, `Register::PC`/`SP`/`RA`); the
 new surface is the *backend* (how to spawn, attach, stop, read
 memory, read registers, install breakpoints).
 
-**Status:** the POC is in. A debuggee spawns, hits a `BRK`-installed
-breakpoint, and the engine surfaces it back to the front-end (the
-`debugger_runs_to_first_breakpoint` smoke test under
-`tests/darwin_smoke.rs`). The Mach exception-port loop
-(allocate / register / receive / reply) is wired up but not yet
-substituted for the ptrace-driven `Tracer::resume`; the cutover is
-the next big chunk. `cargo check` and `cargo build` pass
-unconditionally on `aarch64-apple-darwin`; `cargo test` runs the
-non-entitlement-gated smokes (`exception_port_*`) on every macOS
-host.
+**Status: parity achieved (2026-04-29).** Full
+`--test debugger` suite is **86/86 passing** on darwin/aarch64
+(1 skipped — `mod tokio` Linux-gated until the TLS uninit-state
+decoder lands; see "Remaining" below). 75/75 on `--test dap`
+including attach. 72/72 on `--lib`.
+
+The decisive fix was **I-cache coherency for breakpoint writes**
+(commit `4459ef8`): Apple Silicon has split D/I caches with weak
+coherency for self-modifying code. `mach_vm_write` updates D-cache
+but the inferior's I-cache may still hold the pre-write
+instruction, so a BRK we just wrote silently no-op'd on every
+already-cached path. After every `mach_vm_write` we now
+`mach_vm_machine_attribute(MATTR_CACHE, MATTR_VAL_ICACHE_FLUSH)`
+the modified range — same primitive lldb uses. Single change that
+fixed the loop-step test *and* removed all the "flaky" signal /
+debug-trait failures (same root cause).
 
 ### Done — Phase 2 (POC)
 
@@ -562,32 +568,35 @@ Recent darwin-specific fixes in this phase:
   exact count.
 * Test runner self-signs + re-execs if missing `cs.debugger`.
 
-### Phase 3 — parity with linux/aarch64
+### Phase 3 — parity with linux/aarch64 (DONE)
 
-* **Cut `Tracer` over from ptrace+SIGTRAP to Mach exception ports.**
-  Today's darwin `Tracer::resume` does `ptrace::cont` + `waitpid`,
-  classifying SIGTRAP as a breakpoint by matching PC against the
-  registry. The post-BP single-step path is racy because the
-  ptrace event is the only stop signal we have. Wiring
-  `ExceptionPort::receive` as the primary stop source (decoding
-  EXC_BREAKPOINT, EXC_BAD_ACCESS-as-watchpoint, EXC_SOFTWARE) and
-  `reply(KERN_SUCCESS)` as the resume primitive lets us drop the
-  ptrace stop-signal coupling and gives multi-thread for free.
-* **TLS reads.** `thread_get_state(ARM_THREAD_STATE64)` doesn't
-  expose `TPIDRRO_EL0` (the pthread pointer on darwin); we have
-  to follow the dyld pthread struct layout via `mach_vm_read`.
-  Replaces the `thread_db_compat::NoThreadDB` stub.
-* **Multi-thread tracee enumeration.** `TraceeCtl` currently only
-  knows about the main thread; `task_threads()` enumeration
-  populates the rest. Mach thread ports are u32 names — we need a
-  stable mapping into the `Pid`-typed `TraceeCtl` API.
-* **Module-load notifications.** `dyld_image_list` is a snapshot;
-  for runtime dlopen/dlclose tracking we install a software BP on
-  `dyld_all_image_infos.notification` and re-walk the image array
-  on each fire (the linux equivalent is the `r_brk` rendezvous
-  callback).
-* **DAP.** Working: 75/75 sequential. Two darwin-specific
-  fixes:
+All five items below landed; the suite is 86/86 on darwin.
+
+* ✅ **Mach exception ports as primary stop source.**
+  `Tracer::resume` and `single_step` now drive the inferior via
+  `ExceptionPort::receive` + `reply(KERN_SUCCESS)`; the
+  ptrace+SIGTRAP path is the bootstrap-only `PT_ATTACHEXC`
+  handshake.
+* ✅ **TLS reads (init case).** `darwin_mach::resolve_tlv` walks
+  the Mach-O `tlv_descriptor` (16-byte `{ thunk, key, offset }`)
+  → pthread TSD via `THREAD_IDENTIFIER_INFO::thread_handle`.
+  `parse_tls`'s `tls_unwrapped` path peels the dsymutil-flattened
+  `LazyStorage<T,F>` / `EagerStorage<T>` wrapper chain
+  (`UnsafeCell` / `MaybeUninit` / `ManuallyDrop`) down to T. The
+  TLS *uninit* discriminant is the one thing not done — see
+  Remaining below.
+* ✅ **Multi-thread tracee enumeration.**
+  `Tracer::reconcile_threads` enumerates `task_threads_vec` after
+  each Mach exception, maps each thread port → kernel thread_id →
+  synthetic `Pid`, updates `tracee_ctl` and the per-pid
+  thread-port registry. `RegisterMap::current(pid)` resolves to
+  the focus thread's port.
+* ✅ **Module-load notifications.** `Rendezvous::r_brk` returns
+  `dyld_all_image_infos.notification`; BP there fires on
+  dlopen/dlclose. Falls back to `proc_maps` for dyld 4 where
+  `infoArray` may be empty.
+* ✅ **DAP.** 75/75 sequential, including attach. Two
+  darwin-specific fixes:
   1. `tests/dap/dap_client.rs::ensure_bs_entitled` re-codesigns
      the spawned `bs` binary (and the `dap_attach` target)
      with `tests/darwin.entitlements` before each test run.
@@ -629,6 +638,23 @@ Recent darwin-specific fixes in this phase:
   trait so a third backend (e.g. *BSD, or a record-and-replay
   backend for time-travel) is a clean addition rather than
   another arm of every cfg.
+
+### Remaining (one item)
+
+* **TLS uninit-state discriminant decoder.** dsymutil keeps
+  `LazyStorage<T, F>::state` (the `Cell<DtorState>` /
+  `AtomicU8` byte that tracks whether T has been initialised on
+  this thread) but our synthetic-wrap path always emits a
+  `Specialized<Tls>` regardless of state. Reading state and
+  short-circuiting to `None` when state == Uninitialized would:
+  1. Make `assert_uninit_tls` clauses pass (currently
+     `#[cfg(not(target_os = "macos"))]`-gated in
+     `tests/debugger/variables.rs`).
+  2. Unblock both tokio tests (tokio's worker discovery reads
+     its own per-thread CONTEXT TLS — currently misclassified
+     as init on every worker, breaking the discovery walk).
+  Encoding varies by rustc version (`Cell<DtorState>` in some,
+  `AtomicU8` in others). ~1 week of focused work.
 
 ## Phase 2 — `rust-mangle-tree`
 
@@ -754,3 +780,7 @@ of. Plan: [`doc/plans/phase-9-ai-bot-scripting.md`](plans/phase-9-ai-bot-scripti
 The DAP server's BugStalker-specific `customRequest`s
 (starting with Phase 3D's `bs/awaitTrace`) become thin shims over
 the structured-command core, proving the layering is right.
+
+## Secret Plan
+
+The ultimate goal with wild linker + BugStalker + cranelift is a Visual Basic style edit debug loop.
