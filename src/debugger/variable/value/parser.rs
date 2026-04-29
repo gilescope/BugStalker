@@ -557,7 +557,16 @@ impl ValueParser {
                     (1 . 89) .. => type_ns_h.contains(&["std", "sys", "thread_local", "native"]),
                 ).unwrap_or_default();
 
-                if type_is_tls || modifiers.tls {
+                // Darwin: when `tls_unwrapped` is set the std TLS
+                // wrapper has been flattened by dsymutil, so the
+                // structural markers `parse_tls` looks for
+                // (`eager`, `state`, `__getit`) aren't there. Skip
+                // the dedicated TLS parser and let the regular
+                // parse produce the bare T; the synthetic-wrap
+                // fallback in `parse_with_modifiers_or_inner`
+                // then re-wraps it as `Specialized<Tls>` so the
+                // shape matches Linux.
+                if (type_is_tls || modifiers.tls) && !modifiers.tls_unwrapped {
                     return if rust_version >= Version((1, 80, 0)) {
                         match parser_ext.parse_tls(pcx, &struct_var, type_params, rust_version) {
                             Ok(Some(value)) => Some(Value::Specialized {
@@ -1048,14 +1057,18 @@ impl ValueParser {
         let parsed =
             self.parse_inner_with_modifiers(pcx, bin_data, pcx.type_graph.root(), modifiers)?;
 
-        // Darwin: dsymutil flattened the std TLS storage wrapper, so
-        // the value we just parsed is the bare T (or `Cell<T>`).
-        // Wrap it as a synthetic [`TlsVariable`] so callers (and the
-        // test suite) see the same `Value::Specialized<Tls>` shape
-        // they get on Linux. The wrap is skipped if the inner parser
-        // already produced a TLS specialisation (lazy `Storage<T>`
-        // case — dsymutil keeps the wrapper there) so we don't
-        // double-wrap.
+        // Darwin: dsymutil flattened the std TLS storage wrapper.
+        // What we parsed is the outer `LazyStorage<T, !>` /
+        // `EagerStorage<T>` (dsymutil drops the `LazyStorage::Alive`
+        // discriminant enum but keeps the Storage struct itself plus
+        // the `UnsafeCell` / `MaybeUninit` / `ManuallyDrop`
+        // transparent wrappers around T). Peel them down to T so the
+        // synthetic `TlsVariable` exposes the same `inner_type` shape
+        // callers see on Linux (`Cell<i32>` for the lazy case,
+        // `i32` for `const`-init via EagerStorage). The peeler walks
+        // the canonical `value` (or `__0`) field through every layer
+        // whose type-name matches a known wrapper; it stops the
+        // moment the type-name doesn't match, leaving T at the leaf.
         if modifiers.tls_unwrapped
             && !matches!(
                 parsed,
@@ -1065,10 +1078,11 @@ impl ValueParser {
                 }
             )
         {
-            let inner_type = parsed.r#type().clone();
+            let peeled = peel_tls_storage_wrappers(parsed);
+            let inner_type = peeled.r#type().clone();
             return Some(Value::Specialized {
                 value: Some(SpecializedValue::Tls(TlsVariable {
-                    inner_value: Some(Box::new(parsed)),
+                    inner_value: Some(Box::new(peeled)),
                     inner_type,
                 })),
                 original: StructValue::default(),
@@ -1077,6 +1091,59 @@ impl ValueParser {
 
         Some(parsed)
     }
+}
+
+/// Darwin TLS wrapper-peeling. Walks down through every
+/// transparent-wrapper layer between the std-internal
+/// `LazyStorage<T, F>` / `EagerStorage<T>` and the user's `T`.
+/// Three shapes to handle:
+///
+/// * `Storage` / `LazyStorage` / `EagerStorage` / `UnsafeCell` /
+///   `ManuallyDrop` — parsed as `Value::Struct`. Walk the
+///   `value` (or `__0` for tuple-shaped wrappers) field.
+/// * `MaybeUninit<T>` — parsed as
+///   `Value::Specialized<SpecializedValue::MaybeUninit(inner)>`
+///   by Phase 1 S10. Unbox the inner directly.
+/// * Anything else — stop. That's `T`.
+///
+/// Bounded — stops on first non-wrapper layer or when no peelable
+/// field is reachable.
+fn peel_tls_storage_wrappers(mut val: Value) -> Value {
+    const STRUCT_WRAPPERS: &[&str] = &[
+        "LazyStorage",
+        "EagerStorage",
+        "Storage",
+        "UnsafeCell",
+        "ManuallyDrop",
+    ];
+    const MAX_DEPTH: u32 = 8;
+    for _ in 0..MAX_DEPTH {
+        match val {
+            Value::Specialized {
+                value: Some(crate::debugger::variable::value::SpecializedValue::MaybeUninit(inner)),
+                ..
+            } => {
+                val = *inner;
+            }
+            Value::Struct(s) => {
+                let name = s
+                    .type_ident
+                    .name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
+                if !STRUCT_WRAPPERS.iter().any(|w| name.starts_with(w)) {
+                    return Value::Struct(s);
+                }
+                let s_clone = s.clone();
+                match s.field("value").or_else(|| s_clone.clone().field("__0")) {
+                    Some(v) => val = v,
+                    None => return Value::Struct(s_clone),
+                }
+            }
+            _ => return val,
+        }
+    }
+    val
 }
 
 #[inline(never)]
