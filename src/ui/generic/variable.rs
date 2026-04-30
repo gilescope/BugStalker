@@ -101,9 +101,11 @@ fn render_value_inner(
             ValueLayout::Structure(members) => {
                 let type_name = value.r#type().name_fmt();
                 let spec = viz.and_then(|r| r.find(&type_name));
-                let summary_str = spec
-                    .and_then(|s| s.summary.as_deref())
-                    .map(|tmpl| substitute_template(tmpl, members));
+                let summary_str = spec.and_then(|s| {
+                    s.summary
+                        .as_deref()
+                        .map(|tmpl| substitute_template(tmpl, members, s))
+                });
 
                 let header = match (print_type, summary_str.as_deref()) {
                     (_, Some(s)) => format!("{type_name} {s}"),
@@ -205,10 +207,24 @@ fn render_value_inner(
 
 /// TUI/console substitution — uses the type-suppressed inline
 /// render so `Person({name}, age {age})` reads as
-/// `Person("Ada", age 36)` rather than
-/// `Person(String("Ada"), age u32(36))`.
-fn substitute_template(template: &str, members: &[Member]) -> String {
+/// `Person(Ada, age 36)` rather than
+/// `Person(String(Ada), age u32(36))`. Honours per-field
+/// `format` overrides from `spec`, so a placeholder `{flags}`
+/// for a field marked `format = "hex"` substitutes as
+/// `0xff00ff` rather than the raw decimal form.
+fn substitute_template(template: &str, members: &[Member], spec: &TypeViewSpec) -> String {
     crate::debugger::viz::substitute_template(template, members, |m| {
+        let format = m
+            .field_name
+            .as_deref()
+            .and_then(|name| spec.fields.iter().find(|f| f.name == name))
+            .map(|f| f.format)
+            .filter(|f| *f != Format::Default);
+        if let Some(fmt) = format
+            && let Some(s) = format_scalar(&m.value, fmt)
+        {
+            return s;
+        }
         render_value_inner(&m.value, 0, false, None)
     })
 }
@@ -234,6 +250,14 @@ fn apply_field_overrides<'a>(
         }
         None => (Some(name), false, None),
     }
+}
+
+/// Public alias for the DAP path. The TUI/console rendering and
+/// the DAP one-line rendering both share this same scalar
+/// formatter — the formatting itself is independent of the
+/// surrounding render style.
+pub fn format_scalar_for_dap(value: &Value, fmt: Format) -> Option<String> {
+    format_scalar(value, fmt)
 }
 
 /// Apply a `#[bs_viz(format = "...")]` override to a scalar

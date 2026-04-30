@@ -701,14 +701,16 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1 + 2 + 3 + 4 shipped (2026-04-30).** Step 1
-wires the declarative-spec data path end-to-end; step 2 wires
-the renderer so registered types render through their spec;
-step 3 unblocks generics in the derive and applies the
-`format = "hex|bin|oct"` family at render time; step 4 adds
-`format = "iso8601"` (Unix-epoch-seconds → UTC ISO-8601) and
-`format = "duration"` (nanoseconds → human-readable). The
-following is live:
+**Status: steps 1–5 shipped (2026-04-30).** Step 1 wires the
+declarative-spec data path end-to-end; step 2 wires the
+renderer so registered types render through their spec; step 3
+unblocks generics in the derive and applies the `format = "hex|
+bin|oct"` family at render time; step 4 adds `format =
+"iso8601"` (Unix-epoch-seconds → UTC ISO-8601) and `format =
+"duration"` (nanoseconds → human-readable); step 5 unblocks
+tuple structs and unit structs in the derive *and* fixes a
+silent bug where summary-template substitution skipped per-field
+format overrides. The following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -800,6 +802,34 @@ Step 4 added:
   — these cover the conversion logic without needing a
   debuggee.
 
+Step 5 added:
+
+* **Tuple structs.** `bs-viz-derive` no longer errors on
+  `f.ident.is_none()`; tuple-struct fields receive the
+  Rust-DWARF convention name (`__0`, `__1`, …) which makes
+  summary-template placeholders + per-field attribute lookup
+  resolve cleanly. Newtype `pub struct UserId(#[bs_viz(format =
+  "hex")] pub u64);` is the canonical use case.
+* **Unit structs.** Empty field list serialises and decodes
+  cleanly; only the type-level `summary` template applies.
+* **Bug fix — summary template now honours field format
+  overrides.** Previously `summary = "UserId#{__0}"` substituted
+  the raw decimal value of `__0` even when the field carried
+  `format = "hex"`. The substitution closure now consults the
+  spec's per-field format alongside the rename / hidden flags.
+  Same fix applied to both the TUI/console path and the DAP
+  path.
+* `viz_demo` gains `UserId(u64)` + `Point(i32, i32)` +
+  `Sentinel`; the integration test asserts:
+  * 7 specs recovered (was 4)
+  * `UserId` registry entry has one field named `__0` with
+    `Format::Hex`
+  * `Point` has fields `__0`, `__1`
+  * `Sentinel` round-trips with empty fields list
+  * `uid` renders as `UserId#0xcafebabe` (hex applied
+    *inside* the template — was the bug)
+  * `pt` renders as `Point(10, 20)`
+
 **Remaining (in plan order):**
 
 1. **Per-callsite DAP wiring.** `data.rs` has 12+ existing
@@ -807,8 +837,9 @@ Step 4 added:
    viz-aware. Update each `impl DebugSession` callsite to pass
    `Some(self.debugger.view_registry())` so the IDE actually
    picks up summaries. Mechanical.
-2. **Tuple structs + enums** in the derive (still compile-error
-   gated, deliberately). Variant-level summaries follow.
+2. **Enums** in the derive (still compile-error gated). Needs
+   variant-level `summary` and `tag = "..."` attributes per the
+   plan.
 3. **`module_path!()` in the macro** so the wire `type_name`
    matches what the v0 demangler produces. Removes the suffix
    fallback and its ambiguity bail.

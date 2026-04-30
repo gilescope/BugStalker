@@ -68,17 +68,22 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let summary = parse_type_attrs(&input.attrs)?;
     let mut field_specs = Vec::new();
-    for f in fields.iter() {
-        let Some(name_ident) = f.ident.as_ref() else {
-            return Err(syn::Error::new(
-                f.span(),
-                "step 1 of #[derive(DebugView)] only handles named fields; \
-                 tuple/unit structs land in a later phase-4 batch",
-            ));
+    for (idx, f) in fields.iter().enumerate() {
+        // Step 5: tuple structs are now supported. Rust emits
+        // tuple-struct fields under DWARF as `__0`, `__1`, etc.
+        // — we mirror that name in the spec so the registry's
+        // field lookup matches what the renderer sees at debug
+        // time. Named fields still use their literal name.
+        // Unit structs (no fields) fall out of this loop with
+        // `field_specs` empty, which the spec format already
+        // tolerates.
+        let field_name = match f.ident.as_ref() {
+            Some(ident) => ident.to_string(),
+            None => format!("__{idx}"),
         };
         let attrs = parse_field_attrs(&f.attrs)?;
         field_specs.push(FieldSpec {
-            name: name_ident.to_string(),
+            name: field_name,
             rename: attrs.rename,
             hidden: attrs.skip,
             format: attrs.format.unwrap_or(Format::Default),

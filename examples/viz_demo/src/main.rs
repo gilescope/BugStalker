@@ -47,6 +47,26 @@ pub struct Wrap<T> {
     pub inner: T,
 }
 
+/// Step 5 — tuple structs are supported. Rust DWARF names the
+/// fields `__0`, `__1`, etc.; the macro mirrors that
+/// convention so summary placeholders + per-field attributes
+/// resolve. Newtype-style `pub struct UserId(pub u64);` is the
+/// canonical use case.
+#[derive(DebugView)]
+#[bs_viz(summary = "UserId#{__0}")]
+pub struct UserId(#[bs_viz(format = "hex")] pub u64);
+
+/// Step 5 — multi-field tuple struct.
+#[derive(DebugView)]
+#[bs_viz(summary = "Point({__0}, {__1})")]
+pub struct Point(pub i32, pub i32);
+
+/// Step 5 — unit struct. Empty field list is valid in the spec
+/// format; the registry round-trips it via `decode_all`.
+#[derive(DebugView)]
+#[bs_viz(summary = "Sentinel")]
+pub struct Sentinel;
+
 fn main() {
     let p = Person {
         name: "Ada".to_string(),
@@ -65,7 +85,10 @@ fn main() {
         latency_ns: 5_000_000,
         seq: 9,
     };
+    let uid = UserId(0xCAFE_BABE);
+    let pt = Point(10, 20);
+    let sentinel = Sentinel;
     // Reference everything so the linker keeps them.
     println!("{} / {} / {} / {}", p.name, c.label, w_i32.inner, ev.seq); // BP_LINE = next line below
-    std::hint::black_box((&p, &c, &w_i32, &w_str, &ev));
+    std::hint::black_box((&p, &c, &w_i32, &w_str, &ev, &uid, &pt, &sentinel));
 }

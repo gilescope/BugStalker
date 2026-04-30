@@ -7,6 +7,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 5 — tuple + unit structs):
+  - `#[derive(DebugView)]` now accepts tuple structs and unit
+    structs. Tuple-struct fields receive the Rust-DWARF
+    convention name `__0`, `__1`, ..., so summary-template
+    placeholders + per-field attribute lookup resolve cleanly.
+    Newtype-style `pub struct UserId(#[bs_viz(format = "hex")]
+    pub u64);` is the canonical use case. Unit structs serialise
+    with an empty field list; only their type-level `summary`
+    applies.
+  - **Bug fix.** Summary-template substitution previously
+    ignored per-field format overrides — `summary = "UserId#{__0}"`
+    on a tuple struct whose `__0` carried `format = "hex"`
+    substituted the raw decimal form. The substitution closure
+    now consults the spec's per-field format alongside rename /
+    hidden flags. Fix applies to both the TUI/console path
+    (`ui::generic::variable::substitute_template`) and the DAP
+    path (`dap::yadap::session::data::render_value_to_string_with_viz`).
+    `format_scalar_for_dap` is the new public alias the DAP
+    closure uses.
+  - `viz_demo` gains `UserId(u64)`, `Point(i32, i32)`, and
+    `Sentinel` (unit struct). Integration test asserts:
+    7 specs recovered, tuple-struct field names round-trip as
+    `__0` / `__1`, unit struct round-trips with empty fields,
+    `uid` renders as `UserId#0xcafebabe` (was the bug), `pt`
+    renders as `Point(10, 20)`.
 - visualisers (Phase 4 Tier-A step 4 — iso8601 + duration formats):
   - `#[bs_viz(format = "iso8601")]` on integer scalars renders
     the value as a UTC ISO-8601 timestamp (Unix epoch seconds

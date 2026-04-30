@@ -26,14 +26,14 @@ fn debug_view_specs_loaded_from_demo_binary() {
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
     let debugger = builder.build(process).unwrap();
 
-    // Four derives in the demo binary (Person, Counter, Wrap,
-    // Event); all four should have been discovered at attach.
-    // `Wrap` is generic — we still emit only one spec per type
-    // *definition*.
+    // Seven derives in the demo binary: Person, Counter, Wrap,
+    // Event, UserId, Point, Sentinel. `Wrap` is generic — we
+    // still emit only one spec per type *definition*; tuple
+    // and unit structs all count as one spec each.
     assert_eq!(
         debugger.view_spec_count(),
-        4,
-        "expected 4 specs from viz_demo, got {}",
+        7,
+        "expected 7 specs from viz_demo, got {}",
         debugger.view_spec_count(),
     );
 
@@ -85,6 +85,30 @@ fn debug_view_specs_loaded_from_demo_binary() {
     // A type without a derive must miss.
     assert!(debugger.view_spec_for("std::string::String").is_none());
 
+    // Step 5 — tuple + unit structs are spec'd. UserId has one
+    // field with `format = "hex"` named `__0`. Point has two
+    // unnamed fields. Sentinel has none.
+    let uid_spec = debugger
+        .view_spec_for("UserId")
+        .expect("UserId spec should be in the registry");
+    assert_eq!(uid_spec.summary.as_deref(), Some("UserId#{__0}"));
+    assert_eq!(uid_spec.fields.len(), 1);
+    assert_eq!(uid_spec.fields[0].name, "__0");
+    assert_eq!(uid_spec.fields[0].format, Format::Hex);
+
+    let pt_spec = debugger
+        .view_spec_for("Point")
+        .expect("Point spec should be in the registry");
+    assert_eq!(pt_spec.fields.len(), 2);
+    assert_eq!(pt_spec.fields[0].name, "__0");
+    assert_eq!(pt_spec.fields[1].name, "__1");
+
+    let sentinel_spec = debugger
+        .view_spec_for("Sentinel")
+        .expect("Sentinel spec should be in the registry");
+    assert!(sentinel_spec.fields.is_empty());
+    assert_eq!(sentinel_spec.summary.as_deref(), Some("Sentinel"));
+
     drop(debugger);
 }
 
@@ -96,12 +120,11 @@ fn debug_view_summary_applied_at_render_time() {
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
-    // BP at the `black_box` line — `p`, `c`, `w_i32`, `w_str`,
-    // `ev` are all alive at that point so we can read them as
-    // locals.
-    debugger.set_breakpoint_at_line("main.rs", 70).unwrap();
+    // BP at the `black_box` line — every local in `main` is
+    // alive at this point.
+    debugger.set_breakpoint_at_line("main.rs", 93).unwrap();
     debugger.start_debugee().unwrap();
-    assert_eq!(info.line.take(), Some(70));
+    assert_eq!(info.line.take(), Some(93));
 
     let viz = debugger.view_registry();
     let locals = debugger.read_local_variables().unwrap();
@@ -219,6 +242,47 @@ fn debug_view_summary_applied_at_render_time() {
         ev_with_spec.contains("seq:"),
         "seq field missing from spec render: {ev_with_spec}",
     );
+
+    // Step 5 — tuple-struct render. UserId has one field named
+    // `__0` with `format = "hex"` applied. The summary template
+    // resolves the placeholder, AND the field-level hex
+    // formatter is applied via the same path.
+    let uid_local = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("uid"))
+        .expect("local `uid` should be in scope");
+    let uid_with_spec = render_value_with_viz(uid_local.value(), Some(viz));
+    assert!(
+        uid_with_spec.contains("UserId#0xcafebabe"),
+        "tuple-struct hex format not applied to __0: {uid_with_spec}",
+    );
+
+    let pt_local = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("pt"))
+        .expect("local `pt` should be in scope");
+    let pt_with_spec = render_value_with_viz(pt_local.value(), Some(viz));
+    assert!(
+        pt_with_spec.contains("Point(10, 20)"),
+        "multi-field tuple-struct summary not applied: {pt_with_spec}",
+    );
+
+    let sentinel_local = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("sentinel"));
+    if let Some(sentinel_local) = sentinel_local {
+        let sentinel_with_spec =
+            render_value_with_viz(sentinel_local.value(), Some(viz));
+        assert!(
+            sentinel_with_spec.contains("Sentinel"),
+            "unit-struct summary not applied: {sentinel_with_spec}",
+        );
+    }
+    // Note: `sentinel: Sentinel` may be elided by rustc if it
+    // contributes no bytes — DWARF on darwin sometimes drops
+    // unit-struct locals entirely. Don't fail the test for that;
+    // the spec's existence in the registry (asserted above) is
+    // already proved.
 
     debugger.continue_debugee().unwrap();
     drop(debugger);
