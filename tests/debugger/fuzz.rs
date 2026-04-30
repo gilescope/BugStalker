@@ -234,3 +234,47 @@ fn fuzz_hello_world_multi_seed() {
         fuzz_walk(HW_APP, &[], s);
     }
 }
+
+/// Random-example sweep. Each round picks (example, seed) from
+/// the seeded RNG, prints the choice up-front, and runs the
+/// walk. Default 5 rounds; tune via `BS_FUZZ_ROUNDS`. The
+/// printed `(example, seed)` lines make any panic
+/// reproducible — set `BS_FUZZ_SEED=<u64>` (and
+/// `BS_FUZZ_ROUNDS=N`) to replay exactly the same sequence.
+///
+/// Pool entries are `(label, path, args)`. Examples that need
+/// args (e.g. `calc`) provide them; the rest take `&[]`.
+#[test]
+#[serial]
+fn fuzz_random_examples() {
+    let pool: &[(&str, &str, &[&'static str])] = &[
+        ("hello_world", HW_APP, &[]),
+        (
+            "calc",
+            CALC_APP,
+            &["1", "2", "3", "--description", "fuzz-result"],
+        ),
+        ("vars", VARS_APP, &[]),
+        ("recursion", RECURSION_APP, &[]),
+        ("fizzbuzz", FIZZBUZZ_APP, &[]),
+        ("mt", MT_APP, &[]),
+        ("calls", CALLS_APP, &[]),
+    ];
+
+    let rounds = std::env::var("BS_FUZZ_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(5);
+
+    let mut rng = XorShift::new(seed());
+    for round in 0..rounds {
+        let (label, path, args) = rng.pick(pool);
+        let walk_seed = rng.next_u64();
+        eprintln!(
+            "[fuzz round {round}/{rounds}] example={label} seed={walk_seed:#018x} \
+             (replay: BS_FUZZ_SEED={:#018x} BS_FUZZ_ROUNDS={rounds})",
+            seed(),
+        );
+        fuzz_walk(path, args, walk_seed);
+    }
+}
