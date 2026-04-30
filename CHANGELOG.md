@@ -7,6 +7,34 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 1 — declarative `#[derive(DebugView)]`):
+  - New workspace crates: `bs-viz-spec` (wire format, MAGIC `BSV1`,
+    length-prefixed entries, encode/decode), `bs-viz-derive`
+    (proc-macro reading type- and field-level `#[bs_viz(...)]`
+    attributes and emitting a `static [u8; N]` into `.bs_viz_spec` /
+    `__DATA,__bs_viz_spec`), and `bs-viz-sdk` (façade re-export
+    `pub use bs_viz_derive::DebugView; pub use bs_viz_spec::*;`).
+  - Step-1 attribute surface: type-level `summary = "..."`;
+    field-level `skip`, `rename = "..."`, `format = "hex|bin|oct|
+    iso8601|duration|utf8|hexdump"`. Generics, enums, tuple
+    structs, and the `custom` escape hatch produce a clear
+    compile-error pointing at the tracking phase.
+  - BugStalker side: `src/debugger/viz/` reads both section names
+    at attach, decodes, and indexes by type name. Lookup falls
+    back to suffix matching against `::<name>` so the renderer
+    can pass fully-qualified demangled names while the macro
+    stores the local-module short form (until `module_path!()`
+    integration in step 2). Ambiguous suffix matches bail to
+    `None` rather than mis-applying.
+  - New `Debugger::view_spec_for(type_name)` and
+    `Debugger::view_spec_count()` API; `bs_viz_spec` re-exported
+    from `bugstalker::bs_viz_spec` for downstream embedders.
+  - Reference debuggee `examples/viz_demo/` with two derives;
+    integration test
+    `tests/debugger/viz.rs::debug_view_specs_loaded_from_demo_binary`
+    asserts both specs are recovered with full attribute
+    fidelity. Renderer integration (applying summaries / per-
+    field overrides at print time) is the next batch.
 - variables (Phase 3 Feature D batch D1 — async `.await` source coords):
   - On a coroutine state-machine enum (`async fn` body), rustc emits
     `DW_AT_decl_file` / `DW_AT_decl_line` on the captured-locals fields

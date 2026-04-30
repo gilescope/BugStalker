@@ -697,6 +697,48 @@ crate.
 * **G** proptest fuzz + `cargo fuzz` scaffold
 * **H** BugStalker integration
 
+## Phase 4 — Visualiser extensibility
+
+**Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
+
+**Status: step 1 (Tier-A foundation) shipped (2026-04-30).** The
+end-to-end declarative-spec path is live:
+
+* `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
+  length-prefixed entries) plus encode/decode + 6 unit tests.
+* `crates/bs-viz-derive/` — `#[derive(DebugView)]` proc-macro
+  supporting type-level `summary = "..."` and field-level `skip`
+  / `rename = "..."` / `format = "hex|bin|oct|iso8601|duration|
+  utf8|hexdump"`. Generics, enums, tuple structs and the `custom`
+  escape hatch error out clearly with a step-2-tracking message.
+* `crates/bs-viz-sdk/` — re-export façade crate authors depend on.
+* `src/debugger/viz/` — section reader + registry (suffix match
+  on the local-only type name pending the `module_path!()`-aware
+  resolver in step 2). 5 unit tests around exact match, suffix
+  match, ambiguous-suffix bail, separator-required guard.
+* `examples/viz_demo/` — two-derive smoke debuggee.
+* `tests/debugger/viz.rs::debug_view_specs_loaded_from_demo_binary`
+  — attaches BugStalker, reads the section, asserts both specs
+  recovered with full attribute fidelity (skip, rename, format).
+
+**Remaining (in plan order):**
+
+1. **Renderer integration.** Apply `summary` templates and
+   field-level overrides during `Display for StructValue` / DAP
+   `variables` rendering. Today the registry is exposed via
+   `Debugger::view_spec_for` / `view_spec_count` for tests; it
+   doesn't yet alter any printed output. Smallest follow-up that
+   makes the feature user-visible.
+2. **`module_path!()` in the macro** so the wire `type_name`
+   matches what the v0 demangler produces. Removes the suffix
+   fallback and its ambiguity bail.
+3. **Generics + enums + tuple structs** in the derive (currently
+   compile-error gated, deliberately).
+4. **`CustomView` escape hatch** — non-declarative Tier A.
+5. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
+   loaded from `~/.config/bugstalker/visualizers/*.wasm` and from
+   `.bs_visualizer_wasm` sections.
+
 ## Phase 1 — Stdlib value-rendering coverage
 
 **Goal:** parity with `rustc`'s `lldb_providers.py` /

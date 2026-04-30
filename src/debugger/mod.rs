@@ -16,6 +16,7 @@ mod step;
 pub(crate) mod thread_db_compat;
 mod utils;
 pub mod variable;
+pub mod viz;
 mod watchpoint;
 
 pub use breakpoint::BreakpointView;
@@ -389,6 +390,13 @@ pub struct Debugger {
     oracles: IndexMap<&'static str, (Arc<dyn Oracle>, bool)>,
     /// Detach flag to skip destructive cleanup on drop.
     detached: bool,
+    /// Phase 4 Tier-A — declarative visualiser registry,
+    /// populated from the debuggee's `.bs_viz_spec` /
+    /// `__bs_viz_spec` section at construction. Empty when the
+    /// debuggee was built without `bs-viz-sdk` or compiled with
+    /// `--release` (specs are debug-build artefacts by
+    /// convention).
+    viz: viz::VizRegistry,
 }
 
 impl Debugger {
@@ -442,6 +450,19 @@ impl Debugger {
             Debugee::new_non_running(program_path, &process, &object)?
         };
 
+        // Phase 4 Tier-A: scan visualiser specs out of the
+        // executable. Done here, while the `object::File` is
+        // still alive and we don't have to re-parse it later.
+        let viz = viz::VizRegistry::from_object(&object);
+        if !viz.is_empty() {
+            log::debug!(
+                target: "viz",
+                "loaded {} #[derive(DebugView)] spec(s) from {}",
+                viz.len(),
+                program_path.display(),
+            );
+        }
+
         Ok(Self {
             debugee,
             process,
@@ -454,7 +475,26 @@ impl Debugger {
                 .map(|oracle| (oracle.name(), (oracle, false)))
                 .collect(),
             detached: false,
+            viz,
         })
+    }
+
+    /// Phase 4 Tier-A — return the registered
+    /// [`bs_viz_spec::TypeViewSpec`] for `type_name`, if any.
+    /// `type_name` should be the fully-qualified rustc/v0
+    /// demangled form (e.g. `my_crate::Person`); the registry
+    /// also matches against the local-only name the proc-macro
+    /// currently emits, so callers don't have to pre-strip the
+    /// module path.
+    pub fn view_spec_for(&self, type_name: &str) -> Option<&bs_viz_spec::TypeViewSpec> {
+        self.viz.find(type_name)
+    }
+
+    /// Total number of visualiser specs loaded from the debuggee.
+    /// Useful for tests + the eventual `bs/visualiserList` DAP
+    /// request.
+    pub fn view_spec_count(&self) -> usize {
+        self.viz.len()
     }
 
     /// Return installed oracle, or `None` if oracle not found or not installed.

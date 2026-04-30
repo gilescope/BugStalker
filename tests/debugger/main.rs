@@ -25,6 +25,7 @@ mod tokio;
 mod fuzz;
 mod unwind;
 mod variables;
+mod viz;
 // Hardware-watchpoint tests only run on x86_64. The aarch64 code path
 // exists (see src/debugger/register/aarch64.rs::debug_impl) and is
 // correct for real hardware, but the CI environments we currently run

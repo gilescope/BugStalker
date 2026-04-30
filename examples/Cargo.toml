@@ -11,6 +11,7 @@ members = [
     "calc",
     "fizzbuzz",
     "hello_world",
+    "showcase",
     "vars",
     "mt",
     "recursion",
@@ -31,6 +32,7 @@ members = [
     "dap_set_variable",
     "dap_data_breakpoints",
     "dap_source_map",
+    "viz_demo",
 ]
 
 exclude = [

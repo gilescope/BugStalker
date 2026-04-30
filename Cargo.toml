@@ -80,6 +80,7 @@ typed-arena = "2.0.2"
 fallible-iterator = "0.3.0"
 itertools = "0.12.1"
 rust-mangle-tree = { path = "crates/rust-mangle-tree" }
+bs-viz-spec = { path = "crates/bs-viz-spec" }
 thiserror = "1.0.69"
 bytes = "1.11.0"
 log = "0.4.29"

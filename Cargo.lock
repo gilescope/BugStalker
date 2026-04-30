@@ -248,6 +248,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs-viz-derive"
+version = "0.0.1"
+dependencies = [
+ "bs-viz-spec",
+ "proc-macro2 1.0.106",
+ "quote 1.0.44",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "bs-viz-sdk"
+version = "0.0.1"
+dependencies = [
+ "bs-viz-derive",
+ "bs-viz-spec",
+]
+
+[[package]]
+name = "bs-viz-spec"
+version = "0.0.1"
+dependencies = [
+ "proptest",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "bugstalker"
 version = "0.4.5"
 dependencies = [
@@ -256,6 +282,7 @@ dependencies = [
  "base64 0.22.1",
  "bit_field",
  "bs-test-harness",
+ "bs-viz-spec",
  "bytes",
  "capstone",
  "chrono",
