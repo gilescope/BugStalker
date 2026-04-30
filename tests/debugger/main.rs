@@ -53,8 +53,24 @@ use std::thread;
 /// signatures, so we self-sign + re-exec on first run if the
 /// entitlement is missing. Idempotent — once the running image
 /// already has it, this is a no-op.
+///
+/// **Cross-process serialisation under nextest parallel.**
+/// The `OnceLock` guard only covers a single process. When
+/// nextest fans out into many test processes against the same
+/// on-disk binary, naive concurrent `codesign --force --sign -`
+/// calls race on the signature blob — a late writer can
+/// overwrite a partial earlier write, surfacing as
+/// `task_for_pid` → `KERN_FAILURE` → `Ptrace(EFAULT)` from a
+/// random subset of tests. Mitigation: take an exclusive
+/// `flock(2)` on a sibling `.codesign.lock` file before
+/// touching the signature, then re-probe entitlements once we
+/// hold the lock so a process that lost the race short-circuits
+/// instead of double-signing. Build-time signing in `build.rs`
+/// would be a stronger fix (no runtime race at all); the lock
+/// is the cheap step.
 #[cfg(target_os = "macos")]
 fn ensure_entitled_self_or_reexec() {
+    use std::os::fd::AsRawFd;
     use std::process::Command;
     use std::sync::OnceLock;
     static GUARD: OnceLock<()> = OnceLock::new();
@@ -74,17 +90,26 @@ fn ensure_entitled_self_or_reexec() {
             return;
         }
     };
-    // Probe entitlements; if cs.debugger is already present, nothing to do.
-    let out = Command::new("codesign")
-        .args(["-d", "--entitlements", "-"])
-        .arg(&exe)
-        .output();
-    if let Ok(out) = &out {
-        let blob = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
-        if blob.contains("com.apple.security.cs.debugger") {
-            let _ = GUARD.set(());
-            return;
+
+    let probe_entitled = |exe: &Path| -> bool {
+        let out = Command::new("codesign")
+            .args(["-d", "--entitlements", "-"])
+            .arg(exe)
+            .output();
+        match out {
+            Ok(out) => {
+                let blob = String::from_utf8_lossy(&out.stdout)
+                    + String::from_utf8_lossy(&out.stderr);
+                blob.contains("com.apple.security.cs.debugger")
+            }
+            Err(_) => false,
         }
+    };
+
+    // Fast path: already entitled, no lock needed.
+    if probe_entitled(&exe) {
+        let _ = GUARD.set(());
+        return;
     }
     // Locate the entitlements plist relative to the workspace.
     let plist = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/darwin.entitlements");
@@ -93,34 +118,87 @@ fn ensure_entitled_self_or_reexec() {
         let _ = GUARD.set(());
         return;
     }
-    let status = Command::new("codesign")
-        .args(["--entitlements"])
-        .arg(&plist)
-        .args(["--force", "--sign", "-"])
-        .arg(&exe)
-        .status();
-    match status {
-        Ok(s) if s.success() => {
-            // Re-exec ourselves so the kernel picks up the new
-            // signature. The original `cargo test` invocation will
-            // see this child's exit code as the test result.
-            let mut cmd = Command::new(&exe);
-            cmd.args(std::env::args_os().skip(1));
-            cmd.env("BS_DARWIN_RESIGNED", "1");
-            // Use exec to avoid leaving a stub parent behind.
-            use std::os::unix::process::CommandExt;
-            let err = cmd.exec();
-            eprintln!("[bs/test] failed to re-exec after resign: {err}");
-            std::process::exit(70);
-        }
-        Ok(s) => {
-            eprintln!("[bs/test] codesign exited with status {s}; tests will likely fail");
+
+    // Cross-process serialisation. Open (or create) a sibling
+    // lock file next to the binary, then `flock(LOCK_EX)` to
+    // serialise resign with any other test process pointing at
+    // the same binary. The lock auto-releases when `_lock_file`
+    // is dropped at end of scope.
+    let lock_path = {
+        let mut p = exe.clone();
+        let new_name = match p.file_name().and_then(|s| s.to_str()) {
+            Some(name) => format!("{name}.codesign.lock"),
+            None => "codesign.lock".to_string(),
+        };
+        p.set_file_name(new_name);
+        p
+    };
+    let _lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(f) => {
+            // SAFETY: fd is valid for the duration of `f`; flock
+            // is a thread-safe POSIX advisory lock. LOCK_EX
+            // blocks until acquired (no timeout — we want to
+            // wait for the prior signer).
+            let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                eprintln!(
+                    "[bs/test] flock({lock_path:?}) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            f
         }
         Err(e) => {
-            eprintln!("[bs/test] codesign failed to spawn: {e}");
+            eprintln!("[bs/test] could not open codesign lock {lock_path:?}: {e}");
+            // Fall through unlocked — best effort.
+            std::fs::File::open("/dev/null").expect("/dev/null open")
+        }
+    };
+
+    // Re-probe under the lock: if a peer just finished signing
+    // we skip the redundant (and racy) overwrite. We still need
+    // to re-exec ourselves below — our running image was loaded
+    // from the file *before* the peer signed, so the kernel
+    // stamped us with the old (un-entitled) csflags.
+    let already_signed_by_peer = probe_entitled(&exe);
+    if !already_signed_by_peer {
+        let status = Command::new("codesign")
+            .args(["--entitlements"])
+            .arg(&plist)
+            .args(["--force", "--sign", "-"])
+            .arg(&exe)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("[bs/test] codesign exited with status {s}; tests will likely fail");
+                let _ = GUARD.set(());
+                return;
+            }
+            Err(e) => {
+                eprintln!("[bs/test] codesign failed to spawn: {e}");
+                let _ = GUARD.set(());
+                return;
+            }
         }
     }
-    let _ = GUARD.set(());
+    // Re-exec so the kernel re-reads the signature. Drop the
+    // lock first so any waiting peer wakes up immediately,
+    // re-probes, finds the file already entitled, and re-execs
+    // without redundantly resigning.
+    let mut cmd = Command::new(&exe);
+    cmd.args(std::env::args_os().skip(1));
+    cmd.env("BS_DARWIN_RESIGNED", "1");
+    drop(_lock_file);
+    use std::os::unix::process::CommandExt;
+    let err = cmd.exec();
+    eprintln!("[bs/test] failed to re-exec after resign: {err}");
+    std::process::exit(70);
 }
 
 #[cfg(not(target_os = "macos"))]

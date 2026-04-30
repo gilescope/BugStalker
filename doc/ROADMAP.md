@@ -403,6 +403,16 @@ exception subscription racing across simultaneous attaches still
 needs a serialising mutex. Tracked under "Phase 3 — parity with
 linux/aarch64" below; serial runs are the canonical green.
 
+A *second*, separate parallel-run failure mode used to live in
+`tests/debugger/main.rs::ensure_entitled_self_or_reexec` — the
+**codesign race**. With ad-hoc `flock(2)` on a sibling
+`.codesign.lock` file (commit landing this note) only one
+process ever calls `codesign --force` at a time; peers wait,
+re-probe under the lock, and re-exec to pick up the new
+signature without re-signing. A nicer follow-up would be to push
+the resign into a `build.rs` post-link step so it runs exactly
+once per build artefact, eliminating the runtime work entirely.
+
 The multithreading subsystem is wired in:
 
 * `darwin_mach::set_thread_port` / `thread_port_for_pid_or_first`
