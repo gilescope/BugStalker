@@ -13,6 +13,7 @@ use crate::common::{TestHooks, TestInfo};
 use crate::prepare_debugee_process;
 use bugstalker::bs_viz_spec::{self, Format};
 use bugstalker::debugger::DebuggerBuilder;
+use bugstalker::ui::generic::variable::render_value_with_viz;
 use serial_test::serial;
 
 const VIZ_DEMO_APP: &str = "./examples/target/debug/viz_demo";
@@ -74,5 +75,70 @@ fn debug_view_specs_loaded_from_demo_binary() {
     // A type without a derive must miss.
     assert!(debugger.view_spec_for("std::string::String").is_none());
 
+    drop(debugger);
+}
+
+#[test]
+#[serial]
+fn debug_view_summary_applied_at_render_time() {
+    let process = prepare_debugee_process(VIZ_DEMO_APP, &[]);
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // BP at the `black_box` line — both `p` and `c` are alive at
+    // that point so we can read both as locals.
+    debugger.set_breakpoint_at_line("main.rs", 39).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(39));
+
+    let viz = debugger.view_registry();
+    let locals = debugger.read_local_variables().unwrap();
+
+    // Find both registered locals; render each against the viz
+    // registry and the bare path. The viz path must produce the
+    // summary template; the bare path must not (proves we
+    // didn't accidentally make the templating unconditional).
+    let p_local = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("p"))
+        .expect("local `p` should be in scope at line 41");
+    let bare = render_value_with_viz(p_local.value(), None);
+    let with_spec = render_value_with_viz(p_local.value(), Some(viz));
+
+    assert!(
+        with_spec.contains("Person(Ada, age 36)"),
+        "summary template not applied — render output: {with_spec}",
+    );
+    assert!(
+        !bare.contains("Person(Ada, age 36)"),
+        "viz=None path should not apply the template; got: {bare}",
+    );
+
+    // `_private_token` is `#[bs_viz(skip)]`; it should *not*
+    // appear in the with-spec render.
+    assert!(
+        !with_spec.contains("_private_token"),
+        "skip attribute not honoured — _private_token leaked into render: {with_spec}",
+    );
+    // It *should* appear in the bare render to confirm we didn't
+    // accidentally hide it everywhere.
+    assert!(
+        bare.contains("_private_token"),
+        "bare render unexpectedly omitted _private_token — render is broken: {bare}",
+    );
+
+    // `category` is renamed to `kind`. With the spec applied,
+    // the original name must not appear, the renamed one must.
+    assert!(
+        with_spec.contains("kind:"),
+        "rename to `kind` not applied: {with_spec}",
+    );
+    assert!(
+        !with_spec.contains("category:"),
+        "rename leaked the original `category:` label: {with_spec}",
+    );
+
+    debugger.continue_debugee().unwrap();
     drop(debugger);
 }

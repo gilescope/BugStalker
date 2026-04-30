@@ -497,6 +497,14 @@ impl Debugger {
         self.viz.len()
     }
 
+    /// Borrow the full visualiser registry. Render-layer callers
+    /// (DAP `variables` response, TUI rendering pipeline) thread
+    /// this through so registered types render via their
+    /// declarative spec.
+    pub fn view_registry(&self) -> &viz::VizRegistry {
+        &self.viz
+    }
+
     /// Return installed oracle, or `None` if oracle not found or not installed.
     ///
     /// # Arguments

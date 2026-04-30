@@ -701,8 +701,10 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: step 1 (Tier-A foundation) shipped (2026-04-30).** The
-end-to-end declarative-spec path is live:
+**Status: steps 1 + 2 shipped (2026-04-30).** Step 1 wires the
+declarative-spec data path end-to-end; step 2 wires the renderer
+so registered types actually render through their spec. The
+following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -721,21 +723,47 @@ end-to-end declarative-spec path is live:
   — attaches BugStalker, reads the section, asserts both specs
   recovered with full attribute fidelity (skip, rename, format).
 
+Step 2 added:
+
+* `crate::debugger::viz::substitute_template` — generic helper
+  factored so the DAP and TUI/console renderers share one
+  substitution implementation. `{field_name}` placeholders, `{{`
+  / `}}` escape pair, `{?name}` for unknown placeholders so a
+  typo is visible rather than silent.
+* `ui::generic::variable::render_value_with_viz` /
+  `render_variable_with_viz` (TUI/console path) and
+  `dap::yadap::session::data::render_value_to_string_with_viz`
+  (DAP path). Both honour summary templates, `#[bs_viz(skip)]`
+  field hiding, and `#[bs_viz(rename = "...")]` field renaming.
+* `Debugger::view_registry()` exposes the registry to render-
+  layer callers.
+* `tests/debugger/viz.rs::debug_view_summary_applied_at_render_time`
+  attaches BugStalker against `viz_demo`, breaks at the
+  `black_box` line, reads `p` as a local, and verifies all
+  three rendering effects: summary substitution applied,
+  `_private_token` hidden, `category` renamed to `kind`. Also
+  verifies the `viz=None` path still renders the bare struct
+  dump — proving the new code is opt-in and doesn't accidentally
+  change the no-spec rendering.
+
 **Remaining (in plan order):**
 
-1. **Renderer integration.** Apply `summary` templates and
-   field-level overrides during `Display for StructValue` / DAP
-   `variables` rendering. Today the registry is exposed via
-   `Debugger::view_spec_for` / `view_spec_count` for tests; it
-   doesn't yet alter any printed output. Smallest follow-up that
-   makes the feature user-visible.
+1. **Per-callsite DAP wiring.** `data.rs` has 12+ existing
+   `render_value_to_string` callers; only the helper itself is
+   viz-aware. Update each `impl DebugSession` callsite to pass
+   `Some(self.debugger.view_registry())` so the IDE actually
+   picks up summaries. Mechanical; deferred to keep this batch
+   focused on the contract test.
 2. **`module_path!()` in the macro** so the wire `type_name`
    matches what the v0 demangler produces. Removes the suffix
    fallback and its ambiguity bail.
 3. **Generics + enums + tuple structs** in the derive (currently
    compile-error gated, deliberately).
-4. **`CustomView` escape hatch** — non-declarative Tier A.
-5. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
+4. **`format = "hex"` etc. honoured at render time.** The macro
+   already records the format tag; the renderer ignores it for
+   now.
+5. **`CustomView` escape hatch** — non-declarative Tier A.
+6. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
    loaded from `~/.config/bugstalker/visualizers/*.wasm` and from
    `.bs_visualizer_wasm` sections.
 

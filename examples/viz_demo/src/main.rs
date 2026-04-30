@@ -35,6 +35,6 @@ fn main() {
     };
     let c = Counter { label: "ticks", n: 42 };
     // Reference both so the linker keeps them.
-    println!("{} / {}", p.name, c.label);
+    println!("{} / {}", p.name, c.label); // BP_LINE = next line below
     std::hint::black_box((&p, &c));
 }

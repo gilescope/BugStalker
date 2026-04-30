@@ -2,14 +2,29 @@
 use crate::debugger::address::RelocatedAddress;
 use crate::debugger::variable::execute::{QueryResult, QueryResultKind};
 use crate::debugger::variable::render::{RenderValue, ValueLayout};
+use crate::debugger::variable::value::Member;
 use crate::debugger::variable::value::Value;
+use crate::debugger::viz::VizRegistry;
 use crate::ui::syntax;
 use crate::ui::syntax::StylizedLine;
+use bs_viz_spec::TypeViewSpec;
 use syntect::util::as_24_bit_terminal_escaped;
 
 const TAB: &str = "    ";
 
 pub fn render_variable(var: &QueryResult, prerender: Option<&str>) -> anyhow::Result<String> {
+    render_variable_with_viz(var, prerender, None)
+}
+
+/// Phase 4 Tier-A — like [`render_variable`] but consults a
+/// [`VizRegistry`] (see [`crate::debugger::Debugger::view_registry`])
+/// so registered `#[derive(DebugView)]` types render through their
+/// declarative spec instead of the default structure dump.
+pub fn render_variable_with_viz(
+    var: &QueryResult,
+    prerender: Option<&str>,
+    viz: Option<&VizRegistry>,
+) -> anyhow::Result<String> {
     let syntax_renderer = syntax::rust_syntax_renderer();
     let mut line_renderer = syntax_renderer.line_renderer();
     let prefix = if var.kind() == QueryResultKind::Root && var.identity().name.is_some() {
@@ -21,7 +36,7 @@ pub fn render_variable(var: &QueryResult, prerender: Option<&str>) -> anyhow::Re
     let var_as_string = if let Some(value) = prerender {
         format!("{prefix}{value}")
     } else {
-        format!("{prefix}{}", render_value(var.value()))
+        format!("{prefix}{}", render_value_with_viz(var.value(), viz))
     };
     Ok(var_as_string
         .lines()
@@ -40,10 +55,24 @@ pub fn render_variable(var: &QueryResult, prerender: Option<&str>) -> anyhow::Re
 }
 
 pub fn render_value(value: &Value) -> String {
-    render_value_inner(value, 0, true)
+    render_value_inner(value, 0, true, None)
 }
 
-fn render_value_inner(value: &Value, depth: usize, print_type: bool) -> String {
+/// Render with optional Tier-A spec lookup. When `viz` is
+/// `Some`, struct rendering looks the type name up; on a hit
+/// the rendered output prepends the `summary` template (with
+/// `{field_name}` placeholders substituted) and applies
+/// per-field `skip` / `rename` filters in the child list.
+pub fn render_value_with_viz(value: &Value, viz: Option<&VizRegistry>) -> String {
+    render_value_inner(value, 0, true, viz)
+}
+
+fn render_value_inner(
+    value: &Value,
+    depth: usize,
+    print_type: bool,
+    viz: Option<&VizRegistry>,
+) -> String {
     match value.value_layout() {
         Some(layout) => match layout {
             ValueLayout::PreRendered(rendered_value) => match value {
@@ -66,25 +95,44 @@ fn render_value_inner(value: &Value, depth: usize, print_type: bool) -> String {
                 format!(
                     "{}::{}",
                     value.r#type().name_fmt(),
-                    render_value_inner(val, depth, true)
+                    render_value_inner(val, depth, true, viz)
                 )
             }
             #[allow(clippy::useless_format)]
             ValueLayout::Structure(members) => {
-                let mut render = if print_type {
-                    format!("{} {{", value.r#type().name_fmt())
-                } else {
-                    format!("{{")
+                let type_name = value.r#type().name_fmt();
+                let spec = viz.and_then(|r| r.find(&type_name));
+                let summary_str = spec
+                    .and_then(|s| s.summary.as_deref())
+                    .map(|tmpl| substitute_template(tmpl, members));
+
+                let header = match (print_type, summary_str.as_deref()) {
+                    (_, Some(s)) => format!("{type_name} {s}"),
+                    (true, None) => format!("{type_name}"),
+                    (false, None) => String::new(),
                 };
 
+                // Apply per-field skip / rename overrides when a
+                // spec is present. Without a spec, behave exactly
+                // as before.
+                let mut render = if header.is_empty() {
+                    format!("{{")
+                } else {
+                    format!("{header} {{")
+                };
                 let tabs = TAB.repeat(depth + 1);
 
                 for member in members {
+                    let (display_name, hidden) =
+                        apply_field_overrides(spec, member.field_name.as_deref());
+                    if hidden {
+                        continue;
+                    }
                     render = format!("{render}\n");
                     render = format!(
                         "{render}{tabs}{}: {}",
-                        member.field_name.as_deref().unwrap_or_default(),
-                        render_value_inner(&member.value, depth + 1, true)
+                        display_name.unwrap_or_default(),
+                        render_value_inner(&member.value, depth + 1, true, viz)
                     );
                 }
 
@@ -106,8 +154,8 @@ fn render_value_inner(value: &Value, depth: usize, print_type: bool) -> String {
                     render = format!("{render}\n");
                     render = format!(
                         "{render}{tabs}{}: {}",
-                        render_value_inner(key, depth + 1, show_kv_type),
-                        render_value_inner(val, depth + 1, show_kv_type)
+                        render_value_inner(key, depth + 1, show_kv_type, viz),
+                        render_value_inner(val, depth + 1, show_kv_type, viz)
                     );
                     show_kv_type = false;
                 }
@@ -124,7 +172,7 @@ fn render_value_inner(value: &Value, depth: usize, print_type: bool) -> String {
                     render = format!(
                         "{render}{tabs}{}: {}",
                         item.index,
-                        render_value_inner(&item.value, depth + 1, false)
+                        render_value_inner(&item.value, depth + 1, false, viz)
                     );
                 }
 
@@ -139,7 +187,7 @@ fn render_value_inner(value: &Value, depth: usize, print_type: bool) -> String {
                     render = format!("{render}\n");
                     render = format!(
                         "{render}{tabs}{}",
-                        render_value_inner(val, depth + 1, false)
+                        render_value_inner(val, depth + 1, false, viz)
                     );
                 }
 
@@ -147,5 +195,40 @@ fn render_value_inner(value: &Value, depth: usize, print_type: bool) -> String {
             }
         },
         None => format!("{}(unknown)", value.r#type().name_fmt()),
+    }
+}
+
+/// TUI/console substitution — uses the type-suppressed inline
+/// render so `Person({name}, age {age})` reads as
+/// `Person("Ada", age 36)` rather than
+/// `Person(String("Ada"), age u32(36))`.
+fn substitute_template(template: &str, members: &[Member]) -> String {
+    crate::debugger::viz::substitute_template(template, members, |m| {
+        render_value_inner(&m.value, 0, false, None)
+    })
+}
+
+/// Resolve field name + visibility against a spec entry. Returns
+/// `(displayed_name, hidden)`. With no spec or no entry for this
+/// field, the raw name is returned and `hidden` is `false`.
+fn apply_field_overrides<'a>(
+    spec: Option<&'a TypeViewSpec>,
+    field_name: Option<&'a str>,
+) -> (Option<&'a str>, bool) {
+    let Some(name) = field_name else {
+        return (None, false);
+    };
+    let Some(spec) = spec else {
+        return (Some(name), false);
+    };
+    match spec.fields.iter().find(|f| f.name == name) {
+        Some(f) => {
+            let display = f
+                .rename
+                .as_deref()
+                .or(Some(name));
+            (display, f.hidden)
+        }
+        None => (Some(name), false),
     }
 }

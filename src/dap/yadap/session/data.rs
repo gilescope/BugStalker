@@ -491,6 +491,21 @@ fn write_bytes(dbg: &debugger::Debugger, addr: usize, bytes: &[u8]) -> anyhow::R
 }
 
 pub fn render_value_to_string(v: &debugger::variable::value::Value) -> String {
+    render_value_to_string_with_viz(v, None)
+}
+
+/// Phase 4 Tier-A — DAP renderer that consults the
+/// [`debugger::viz::VizRegistry`]. When the value is a struct
+/// whose type has a registered `summary` template, the rendered
+/// summary appears in the `value` field of the DAP `Variable`
+/// instead of the placeholder `{...}`. Children continue to be
+/// served via the normal `variables` request walk; that walk
+/// also threads the registry, so nested structs render the same
+/// way.
+pub fn render_value_to_string_with_viz(
+    v: &debugger::variable::value::Value,
+    viz: Option<&debugger::viz::VizRegistry>,
+) -> String {
     use debugger::variable::render::RenderValue;
     match v.value_layout() {
         Some(debugger::variable::render::ValueLayout::PreRendered(s)) => s.to_string(),
@@ -501,10 +516,20 @@ pub fn render_value_to_string(v: &debugger::variable::value::Value) -> String {
             format!(
                 "{}::{}",
                 RenderValue::r#type(inner).name_fmt(),
-                render_value_to_string(inner)
+                render_value_to_string_with_viz(inner, viz)
             )
         }
-        Some(debugger::variable::render::ValueLayout::Structure(_)) => "{...}".to_string(),
+        Some(debugger::variable::render::ValueLayout::Structure(members)) => {
+            let type_name = RenderValue::r#type(v).name_fmt();
+            if let Some(spec) = viz.and_then(|r| r.find(&type_name)) {
+                if let Some(tmpl) = spec.summary.as_deref() {
+                    return debugger::viz::substitute_template(tmpl, members, |m| {
+                        render_value_to_string_with_viz(&m.value, viz)
+                    });
+                }
+            }
+            "{...}".to_string()
+        }
         Some(debugger::variable::render::ValueLayout::IndexedList(_)) => "[...]".to_string(),
         Some(debugger::variable::render::ValueLayout::NonIndexedList(_)) => "[...]".to_string(),
         Some(debugger::variable::render::ValueLayout::Map(_)) => "{...}".to_string(),

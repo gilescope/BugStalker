@@ -7,6 +7,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 2 — renderer integration):
+  - New `Debugger::view_registry()` borrow exposed to render-
+    layer callers.
+  - New `crate::debugger::viz::substitute_template` shared
+    helper. `{field_name}` placeholders, `{{` / `}}` escape pair,
+    `{?name}` for unknown placeholders so a typo doesn't silently
+    swallow itself.
+  - New `ui::generic::variable::{render_value_with_viz,
+    render_variable_with_viz}` (TUI/console path) and
+    `dap::yadap::session::data::render_value_to_string_with_viz`
+    (DAP path). All three honour the type-level `summary`
+    template, the field-level `skip` (hide field), and the
+    field-level `rename = "..."`. The `format = "hex|bin|...""`
+    overrides are decoded into the registry but not yet applied
+    at render time — tracked under "Remaining" in ROADMAP §4.
+  - Pre-existing `render_value` / `render_value_to_string` are
+    one-line shims passing `None`, so call sites that haven't
+    been updated keep their current rendering exactly.
+  - Integration test
+    `tests/debugger/viz.rs::debug_view_summary_applied_at_render_time`
+    attaches BugStalker against `viz_demo`, reads `p` as a local
+    after construction, and verifies all three render effects:
+    summary applied, hidden field absent, renamed field uses the
+    new label. Also asserts the `viz=None` path is unchanged.
 - visualisers (Phase 4 Tier-A step 1 — declarative `#[derive(DebugView)]`):
   - New workspace crates: `bs-viz-spec` (wire format, MAGIC `BSV1`,
     length-prefixed entries, encode/decode), `bs-viz-derive`

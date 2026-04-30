@@ -19,6 +19,61 @@ use std::collections::HashMap;
 use bs_viz_spec::TypeViewSpec;
 use object::{Object, ObjectSection};
 
+use crate::debugger::variable::value::Member;
+
+/// Substitute `{field_name}` placeholders in `template`. `{{` /
+/// `}}` produce literal braces. Unknown placeholders render as
+/// `{?name}` so a typo is visible rather than silent. The
+/// caller-supplied `render_field` closure decides how each
+/// member's value gets stringified — DAP wants compact one-line
+/// renders, TUI wants the type-suppressed inline form.
+pub fn substitute_template(
+    template: &str,
+    members: &[Member],
+    mut render_field: impl FnMut(&Member) -> String,
+) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'{' && bytes.get(i + 1) == Some(&b'{') {
+            out.push('{');
+            i += 2;
+        } else if b == b'}' && bytes.get(i + 1) == Some(&b'}') {
+            out.push('}');
+            i += 2;
+        } else if b == b'{' {
+            let start = i + 1;
+            let end = match bytes[start..].iter().position(|&c| c == b'}') {
+                Some(p) => start + p,
+                None => {
+                    out.push('{');
+                    i += 1;
+                    continue;
+                }
+            };
+            let name = &template[start..end];
+            match members
+                .iter()
+                .find(|m| m.field_name.as_deref() == Some(name))
+            {
+                Some(m) => out.push_str(&render_field(m)),
+                None => {
+                    out.push_str("{?");
+                    out.push_str(name);
+                    out.push('}');
+                }
+            }
+            i = end + 1;
+        } else {
+            out.push(b as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Section names. ELF tolerates dots in section names; Mach-O
 /// caps the `sectname` at 16 chars and pairs it with a segment
 /// name. We carry both literals so a single binary can be
