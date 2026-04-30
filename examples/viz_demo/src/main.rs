@@ -25,6 +25,19 @@ pub struct Counter {
     pub n: u64,
 }
 
+/// Step 4 — `iso8601` and `duration` formats applied at render
+/// time. `created_at` is opted in to ISO-8601 interpretation
+/// (Unix epoch seconds), `latency_ns` to a duration display.
+#[derive(DebugView)]
+#[bs_viz(summary = "Event(created={created_at}, took={latency_ns})")]
+pub struct Event {
+    #[bs_viz(format = "iso8601")]
+    pub created_at: i64,
+    #[bs_viz(format = "duration")]
+    pub latency_ns: u64,
+    pub seq: u32,
+}
+
 /// Step 3 — generic types are supported. The macro emits one
 /// spec per *definition*; the registry's lookup strips
 /// `<…>` so `Wrap<i32>` resolves to this entry.
@@ -45,7 +58,14 @@ fn main() {
     let c = Counter { label: "ticks", n: 42 };
     let w_i32 = Wrap { inner: 17_i32 };
     let w_str = Wrap { inner: "fish" };
+    let ev = Event {
+        // 2024-01-15T12:34:56Z (a known ISO-8601 fixed point).
+        created_at: 1705_322_096,
+        // 5 ms in nanoseconds.
+        latency_ns: 5_000_000,
+        seq: 9,
+    };
     // Reference everything so the linker keeps them.
-    println!("{} / {} / {}", p.name, c.label, w_i32.inner); // BP_LINE = next line below
-    std::hint::black_box((&p, &c, &w_i32, &w_str));
+    println!("{} / {} / {} / {}", p.name, c.label, w_i32.inner, ev.seq); // BP_LINE = next line below
+    std::hint::black_box((&p, &c, &w_i32, &w_str, &ev));
 }

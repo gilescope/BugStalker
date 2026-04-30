@@ -238,9 +238,21 @@ fn apply_field_overrides<'a>(
 
 /// Apply a `#[bs_viz(format = "...")]` override to a scalar
 /// value. Returns `Some(rendered)` when the value is a scalar
-/// integer (or, for `utf8`/`hexdump`, a byte slice we can read)
-/// and the format is applicable. Otherwise `None`, signalling
-/// the caller should fall back to default rendering.
+/// integer and the format is applicable. Otherwise `None`,
+/// signalling the caller should fall back to default rendering.
+///
+/// Step 4 conventions for the time-shaped formats:
+///
+/// * `iso8601` reads an integer as **Unix epoch seconds** (UTC).
+///   The user explicitly opts in by attaching the attribute, so
+///   we don't need to recognise `SystemTime`'s internal layout
+///   — useful for raw timestamps stored as `i64` / `u64`.
+/// * `duration` reads an integer as **nanoseconds** and renders
+///   it in the largest sensible unit (ns / µs / ms / s).
+///
+/// `utf8` / `hexdump` need byte-array detection (Vec<u8>, &[u8],
+/// etc.); they fall through to default rendering until that
+/// decoder lands in a follow-up batch.
 fn format_scalar(value: &Value, fmt: Format) -> Option<String> {
     if let Value::Scalar(s) = value {
         let n = s.try_as_number()?;
@@ -248,18 +260,99 @@ fn format_scalar(value: &Value, fmt: Format) -> Option<String> {
             Format::Hex => format!("{:#x}", n),
             Format::Bin => format!("{:#b}", n),
             Format::Oct => format!("{:#o}", n),
-            // iso8601 / duration only meaningful for time types,
-            // utf8 / hexdump only for byte arrays. Step 3
-            // implements the integer formats; the others fall
-            // back to default rendering until their type-specific
-            // decoders land.
-            Format::Default
-            | Format::Iso8601
-            | Format::Duration
-            | Format::Utf8
-            | Format::Hexdump => return None,
+            Format::Iso8601 => format_unix_epoch_iso8601(n)?,
+            Format::Duration => format_nanos(n)?,
+            Format::Default | Format::Utf8 | Format::Hexdump => return None,
         });
     }
     // Non-scalar — let the default renderer handle it.
     None
+}
+
+/// Render `secs` interpreted as Unix epoch seconds in UTC, in
+/// ISO-8601 form (`YYYY-MM-DDTHH:MM:SSZ`). Returns `None` for
+/// values outside `chrono`'s representable range so we fall back
+/// to default rendering rather than swallowing the value.
+fn format_unix_epoch_iso8601(secs: i64) -> Option<String> {
+    use chrono::{DateTime, Utc};
+    let dt: DateTime<Utc> = DateTime::from_timestamp(secs, 0)?;
+    Some(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::{format_nanos, format_unix_epoch_iso8601};
+
+    #[test]
+    fn iso8601_known_fixed_point() {
+        // 2024-01-15T12:34:56Z — same constant the integration
+        // test in `tests/debugger/viz.rs` uses against `viz_demo`,
+        // so the lookup tables on both sides agree.
+        assert_eq!(
+            format_unix_epoch_iso8601(1_705_322_096).as_deref(),
+            Some("2024-01-15T12:34:56Z"),
+        );
+    }
+
+    #[test]
+    fn iso8601_unix_epoch() {
+        assert_eq!(
+            format_unix_epoch_iso8601(0).as_deref(),
+            Some("1970-01-01T00:00:00Z"),
+        );
+    }
+
+    #[test]
+    fn iso8601_negative_pre_epoch() {
+        assert_eq!(
+            format_unix_epoch_iso8601(-1).as_deref(),
+            Some("1969-12-31T23:59:59Z"),
+        );
+    }
+
+    #[test]
+    fn duration_units() {
+        assert_eq!(format_nanos(0).as_deref(), Some("0ns"));
+        assert_eq!(format_nanos(999).as_deref(), Some("999ns"));
+        assert_eq!(format_nanos(1_500).as_deref(), Some("1.500µs"));
+        assert_eq!(format_nanos(5_000_000).as_deref(), Some("5.000ms"));
+        assert_eq!(format_nanos(1_500_000_000).as_deref(), Some("1.5s"));
+        assert_eq!(format_nanos(2_000_000_000).as_deref(), Some("2s"));
+    }
+
+    #[test]
+    fn duration_negative_falls_through() {
+        assert!(format_nanos(-1).is_none());
+    }
+}
+
+/// Render `nanos` as a duration, picking the largest sensible
+/// unit. Negative values fall back to the default renderer
+/// (`Duration` is unsigned in std, so a negative annotated
+/// scalar is almost certainly a misuse rather than a real
+/// duration we should pretend to format).
+fn format_nanos(nanos: i64) -> Option<String> {
+    if nanos < 0 {
+        return None;
+    }
+    let n = nanos as u64;
+    Some(if n >= 1_000_000_000 {
+        let secs = n / 1_000_000_000;
+        let rem = n % 1_000_000_000;
+        // Trim trailing zeros for readability: 1.500s not
+        // 1.500000000s. `format!` doesn't do this for us.
+        let frac = format!("{rem:09}");
+        let frac = frac.trim_end_matches('0');
+        if frac.is_empty() {
+            format!("{secs}s")
+        } else {
+            format!("{secs}.{frac}s")
+        }
+    } else if n >= 1_000_000 {
+        format!("{:.3}ms", nanos as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.3}µs", nanos as f64 / 1_000.0)
+    } else {
+        format!("{n}ns")
+    })
 }

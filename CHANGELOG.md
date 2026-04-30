@@ -7,6 +7,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 4 — iso8601 + duration formats):
+  - `#[bs_viz(format = "iso8601")]` on integer scalars renders
+    the value as a UTC ISO-8601 timestamp (Unix epoch seconds
+    convention) — `1_705_322_096` → `2024-01-15T12:34:56Z`.
+    Powered by `chrono::DateTime::from_timestamp`; values
+    outside chrono's representable range fall back to default
+    rendering.
+  - `#[bs_viz(format = "duration")]` on integer scalars renders
+    the value as a human-readable duration in nanoseconds:
+    `5_000_000` → `5.000ms`, `1_500_000_000` → `1.5s`,
+    `2_000_000_000` → `2s` (trailing-zero trim on the seconds
+    branch). Negative values fall through to default rendering
+    since `Duration` is unsigned.
+  - `viz_demo` gains an `Event` struct exercising both formats
+    inside the summary template. `tests/debugger/viz.rs` asserts
+    `2024-01-15T12:34:56Z` and `5.000ms` appear in the with-spec
+    render and *don't* appear in the bare render.
+  - 5 new unit tests in `ui::generic::variable::format_tests`
+    cover the conversion functions: ISO-8601 fixed point + Unix
+    epoch + pre-epoch negative; duration unit boundaries;
+    negative-duration fallback.
+  - `format = "utf8"` and `format = "hexdump"` are still
+    fall-through (need byte-array detection); tracked under
+    "Remaining" §4.
 - visualisers (Phase 4 Tier-A step 3 — generics + format=hex):
   - `#[derive(DebugView)]` now accepts generic types. The macro
     emits one spec per type *definition* (not per

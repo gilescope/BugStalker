@@ -701,11 +701,14 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1 + 2 + 3 shipped (2026-04-30).** Step 1 wires
-the declarative-spec data path end-to-end; step 2 wires the
-renderer so registered types render through their spec; step 3
-unblocks generics in the derive and applies the `format = "hex|
-bin|oct"` family at render time. The following is live:
+**Status: steps 1 + 2 + 3 + 4 shipped (2026-04-30).** Step 1
+wires the declarative-spec data path end-to-end; step 2 wires
+the renderer so registered types render through their spec;
+step 3 unblocks generics in the derive and applies the
+`format = "hex|bin|oct"` family at render time; step 4 adds
+`format = "iso8601"` (Unix-epoch-seconds → UTC ISO-8601) and
+`format = "duration"` (nanoseconds → human-readable). The
+following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -771,6 +774,32 @@ Step 3 added:
   `strip_generic_args` (basic / nested / malformed-input) and a
   `find_with_generics` integration test.
 
+Step 4 added:
+
+* **`format = "iso8601"` on integer scalars.** Reads the integer
+  as Unix epoch seconds (UTC) and renders
+  `YYYY-MM-DDTHH:MM:SSZ`. Crate authors opt in by attaching the
+  attribute to an `i64` / `u64` field — we don't try to detect
+  `SystemTime`'s internal layout (that's a separate decoder).
+  Powered by `chrono::DateTime::from_timestamp`; values outside
+  chrono's range fall back to default rendering.
+* **`format = "duration"` on integer scalars.** Reads as
+  nanoseconds, picks the largest sensible unit (ns / µs / ms /
+  s) — `5_000_000` → `5.000ms`, `1_500_000_000` → `1.5s`. Trims
+  trailing zeros for the seconds branch so `2_000_000_000` is
+  `2s` not `2.000000000s`. Negative values fall back to default
+  rendering since `Duration` is unsigned.
+* `viz_demo` gains an `Event` struct with `created_at: i64`
+  (`format = "iso8601"`) and `latency_ns: u64` (`format =
+  "duration"`); `tests/debugger/viz.rs` asserts both render
+  forms appear in the with-spec output and *don't* in the bare
+  output.
+* 5 new unit tests in `ui::generic::variable::format_tests`
+  (ISO-8601 known fixed point + Unix epoch + pre-epoch
+  negative; duration unit boundaries; negative-duration fallback)
+  — these cover the conversion logic without needing a
+  debuggee.
+
 **Remaining (in plan order):**
 
 1. **Per-callsite DAP wiring.** `data.rs` has 12+ existing
@@ -783,10 +812,9 @@ Step 3 added:
 3. **`module_path!()` in the macro** so the wire `type_name`
    matches what the v0 demangler produces. Removes the suffix
    fallback and its ambiguity bail.
-4. **`format = "iso8601" | "duration" | "utf8" | "hexdump"`
-   applied at render time.** Need type-specific decoders
-   (`SystemTime` → ISO-8601, `Duration` → human-readable,
-   `&[u8]` → utf-8 probe / hex dump).
+4. **`format = "utf8" | "hexdump"` applied at render time.**
+   Need byte-array detection (`Vec<u8>`, `&[u8]`, `[u8; N]`) —
+   the source-byte plumbing is its own slice of work.
 5. **`CustomView` escape hatch** — non-declarative Tier A.
 6. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
    loaded from `~/.config/bugstalker/visualizers/*.wasm` and from

@@ -26,14 +26,14 @@ fn debug_view_specs_loaded_from_demo_binary() {
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
     let debugger = builder.build(process).unwrap();
 
-    // Three derives in the demo binary (Person, Counter, Wrap);
-    // all three should have been discovered at attach. `Wrap`
-    // is generic — we still emit only one spec per type
+    // Four derives in the demo binary (Person, Counter, Wrap,
+    // Event); all four should have been discovered at attach.
+    // `Wrap` is generic — we still emit only one spec per type
     // *definition*.
     assert_eq!(
         debugger.view_spec_count(),
-        3,
-        "expected 3 specs from viz_demo, got {}",
+        4,
+        "expected 4 specs from viz_demo, got {}",
         debugger.view_spec_count(),
     );
 
@@ -96,11 +96,12 @@ fn debug_view_summary_applied_at_render_time() {
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
-    // BP at the `black_box` line — `p`, `c`, `w_i32`, `w_str`
-    // are all alive at that point so we can read them as locals.
-    debugger.set_breakpoint_at_line("main.rs", 49).unwrap();
+    // BP at the `black_box` line — `p`, `c`, `w_i32`, `w_str`,
+    // `ev` are all alive at that point so we can read them as
+    // locals.
+    debugger.set_breakpoint_at_line("main.rs", 70).unwrap();
     debugger.start_debugee().unwrap();
-    assert_eq!(info.line.take(), Some(49));
+    assert_eq!(info.line.take(), Some(70));
 
     let viz = debugger.view_registry();
     let locals = debugger.read_local_variables().unwrap();
@@ -182,6 +183,41 @@ fn debug_view_summary_applied_at_render_time() {
     assert!(
         ws.contains("Wrap[fish]"),
         "Wrap<&str> summary not applied — got: {ws}",
+    );
+
+    // Step 4 — `iso8601` and `duration` formats applied.
+    // `created_at = 1705322096` is `2024-01-15T12:34:56Z`;
+    // `latency_ns = 5_000_000` is `5.000ms`. Both appear inside
+    // the summary template *and* in the per-field child render.
+    let ev_local = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("ev"))
+        .expect("local `ev` should be in scope");
+    let ev_with_spec = render_value_with_viz(ev_local.value(), Some(viz));
+    let ev_bare = render_value_with_viz(ev_local.value(), None);
+
+    assert!(
+        ev_with_spec.contains("2024-01-15T12:34:56Z"),
+        "iso8601 format not applied — got: {ev_with_spec}",
+    );
+    assert!(
+        ev_with_spec.contains("5.000ms"),
+        "duration format not applied — got: {ev_with_spec}",
+    );
+    assert!(
+        !ev_bare.contains("2024-01-15"),
+        "viz=None path unexpectedly produced ISO-8601: {ev_bare}",
+    );
+    assert!(
+        !ev_bare.contains("5.000ms"),
+        "viz=None path unexpectedly produced ms duration: {ev_bare}",
+    );
+    // The non-formatted `seq` field still renders as the bare
+    // type/value form. Sanity that we didn't accidentally route
+    // every field through `format_scalar`.
+    assert!(
+        ev_with_spec.contains("seq:"),
+        "seq field missing from spec render: {ev_with_spec}",
     );
 
     debugger.continue_debugee().unwrap();
