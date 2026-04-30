@@ -7,6 +7,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 3 — generics + format=hex):
+  - `#[derive(DebugView)]` now accepts generic types. The macro
+    emits one spec per type *definition* (not per
+    monomorphisation); the registry's `find()` strips trailing
+    `<…>` (bracket-depth-aware) before searching, so
+    `Wrap<i32>`, `Wrap<Vec<u8>>`, and nested
+    `HashMap<K, Vec<i32>>` all resolve to the single `Wrap` /
+    `HashMap` entry.
+  - `#[bs_viz(format = "hex|bin|oct")]` now actually formats the
+    rendered scalar (`0xff00ff` instead of `u32(16711935)`). The
+    `iso8601` / `duration` / `utf8` / `hexdump` family are
+    decoded into the registry but still fall through to default
+    rendering pending type-specific decoders.
+  - `examples/viz_demo` gains a generic `Wrap<T>` derive; the
+    integration test `debug_view_summary_applied_at_render_time`
+    now asserts both `w_i32: Wrap<i32>` and `w_str: Wrap<&str>`
+    render through the same single `Wrap[{inner}]` template, and
+    `flags: 0xff00ff` proves the format tag is honoured.
+  - 4 new unit tests in `src/debugger/viz/mod.rs` for
+    `strip_generic_args` and a `find_with_generics` lookup
+    integration test.
 - visualisers (Phase 4 Tier-A step 2 — renderer integration):
   - New `Debugger::view_registry()` borrow exposed to render-
     layer callers.

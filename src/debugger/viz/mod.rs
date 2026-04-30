@@ -82,6 +82,48 @@ pub fn substitute_template(
 const SECT_LINUX: &str = ".bs_viz_spec";
 const SECT_DARWIN: &str = "__bs_viz_spec";
 
+/// Strip the trailing `<...>` generic-args block from a type
+/// name, with proper bracket-depth tracking so nested generics
+/// (`HashMap<K, Vec<i32>>`) are removed cleanly. Returns the
+/// original slice when no `<>` block is present, so callers can
+/// cheaply compare for "did anything change".
+fn strip_generic_args(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    // Find the *outermost* `<` that opens the trailing block.
+    // A trailing `>` is required for it to be a generic-args
+    // block (rust doesn't have stray `<` in type names).
+    if !name.ends_with('>') {
+        return name;
+    }
+    // Walk the bytes once, tracking depth, and remember the
+    // index of the matching `<` for the trailing `>`.
+    let mut depth: i32 = 0;
+    let mut open_idx: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => {
+                if depth == 0 {
+                    open_idx = Some(i);
+                }
+                depth += 1;
+            }
+            b'>' => {
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    // Well-formed name with balanced brackets: depth == 0 at end.
+    // Otherwise leave the name alone — better to miss a match
+    // than mis-truncate a malformed name.
+    if depth == 0
+        && let Some(open) = open_idx
+    {
+        return &name[..open];
+    }
+    name
+}
+
 /// In-memory registry of every `#[derive(DebugView)]` spec
 /// recovered from the debuggee.
 #[derive(Debug, Clone, Default)]
@@ -131,11 +173,17 @@ impl VizRegistry {
     }
 
     /// Return the spec whose `type_name` matches `query`. Match
-    /// rules in order:
+    /// rules, tried in order:
     ///
     /// 1. **Exact match.** If a spec was registered under
     ///    exactly this name, return it.
-    /// 2. **Suffix match against `::<query>`.** The proc-macro
+    /// 2. **Strip generic args.** `Wrap<i32>` → `Wrap`. The
+    ///    macro emits one spec per type *definition*, not per
+    ///    monomorphisation; the renderer hands us the
+    ///    monomorphised name from the v0 demangler, so we strip
+    ///    `<...>` (with proper depth tracking — `HashMap<K,
+    ///    Vec<i32>>` has nested `<>` pairs) before retrying.
+    /// 3. **Suffix match against `::<query>`.** The proc-macro
     ///    currently emits the *local* type name (e.g. `Person`)
     ///    rather than the fully-qualified one
     ///    (`my_crate::Person`). The renderer asks with the
@@ -145,24 +193,29 @@ impl VizRegistry {
     ///    is ambiguous and returns `None` — caller should treat
     ///    "ambiguous" the same as "no spec" so we don't apply
     ///    the wrong template silently. Once the macro records
-    ///    `module_path!()` (phase-4 batch 2) this fallback
-    ///    becomes unreachable.
+    ///    `module_path!()` (later batch) this fallback becomes
+    ///    unreachable.
     pub fn find(&self, query: &str) -> Option<&TypeViewSpec> {
         if let Some(spec) = self.by_name.get(query) {
             return Some(spec);
         }
+        // Generic-stripped exact + suffix match.
+        let stripped = strip_generic_args(query);
+        if stripped != query {
+            if let Some(spec) = self.by_name.get(stripped) {
+                return Some(spec);
+            }
+        }
+        // Suffix match — operates on the already-stripped form
+        // so `my_crate::Wrap<i32>` matches a registered `Wrap`.
         let mut hit: Option<&TypeViewSpec> = None;
         for (key, spec) in &self.by_name {
-            // `query` ends with `::<key>` *or* `query == key`
-            // (handled above). Single-segment registered names
-            // are matched by suffix.
-            if query.len() > key.len() + 2
-                && query.ends_with(key)
-                && query.as_bytes()[query.len() - key.len() - 2..query.len() - key.len()]
+            if stripped.len() > key.len() + 2
+                && stripped.ends_with(key)
+                && stripped.as_bytes()[stripped.len() - key.len() - 2..stripped.len() - key.len()]
                     == *b"::"
             {
                 if hit.is_some() {
-                    // Ambiguous; bail.
                     return None;
                 }
                 hit = Some(spec);
@@ -253,16 +306,65 @@ mod tests {
                 fields: vec![],
             },
         );
-        // `my_crate::Person` now suffix-matches both `Person`
-        // and `twin::Person`; ambiguous.
-        // (The exact match on `Person` is unaffected.)
-        assert!(r.find("my_crate::Person").is_none());
-        assert!(r.find("Person").is_some()); // exact still wins
+        // `crate::twin::Person` suffix-matches *both* registered
+        // keys: `Person` (single-segment suffix) and
+        // `twin::Person` (multi-segment suffix). The lookup
+        // bails to `None` rather than picking one arbitrarily.
+        assert!(r.find("crate::twin::Person").is_none());
+        // Exact match still wins regardless of any suffix-match
+        // ambiguity that could otherwise apply.
+        assert!(r.find("Person").is_some());
+        assert!(r.find("twin::Person").is_some());
     }
 
     #[test]
     fn miss_returns_none() {
         let r = populate();
         assert!(r.find("NotARegisteredType").is_none());
+    }
+
+    #[test]
+    fn strip_generic_args_basic() {
+        assert_eq!(strip_generic_args("Wrap<i32>"), "Wrap");
+        assert_eq!(strip_generic_args("Wrap"), "Wrap");
+        assert_eq!(strip_generic_args(""), "");
+    }
+
+    #[test]
+    fn strip_generic_args_nested() {
+        assert_eq!(
+            strip_generic_args("HashMap<K, Vec<i32>>"),
+            "HashMap"
+        );
+        assert_eq!(
+            strip_generic_args("a::b::Wrap<Vec<HashMap<K, V>>>"),
+            "a::b::Wrap",
+        );
+    }
+
+    #[test]
+    fn strip_generic_args_keeps_malformed() {
+        // No trailing `>` → leave alone.
+        assert_eq!(strip_generic_args("Wrap<i32"), "Wrap<i32");
+        // Unbalanced → leave alone (better miss than mistruncate).
+        assert_eq!(strip_generic_args("Wrap>"), "Wrap>");
+    }
+
+    #[test]
+    fn find_with_generics() {
+        let mut by_name = HashMap::new();
+        by_name.insert(
+            "Wrap".to_string(),
+            TypeViewSpec {
+                type_name: "Wrap".to_string(),
+                summary: Some("Wrap[{inner}]".to_string()),
+                fields: vec![],
+            },
+        );
+        let r = VizRegistry { by_name };
+        assert!(r.find("Wrap<i32>").is_some());
+        assert!(r.find("Wrap<Vec<u8>>").is_some());
+        assert!(r.find("my_crate::Wrap<i32>").is_some());
+        assert!(r.find("Other<i32>").is_none());
     }
 }

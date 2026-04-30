@@ -40,13 +40,15 @@ pub fn derive_debug_view(input: TokenStream) -> TokenStream {
 }
 
 fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
-    if !input.generics.params.is_empty() {
-        return Err(syn::Error::new(
-            input.generics.span(),
-            "step 1 of #[derive(DebugView)] does not support generics yet \
-             — track the per-monomorphisation lowering in phase-4 batch 2",
-        ));
-    }
+    // Phase 4 step 3: generics are now allowed. We still emit a
+    // single spec entry per *type definition* (not per
+    // monomorphisation) — the v0 demangler hands BugStalker
+    // names like `Wrap<i32>`, and the registry's lookup strips
+    // the generic-args before searching, so `Wrap<i32>` and
+    // `Wrap<String>` both resolve to the one spec emitted from
+    // `pub struct Wrap<T> { ... }`. This is correct as long as
+    // the field set + summary template are generic-uniform; the
+    // common case for crate authors.
     let fields = match &input.data {
         Data::Struct(s) => &s.fields,
         Data::Enum(_) => {

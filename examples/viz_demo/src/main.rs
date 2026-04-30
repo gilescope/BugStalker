@@ -25,6 +25,15 @@ pub struct Counter {
     pub n: u64,
 }
 
+/// Step 3 — generic types are supported. The macro emits one
+/// spec per *definition*; the registry's lookup strips
+/// `<…>` so `Wrap<i32>` resolves to this entry.
+#[derive(DebugView)]
+#[bs_viz(summary = "Wrap[{inner}]")]
+pub struct Wrap<T> {
+    pub inner: T,
+}
+
 fn main() {
     let p = Person {
         name: "Ada".to_string(),
@@ -34,7 +43,9 @@ fn main() {
         flags: 0x00FF_00FF,
     };
     let c = Counter { label: "ticks", n: 42 };
-    // Reference both so the linker keeps them.
-    println!("{} / {}", p.name, c.label); // BP_LINE = next line below
-    std::hint::black_box((&p, &c));
+    let w_i32 = Wrap { inner: 17_i32 };
+    let w_str = Wrap { inner: "fish" };
+    // Reference everything so the linker keeps them.
+    println!("{} / {} / {}", p.name, c.label, w_i32.inner); // BP_LINE = next line below
+    std::hint::black_box((&p, &c, &w_i32, &w_str));
 }

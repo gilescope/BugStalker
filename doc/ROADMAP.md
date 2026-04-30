@@ -701,10 +701,11 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1 + 2 shipped (2026-04-30).** Step 1 wires the
-declarative-spec data path end-to-end; step 2 wires the renderer
-so registered types actually render through their spec. The
-following is live:
+**Status: steps 1 + 2 + 3 shipped (2026-04-30).** Step 1 wires
+the declarative-spec data path end-to-end; step 2 wires the
+renderer so registered types render through their spec; step 3
+unblocks generics in the derive and applies the `format = "hex|
+bin|oct"` family at render time. The following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -746,22 +747,46 @@ Step 2 added:
   dump — proving the new code is opt-in and doesn't accidentally
   change the no-spec rendering.
 
+Step 3 added:
+
+* **Generics in `#[derive(DebugView)]`.** The compile-time block
+  on `generics.params.is_empty()` is gone. The macro emits one
+  spec per type *definition* (not per monomorphisation); the
+  registry's lookup strips the trailing `<…>` from the query
+  before searching, so `Wrap<i32>` and `Wrap<Vec<u8>>` both
+  resolve to the single `Wrap` entry. Bracket-depth-aware so
+  nested generics (`HashMap<K, Vec<i32>>`) are stripped cleanly.
+* **`format = "hex|bin|oct"` honoured at render time.** Per-
+  field format tags decoded into the registry now actually shape
+  the rendered output. Hex/bin/oct integer formats are live;
+  `iso8601` / `duration` / `utf8` / `hexdump` decode but fall
+  back to default rendering until their type-specific decoders
+  land — tracked under "Remaining".
+* `tests/debugger/viz.rs` extended: 3 specs expected (Wrap added
+  to `viz_demo`), `Wrap<i32>` / `Wrap<&str>` / nested-generic
+  lookups asserted, `flags` field renders as `0xff00ff` instead
+  of `u32(16711935)`, both `w_i32` and `w_str` locals render
+  through the single shared `Wrap` template.
+* `src/debugger/viz/mod.rs` gains 4 new unit tests for
+  `strip_generic_args` (basic / nested / malformed-input) and a
+  `find_with_generics` integration test.
+
 **Remaining (in plan order):**
 
 1. **Per-callsite DAP wiring.** `data.rs` has 12+ existing
    `render_value_to_string` callers; only the helper itself is
    viz-aware. Update each `impl DebugSession` callsite to pass
    `Some(self.debugger.view_registry())` so the IDE actually
-   picks up summaries. Mechanical; deferred to keep this batch
-   focused on the contract test.
-2. **`module_path!()` in the macro** so the wire `type_name`
+   picks up summaries. Mechanical.
+2. **Tuple structs + enums** in the derive (still compile-error
+   gated, deliberately). Variant-level summaries follow.
+3. **`module_path!()` in the macro** so the wire `type_name`
    matches what the v0 demangler produces. Removes the suffix
    fallback and its ambiguity bail.
-3. **Generics + enums + tuple structs** in the derive (currently
-   compile-error gated, deliberately).
-4. **`format = "hex"` etc. honoured at render time.** The macro
-   already records the format tag; the renderer ignores it for
-   now.
+4. **`format = "iso8601" | "duration" | "utf8" | "hexdump"`
+   applied at render time.** Need type-specific decoders
+   (`SystemTime` → ISO-8601, `Duration` → human-readable,
+   `&[u8]` → utf-8 probe / hex dump).
 5. **`CustomView` escape hatch** — non-declarative Tier A.
 6. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
    loaded from `~/.config/bugstalker/visualizers/*.wasm` and from

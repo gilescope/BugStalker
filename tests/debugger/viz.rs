@@ -26,12 +26,14 @@ fn debug_view_specs_loaded_from_demo_binary() {
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
     let debugger = builder.build(process).unwrap();
 
-    // Two derives in the demo binary; both should have been
-    // discovered at attach.
+    // Three derives in the demo binary (Person, Counter, Wrap);
+    // all three should have been discovered at attach. `Wrap`
+    // is generic — we still emit only one spec per type
+    // *definition*.
     assert_eq!(
         debugger.view_spec_count(),
-        2,
-        "expected 2 specs from viz_demo, got {}",
+        3,
+        "expected 3 specs from viz_demo, got {}",
         debugger.view_spec_count(),
     );
 
@@ -72,6 +74,14 @@ fn debug_view_specs_loaded_from_demo_binary() {
     assert!(debugger.view_spec_for("viz_demo::Person").is_some());
     assert!(debugger.view_spec_for("viz_demo::Counter").is_some());
 
+    // Generic-arg stripping — `Wrap<i32>` and `Wrap<&str>` both
+    // resolve to the single `Wrap` definition.
+    assert!(debugger.view_spec_for("Wrap<i32>").is_some());
+    assert!(debugger.view_spec_for("Wrap<&str>").is_some());
+    assert!(debugger.view_spec_for("viz_demo::Wrap<i32>").is_some());
+    // Even nested generics resolve cleanly.
+    assert!(debugger.view_spec_for("Wrap<Vec<i32>>").is_some());
+
     // A type without a derive must miss.
     assert!(debugger.view_spec_for("std::string::String").is_none());
 
@@ -86,11 +96,11 @@ fn debug_view_summary_applied_at_render_time() {
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
-    // BP at the `black_box` line — both `p` and `c` are alive at
-    // that point so we can read both as locals.
-    debugger.set_breakpoint_at_line("main.rs", 39).unwrap();
+    // BP at the `black_box` line — `p`, `c`, `w_i32`, `w_str`
+    // are all alive at that point so we can read them as locals.
+    debugger.set_breakpoint_at_line("main.rs", 49).unwrap();
     debugger.start_debugee().unwrap();
-    assert_eq!(info.line.take(), Some(39));
+    assert_eq!(info.line.take(), Some(49));
 
     let viz = debugger.view_registry();
     let locals = debugger.read_local_variables().unwrap();
@@ -137,6 +147,41 @@ fn debug_view_summary_applied_at_render_time() {
     assert!(
         !with_spec.contains("category:"),
         "rename leaked the original `category:` label: {with_spec}",
+    );
+
+    // Step 3 — `format = "hex"` on `flags` produces `0xff00ff`
+    // (lower-case for `{:#x}`). The bare path keeps the default
+    // `u32(16711935)` shape.
+    assert!(
+        with_spec.contains("flags: 0xff00ff"),
+        "format=hex not applied — render output: {with_spec}",
+    );
+    assert!(
+        !bare.contains("0xff00ff"),
+        "bare render unexpectedly applied hex format: {bare}",
+    );
+
+    // Step 3 — generic `Wrap<i32>` resolves through the
+    // `Wrap` spec and renders the summary template
+    // `Wrap[{inner}]`. Read both monomorphisations to prove
+    // both work off the same single registered entry.
+    let w_i32 = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("w_i32"))
+        .expect("local `w_i32` should be in scope");
+    let w_str = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("w_str"))
+        .expect("local `w_str` should be in scope");
+    let wi = render_value_with_viz(w_i32.value(), Some(viz));
+    let ws = render_value_with_viz(w_str.value(), Some(viz));
+    assert!(
+        wi.contains("Wrap[17]"),
+        "Wrap<i32> summary not applied — got: {wi}",
+    );
+    assert!(
+        ws.contains("Wrap[fish]"),
+        "Wrap<&str> summary not applied — got: {ws}",
     );
 
     debugger.continue_debugee().unwrap();

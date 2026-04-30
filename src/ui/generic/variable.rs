@@ -2,12 +2,11 @@
 use crate::debugger::address::RelocatedAddress;
 use crate::debugger::variable::execute::{QueryResult, QueryResultKind};
 use crate::debugger::variable::render::{RenderValue, ValueLayout};
-use crate::debugger::variable::value::Member;
-use crate::debugger::variable::value::Value;
+use crate::debugger::variable::value::{Member, Value};
 use crate::debugger::viz::VizRegistry;
 use crate::ui::syntax;
 use crate::ui::syntax::StylizedLine;
-use bs_viz_spec::TypeViewSpec;
+use bs_viz_spec::{Format, TypeViewSpec};
 use syntect::util::as_24_bit_terminal_escaped;
 
 const TAB: &str = "    ";
@@ -123,16 +122,22 @@ fn render_value_inner(
                 let tabs = TAB.repeat(depth + 1);
 
                 for member in members {
-                    let (display_name, hidden) =
+                    let (display_name, hidden, format) =
                         apply_field_overrides(spec, member.field_name.as_deref());
                     if hidden {
                         continue;
                     }
+                    let rendered = format
+                        .filter(|f| *f != Format::Default)
+                        .and_then(|f| format_scalar(&member.value, f))
+                        .unwrap_or_else(|| {
+                            render_value_inner(&member.value, depth + 1, true, viz)
+                        });
                     render = format!("{render}\n");
                     render = format!(
                         "{render}{tabs}{}: {}",
                         display_name.unwrap_or_default(),
-                        render_value_inner(&member.value, depth + 1, true, viz)
+                        rendered,
                     );
                 }
 
@@ -208,27 +213,53 @@ fn substitute_template(template: &str, members: &[Member]) -> String {
     })
 }
 
-/// Resolve field name + visibility against a spec entry. Returns
-/// `(displayed_name, hidden)`. With no spec or no entry for this
-/// field, the raw name is returned and `hidden` is `false`.
+/// Resolve display name, visibility, and per-field format
+/// against a spec entry. Returns `(displayed_name, hidden,
+/// format)`. With no spec or no entry for this field, the raw
+/// name is returned, `hidden = false`, and `format = None`.
 fn apply_field_overrides<'a>(
     spec: Option<&'a TypeViewSpec>,
     field_name: Option<&'a str>,
-) -> (Option<&'a str>, bool) {
+) -> (Option<&'a str>, bool, Option<Format>) {
     let Some(name) = field_name else {
-        return (None, false);
+        return (None, false, None);
     };
     let Some(spec) = spec else {
-        return (Some(name), false);
+        return (Some(name), false, None);
     };
     match spec.fields.iter().find(|f| f.name == name) {
         Some(f) => {
-            let display = f
-                .rename
-                .as_deref()
-                .or(Some(name));
-            (display, f.hidden)
+            let display = f.rename.as_deref().or(Some(name));
+            (display, f.hidden, Some(f.format))
         }
-        None => (Some(name), false),
+        None => (Some(name), false, None),
     }
+}
+
+/// Apply a `#[bs_viz(format = "...")]` override to a scalar
+/// value. Returns `Some(rendered)` when the value is a scalar
+/// integer (or, for `utf8`/`hexdump`, a byte slice we can read)
+/// and the format is applicable. Otherwise `None`, signalling
+/// the caller should fall back to default rendering.
+fn format_scalar(value: &Value, fmt: Format) -> Option<String> {
+    if let Value::Scalar(s) = value {
+        let n = s.try_as_number()?;
+        return Some(match fmt {
+            Format::Hex => format!("{:#x}", n),
+            Format::Bin => format!("{:#b}", n),
+            Format::Oct => format!("{:#o}", n),
+            // iso8601 / duration only meaningful for time types,
+            // utf8 / hexdump only for byte arrays. Step 3
+            // implements the integer formats; the others fall
+            // back to default rendering until their type-specific
+            // decoders land.
+            Format::Default
+            | Format::Iso8601
+            | Format::Duration
+            | Format::Utf8
+            | Format::Hexdump => return None,
+        });
+    }
+    // Non-scalar — let the default renderer handle it.
+    None
 }
