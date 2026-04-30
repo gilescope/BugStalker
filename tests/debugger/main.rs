@@ -22,6 +22,7 @@ mod symbol;
 // tokio-on-darwin batch.
 #[cfg(target_os = "linux")]
 mod tokio;
+mod fuzz;
 mod unwind;
 mod variables;
 // Hardware-watchpoint tests only run on x86_64. The aarch64 code path
