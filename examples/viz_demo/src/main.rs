@@ -67,6 +67,16 @@ pub struct Point(pub i32, pub i32);
 #[bs_viz(summary = "Sentinel")]
 pub struct Sentinel;
 
+/// Step 9 — `name = "..."` override. When two crates each
+/// derive `DebugView` on a type with the same local name, the
+/// suffix-match lookup is ambiguous and bails to `None`. The
+/// override lets users record the fully-qualified name so the
+/// exact-match path fires. The recorded name is what
+/// `Debugger::view_spec_for` looks up.
+#[derive(DebugView)]
+#[bs_viz(name = "qualified::Marker", summary = "Marker#{__0}")]
+pub struct Marker(pub u32);
+
 /// Step 6 — enum with type-level summary as fallback.
 /// Step 8 — per-variant `summary` overrides the type-level one
 /// when that variant is active, and `tag = "..."` annotates the
@@ -105,9 +115,11 @@ fn main() {
     let sentinel = Sentinel;
     let status_ok = Status::Connected(443);
     let status_err = Status::Error("transport reset");
+    let marker = Marker(99);
     // Reference everything so the linker keeps them.
     println!("{} / {} / {} / {}", p.name, c.label, w_i32.inner, ev.seq); // BP_LINE = next line below
     std::hint::black_box((
         &p, &c, &w_i32, &w_str, &ev, &uid, &pt, &sentinel, &status_ok, &status_err,
+        &marker,
     ));
 }

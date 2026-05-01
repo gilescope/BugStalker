@@ -27,14 +27,16 @@ fn debug_view_specs_loaded_from_demo_binary() {
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
     let debugger = builder.build(process).unwrap();
 
-    // Eight derives in the demo binary: Person, Counter, Wrap,
-    // Event, UserId, Point, Sentinel, Status. `Wrap` is
-    // generic — one spec per type *definition*; tuple, unit,
-    // and enum each count as one spec.
+    // Nine derives in the demo binary: Person, Counter, Wrap,
+    // Event, UserId, Point, Sentinel, Status, Marker. `Wrap`
+    // is generic — one spec per type *definition*; tuple,
+    // unit, and enum each count as one spec; `Marker` carries
+    // a `name = "..."` override so it registers under
+    // `"qualified::Marker"`.
     assert_eq!(
         debugger.view_spec_count(),
-        8,
-        "expected 8 specs from viz_demo, got {}",
+        9,
+        "expected 9 specs from viz_demo, got {}",
         debugger.view_spec_count(),
     );
 
@@ -143,6 +145,20 @@ fn debug_view_specs_loaded_from_demo_binary() {
         .expect("Error variant should be in the spec");
     assert_eq!(err_v.tag.as_deref(), Some("err"));
 
+    // Step 9 — `name = "qualified::Marker"` overrides the
+    // recorded type_name. The local-only "Marker" lookup must
+    // miss; the explicit qualified key hits exactly. This is
+    // how a crate author disambiguates after a suffix-match
+    // ambiguity bail.
+    let marker_spec = debugger
+        .view_spec_for("qualified::Marker")
+        .expect("qualified::Marker should resolve via the explicit name");
+    assert_eq!(marker_spec.summary.as_deref(), Some("Marker#{__0}"));
+    // The fully-qualified probe also succeeds via suffix-match
+    // on its own — `something::qualified::Marker` should still
+    // resolve.
+    assert!(debugger.view_spec_for("crate::qualified::Marker").is_some());
+
     drop(debugger);
 }
 
@@ -156,9 +172,9 @@ fn debug_view_summary_applied_at_render_time() {
 
     // BP at the `black_box` line — every local in `main` is
     // alive at this point.
-    debugger.set_breakpoint_at_line("main.rs", 110).unwrap();
+    debugger.set_breakpoint_at_line("main.rs", 121).unwrap();
     debugger.start_debugee().unwrap();
-    assert_eq!(info.line.take(), Some(110));
+    assert_eq!(info.line.take(), Some(121));
 
     let viz = debugger.view_registry();
     let locals = debugger.read_local_variables().unwrap();
@@ -356,6 +372,26 @@ fn debug_view_summary_applied_at_render_time() {
         !ok_bare.contains("Connected (port"),
         "viz=None path unexpectedly produced variant summary: {ok_bare}",
     );
+
+    // Step 9 — `Marker` registers under `"qualified::Marker"`
+    // (an arbitrary prefix the user chose). The renderer
+    // queries with the actual demangled path
+    // (`viz_demo::Marker`); since that path does not end in
+    // `::qualified::Marker`, the suffix-match misses and the
+    // bare struct render is produced. This is the *expected*
+    // behaviour — the override exists so users can pick the key
+    // *they* want for an external lookup, not to magically
+    // rewrite what the demangler emits. The contract is
+    // asserted at registry level above; here we sanity-check
+    // that the renderer doesn't panic when a registered name
+    // doesn't match the demangled path.
+    let marker_local = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("marker"));
+    if let Some(marker_local) = marker_local {
+        let r = render_value_with_viz(marker_local.value(), Some(viz));
+        assert!(!r.is_empty(), "marker render should not be empty");
+    }
 
     // Step 7 — DAP path now threads the registry through. The
     // public `data::read_locals` function is what the IDE

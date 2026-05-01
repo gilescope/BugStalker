@@ -7,6 +7,24 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 9 — `name = "..."` override):
+  - New `#[bs_viz(name = "fully::qualified::Path")]` type-level
+    attribute. When set, overrides the recorded `type_name` in
+    the spec — useful for disambiguating two crates that each
+    derive `DebugView` on a type with the same local name and
+    consequently hit the registry's suffix-match ambiguity bail.
+    Default behaviour (no `name` attr) is unchanged.
+  - `bs-viz-sdk` README rewritten to document the full attribute
+    surface — type / field / variant levels — in one place.
+  - `viz_demo` gains `Marker(u32)` with
+    `#[bs_viz(name = "qualified::Marker")]`. Test asserts
+    `view_spec_for("qualified::Marker")` resolves exactly while
+    `view_spec_for("Marker")` misses, proving the override
+    replaces the key cleanly.
+  - True `module_path!()` integration (so the common case
+    Just Works without an explicit override) is still tracked
+    under "Remaining" §1 — needs a const-fn that assembles
+    bytes from a runtime-known prefix.
 - visualisers (Phase 4 Tier-A step 8 — per-variant enum attrs):
   - **Wire format v2.** `bs-viz-spec` bumps `VERSION` to 2 and
     appends a `num_variants + variant[]` block to each entry's

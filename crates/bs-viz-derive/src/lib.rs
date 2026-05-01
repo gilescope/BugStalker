@@ -65,7 +65,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             }
         };
 
-    let summary = parse_type_attrs(&input.attrs)?;
+    let type_attrs = parse_type_attrs(&input.attrs)?;
+    let summary = type_attrs.summary;
     let mut field_specs = Vec::new();
     let field_iter: Box<dyn Iterator<Item = &syn::Field>> = match fields {
         Some(fs) => Box::new(fs.iter()),
@@ -105,7 +106,17 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // `"::Name"` is fine — the proc-macro emits Rust source, the
     // compiler evaluates it.
     let ty_ident = &input.ident;
-    let local_name = ty_ident.to_string();
+    // Step 9 — `#[bs_viz(name = "...")]` overrides the recorded
+    // type_name. Without it we fall back to the local-only
+    // ident, which still works via the registry's suffix match
+    // for the unambiguous-name case. Users hitting an ambiguity
+    // bail (two crates each defining `Person`) write the
+    // qualified path themselves until the const-fn-assembled
+    // `module_path!()` integration lands.
+    let local_name = type_attrs
+        .name
+        .clone()
+        .unwrap_or_else(|| ty_ident.to_string());
 
     // Encode at proc-macro time using a placeholder type_name;
     // patch the bytes at the language level by rebuilding the
@@ -169,29 +180,48 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     })
 }
 
-/// Parsed `#[bs_viz(...)]` data on a struct itself. Only
-/// `summary = "..."` is supported in step 1.
-fn parse_type_attrs(attrs: &[syn::Attribute]) -> syn::Result<Option<String>> {
-    let mut summary: Option<String> = None;
+#[derive(Default)]
+struct TypeAttrs {
+    summary: Option<String>,
+    /// Step 9 — explicit `name = "..."` override for the recorded
+    /// type-name. When set, this string is used verbatim as the
+    /// spec's `type_name` (and therefore the registry's lookup
+    /// key) instead of the local stringified ident. The escape
+    /// hatch for users who hit a suffix-match ambiguity bail —
+    /// they can disambiguate by writing the full path
+    /// themselves: `#[bs_viz(name = "my_crate::Person")]`. Once
+    /// the macro learns to compose `module_path!()` at the user
+    /// crate's compile time (a follow-up), this attribute
+    /// becomes redundant for the common case but stays as the
+    /// authoritative override for re-exports / module renames.
+    name: Option<String>,
+}
+
+fn parse_type_attrs(attrs: &[syn::Attribute]) -> syn::Result<TypeAttrs> {
+    let mut out = TypeAttrs::default();
     for attr in attrs {
         if !attr.path().is_ident("bs_viz") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("summary") {
-                let v = meta.value()?;
-                let s: syn::LitStr = v.parse()?;
-                summary = Some(s.value());
+                let v: syn::LitStr = meta.value()?.parse()?;
+                out.summary = Some(v.value());
+                Ok(())
+            } else if meta.path.is_ident("name") {
+                let v: syn::LitStr = meta.value()?.parse()?;
+                out.name = Some(v.value());
                 Ok(())
             } else {
                 Err(meta.error(
                     "unknown #[bs_viz(...)] attribute on type \
-                     (step 1 supports `summary = \"...\"` only)",
+                     (supports `summary = \"...\"` and \
+                     `name = \"fully::qualified::Path\"`)",
                 ))
             }
         })?;
     }
-    Ok(summary)
+    Ok(out)
 }
 
 #[derive(Default)]

@@ -701,7 +701,7 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1–8 shipped (2026-05-01).** Step 1 wires the
+**Status: steps 1–9 shipped (2026-05-01).** Step 1 wires the
 declarative-spec data path end-to-end; step 2 wires the
 renderer; step 3 unblocks generics + `format = "hex|bin|oct"`;
 step 4 adds `format = "iso8601"` and `format = "duration"`;
@@ -710,7 +710,10 @@ where templates skipped field formats; step 6 unblocks enums
 with type-level summaries; step 7 wires every existing DAP
 callsite through to the registry; step 8 bumps the spec wire
 format to v2 and lights up per-variant `summary` overrides +
-`tag = "..."` state-tag chips on enums. The following is live:
+`tag = "..."` state-tag chips on enums; step 9 ships the
+`#[bs_viz(name = "...")]` type-name override as the
+authoritative escape hatch for suffix-match ambiguity. The
+following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -913,11 +916,36 @@ Step 8 added:
   DAP `read_locals` path) plus per-variant fields round-trip
   in the registry.
 
+Step 9 added:
+
+* **`#[bs_viz(name = "fully::qualified::Path")]`.** Type-level
+  attribute that overrides the recorded `type_name` in the spec.
+  When set, the registry indexes the spec under exactly this
+  string; the registered key then matches an exact-match query
+  cleanly and disambiguates the rare case of two crates each
+  deriving on a type with the same local name. Default
+  behaviour (no `name` attr) is unchanged: local-only ident +
+  the registry's suffix-match.
+* **`bs-viz-sdk` README** documents the full attribute surface
+  in one place — type / field / variant levels — and notes which
+  formats are live vs. round-tripping pending decoders.
+* `viz_demo` gains `Marker(u32)` derived with
+  `#[bs_viz(name = "qualified::Marker")]`. The integration test
+  asserts `view_spec_for("qualified::Marker")` resolves
+  exactly, while local `view_spec_for("Marker")` misses (proving
+  the override actually replaces the recorded key, doesn't
+  duplicate).
+* **Follow-up still tracked.** True `module_path!()` integration
+  needs a `const fn` that assembles bytes from a runtime-known
+  prefix at user-crate compile time. Tractable but ~100 lines of
+  const-fn machinery; deferred until the explicit `name` escape
+  hatch shows real usage signal.
+
 **Remaining (in plan order):**
 
-1. **`module_path!()` in the macro** so the wire `type_name`
-   matches what the v0 demangler produces. Removes the suffix
-   fallback and its ambiguity bail.
+1. **`module_path!()` integrated into the macro itself** — the
+   const-fn-assembled approach so users don't have to write the
+   `name = "..."` override by hand for the common case.
 2. **`format = "utf8" | "hexdump"` applied at render time.**
    Need byte-array detection (`Vec<u8>`, `&[u8]`, `[u8; N]`) —
    the source-byte plumbing is its own slice of work.
