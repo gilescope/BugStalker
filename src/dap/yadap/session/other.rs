@@ -308,6 +308,64 @@ impl super::DebugSession {
     ///   "waitingForTaskId": 12          // joinHandle only
     /// }
     /// ```
+    /// `bs/visualiserList` — enumerate every Phase 4 Tier-A
+    /// visualiser spec the loader recovered from the debuggee
+    /// binary. Lets an IDE settings panel surface "what's
+    /// registered" without having to hit a value first; also
+    /// useful for debugging the macro / loader plumbing
+    /// itself.
+    ///
+    /// Response shape:
+    ///
+    /// ```json
+    /// {
+    ///   "visualisers": [
+    ///     {
+    ///       "typeName": "viz_demo::Person",
+    ///       "summary":  "Person({name}, age {age})",
+    ///       "origin":   "tier-a",
+    ///       "fields":   [{ "name": ..., "rename": ..., ... }],
+    ///       "variants": [{ "name": ..., "summary": ..., "tag": ..., "fields": [...] }]
+    ///     },
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// `origin` is currently always `"tier-a"`; when Tier B
+    /// (wasm) ships it will distinguish wasm-loaded visualisers
+    /// and built-in stdlib specialisations.
+    pub(super) fn handle_visualiser_list(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let dbg = self
+            .debugger
+            .as_ref()
+            .ok_or_else(|| anyhow!("bs/visualiserList: debugger not initialized"))?;
+        let viz = dbg.view_registry();
+        let visualisers: Vec<Value> = viz
+            .iter()
+            .map(|(name, spec)| {
+                json!({
+                    "typeName": name,
+                    "summary":  spec.summary,
+                    "origin":   "tier-a",
+                    "fields":   spec.fields.iter().map(serialize_field).collect::<Vec<_>>(),
+                    "variants": spec.variants.iter().map(|v| json!({
+                        "name":    v.name,
+                        "summary": v.summary,
+                        "tag":     v.tag,
+                        "fields":  v.fields.iter().map(serialize_field).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        self.send_success_body(
+            req,
+            json!({
+                "visualisers": visualisers,
+            }),
+        )
+    }
+
     pub(super) fn handle_await_trace(&mut self, req: &DapRequest) -> anyhow::Result<()> {
         let dbg = self
             .debugger
@@ -471,4 +529,17 @@ fn completion_prefix(text: &str, column: Option<i64>) -> (String, i64, i64) {
     let length = (end_idx - start_idx) as i64;
     let start_column = start_idx as i64 + 1;
     (prefix, start_column, length)
+}
+
+/// Serialise one [`bs_viz_spec::FieldSpec`] into the JSON shape
+/// the `bs/visualiserList` response uses. Shared between the
+/// type-level fields list and the per-variant fields list so
+/// the structure stays in one place.
+fn serialize_field(f: &bs_viz_spec::FieldSpec) -> Value {
+    json!({
+        "name":   f.name,
+        "rename": f.rename,
+        "hidden": f.hidden,
+        "format": f.format.as_wire_str(),
+    })
 }

@@ -655,6 +655,8 @@ impl DebugSession {
             // Phase 3 Feature D batch D3 — BugStalker-specific custom
             // requests. Spec lives in `doc/plans/phase-3-dyn-trait-and-async.md`.
             "bs/awaitTrace" => self.handle_await_trace(req)?,
+            // Phase 4 step 12 — Tier-A visualiser introspection.
+            "bs/visualiserList" => self.handle_visualiser_list(req)?,
             other => {
                 self.send_err(req, format!("Unsupported DAP command: {other}"))?;
             }

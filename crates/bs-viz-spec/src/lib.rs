@@ -106,6 +106,22 @@ impl Format {
             _ => return None,
         })
     }
+
+    /// Stable lower-case wire string. Used by the DAP
+    /// `bs/visualiserList` response and any other JSON
+    /// surface that surfaces format tags to clients.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Hex => "hex",
+            Self::Bin => "bin",
+            Self::Oct => "oct",
+            Self::Iso8601 => "iso8601",
+            Self::Duration => "duration",
+            Self::Utf8 => "utf8",
+            Self::Hexdump => "hexdump",
+        }
+    }
 }
 
 /// Per-field spec.

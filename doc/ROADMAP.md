@@ -701,7 +701,7 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1–11 shipped (2026-05-01).** Step 1 wires the
+**Status: steps 1–12 shipped (2026-05-01).** Step 1 wires the
 declarative-spec data path end-to-end; step 2 wires the
 renderer; step 3 unblocks generics + `format = "hex|bin|oct"`;
 step 4 adds `format = "iso8601"` and `format = "duration"`;
@@ -713,8 +713,10 @@ format to v2 and lights up per-variant `summary` + `tag` on
 enums; step 9 ships the `#[bs_viz(name = "...")]` override;
 step 10 makes the common case Just Work via a const-fn-
 assembled `module_path!()`-prefixed name; step 11 closes the
-last format gap by applying `format = "utf8"` and `format =
-"hexdump"` to byte-array fields. The following is live:
+last format gap with `format = "utf8" | "hexdump"` on byte
+arrays; step 12 ships the `bs/visualiserList` custom DAP
+request so an IDE settings panel can enumerate every Tier-A
+spec recovered from the debuggee. The following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -995,15 +997,38 @@ Step 11 added:
   `raw: 00 ff 42 53 56 31`. Integration test asserts both
   rendered forms appear in the with-spec output.
 
+Step 12 added:
+
+* **`bs/visualiserList` custom DAP request.** Enumerates every
+  Tier-A spec the loader recovered, with full attribute fidelity
+  (type name, summary template, fields with rename / hidden /
+  format, variants with their own summary / tag / per-field
+  overrides). `origin` field is always `"tier-a"` today; will
+  distinguish wasm-loaded specs once Tier B ships.
+* `Format::as_wire_str()` exposes a stable lower-case JSON
+  string for each format tag (`"hex"`, `"iso8601"`, …), so the
+  wire surface and the attribute syntax users write match.
+* New `tests/dap/dap_stdio.rs::test_stdio_dap_visualiser_list`
+  drives the full DAP wire: launches `bs --dap-local viz_demo`,
+  initialises, sends `bs/visualiserList`, asserts 10 visualisers
+  come back and the `Person` / `Status` / `qualified::Marker`
+  shapes are exactly right (hex format, hidden field, variant
+  tags + summaries, name override).
+
 **Remaining (in plan order):**
 
-1. **`CustomView` escape hatch** — non-declarative Tier A.
+1. **`bs/visualiserToggle` and `bs/visualiserError`** — the
+   other two custom DAP requests called out in the plan.
+   Toggle disables a visualiser per-session (debugging the
+   visualiser itself); Error returns the most recent
+   visualiser-failure for the IDE problems panel. Small,
+   bounded.
+2. **`CustomView` escape hatch** — non-declarative Tier A.
    `#[bs_viz(custom)]` + `impl CustomView for MyType` lets
    crate authors hook into the existing `call_debug_fmt`
    machinery for visualisations that go beyond the
-   declarative spec (custom slot tables, hash-structure walks,
-   etc.).
-2. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
+   declarative spec.
+3. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
    loaded from `~/.config/bugstalker/visualizers/*.wasm` and from
    `.bs_visualizer_wasm` sections.
 

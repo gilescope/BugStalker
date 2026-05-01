@@ -7,6 +7,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 12 — `bs/visualiserList` DAP):
+  - New `bs/visualiserList` custom DAP request enumerates every
+    Tier-A spec the loader recovered from the debuggee. Response
+    body is `{ "visualisers": [{ "typeName", "summary", "origin",
+    "fields": [...], "variants": [{ "name", "summary", "tag",
+    "fields": [...] }] }] }` with full attribute fidelity. An IDE
+    settings panel can render the list without first having to
+    hit a value of any of those types.
+  - `Format::as_wire_str()` returns a stable lower-case wire
+    string (`"hex"`, `"iso8601"`, …) shared by the JSON response
+    and the attribute syntax users write.
+  - `origin` is always `"tier-a"` today; will distinguish
+    `"tier-b"` (wasm) and `"built-in"` (stdlib specialisations)
+    when those land.
+  - Integration test
+    `tests/dap/dap_stdio.rs::test_stdio_dap_visualiser_list`
+    drives the full DAP wire end-to-end against `viz_demo` —
+    asserts 10 visualisers, `Person.flags = format "hex"`,
+    `Person._private_token` hidden, `Status::Connected` tag
+    `"ok"`, `qualified::Marker` registered under the explicit
+    name override.
 - darwin: auto-recover DWARF for `split-debuginfo = "unpacked"`:
   - The DWARF loader (`src/debugger/debugee/dwarf/mod.rs`)
     previously had four lookup paths: `.dSYM` bundle (macOS),
