@@ -122,14 +122,15 @@ impl From<MachError> for Error {
             eprintln!("[darwin_mach->Error] {}", e);
             eprintln!("{}", std::backtrace::Backtrace::force_capture());
         }
-        // KERN_FAILURE on darwin almost always means the *caller*
-        // (us) lacks the debugger entitlement — `task_for_pid`
-        // returns this even when the inferior is our own child.
-        // Surface that distinct case as a richer error variant so
-        // the DAP layer's response.message contains the actual
-        // remediation steps instead of a bare `Ptrace(EFAULT)`.
-        // Other Mach failures keep the historical mapping.
-        if e.0 == 5 {
+        // KERN_FAILURE on darwin is the *generic* Mach error code —
+        // many syscalls return it for unrelated reasons. We only
+        // promote it to `DarwinDebuggerEntitlementMissing` if
+        // `task_for_pid` has not yet succeeded in this process: if
+        // it has, the cs.debugger entitlement is already proven and
+        // a later KERN_FAILURE comes from a different Mach call
+        // (e.g. `thread_set_arm_debug_state64` during a step) and
+        // would mislead the user if reported as a codesign issue.
+        if e.0 == 5 && !TASK_FOR_PID_EVER_SUCCEEDED.load(std::sync::atomic::Ordering::Relaxed) {
             // The binary that needs the entitlement is *us* — the
             // running BugStalker binary, not the inferior — so resolve
             // current_exe() and inline its absolute path into the
@@ -181,6 +182,16 @@ fn check(kr: kern_return_t) -> Result<(), MachError> {
 static TASK_FOR_PID_CACHE: std::sync::Mutex<Option<HashMap<i32, task_t>>> =
     std::sync::Mutex::new(None);
 
+// Set to true the first time `task_for_pid` returns KERN_SUCCESS in
+// this process. Used by the `From<MachError> for Error` impl to
+// disambiguate KERN_FAILURE: before the flag flips it's almost
+// certainly missing-cs.debugger; after it flips, the entitlement is
+// already proven and any later KERN_FAILURE is from a different
+// Mach call (e.g. `thread_set_state`, `task_resume`) and shouldn't
+// be misreported as a codesign issue.
+pub(super) static TASK_FOR_PID_EVER_SUCCEEDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
     {
         let guard = TASK_FOR_PID_CACHE.lock().unwrap();
@@ -196,6 +207,7 @@ pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
     let kr = unsafe { raw_task_for_pid(mach_task_self(), pid.as_raw(), &mut task) };
     check(kr)?;
     debug_assert!(task != 0, "task_for_pid returned KERN_SUCCESS but null port");
+    TASK_FOR_PID_EVER_SUCCEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut guard = TASK_FOR_PID_CACHE.lock().unwrap();
     guard.get_or_insert_with(HashMap::new).insert(pid.as_raw(), task);
     Ok(task)
