@@ -71,9 +71,9 @@ pub enum Error {
          binary with the `com.apple.security.cs.debugger` entitlement \
          (see tests/darwin.entitlements). \
          `codesign -s - --entitlements tests/darwin.entitlements --force \
-         <path-to-binary>`"
+         {binary}`"
     )]
-    DarwinDebuggerEntitlementMissing { mach: String },
+    DarwinDebuggerEntitlementMissing { mach: String, binary: String },
     #[error("{0} syscall error: {1}")]
     Syscall(&'static str, nix::Error),
     #[error("multiple syscall errors {0:?}")]

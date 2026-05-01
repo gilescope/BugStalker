@@ -130,8 +130,17 @@ impl From<MachError> for Error {
         // remediation steps instead of a bare `Ptrace(EFAULT)`.
         // Other Mach failures keep the historical mapping.
         if e.0 == 5 {
+            // The binary that needs the entitlement is *us* — the
+            // running BugStalker binary, not the inferior — so resolve
+            // current_exe() and inline its absolute path into the
+            // codesign command. Fall back to a placeholder if the
+            // syscall fails (rare; e.g. exe deleted from under us).
+            let binary = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<path-to-binary>".to_string());
             return Error::DarwinDebuggerEntitlementMissing {
                 mach: e.to_string(),
+                binary,
             };
         }
         Ptrace(Errno::EFAULT)
