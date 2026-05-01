@@ -701,15 +701,16 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1–7 shipped (2026-05-01).** Step 1 wires the
+**Status: steps 1–8 shipped (2026-05-01).** Step 1 wires the
 declarative-spec data path end-to-end; step 2 wires the
 renderer; step 3 unblocks generics + `format = "hex|bin|oct"`;
 step 4 adds `format = "iso8601"` and `format = "duration"`;
 step 5 unblocks tuple + unit structs and fixes the silent bug
 where templates skipped field formats; step 6 unblocks enums
 with type-level summaries; step 7 wires every existing DAP
-callsite through to the registry so the IDE actually shows
-summaries in its variables panel. The following is live:
+callsite through to the registry; step 8 bumps the spec wire
+format to v2 and lights up per-variant `summary` overrides +
+`tag = "..."` state-tag chips on enums. The following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -881,19 +882,47 @@ Step 7 added:
   predicate, not a UI render — applying summaries there would
   change comparison semantics.
 
+Step 8 added:
+
+* **Wire format v2** — `bs-viz-spec` bumps `VERSION` to `2` and
+  appends a `num_variants + variant[]` block to the payload.
+  Each `VariantSpec` carries `name`, optional `summary`,
+  optional `tag`, and a per-variant field list. Pre-v2 readers
+  reject v2 entries cleanly via `UnsupportedVersion`. New
+  unit test `roundtrip_enum_with_variants` covers the round
+  trip.
+* **`bs-viz-derive` parses variant attributes.**
+  `#[bs_viz(summary = "...", tag = "...")]` on an enum variant
+  is recognised; per-field overrides on variant fields parse
+  identically to struct fields (so `#[bs_viz(format = "hex")]`
+  on a variant's tuple field works the same way as on a struct
+  field).
+* **Renderer dispatches variant-first.** TUI/console + DAP
+  paths both prefer the variant-level `summary` over the type-
+  level one, apply variant-scoped field overrides for
+  placeholder substitution, and prepend a leading `[tag]` chip
+  (with one space before it) when the active variant carries a
+  `tag = "..."` attribute. Render shape:
+    `<EnumType>` `[<tag>]` `<variant-or-type-summary>`
+  — the IDE chooses how to surface the tag (colour chip,
+  status icon); the wire format keeps it as opaque text.
+* `viz_demo`'s `Status` enum now carries variant attributes:
+  `Connected(u32)` → `Status [ok] ✓ Connected (port 443)`;
+  `Error(&str)` → `Status [err] ✗ Error: transport reset`.
+  Integration test asserts both render forms (TUI path *and*
+  DAP `read_locals` path) plus per-variant fields round-trip
+  in the registry.
+
 **Remaining (in plan order):**
 
-1. **Per-variant attributes on enums.** Variant-level `summary`
-   override + `tag = "..."` for state-tag display. Wire format
-   needs an additive `variants` list; bump the spec version.
-2. **`module_path!()` in the macro** so the wire `type_name`
+1. **`module_path!()` in the macro** so the wire `type_name`
    matches what the v0 demangler produces. Removes the suffix
    fallback and its ambiguity bail.
-3. **`format = "utf8" | "hexdump"` applied at render time.**
+2. **`format = "utf8" | "hexdump"` applied at render time.**
    Need byte-array detection (`Vec<u8>`, `&[u8]`, `[u8; N]`) —
    the source-byte plumbing is its own slice of work.
-4. **`CustomView` escape hatch** — non-declarative Tier A.
-5. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
+3. **`CustomView` escape hatch** — non-declarative Tier A.
+4. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
    loaded from `~/.config/bugstalker/visualizers/*.wasm` and from
    `.bs_visualizer_wasm` sections.
 

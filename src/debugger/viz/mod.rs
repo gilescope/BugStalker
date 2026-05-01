@@ -259,6 +259,7 @@ mod tests {
                     hidden: false,
                     format: Format::Default,
                 }],
+                variants: vec![],
             },
         );
         by_name.insert(
@@ -267,6 +268,7 @@ mod tests {
                 type_name: "other::Thing".to_string(),
                 summary: None,
                 fields: vec![],
+                variants: vec![],
             },
         );
         VizRegistry { by_name }
@@ -304,6 +306,7 @@ mod tests {
                 type_name: "twin::Person".to_string(),
                 summary: None,
                 fields: vec![],
+                variants: vec![],
             },
         );
         // `crate::twin::Person` suffix-matches *both* registered
@@ -359,6 +362,7 @@ mod tests {
                 type_name: "Wrap".to_string(),
                 summary: Some("Wrap[{inner}]".to_string()),
                 fields: vec![],
+                variants: vec![],
             },
         );
         let r = VizRegistry { by_name };

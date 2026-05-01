@@ -91,24 +91,56 @@ fn render_value_inner(
                 }
             }
             ValueLayout::Wrapped(val) => {
-                // Phase 4 step 6 — enum summary template
-                // application. When the outer is a RustEnum and
-                // its enum-type carries a registered spec, we
-                // substitute the template against the *active
-                // variant's* members. The variant's struct is
-                // already what `Wrapped` is pointing at, so we
-                // just need to recognise the outer shape.
-                if let Value::RustEnum(_) = value
-                    && let Value::Struct(variant) = val
-                    && let Some(spec) = viz.and_then(|r| {
+                // Step 6 + 8 — enum dispatch on active variant.
+                // Step 6 took the type-level summary; step 8
+                // looks first for a *variant-level* spec, falls
+                // back to the type-level one, and prepends the
+                // variant's `tag` (when set) as a leading
+                // `[tag]` chip. Render order:
+                //
+                //   <enum> [<tag>] <summary-or-default>
+                //
+                // The tag is purely a string the crate author
+                // chose (`ok`, `warn`, `err`, ...); presentation
+                // is the IDE's call. Wrapping it in `[...]` is
+                // BugStalker's lowest-common-denominator default.
+                if let Value::RustEnum(re) = value {
+                    if let Some(spec) = viz.and_then(|r| {
                         let outer = value.r#type().name_fmt();
                         r.find(&outer)
-                    })
-                    && let Some(tmpl) = spec.summary.as_deref()
-                {
-                    let outer_type = value.r#type().name_fmt();
-                    let summary = substitute_template(tmpl, &variant.members, spec);
-                    return format!("{outer_type} {summary}");
+                    }) {
+                        let active_variant_name = re
+                            .value
+                            .as_ref()
+                            .and_then(|m| m.field_name.as_deref());
+                        let variant_spec = active_variant_name
+                            .and_then(|n| spec.variants.iter().find(|v| v.name == n));
+                        let tmpl = variant_spec
+                            .and_then(|v| v.summary.as_deref())
+                            .or(spec.summary.as_deref());
+                        if let (Some(tmpl), Value::Struct(variant)) = (tmpl, val) {
+                            // Variant-scoped fields override
+                            // type-level ones for placeholder
+                            // resolution. We synthesise a temp
+                            // spec view via `substitute_with_fields`
+                            // so renames / formats from the
+                            // variant entry apply.
+                            let outer_type = value.r#type().name_fmt();
+                            let summary = match variant_spec {
+                                Some(v) => substitute_template_with_fields(
+                                    tmpl,
+                                    &variant.members,
+                                    &v.fields,
+                                ),
+                                None => substitute_template(tmpl, &variant.members, spec),
+                            };
+                            let tag_prefix = variant_spec
+                                .and_then(|v| v.tag.as_deref())
+                                .map(|t| format!(" [{t}]"))
+                                .unwrap_or_default();
+                            return format!("{outer_type}{tag_prefix} {summary}");
+                        }
+                    }
                 }
                 format!(
                     "{}::{}",
@@ -232,11 +264,24 @@ fn render_value_inner(
 /// for a field marked `format = "hex"` substitutes as
 /// `0xff00ff` rather than the raw decimal form.
 fn substitute_template(template: &str, members: &[Member], spec: &TypeViewSpec) -> String {
+    substitute_template_with_fields(template, members, &spec.fields)
+}
+
+/// Same substitution as [`substitute_template`] but takes the
+/// per-field overrides directly. Step 8 needs this so a
+/// variant-scoped field list (the `fields` of a
+/// `VariantSpec`) can drive placeholder resolution without
+/// having to round-trip through a synthetic `TypeViewSpec`.
+fn substitute_template_with_fields(
+    template: &str,
+    members: &[Member],
+    fields: &[bs_viz_spec::FieldSpec],
+) -> String {
     crate::debugger::viz::substitute_template(template, members, |m| {
         let format = m
             .field_name
             .as_deref()
-            .and_then(|name| spec.fields.iter().find(|f| f.name == name))
+            .and_then(|name| fields.iter().find(|f| f.name == name))
             .map(|f| f.format)
             .filter(|f| *f != Format::Default);
         if let Some(fmt) = format

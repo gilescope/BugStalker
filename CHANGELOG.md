@@ -7,6 +7,31 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 8 — per-variant enum attrs):
+  - **Wire format v2.** `bs-viz-spec` bumps `VERSION` to 2 and
+    appends a `num_variants + variant[]` block to each entry's
+    payload. Each `VariantSpec` carries `name`, optional
+    `summary`, optional `tag`, and a per-variant `Vec<FieldSpec>`.
+    Pre-v2 readers reject the entry cleanly via
+    `UnsupportedVersion`.
+  - **`bs-viz-derive` parses variant attrs.** `#[bs_viz(summary
+    = "...", tag = "...")]` on an enum variant lights up.
+    Per-field overrides on variant fields use the same parser
+    as struct fields.
+  - **Renderer dispatches variant-first.** Both the TUI/console
+    path (`ui::generic::variable`) and the DAP path
+    (`data::render_value_to_string_with_viz`) prefer the
+    variant-level summary over the type-level one, apply
+    variant-scoped field overrides for placeholder substitution,
+    and prepend a leading `[tag]` chip to the rendered enum
+    (with one space before it) when the active variant carries
+    a `tag = "..."` attribute.
+  - `viz_demo`'s `Status` enum gets variant attributes:
+    `Connected(u32)` renders as `Status [ok] ✓ Connected (port
+    443)`, `Error(&str)` as `Status [err] ✗ Error: transport
+    reset`. Integration test asserts both forms via the TUI
+    path and the DAP `read_locals` path.
+  - Full debugger + dap suites: 172/172 sequentially.
 - visualisers (Phase 4 Tier-A step 7 — DAP per-callsite wiring):
   - `value_children` now takes `viz: Option<&VizRegistry>` and
     propagates it through every recursive descent. Free

@@ -28,7 +28,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{Data, DeriveInput, LitByteStr, parse_macro_input, spanned::Spanned};
 
-use bs_viz_spec::{FieldSpec, Format, TypeViewSpec};
+use bs_viz_spec::{FieldSpec, Format, TypeViewSpec, VariantSpec};
 
 #[proc_macro_derive(DebugView, attributes(bs_viz))]
 pub fn derive_debug_view(input: TokenStream) -> TokenStream {
@@ -49,21 +49,21 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // `pub struct Wrap<T> { ... }`. This is correct as long as
     // the field set + summary template are generic-uniform; the
     // common case for crate authors.
-    let fields: Option<&syn::Fields> = match &input.data {
-        Data::Struct(s) => Some(&s.fields),
-        // Phase 4 step 6: enums accepted, but step 6 only carries
-        // a *type-level* summary — placeholders refer to fields
-        // of whichever variant is active at render time. Per-
-        // variant `summary = "..."` and `tag = "..."` overrides
-        // are tracked under ROADMAP §4 step 7.
-        Data::Enum(_) => None,
-        Data::Union(_) => {
-            return Err(syn::Error::new(
-                input.span(),
-                "#[derive(DebugView)] does not support unions",
-            ));
-        }
-    };
+    let (fields, enum_variants): (Option<&syn::Fields>, Option<&syn::DataEnum>) =
+        match &input.data {
+            Data::Struct(s) => (Some(&s.fields), None),
+            // Phase 4 step 8: enums also carry per-variant
+            // attributes — `#[bs_viz(summary = "...", tag = "...")]`
+            // on individual variants, plus per-field overrides
+            // scoped to the variant.
+            Data::Enum(e) => (None, Some(e)),
+            Data::Union(_) => {
+                return Err(syn::Error::new(
+                    input.span(),
+                    "#[derive(DebugView)] does not support unions",
+                ));
+            }
+        };
 
     let summary = parse_type_attrs(&input.attrs)?;
     let mut field_specs = Vec::new();
@@ -129,10 +129,17 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // If proves limiting (e.g. two crates each defining
     // `Person`), batch 2 will introduce a `module_path!()`-aware
     // resolver. For step 1, suffix matching is enough.
+    // Step 8: collect per-variant specs when this is an enum.
+    let variant_specs = match enum_variants {
+        Some(e) => collect_variant_specs(e)?,
+        None => Vec::new(),
+    };
+
     let spec = TypeViewSpec {
         type_name: local_name.clone(),
         summary,
         fields: field_specs,
+        variants: variant_specs,
     };
     let bytes = bs_viz_spec::encode(&spec);
     let byte_lit = LitByteStr::new(&bytes, ty_ident.span());
@@ -222,6 +229,69 @@ fn parse_field_attrs(attrs: &[syn::Attribute]) -> syn::Result<FieldAttrs> {
         })?;
     }
     Ok(out)
+}
+
+/// Walk a `Data::Enum`, build a `VariantSpec` per variant. Each
+/// variant's `#[bs_viz(...)]` attributes parse the same way as a
+/// type's, with `summary` + `tag` recognised; field-level
+/// attributes parse identically to struct fields. Tuple-style
+/// variants name their fields `__0`, `__1`, ... matching the
+/// struct convention.
+fn collect_variant_specs(e: &syn::DataEnum) -> syn::Result<Vec<VariantSpec>> {
+    let mut out = Vec::with_capacity(e.variants.len());
+    for v in &e.variants {
+        let (summary, tag) = parse_variant_attrs(&v.attrs)?;
+        let mut field_specs = Vec::new();
+        for (idx, f) in v.fields.iter().enumerate() {
+            let field_name = match f.ident.as_ref() {
+                Some(ident) => ident.to_string(),
+                None => format!("__{idx}"),
+            };
+            let attrs = parse_field_attrs(&f.attrs)?;
+            field_specs.push(FieldSpec {
+                name: field_name,
+                rename: attrs.rename,
+                hidden: attrs.skip,
+                format: attrs.format.unwrap_or(Format::Default),
+            });
+        }
+        out.push(VariantSpec {
+            name: v.ident.to_string(),
+            summary,
+            tag,
+            fields: field_specs,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse `#[bs_viz(summary = "...", tag = "...")]` on an enum
+/// variant. Both attributes are optional.
+fn parse_variant_attrs(attrs: &[syn::Attribute]) -> syn::Result<(Option<String>, Option<String>)> {
+    let mut summary = None;
+    let mut tag = None;
+    for attr in attrs {
+        if !attr.path().is_ident("bs_viz") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("summary") {
+                let v: syn::LitStr = meta.value()?.parse()?;
+                summary = Some(v.value());
+                Ok(())
+            } else if meta.path.is_ident("tag") {
+                let v: syn::LitStr = meta.value()?.parse()?;
+                tag = Some(v.value());
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unknown #[bs_viz(...)] attribute on enum variant \
+                     (step 8 supports `summary = \"...\"` and `tag = \"...\"`)",
+                ))
+            }
+        })?;
+    }
+    Ok((summary, tag))
 }
 
 fn parse_format(s: &str, span: proc_macro2::Span) -> syn::Result<Format> {

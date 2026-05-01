@@ -110,18 +110,38 @@ fn debug_view_specs_loaded_from_demo_binary() {
     assert!(sentinel_spec.fields.is_empty());
     assert_eq!(sentinel_spec.summary.as_deref(), Some("Sentinel"));
 
-    // Step 6 — enum spec round-trip. Step 6 only emits the
-    // type-level summary; per-variant attributes follow in
-    // step 7.
+    // Step 6 + 8 — enum spec round-trip. Step 6 emits the
+    // type-level summary; step 8 also emits per-variant
+    // summaries + tags.
     let status_spec = debugger
         .view_spec_for("Status")
         .expect("Status enum spec should be in the registry");
     assert_eq!(status_spec.summary.as_deref(), Some("Status[{__0}]"));
     assert!(
         status_spec.fields.is_empty(),
-        "step 6 enum derive emits no per-field entries; got {:?}",
+        "enum derive emits no top-level field entries; got {:?}",
         status_spec.fields,
     );
+    assert_eq!(status_spec.variants.len(), 3);
+    let connected = status_spec
+        .variants
+        .iter()
+        .find(|v| v.name == "Connected")
+        .expect("Connected variant should be in the spec");
+    assert_eq!(
+        connected.summary.as_deref(),
+        Some("✓ Connected (port {__0})"),
+    );
+    assert_eq!(connected.tag.as_deref(), Some("ok"));
+    assert_eq!(connected.fields.len(), 1);
+    assert_eq!(connected.fields[0].name, "__0");
+
+    let err_v = status_spec
+        .variants
+        .iter()
+        .find(|v| v.name == "Error")
+        .expect("Error variant should be in the spec");
+    assert_eq!(err_v.tag.as_deref(), Some("err"));
 
     drop(debugger);
 }
@@ -136,9 +156,9 @@ fn debug_view_summary_applied_at_render_time() {
 
     // BP at the `black_box` line — every local in `main` is
     // alive at this point.
-    debugger.set_breakpoint_at_line("main.rs", 107).unwrap();
+    debugger.set_breakpoint_at_line("main.rs", 110).unwrap();
     debugger.start_debugee().unwrap();
-    assert_eq!(info.line.take(), Some(107));
+    assert_eq!(info.line.take(), Some(110));
 
     let viz = debugger.view_registry();
     let locals = debugger.read_local_variables().unwrap();
@@ -314,17 +334,27 @@ fn debug_view_summary_applied_at_render_time() {
     let err_with_spec = render_value_with_viz(status_err_local.value(), Some(viz));
     let ok_bare = render_value_with_viz(status_ok_local.value(), None);
 
+    // Step 8 — variant-level summary and tag override the
+    // type-level template. `Connected(443)` carries
+    // `summary = "✓ Connected (port {__0})"` and `tag = "ok"`,
+    // so the rendered form prepends `[ok]` and uses the
+    // variant template instead of the type-level
+    // `Status[{__0}]`.
     assert!(
-        ok_with_spec.contains("Status[443]"),
-        "enum summary not applied to active Connected variant: {ok_with_spec}",
+        ok_with_spec.contains("[ok]") && ok_with_spec.contains("Connected (port 443)"),
+        "variant-level summary + tag not applied to Connected: {ok_with_spec}",
     );
     assert!(
-        err_with_spec.contains("Status[transport reset]"),
-        "enum summary not applied to active Error variant: {err_with_spec}",
+        err_with_spec.contains("[err]") && err_with_spec.contains("Error: transport reset"),
+        "variant-level summary + tag not applied to Error: {err_with_spec}",
     );
     assert!(
-        !ok_bare.contains("Status[443]"),
-        "viz=None path unexpectedly produced enum summary: {ok_bare}",
+        !ok_bare.contains("[ok]"),
+        "viz=None path unexpectedly produced variant tag: {ok_bare}",
+    );
+    assert!(
+        !ok_bare.contains("Connected (port"),
+        "viz=None path unexpectedly produced variant summary: {ok_bare}",
     );
 
     // Step 7 — DAP path now threads the registry through. The
@@ -346,8 +376,9 @@ fn debug_view_summary_applied_at_render_time() {
         .find(|v| v.name.starts_with("status_ok"))
         .expect("DAP locals should include `status_ok`");
     assert!(
-        dap_status_ok.value.contains("Status[443]"),
-        "DAP value for `status_ok` missing enum summary: {}",
+        dap_status_ok.value.contains("[ok]")
+            && dap_status_ok.value.contains("Connected (port 443)"),
+        "DAP value for `status_ok` missing variant-level enum render: {}",
         dap_status_ok.value,
     );
     // Generics work via DAP too.

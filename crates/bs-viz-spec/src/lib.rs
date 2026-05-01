@@ -15,7 +15,7 @@
 //!
 //! ```text
 //! entry := u32 magic = 0x42_53_56_31 ("BSV1")  -- "BugStalker Viz v1"
-//!        u8   version = 1
+//!        u8   version = 2
 //!        u32  payload_len
 //!        bytes[payload_len] payload
 //!
@@ -23,15 +23,31 @@
 //!          opt-str summary
 //!          u32 num_fields
 //!          field[num_fields]
+//!          u32 num_variants               -- v2: 0 for non-enums
+//!          variant[num_variants]          -- v2 only
 //!
 //! field := str name
 //!        opt-str rename
 //!        u8 hidden = 0|1
 //!        u8 format    -- enum tag, see `Format::*`
 //!
+//! variant := str name
+//!          opt-str summary
+//!          opt-str tag
+//!          u32 num_fields
+//!          field[num_fields]              -- per-variant overrides
+//!
 //! str     := u32 len + bytes[len]
 //! opt-str := u8 present + str (when present == 1)
 //! ```
+//!
+//! **Version 2 changes vs. v1:** appended `num_variants +
+//! variant[]` block at the end of payload. The wire-format
+//! version bumped to keep the contract a single-source-of-truth
+//! check; readers that understand v2 also know to expect the
+//! variant block. Pre-v2 readers reject v2 entries cleanly via
+//! `UnsupportedVersion`, so a stale BugStalker against a fresh
+//! debuggee fails fast rather than silently misinterpreting.
 //!
 //! Numbers are little-endian. The format is *not* self-describing
 //! beyond the magic/version pair — that is intentional: this is a
@@ -50,7 +66,7 @@ pub const MAGIC: [u8; 4] = *b"BSV1";
 
 /// Wire-format version. Bump on every breaking layout change;
 /// readers must reject unknown versions and skip the entry.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 
 /// Per-field display format override.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +117,30 @@ pub struct FieldSpec {
     pub format: Format,
 }
 
+/// Per-variant spec entry on an enum (v2+). `name` is the
+/// variant's identifier as it appears in source (e.g.
+/// `Connected`); the renderer matches on this when dispatching
+/// at the `RustEnum.value.field_name` level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariantSpec {
+    pub name: String,
+    /// Variant-specific `summary = "..."` template that
+    /// overrides the type-level one when this variant is
+    /// active. Placeholder semantics identical to type-level.
+    pub summary: Option<String>,
+    /// Phase 4 plan §"Variant-level" — `tag = "..."` lets a
+    /// variant carry a state-tag string (e.g. `Connected`,
+    /// `Offline`) for renderers that surface it as a colour
+    /// chip / status icon. Stored verbatim; consumers decide
+    /// presentation.
+    pub tag: Option<String>,
+    /// Per-field overrides scoped to this variant. Field
+    /// names follow the same convention as struct fields
+    /// (`__0`, `__1` for tuple variants, named fields for
+    /// struct variants).
+    pub fields: Vec<FieldSpec>,
+}
+
 /// Top-level spec for one `#[derive(DebugView)]` type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeViewSpec {
@@ -115,8 +155,12 @@ pub struct TypeViewSpec {
     /// verbatim here.
     pub summary: Option<String>,
     /// Per-field overrides. Empty for unit / tuple structs in
-    /// step 1.
+    /// step 1, and for enums (per-field overrides on enums live
+    /// inside `variants[].fields`).
     pub fields: Vec<FieldSpec>,
+    /// Per-variant overrides for enums. Empty for non-enums.
+    /// V2+ wire format only; older readers reject the entry.
+    pub variants: Vec<VariantSpec>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -136,6 +180,24 @@ pub enum DecodeError {
     UnknownFormatTag { tag: u8 },
 }
 
+fn write_field(out: &mut Vec<u8>, f: &FieldSpec) {
+    write_str(out, &f.name);
+    write_opt_str(out, f.rename.as_deref());
+    out.push(f.hidden as u8);
+    out.push(f.format as u8);
+}
+
+fn write_field_list(out: &mut Vec<u8>, fields: &[FieldSpec]) {
+    let n: u32 = fields
+        .len()
+        .try_into()
+        .expect("more than u32::MAX fields is implausible");
+    out.extend_from_slice(&n.to_le_bytes());
+    for f in fields {
+        write_field(out, f);
+    }
+}
+
 /// Encode one spec into its on-wire form (entry header +
 /// payload). Used by the proc-macro at expansion time; the
 /// resulting bytes are emitted as a `static` byte literal.
@@ -143,17 +205,21 @@ pub fn encode(spec: &TypeViewSpec) -> Vec<u8> {
     let mut payload = Vec::new();
     write_str(&mut payload, &spec.type_name);
     write_opt_str(&mut payload, spec.summary.as_deref());
-    let n_fields: u32 = spec
-        .fields
+    write_field_list(&mut payload, &spec.fields);
+
+    // V2 trailer: variants block. Always emitted (length 0 for
+    // non-enums) so the decoder can rely on its presence.
+    let n_variants: u32 = spec
+        .variants
         .len()
         .try_into()
-        .expect("more than u32::MAX fields is impossible in practice");
-    payload.extend_from_slice(&n_fields.to_le_bytes());
-    for f in &spec.fields {
-        write_str(&mut payload, &f.name);
-        write_opt_str(&mut payload, f.rename.as_deref());
-        payload.push(f.hidden as u8);
-        payload.push(f.format as u8);
+        .expect("more than u32::MAX variants is implausible");
+    payload.extend_from_slice(&n_variants.to_le_bytes());
+    for v in &spec.variants {
+        write_str(&mut payload, &v.name);
+        write_opt_str(&mut payload, v.summary.as_deref());
+        write_opt_str(&mut payload, v.tag.as_deref());
+        write_field_list(&mut payload, &v.fields);
     }
 
     let mut out = Vec::with_capacity(4 + 1 + 4 + payload.len());
@@ -198,20 +264,23 @@ pub fn decode_one(bytes: &[u8]) -> Result<(TypeViewSpec, usize), DecodeError> {
     let mut p = Reader::new(&bytes[payload_start..payload_end]);
     let type_name = p.read_str("type_name")?;
     let summary = p.read_opt_str("summary")?;
-    let n_fields = p.read_u32("n_fields")? as usize;
-    let mut fields = Vec::with_capacity(n_fields);
-    for _ in 0..n_fields {
-        let name = p.read_str("field.name")?;
-        let rename = p.read_opt_str("field.rename")?;
-        let hidden = p.read_u8("field.hidden")? != 0;
-        let fmt_tag = p.read_u8("field.format")?;
-        let format =
-            Format::from_tag(fmt_tag).ok_or(DecodeError::UnknownFormatTag { tag: fmt_tag })?;
-        fields.push(FieldSpec {
+    let fields = p.read_field_list("fields")?;
+    // V2 variants block. The wire format always has it (length
+    // 0 for non-enums), so an absent block means a corrupt
+    // payload and the truncation error from `read_u32` is the
+    // right signal.
+    let n_variants = p.read_u32("n_variants")? as usize;
+    let mut variants = Vec::with_capacity(n_variants);
+    for _ in 0..n_variants {
+        let name = p.read_str("variant.name")?;
+        let v_summary = p.read_opt_str("variant.summary")?;
+        let tag = p.read_opt_str("variant.tag")?;
+        let v_fields = p.read_field_list("variant.fields")?;
+        variants.push(VariantSpec {
             name,
-            rename,
-            hidden,
-            format,
+            summary: v_summary,
+            tag,
+            fields: v_fields,
         });
     }
 
@@ -220,6 +289,7 @@ pub fn decode_one(bytes: &[u8]) -> Result<(TypeViewSpec, usize), DecodeError> {
             type_name,
             summary,
             fields,
+            variants,
         },
         payload_end,
     ))
@@ -328,6 +398,26 @@ impl<'a> Reader<'a> {
             }
         }
     }
+
+    fn read_field_list(&mut self, what: &'static str) -> Result<Vec<FieldSpec>, DecodeError> {
+        let n = self.read_u32(what)? as usize;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let name = self.read_str("field.name")?;
+            let rename = self.read_opt_str("field.rename")?;
+            let hidden = self.read_u8("field.hidden")? != 0;
+            let fmt_tag = self.read_u8("field.format")?;
+            let format = Format::from_tag(fmt_tag)
+                .ok_or(DecodeError::UnknownFormatTag { tag: fmt_tag })?;
+            out.push(FieldSpec {
+                name,
+                rename,
+                hidden,
+                format,
+            });
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +454,40 @@ mod tests {
                     format: Format::Iso8601,
                 },
             ],
+            variants: vec![],
+        }
+    }
+
+    fn enum_sample() -> TypeViewSpec {
+        TypeViewSpec {
+            type_name: "my_crate::Status".to_string(),
+            summary: Some("Status[{__0}]".to_string()),
+            fields: vec![],
+            variants: vec![
+                VariantSpec {
+                    name: "Connected".to_string(),
+                    summary: Some("✓ Connected (port {__0})".to_string()),
+                    tag: Some("ok".to_string()),
+                    fields: vec![FieldSpec {
+                        name: "__0".to_string(),
+                        rename: None,
+                        hidden: false,
+                        format: Format::Default,
+                    }],
+                },
+                VariantSpec {
+                    name: "Disconnected".to_string(),
+                    summary: None,
+                    tag: Some("warn".to_string()),
+                    fields: vec![],
+                },
+                VariantSpec {
+                    name: "Error".to_string(),
+                    summary: Some("✗ Error: {__0}".to_string()),
+                    tag: Some("err".to_string()),
+                    fields: vec![],
+                },
+            ],
         }
     }
 
@@ -383,6 +507,7 @@ mod tests {
             type_name: "other::Thing".to_string(),
             summary: None,
             fields: vec![],
+            variants: vec![],
         };
         let mut buf = Vec::new();
         buf.extend(encode(&s1));
@@ -390,6 +515,21 @@ mod tests {
         let (specs, err) = decode_all(&buf);
         assert!(err.is_none(), "unexpected: {err:?}");
         assert_eq!(specs, vec![s1, s2]);
+    }
+
+    #[test]
+    fn roundtrip_enum_with_variants() {
+        let s = enum_sample();
+        let bytes = encode(&s);
+        let (back, consumed) = decode_one(&bytes).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(consumed, bytes.len());
+        // Sanity: variants survived in order, with their full
+        // attribute payload.
+        assert_eq!(back.variants.len(), 3);
+        assert_eq!(back.variants[0].tag.as_deref(), Some("ok"));
+        assert_eq!(back.variants[1].summary, None);
+        assert_eq!(back.variants[2].tag.as_deref(), Some("err"));
     }
 
     #[test]

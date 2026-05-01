@@ -67,15 +67,18 @@ pub struct Point(pub i32, pub i32);
 #[bs_viz(summary = "Sentinel")]
 pub struct Sentinel;
 
-/// Step 6 — enums supported with a type-level summary. The
-/// placeholder `{__0}` resolves to the first field of whichever
-/// variant is active at render time. Variant-specific summaries
-/// (`#[bs_viz]` on each variant) are tracked under step 7.
+/// Step 6 — enum with type-level summary as fallback.
+/// Step 8 — per-variant `summary` overrides the type-level one
+/// when that variant is active, and `tag = "..."` annotates the
+/// rendered enum with a state-tag chip.
 #[derive(DebugView)]
 #[bs_viz(summary = "Status[{__0}]")]
 pub enum Status {
+    #[bs_viz(summary = "✓ Connected (port {__0})", tag = "ok")]
     Connected(u32),
+    #[bs_viz(summary = "○ Disconnected", tag = "warn")]
     Disconnected,
+    #[bs_viz(summary = "✗ Error: {__0}", tag = "err")]
     Error(&'static str),
 }
 
