@@ -45,7 +45,6 @@ use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_region, mach_vm
 use mach2::vm_prot::{VM_PROT_COPY, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, vm_prot_t};
 use mach2::vm_region::{VM_REGION_BASIC_INFO_64, vm_region_basic_info_64, vm_region_info_t};
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t};
-use nix::errno::Errno;
 use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::mem;
@@ -144,7 +143,11 @@ impl From<MachError> for Error {
                 binary,
             };
         }
-        Ptrace(Errno::EFAULT)
+        // Preserve the kr verbatim. Don't pretend it's a
+        // ptrace EFAULT — that misleads the user into chasing a
+        // memory-address bug when the actual failure is a Mach
+        // call (use BS_DARWIN_DEBUG=1 to see *which* one).
+        Error::DarwinMach { mach: e.to_string() }
     }
 }
 

@@ -74,6 +74,16 @@ pub enum Error {
          {binary}`"
     )]
     DarwinDebuggerEntitlementMissing { mach: String, binary: String },
+    /// Generic Mach failure that isn't task_for_pid's
+    /// missing-entitlement signature. Preserves the kr code +
+    /// description verbatim so the user (and grep) can match it
+    /// against `<mach/kern_return.h>` instead of being told a
+    /// confidently-wrong remediation. Set `BS_DARWIN_DEBUG=1` to
+    /// also get a backtrace at the conversion site, which surfaces
+    /// the specific Mach call (`thread_set_arm_debug_state64`,
+    /// `task_resume`, …) that started the chain.
+    #[error("Mach failure: {mach}")]
+    DarwinMach { mach: String },
     #[error("{0} syscall error: {1}")]
     Syscall(&'static str, nix::Error),
     #[error("multiple syscall errors {0:?}")]
@@ -218,6 +228,12 @@ impl Error {
             // every subsequent ptrace/task_for_pid call will fail
             // for the same reason. Surface it once and stop.
             Error::DarwinDebuggerEntitlementMissing { .. } => true,
+            // Generic Mach failures aren't always fatal — a single
+            // failed `thread_set_state` during step-over shouldn't
+            // tear down the whole session — but we don't have
+            // per-call recovery yet, so treat them like ptrace
+            // errors and let the user continue/inspect the session.
+            Error::DarwinMach { .. } => false,
             Error::MultipleErrors(_) => false,
             Error::DebugIDFormat => false,
             Error::VariableParsing(_) => false,
