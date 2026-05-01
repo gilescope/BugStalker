@@ -143,11 +143,16 @@ impl From<MachError> for Error {
                 binary,
             };
         }
-        // Preserve the kr verbatim. Don't pretend it's a
-        // ptrace EFAULT — that misleads the user into chasing a
-        // memory-address bug when the actual failure is a Mach
-        // call (use BS_DARWIN_DEBUG=1 to see *which* one).
-        Error::DarwinMach { mach: e.to_string() }
+        // Preserve the kr verbatim and capture the stack so the
+        // user-facing error report itself names the failing Mach
+        // call (`thread_set_arm_debug_state64`, `task_resume`,
+        // `vm_write_word`, …). Beats blanket-mapping to
+        // `Ptrace(EFAULT)` and beats per-callsite instrumentation
+        // — one capture covers every Mach call in the codebase.
+        Error::DarwinMach {
+            mach: e.to_string(),
+            backtrace: format!("{}", std::backtrace::Backtrace::force_capture()),
+        }
     }
 }
 

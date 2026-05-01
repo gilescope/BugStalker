@@ -78,12 +78,16 @@ pub enum Error {
     /// missing-entitlement signature. Preserves the kr code +
     /// description verbatim so the user (and grep) can match it
     /// against `<mach/kern_return.h>` instead of being told a
-    /// confidently-wrong remediation. Set `BS_DARWIN_DEBUG=1` to
-    /// also get a backtrace at the conversion site, which surfaces
-    /// the specific Mach call (`thread_set_arm_debug_state64`,
-    /// `task_resume`, …) that started the chain.
-    #[error("Mach failure: {mach}")]
-    DarwinMach { mach: String },
+    /// confidently-wrong remediation.
+    ///
+    /// `backtrace` carries a frame chain captured at the
+    /// `From<MachError>` conversion — that's the cheapest way to
+    /// pinpoint which Mach call (`thread_set_state`, `task_resume`,
+    /// `vm_write`, …) actually failed without instrumenting every
+    /// call site by hand. It's appended to the user-facing error
+    /// message so the failure report carries its own diagnostics.
+    #[error("Mach failure: {mach}\n{backtrace}")]
+    DarwinMach { mach: String, backtrace: String },
     #[error("{0} syscall error: {1}")]
     Syscall(&'static str, nix::Error),
     #[error("multiple syscall errors {0:?}")]
