@@ -701,14 +701,15 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1–6 shipped (2026-05-01).** Step 1 wires the
+**Status: steps 1–7 shipped (2026-05-01).** Step 1 wires the
 declarative-spec data path end-to-end; step 2 wires the
 renderer; step 3 unblocks generics + `format = "hex|bin|oct"`;
 step 4 adds `format = "iso8601"` and `format = "duration"`;
 step 5 unblocks tuple + unit structs and fixes the silent bug
 where templates skipped field formats; step 6 unblocks enums
-with type-level summaries that substitute against the active
-variant's members. The following is live:
+with type-level summaries; step 7 wires every existing DAP
+callsite through to the registry so the IDE actually shows
+summaries in its variables panel. The following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -855,24 +856,44 @@ Step 6 added:
   applies the enum summary using the same shared
   `substitute_template` helper.
 
+Step 7 added:
+
+* **DAP per-callsite registry wiring.** `value_children` now
+  takes a `viz: Option<&VizRegistry>` parameter and propagates
+  it through every recursive descent (Structure / IndexedList /
+  NonIndexedList / Map / Wrapped / Referential branches). The
+  free `read_locals(dbg)` and `read_args(dbg)` functions pull
+  `dbg.view_registry()` and pass it through. The two
+  `impl DebugSession` callers in `setExpression` /
+  `evaluate` now do the same. Every `render_value_to_string`
+  callsite in `data.rs` migrated to
+  `render_value_to_string_with_viz`. Net effect: a VS Code
+  variables-panel `value` for a `#[derive(DebugView)]` type now
+  carries the rendered summary instead of the placeholder
+  `{...}`.
+* `tests/debugger/viz.rs::debug_view_summary_applied_at_render_time`
+  now also asserts via `data::read_locals(&debugger)` that
+  three different shapes (struct, enum, generic struct) reach
+  the IDE with their summaries: `p` → `Person(Ada, age 36)`,
+  `status_ok` → `Status[443]`, `w_i32` → `Wrap[17]`.
+* Same change kept the bare-control path (`control.rs::value_truthy`)
+  on the no-viz form: `value_truthy` is a "literal-zero/empty?"
+  predicate, not a UI render — applying summaries there would
+  change comparison semantics.
+
 **Remaining (in plan order):**
 
-1. **Per-callsite DAP wiring.** `data.rs` has 12+ existing
-   `render_value_to_string` callers; only the helper itself is
-   viz-aware. Update each `impl DebugSession` callsite to pass
-   `Some(self.debugger.view_registry())` so the IDE actually
-   picks up summaries. Mechanical.
-2. **Per-variant attributes on enums.** Variant-level `summary`
+1. **Per-variant attributes on enums.** Variant-level `summary`
    override + `tag = "..."` for state-tag display. Wire format
    needs an additive `variants` list; bump the spec version.
-3. **`module_path!()` in the macro** so the wire `type_name`
+2. **`module_path!()` in the macro** so the wire `type_name`
    matches what the v0 demangler produces. Removes the suffix
    fallback and its ambiguity bail.
-4. **`format = "utf8" | "hexdump"` applied at render time.**
+3. **`format = "utf8" | "hexdump"` applied at render time.**
    Need byte-array detection (`Vec<u8>`, `&[u8]`, `[u8; N]`) —
    the source-byte plumbing is its own slice of work.
-5. **`CustomView` escape hatch** — non-declarative Tier A.
-6. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
+4. **`CustomView` escape hatch** — non-declarative Tier A.
+5. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
    loaded from `~/.config/bugstalker/visualizers/*.wasm` and from
    `.bs_visualizer_wasm` sections.
 

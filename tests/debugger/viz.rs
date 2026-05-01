@@ -12,6 +12,7 @@
 use crate::common::{TestHooks, TestInfo};
 use crate::prepare_debugee_process;
 use bugstalker::bs_viz_spec::{self, Format};
+use bugstalker::dap::yadap::session::data;
 use bugstalker::debugger::DebuggerBuilder;
 use bugstalker::ui::generic::variable::render_value_with_viz;
 use serial_test::serial;
@@ -324,6 +325,40 @@ fn debug_view_summary_applied_at_render_time() {
     assert!(
         !ok_bare.contains("Status[443]"),
         "viz=None path unexpectedly produced enum summary: {ok_bare}",
+    );
+
+    // Step 7 — DAP path now threads the registry through. The
+    // public `data::read_locals` function is what the IDE
+    // ultimately consumes; assert that its `value` strings
+    // carry the viz summaries (not the placeholder `{...}`).
+    let dap_locals = data::read_locals(&debugger).unwrap();
+    let dap_p = dap_locals
+        .iter()
+        .find(|v| v.name.starts_with("p"))
+        .expect("DAP locals should include `p`");
+    assert!(
+        dap_p.value.contains("Person(Ada, age 36)"),
+        "DAP value for `p` missing summary — IDE wiring not flowing: {}",
+        dap_p.value,
+    );
+    let dap_status_ok = dap_locals
+        .iter()
+        .find(|v| v.name.starts_with("status_ok"))
+        .expect("DAP locals should include `status_ok`");
+    assert!(
+        dap_status_ok.value.contains("Status[443]"),
+        "DAP value for `status_ok` missing enum summary: {}",
+        dap_status_ok.value,
+    );
+    // Generics work via DAP too.
+    let dap_w_i32 = dap_locals
+        .iter()
+        .find(|v| v.name.starts_with("w_i32"))
+        .expect("DAP locals should include `w_i32`");
+    assert!(
+        dap_w_i32.value.contains("Wrap[17]"),
+        "DAP value for `w_i32` missing generic summary: {}",
+        dap_w_i32.value,
     );
 
     debugger.continue_debugee().unwrap();

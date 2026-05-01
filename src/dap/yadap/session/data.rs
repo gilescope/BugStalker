@@ -368,10 +368,11 @@ impl super::DebugSession {
             .context("setExpression read_variable (refresh)")?;
         let response = if let Some(updated) = refreshed.into_iter().next() {
             let type_graph = Rc::new(updated.type_graph().clone());
-            let child = value_children(&updated, type_graph);
+            let viz = Some(dbg.view_registry());
+            let child = value_children(&updated, type_graph, viz);
             let vars_ref = child.map(|c| self.vars.alloc(c)).unwrap_or(0);
             json!({
-                "value": render_value_to_string(updated.value()),
+                "value": render_value_to_string_with_viz(updated.value(), viz),
                 "type": updated.value().r#type().name_fmt(),
                 "variablesReference": vars_ref,
             })
@@ -432,9 +433,10 @@ impl super::DebugSession {
             } else {
                 let result = results.into_iter().next().unwrap();
                 let type_graph = Rc::new(result.type_graph().clone());
-                let child = value_children(&result, type_graph);
+                let viz = Some(dbg.view_registry());
+                let child = value_children(&result, type_graph, viz);
                 let vars_ref = child.map(|c| self.vars.alloc(c)).unwrap_or(0);
-                let result_str = render_value_to_string(result.value());
+                let result_str = render_value_to_string_with_viz(result.value(), viz);
                 json!({"result": result_str, "variablesReference": vars_ref})
             };
             (body, elapsed)
@@ -748,6 +750,7 @@ fn parse_set_value(kind: ScalarKind, input: &str) -> anyhow::Result<Vec<u8>> {
 fn value_children(
     qr: &debugger::variable::execute::QueryResult,
     type_graph: Rc<debugger::ComplexType>,
+    viz: Option<&debugger::viz::VizRegistry>,
 ) -> Option<Vec<VarItem>> {
     use debugger::variable::render::{RenderValue, ValueLayout};
     let layout = qr.value().value_layout()?;
@@ -763,9 +766,9 @@ fn value_children(
 
                 out.push(VarItem {
                     name: field_name,
-                    value: render_value_to_string(qr.value()),
+                    value: render_value_to_string_with_viz(qr.value(), viz),
                     type_name: Some(qr.value().r#type().to_string()),
-                    child: value_children(&qr, type_graph.clone()),
+                    child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
                 });
@@ -782,9 +785,9 @@ fn value_children(
 
                 out.push(VarItem {
                     name: format!("[{}]", it.index),
-                    value: render_value_to_string(qr.value()),
+                    value: render_value_to_string_with_viz(qr.value(), viz),
                     type_name: Some(qr.value().r#type().to_string()),
-                    child: value_children(&qr, type_graph.clone()),
+                    child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
                 });
@@ -801,9 +804,9 @@ fn value_children(
 
                 out.push(VarItem {
                     name: format!("[{i}]"),
-                    value: render_value_to_string(qr.value()),
+                    value: render_value_to_string_with_viz(qr.value(), viz),
                     type_name: Some(qr.value().r#type().to_string()),
-                    child: value_children(&qr, type_graph.clone()),
+                    child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
                 });
@@ -819,13 +822,13 @@ fn value_children(
                     name: format!("[{i}]"),
                     value: format!(
                         "{} => {}",
-                        render_value_to_string(k),
-                        render_value_to_string(val)
+                        render_value_to_string_with_viz(k, viz),
+                        render_value_to_string_with_viz(val, viz)
                     ),
                     type_name: None,
                     child: cell_qr
                         .as_ref()
-                        .and_then(|qr| value_children(qr, type_graph.clone())),
+                        .and_then(|qr| value_children(qr, type_graph.clone(), viz)),
                     write: None,
                     source: cell_qr.map(|qr| qr.value().clone()),
                 });
@@ -838,7 +841,7 @@ fn value_children(
                 .modify_value(|_, _| Some(v.clone()))
                 .expect("should be `Some`");
 
-            value_children(&qr, type_graph)
+            value_children(&qr, type_graph, viz)
         }
         ValueLayout::Referential(_r) => {
             let qr = qr.clone().modify_value(|pcx, v| v.deref(pcx));
@@ -846,9 +849,9 @@ fn value_children(
             if let Some(deref_qr) = qr {
                 let out = vec![VarItem {
                     name: "deref".to_string(),
-                    value: render_value_to_string(deref_qr.value()),
+                    value: render_value_to_string_with_viz(deref_qr.value(), viz),
                     type_name: Some(deref_qr.value().r#type().to_string()),
-                    child: value_children(&deref_qr, type_graph.clone()),
+                    child: value_children(&deref_qr, type_graph.clone(), viz),
                     write: value_write_meta(deref_qr.value(), type_graph.clone()),
                     source: Some(deref_qr.value().clone()),
                 }];
@@ -864,15 +867,16 @@ fn value_children(
 pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     use debugger::variable::render::RenderValue;
     let locals = dbg.read_local_variables()?;
+    let viz = Some(dbg.view_registry());
     let mut out = Vec::new();
     for r in locals {
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
         out.push(VarItem {
             name,
-            value: render_value_to_string(r.value()),
+            value: render_value_to_string_with_viz(r.value(), viz),
             type_name: Some(r.value().r#type().to_string()),
-            child: value_children(&r, type_graph.clone()),
+            child: value_children(&r, type_graph.clone(), viz),
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
         });
@@ -884,15 +888,16 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     use debugger::variable::dqe::{Dqe, Selector};
     use debugger::variable::render::RenderValue;
     let args = dbg.read_argument(Dqe::Variable(Selector::Any))?;
+    let viz = Some(dbg.view_registry());
     let mut out = Vec::new();
     for r in args {
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
         out.push(VarItem {
             name,
-            value: render_value_to_string(r.value()),
+            value: render_value_to_string_with_viz(r.value(), viz),
             type_name: Some(r.value().r#type().to_string()),
-            child: value_children(&r, type_graph.clone()),
+            child: value_children(&r, type_graph.clone(), viz),
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
         });

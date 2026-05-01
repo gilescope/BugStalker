@@ -7,6 +7,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 7 — DAP per-callsite wiring):
+  - `value_children` now takes `viz: Option<&VizRegistry>` and
+    propagates it through every recursive descent. Free
+    functions `read_locals(dbg)` and `read_args(dbg)` pull
+    `dbg.view_registry()` themselves. The two `impl DebugSession`
+    callers in `setExpression` / `evaluate` thread the registry
+    via `dbg.view_registry()`. Every `render_value_to_string`
+    callsite in `data.rs` migrates to the
+    `..._with_viz` form.
+  - Net user impact: a VS Code variables panel now shows the
+    derived summary string instead of the placeholder `{...}`
+    for any `#[derive(DebugView)]` type. The existing
+    `render_value_to_string` shim is preserved (wraps with
+    `viz: None`) so untouched callers keep their no-viz
+    rendering — `control.rs::value_truthy` for instance is
+    deliberately left on that path since it's a comparison
+    predicate, not a UI render.
+  - `tests/debugger/viz.rs::debug_view_summary_applied_at_render_time`
+    now also asserts the DAP path via `data::read_locals`: `p`
+    is `Person(Ada, age 36)`, `status_ok` is `Status[443]`,
+    `w_i32` is `Wrap[17]`. Three different shapes (struct,
+    enum, generic struct) all flow through the IDE wire
+    correctly.
+  - Full debugger + dap suites: 172/172 sequentially.
 - visualisers (Phase 4 Tier-A step 6 — enums):
   - `#[derive(DebugView)]` now accepts enums. Step 6 only carries
     the type-level `summary` template; per-variant attributes
