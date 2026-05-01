@@ -49,15 +49,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // `pub struct Wrap<T> { ... }`. This is correct as long as
     // the field set + summary template are generic-uniform; the
     // common case for crate authors.
-    let fields = match &input.data {
-        Data::Struct(s) => &s.fields,
-        Data::Enum(_) => {
-            return Err(syn::Error::new(
-                input.span(),
-                "step 1 of #[derive(DebugView)] only handles structs; \
-                 enums land in a later phase-4 batch",
-            ));
-        }
+    let fields: Option<&syn::Fields> = match &input.data {
+        Data::Struct(s) => Some(&s.fields),
+        // Phase 4 step 6: enums accepted, but step 6 only carries
+        // a *type-level* summary — placeholders refer to fields
+        // of whichever variant is active at render time. Per-
+        // variant `summary = "..."` and `tag = "..."` overrides
+        // are tracked under ROADMAP §4 step 7.
+        Data::Enum(_) => None,
         Data::Union(_) => {
             return Err(syn::Error::new(
                 input.span(),
@@ -68,7 +67,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
     let summary = parse_type_attrs(&input.attrs)?;
     let mut field_specs = Vec::new();
-    for (idx, f) in fields.iter().enumerate() {
+    let field_iter: Box<dyn Iterator<Item = &syn::Field>> = match fields {
+        Some(fs) => Box::new(fs.iter()),
+        None => Box::new(std::iter::empty()),
+    };
+    for (idx, f) in field_iter.enumerate() {
         // Step 5: tuple structs are now supported. Rust emits
         // tuple-struct fields under DWARF as `__0`, `__1`, etc.
         // — we mirror that name in the spec so the registry's

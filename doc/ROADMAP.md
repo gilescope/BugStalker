@@ -701,16 +701,14 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1–5 shipped (2026-04-30).** Step 1 wires the
+**Status: steps 1–6 shipped (2026-05-01).** Step 1 wires the
 declarative-spec data path end-to-end; step 2 wires the
-renderer so registered types render through their spec; step 3
-unblocks generics in the derive and applies the `format = "hex|
-bin|oct"` family at render time; step 4 adds `format =
-"iso8601"` (Unix-epoch-seconds → UTC ISO-8601) and `format =
-"duration"` (nanoseconds → human-readable); step 5 unblocks
-tuple structs and unit structs in the derive *and* fixes a
-silent bug where summary-template substitution skipped per-field
-format overrides. The following is live:
+renderer; step 3 unblocks generics + `format = "hex|bin|oct"`;
+step 4 adds `format = "iso8601"` and `format = "duration"`;
+step 5 unblocks tuple + unit structs and fixes the silent bug
+where templates skipped field formats; step 6 unblocks enums
+with type-level summaries that substitute against the active
+variant's members. The following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -830,6 +828,33 @@ Step 5 added:
     *inside* the template — was the bug)
   * `pt` renders as `Point(10, 20)`
 
+Step 6 added:
+
+* **Enums in `#[derive(DebugView)]`.** The compile-error block
+  on `Data::Enum` is gone. The macro emits one spec per enum
+  *type*, with the type-level `summary` template only —
+  per-variant attributes (`#[bs_viz(summary = "...")]` /
+  `#[bs_viz(tag = "...")]` on a variant) are tracked under
+  step 7.
+* **Renderer dispatch on active variant.** When the renderer
+  hits a `RustEnum` whose enum-type carries a registered spec,
+  the summary template substitutes against the active variant's
+  struct members. Placeholder `{__0}` resolves to the first
+  positional field of whichever variant is currently active —
+  `Status::Connected(443)` renders as `Status[443]`,
+  `Status::Error("transport reset")` as
+  `Status[transport reset]`. The fallback path
+  (`EnumType::VariantName(...)`) is unchanged when no spec is
+  registered or no summary is present.
+* `viz_demo` gains `Status { Connected(u32), Disconnected,
+  Error(&'static str) }` with two locals exercising different
+  active variants. The integration test asserts the spec
+  round-trips with `summary = "Status[{__0}]"` and empty
+  fields, *and* both variants render through the template.
+* Same DAP-path mirror — `data.rs::render_value_to_string_with_viz`
+  applies the enum summary using the same shared
+  `substitute_template` helper.
+
 **Remaining (in plan order):**
 
 1. **Per-callsite DAP wiring.** `data.rs` has 12+ existing
@@ -837,9 +862,9 @@ Step 5 added:
    viz-aware. Update each `impl DebugSession` callsite to pass
    `Some(self.debugger.view_registry())` so the IDE actually
    picks up summaries. Mechanical.
-2. **Enums** in the derive (still compile-error gated). Needs
-   variant-level `summary` and `tag = "..."` attributes per the
-   plan.
+2. **Per-variant attributes on enums.** Variant-level `summary`
+   override + `tag = "..."` for state-tag display. Wire format
+   needs an additive `variants` list; bump the spec version.
 3. **`module_path!()` in the macro** so the wire `type_name`
    matches what the v0 demangler produces. Removes the suffix
    fallback and its ambiguity bail.

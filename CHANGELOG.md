@@ -7,6 +7,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 6 — enums):
+  - `#[derive(DebugView)]` now accepts enums. Step 6 only carries
+    the type-level `summary` template; per-variant attributes
+    (`#[bs_viz(summary = "...")]` / `#[bs_viz(tag = "...")]`
+    on individual variants) are tracked under "Remaining" §2.
+  - Renderer dispatches on the active variant: when a
+    `RustEnum` hits the `Wrapped` branch and its enum-type has a
+    registered spec, the summary template substitutes against
+    the *active variant's* struct members. Placeholder `{__0}`
+    resolves to the first positional field of whichever variant
+    is currently active — `Status::Connected(443)` renders as
+    `Status[443]`, `Status::Error("transport reset")` as
+    `Status[transport reset]`. Same dispatch in the DAP path.
+    No-spec / no-summary fallback is unchanged
+    (`EnumType::VariantName(...)`).
+  - `viz_demo` gains a `Status { Connected(u32), Disconnected,
+    Error(&'static str) }` enum and two locals exercising
+    different active variants; integration test asserts both
+    render through the template and that the bare path is
+    unchanged. Spec count is now 8.
 - visualisers (Phase 4 Tier-A step 5 — tuple + unit structs):
   - `#[derive(DebugView)]` now accepts tuple structs and unit
     structs. Tuple-struct fields receive the Rust-DWARF

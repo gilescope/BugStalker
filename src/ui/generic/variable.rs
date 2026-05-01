@@ -91,6 +91,25 @@ fn render_value_inner(
                 }
             }
             ValueLayout::Wrapped(val) => {
+                // Phase 4 step 6 — enum summary template
+                // application. When the outer is a RustEnum and
+                // its enum-type carries a registered spec, we
+                // substitute the template against the *active
+                // variant's* members. The variant's struct is
+                // already what `Wrapped` is pointing at, so we
+                // just need to recognise the outer shape.
+                if let Value::RustEnum(_) = value
+                    && let Value::Struct(variant) = val
+                    && let Some(spec) = viz.and_then(|r| {
+                        let outer = value.r#type().name_fmt();
+                        r.find(&outer)
+                    })
+                    && let Some(tmpl) = spec.summary.as_deref()
+                {
+                    let outer_type = value.r#type().name_fmt();
+                    let summary = substitute_template(tmpl, &variant.members, spec);
+                    return format!("{outer_type} {summary}");
+                }
                 format!(
                     "{}::{}",
                     value.r#type().name_fmt(),

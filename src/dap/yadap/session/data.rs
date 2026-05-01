@@ -513,6 +513,37 @@ pub fn render_value_to_string_with_viz(
             format!("{ptr:p}")
         }
         Some(debugger::variable::render::ValueLayout::Wrapped(inner)) => {
+            // Phase 4 step 6 — enum summary template applied to
+            // the active variant's members. Mirrors the
+            // TUI/console path.
+            if let debugger::variable::value::Value::RustEnum(_) = v
+                && let debugger::variable::value::Value::Struct(variant) = inner
+                && let Some(spec) = viz.and_then(|r| {
+                    let outer = RenderValue::r#type(v).name_fmt();
+                    r.find(&outer)
+                })
+                && let Some(tmpl) = spec.summary.as_deref()
+            {
+                let outer_type = RenderValue::r#type(v).name_fmt();
+                let body = debugger::viz::substitute_template(tmpl, &variant.members, |m| {
+                    let fmt = m
+                        .field_name
+                        .as_deref()
+                        .and_then(|name| spec.fields.iter().find(|f| f.name == name))
+                        .map(|f| f.format)
+                        .filter(|f| *f != bs_viz_spec::Format::Default);
+                    if let Some(fmt) = fmt
+                        && let Some(s) =
+                            crate::ui::generic::variable::format_scalar_for_dap(
+                                &m.value, fmt,
+                            )
+                    {
+                        return s;
+                    }
+                    render_value_to_string_with_viz(&m.value, viz)
+                });
+                return format!("{outer_type} {body}");
+            }
             format!(
                 "{}::{}",
                 RenderValue::r#type(inner).name_fmt(),

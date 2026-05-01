@@ -26,14 +26,14 @@ fn debug_view_specs_loaded_from_demo_binary() {
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
     let debugger = builder.build(process).unwrap();
 
-    // Seven derives in the demo binary: Person, Counter, Wrap,
-    // Event, UserId, Point, Sentinel. `Wrap` is generic — we
-    // still emit only one spec per type *definition*; tuple
-    // and unit structs all count as one spec each.
+    // Eight derives in the demo binary: Person, Counter, Wrap,
+    // Event, UserId, Point, Sentinel, Status. `Wrap` is
+    // generic — one spec per type *definition*; tuple, unit,
+    // and enum each count as one spec.
     assert_eq!(
         debugger.view_spec_count(),
-        7,
-        "expected 7 specs from viz_demo, got {}",
+        8,
+        "expected 8 specs from viz_demo, got {}",
         debugger.view_spec_count(),
     );
 
@@ -109,6 +109,19 @@ fn debug_view_specs_loaded_from_demo_binary() {
     assert!(sentinel_spec.fields.is_empty());
     assert_eq!(sentinel_spec.summary.as_deref(), Some("Sentinel"));
 
+    // Step 6 — enum spec round-trip. Step 6 only emits the
+    // type-level summary; per-variant attributes follow in
+    // step 7.
+    let status_spec = debugger
+        .view_spec_for("Status")
+        .expect("Status enum spec should be in the registry");
+    assert_eq!(status_spec.summary.as_deref(), Some("Status[{__0}]"));
+    assert!(
+        status_spec.fields.is_empty(),
+        "step 6 enum derive emits no per-field entries; got {:?}",
+        status_spec.fields,
+    );
+
     drop(debugger);
 }
 
@@ -122,9 +135,9 @@ fn debug_view_summary_applied_at_render_time() {
 
     // BP at the `black_box` line — every local in `main` is
     // alive at this point.
-    debugger.set_breakpoint_at_line("main.rs", 93).unwrap();
+    debugger.set_breakpoint_at_line("main.rs", 107).unwrap();
     debugger.start_debugee().unwrap();
-    assert_eq!(info.line.take(), Some(93));
+    assert_eq!(info.line.take(), Some(107));
 
     let viz = debugger.view_registry();
     let locals = debugger.read_local_variables().unwrap();
@@ -283,6 +296,35 @@ fn debug_view_summary_applied_at_render_time() {
     // unit-struct locals entirely. Don't fail the test for that;
     // the spec's existence in the registry (asserted above) is
     // already proved.
+
+    // Step 6 — enum summary application. `status_ok =
+    // Status::Connected(443)`; the type-level summary
+    // `Status[{__0}]` substitutes `__0` from the *active
+    // variant*'s struct (`Connected(443)` → `Status[443]`).
+    let status_ok_local = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("status_ok"))
+        .expect("local `status_ok` should be in scope");
+    let status_err_local = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("status_err"))
+        .expect("local `status_err` should be in scope");
+    let ok_with_spec = render_value_with_viz(status_ok_local.value(), Some(viz));
+    let err_with_spec = render_value_with_viz(status_err_local.value(), Some(viz));
+    let ok_bare = render_value_with_viz(status_ok_local.value(), None);
+
+    assert!(
+        ok_with_spec.contains("Status[443]"),
+        "enum summary not applied to active Connected variant: {ok_with_spec}",
+    );
+    assert!(
+        err_with_spec.contains("Status[transport reset]"),
+        "enum summary not applied to active Error variant: {err_with_spec}",
+    );
+    assert!(
+        !ok_bare.contains("Status[443]"),
+        "viz=None path unexpectedly produced enum summary: {ok_bare}",
+    );
 
     debugger.continue_debugee().unwrap();
     drop(debugger);

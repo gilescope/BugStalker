@@ -67,6 +67,18 @@ pub struct Point(pub i32, pub i32);
 #[bs_viz(summary = "Sentinel")]
 pub struct Sentinel;
 
+/// Step 6 — enums supported with a type-level summary. The
+/// placeholder `{__0}` resolves to the first field of whichever
+/// variant is active at render time. Variant-specific summaries
+/// (`#[bs_viz]` on each variant) are tracked under step 7.
+#[derive(DebugView)]
+#[bs_viz(summary = "Status[{__0}]")]
+pub enum Status {
+    Connected(u32),
+    Disconnected,
+    Error(&'static str),
+}
+
 fn main() {
     let p = Person {
         name: "Ada".to_string(),
@@ -88,7 +100,11 @@ fn main() {
     let uid = UserId(0xCAFE_BABE);
     let pt = Point(10, 20);
     let sentinel = Sentinel;
+    let status_ok = Status::Connected(443);
+    let status_err = Status::Error("transport reset");
     // Reference everything so the linker keeps them.
     println!("{} / {} / {} / {}", p.name, c.label, w_i32.inner, ev.seq); // BP_LINE = next line below
-    std::hint::black_box((&p, &c, &w_i32, &w_str, &ev, &uid, &pt, &sentinel));
+    std::hint::black_box((
+        &p, &c, &w_i32, &w_str, &ev, &uid, &pt, &sentinel, &status_ok, &status_err,
+    ));
 }
