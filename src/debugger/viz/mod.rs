@@ -14,7 +14,8 @@
 //! mean the debug state was out of sync with the binary, which
 //! is exactly the bug class this design avoids.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::RwLock;
 
 use bs_viz_spec::TypeViewSpec;
 use object::{Object, ObjectSection};
@@ -126,9 +127,22 @@ fn strip_generic_args(name: &str) -> &str {
 
 /// In-memory registry of every `#[derive(DebugView)]` spec
 /// recovered from the debuggee.
-#[derive(Debug, Clone, Default)]
+///
+/// The `disabled` set carries the typenames the user has muted
+/// for this session via `bs/visualiserToggle`. Entries in
+/// `disabled` make `find()` return `None` even when the spec is
+/// present — the renderer then falls through to the bare
+/// struct/enum form, which is exactly what the user wants when
+/// debugging the visualiser itself or comparing to defaults.
+///
+/// Mutability is per-field: `by_name` is fixed at load time,
+/// `disabled` mutates via `set_enabled` and is wrapped in
+/// `RwLock` so the read-only `find()` can hot-path the
+/// uncontended-reader case.
+#[derive(Debug, Default)]
 pub struct VizRegistry {
     by_name: HashMap<String, TypeViewSpec>,
+    disabled: RwLock<HashSet<String>>,
 }
 
 impl VizRegistry {
@@ -169,7 +183,10 @@ impl VizRegistry {
             }
         }
 
-        Self { by_name }
+        Self {
+            by_name,
+            disabled: RwLock::new(HashSet::new()),
+        }
     }
 
     /// Return the spec whose `type_name` matches `query`. Match
@@ -199,16 +216,37 @@ impl VizRegistry {
     ///    matches (>1 hit) bail to `None` so we never apply the
     ///    wrong spec silently.
     pub fn find(&self, query: &str) -> Option<&TypeViewSpec> {
-        if let Some(spec) = self.by_name.get(query) {
-            return Some(spec);
+        // Compute the candidate hit ignoring `disabled`, then
+        // mute it to `None` if the resolved key is muted. Done
+        // in two passes to keep the lifetime story simple — a
+        // closure capturing `disabled` (a `RwLockReadGuard`)
+        // can't return a borrow of `self.by_name` past its own
+        // scope.
+        let (resolved_key, resolved_spec): (&str, &TypeViewSpec) = match self.resolve(query) {
+            Some(pair) => pair,
+            None => return None,
+        };
+        if self.disabled.read().ok()?.contains(resolved_key) {
+            return None;
+        }
+        Some(resolved_spec)
+    }
+
+    /// Resolution-only pass: same match rules as [`find`], no
+    /// `disabled` check. Returns `(key, spec)` so callers can
+    /// mute the hit themselves. Private — every external caller
+    /// goes through `find`.
+    fn resolve(&self, query: &str) -> Option<(&str, &TypeViewSpec)> {
+        if let Some((k, v)) = self.by_name.get_key_value(query) {
+            return Some((k.as_str(), v));
         }
         let stripped = strip_generic_args(query);
-        if stripped != query {
-            if let Some(spec) = self.by_name.get(stripped) {
-                return Some(spec);
-            }
+        if stripped != query
+            && let Some((k, v)) = self.by_name.get_key_value(stripped)
+        {
+            return Some((k.as_str(), v));
         }
-        let mut hit: Option<&TypeViewSpec> = None;
+        let mut hit: Option<(&str, &TypeViewSpec)> = None;
         for (key, spec) in &self.by_name {
             let forward = stripped.len() > key.len() + 2
                 && stripped.ends_with(key)
@@ -223,10 +261,41 @@ impl VizRegistry {
                 if hit.is_some() {
                     return None;
                 }
-                hit = Some(spec);
+                hit = Some((key.as_str(), spec));
             }
         }
         hit
+    }
+
+    /// Phase 4 step 13 — toggle the `disabled` flag for an
+    /// exact registered type name. `enabled = false` mutes the
+    /// spec so `find()` returns `None` even when the spec is
+    /// present; `enabled = true` un-mutes. Returns `true` iff
+    /// `type_name` is actually registered (the caller can then
+    /// surface "no such visualiser" to the user).
+    pub fn set_enabled(&self, type_name: &str, enabled: bool) -> bool {
+        if !self.by_name.contains_key(type_name) {
+            return false;
+        }
+        let Ok(mut guard) = self.disabled.write() else {
+            return false;
+        };
+        if enabled {
+            guard.remove(type_name);
+        } else {
+            guard.insert(type_name.to_string());
+        }
+        true
+    }
+
+    /// Phase 4 step 13 — read the disabled-set membership for a
+    /// given registered key. Used by `bs/visualiserList` to
+    /// surface whether each spec is currently active.
+    pub fn is_disabled(&self, type_name: &str) -> bool {
+        self.disabled
+            .read()
+            .map(|g| g.contains(type_name))
+            .unwrap_or(false)
     }
 
     /// Total number of indexed specs.
@@ -276,7 +345,10 @@ mod tests {
                 variants: vec![],
             },
         );
-        VizRegistry { by_name }
+        VizRegistry {
+            by_name,
+            disabled: RwLock::new(HashSet::new()),
+        }
     }
 
     #[test]
@@ -370,7 +442,10 @@ mod tests {
                 variants: vec![],
             },
         );
-        let r = VizRegistry { by_name };
+        let r = VizRegistry {
+            by_name,
+            disabled: RwLock::new(HashSet::new()),
+        };
         assert!(r.find("Wrap<i32>").is_some());
         assert!(r.find("Wrap<Vec<u8>>").is_some());
         assert!(r.find("my_crate::Wrap<i32>").is_some());

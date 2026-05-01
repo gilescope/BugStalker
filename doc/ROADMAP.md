@@ -701,22 +701,13 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1–12 shipped (2026-05-01).** Step 1 wires the
-declarative-spec data path end-to-end; step 2 wires the
-renderer; step 3 unblocks generics + `format = "hex|bin|oct"`;
-step 4 adds `format = "iso8601"` and `format = "duration"`;
-step 5 unblocks tuple + unit structs and fixes the silent bug
-where templates skipped field formats; step 6 unblocks enums
-with type-level summaries; step 7 wires every existing DAP
-callsite through to the registry; step 8 bumps the spec wire
-format to v2 and lights up per-variant `summary` + `tag` on
-enums; step 9 ships the `#[bs_viz(name = "...")]` override;
-step 10 makes the common case Just Work via a const-fn-
-assembled `module_path!()`-prefixed name; step 11 closes the
-last format gap with `format = "utf8" | "hexdump"` on byte
-arrays; step 12 ships the `bs/visualiserList` custom DAP
-request so an IDE settings panel can enumerate every Tier-A
-spec recovered from the debuggee. The following is live:
+**Status: steps 1–13 shipped (2026-05-01).** Steps 1–11 ship
+the declarative-spec end-to-end (data path, renderer, generics,
+formats, tuple/unit/enum, DAP wiring, wire format v2 with
+variant attrs, `name = "..."` override, `module_path!()`
+auto-composition, byte-array formats); step 12 ships
+`bs/visualiserList`; step 13 ships `bs/visualiserToggle` with
+per-session enable/disable. The following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -1015,14 +1006,38 @@ Step 12 added:
   shapes are exactly right (hex format, hidden field, variant
   tags + summaries, name override).
 
+Step 13 added:
+
+* **`bs/visualiserToggle` custom DAP request.** Per-session
+  enable/disable for any registered Tier-A spec. Request:
+  `{ typeName: "...", enabled: bool }`. On unknown
+  `typeName` the response carries an actionable error
+  message that quotes the bad name and lists the registered
+  keys (capped at 8 + "and N more") so a user with a typo
+  sees what they meant.
+* **Mutability through `RwLock`.** `VizRegistry.disabled` is a
+  `RwLock<HashSet<String>>` so the read-only `find()` keeps a
+  hot path; the rare toggle goes through the write lock.
+  `find()` was refactored into a private `resolve()` (returns
+  `(key, spec)`) plus a disabled-set check at the surface — the
+  `RwLockReadGuard` lifetime stays scoped to `find()`'s body
+  rather than escaping into the matched borrow.
+* **`bs/visualiserList` reports `enabled: bool`.** Each
+  visualiser entry now includes a per-session enabled state so
+  the IDE settings panel can render a checkbox.
+* **Two new DAP integration tests.** `test_stdio_dap_visualiser_toggle`
+  flips Person off, asserts `enabled = false` in the list,
+  flips back on, then exercises the unknown-typeName error
+  path. `test_stdio_dap_visualiser_list` continues to pass
+  (the new `enabled` field is additive).
+
 **Remaining (in plan order):**
 
-1. **`bs/visualiserToggle` and `bs/visualiserError`** — the
-   other two custom DAP requests called out in the plan.
-   Toggle disables a visualiser per-session (debugging the
-   visualiser itself); Error returns the most recent
-   visualiser-failure for the IDE problems panel. Small,
-   bounded.
+1. **`bs/visualiserError`** — the third plan-§DAP custom
+   request. Returns the most recent visualiser failure for the
+   IDE problems panel. Mostly meaningful once Tier B (wasm)
+   ships — Tier A failures are loader-time and already log via
+   `log::warn`. Defer to land alongside the wasm runtime.
 2. **`CustomView` escape hatch** — non-declarative Tier A.
    `#[bs_viz(custom)]` + `impl CustomView for MyType` lets
    crate authors hook into the existing `call_debug_fmt`

@@ -7,6 +7,25 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 13 — `bs/visualiserToggle` DAP):
+  - New `bs/visualiserToggle` custom DAP request flips a
+    registered Tier-A visualiser on or off per-session.
+    Request: `{ typeName: "...", enabled: bool }`. Returns
+    `{ typeName, enabled }` on success. Unknown `typeName`
+    yields an actionable error with the bad name quoted and a
+    capped list of registered keys.
+  - `VizRegistry` gains an `RwLock<HashSet<String>>` `disabled`
+    set + `set_enabled` / `is_disabled` methods. `find()` was
+    refactored into a private `resolve()` (returns
+    `(key, spec)`) plus a disabled-set check at the surface so
+    the lock guard's lifetime stays scoped.
+  - `bs/visualiserList` response now carries an `enabled: bool`
+    per visualiser so the IDE settings panel can render a
+    checkbox.
+  - New DAP integration test
+    `test_stdio_dap_visualiser_toggle` flips Person off,
+    asserts the list reflects the new state, flips back on,
+    and exercises the unknown-typeName error path.
 - visualisers (Phase 4 Tier-A step 12 — `bs/visualiserList` DAP):
   - New `bs/visualiserList` custom DAP request enumerates every
     Tier-A spec the loader recovered from the debuggee. Response

@@ -348,6 +348,7 @@ impl super::DebugSession {
                     "typeName": name,
                     "summary":  spec.summary,
                     "origin":   "tier-a",
+                    "enabled":  !viz.is_disabled(name),
                     "fields":   spec.fields.iter().map(serialize_field).collect::<Vec<_>>(),
                     "variants": spec.variants.iter().map(|v| json!({
                         "name":    v.name,
@@ -362,6 +363,76 @@ impl super::DebugSession {
             req,
             json!({
                 "visualisers": visualisers,
+            }),
+        )
+    }
+
+    /// `bs/visualiserToggle` — turn a registered Tier-A
+    /// visualiser on or off for this debug session. Useful when
+    /// a user wants to compare the rendered summary against the
+    /// raw struct/enum dump, or when debugging a misbehaving
+    /// visualiser itself.
+    ///
+    /// Request:
+    ///
+    /// ```json
+    /// { "typeName": "viz_demo::Person", "enabled": false }
+    /// ```
+    ///
+    /// `typeName` must match exactly an entry returned by
+    /// `bs/visualiserList`. Suffix-match isn't applied here —
+    /// the toggle is a precise per-spec control.
+    ///
+    /// Response on success:
+    ///
+    /// ```json
+    /// { "typeName": "viz_demo::Person", "enabled": false }
+    /// ```
+    ///
+    /// Response on unknown `typeName`: error reply with a
+    /// human-readable message naming the registered keys
+    /// (capped to keep messages reasonable).
+    pub(super) fn handle_visualiser_toggle(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let dbg = self
+            .debugger
+            .as_ref()
+            .ok_or_else(|| anyhow!("bs/visualiserToggle: debugger not initialized"))?;
+        let type_name = match req.arguments.get("typeName").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return self.send_err(req, "bs/visualiserToggle: missing arguments.typeName"),
+        };
+        let enabled = req
+            .arguments
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !dbg.view_registry().set_enabled(type_name, enabled) {
+            // Build a short list of registered keys so the user
+            // can spot a typo. Cap to keep the message
+            // reasonable on a binary with many derives.
+            let mut keys: Vec<&str> = dbg.view_registry().iter().map(|(n, _)| n).collect();
+            keys.sort();
+            let preview = keys.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+            let suffix = if keys.len() > 8 {
+                format!(" (and {} more)", keys.len() - 8)
+            } else {
+                String::new()
+            };
+            return self.send_err(
+                req,
+                format!(
+                    "bs/visualiserToggle: no spec registered under {type_name:?}; \
+                     known: [{preview}]{suffix}"
+                ),
+            );
+        }
+
+        self.send_success_body(
+            req,
+            json!({
+                "typeName": type_name,
+                "enabled":  enabled,
             }),
         )
     }

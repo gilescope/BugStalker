@@ -1355,3 +1355,124 @@ fn test_stdio_dap_visualiser_list() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Phase 4 step 13 — `bs/visualiserToggle` per-session mute.
+/// Toggle a registered visualiser off, verify
+/// `bs/visualiserList` reflects the new `enabled` state, then
+/// toggle it back on. Also covers the unknown-typeName error
+/// path so a typo from the IDE produces an actionable response
+/// listing the registered keys.
+#[test]
+fn test_stdio_dap_visualiser_toggle() -> anyhow::Result<()> {
+    let viz_demo = std::env::var("CARGO_BIN_EXE_viz_demo")
+        .unwrap_or_else(|_| "./examples/target/debug/viz_demo".to_string());
+
+    let mut dap = start_bs_stdio_dap(&viz_demo)?;
+    dap.send_request(
+        1,
+        "initialize",
+        json!({
+            "clientID":   "test",
+            "clientName": "test-client",
+            "adapterID":  "bs-dap",
+        }),
+    )?;
+    let _ = dap.read_message()?;
+    let _ = dap.read_message()?;
+    dap.send_request(
+        2,
+        "launch",
+        json!({
+            "request":     "launch",
+            "program":     &viz_demo,
+            "stopOnEntry": true,
+        }),
+    )?;
+    loop {
+        let msg = dap.read_message()?;
+        if msg["type"] == "response" && msg["command"] == "launch" {
+            break;
+        }
+    }
+
+    // Sanity: Person is enabled by default.
+    let read_person_enabled = |dap: &mut StdioDAP, seq: i64| -> anyhow::Result<bool> {
+        dap.send_request(seq, "bs/visualiserList", json!({}))?;
+        let resp = loop {
+            let m = dap.read_message()?;
+            if m["type"] == "response" && m["command"] == "bs/visualiserList" {
+                break m;
+            }
+        };
+        let v = resp["body"]["visualisers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["typeName"] == "viz_demo::Person")
+            .expect("Person should be in the list")
+            .clone();
+        Ok(v["enabled"].as_bool().unwrap_or(true))
+    };
+    assert!(read_person_enabled(&mut dap, 3)?);
+
+    // Toggle Person off.
+    dap.send_request(
+        4,
+        "bs/visualiserToggle",
+        json!({
+            "typeName": "viz_demo::Person",
+            "enabled":  false,
+        }),
+    )?;
+    let toggle_resp = loop {
+        let m = dap.read_message()?;
+        if m["type"] == "response" && m["command"] == "bs/visualiserToggle" {
+            break m;
+        }
+    };
+    assert_eq!(toggle_resp["success"], true);
+    assert_eq!(toggle_resp["body"]["typeName"], "viz_demo::Person");
+    assert_eq!(toggle_resp["body"]["enabled"], false);
+
+    // List now reports `enabled = false` for Person.
+    assert!(!read_person_enabled(&mut dap, 5)?);
+
+    // Toggle back on.
+    dap.send_request(
+        6,
+        "bs/visualiserToggle",
+        json!({ "typeName": "viz_demo::Person", "enabled": true }),
+    )?;
+    loop {
+        let m = dap.read_message()?;
+        if m["type"] == "response" && m["command"] == "bs/visualiserToggle" {
+            break;
+        }
+    }
+    assert!(read_person_enabled(&mut dap, 7)?);
+
+    // Unknown typeName: error response with actionable message.
+    dap.send_request(
+        8,
+        "bs/visualiserToggle",
+        json!({ "typeName": "Nonexistent", "enabled": false }),
+    )?;
+    let err_resp = loop {
+        let m = dap.read_message()?;
+        if m["type"] == "response" && m["command"] == "bs/visualiserToggle" {
+            break m;
+        }
+    };
+    assert_eq!(err_resp["success"], false);
+    let msg = err_resp["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("\"Nonexistent\""),
+        "error message should quote the bad name: {msg}",
+    );
+    assert!(
+        msg.contains("known: ["),
+        "error message should list known keys: {msg}",
+    );
+
+    Ok(())
+}

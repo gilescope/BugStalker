@@ -657,6 +657,8 @@ impl DebugSession {
             "bs/awaitTrace" => self.handle_await_trace(req)?,
             // Phase 4 step 12 — Tier-A visualiser introspection.
             "bs/visualiserList" => self.handle_visualiser_list(req)?,
+            // Phase 4 step 13 — per-session toggle.
+            "bs/visualiserToggle" => self.handle_visualiser_toggle(req)?,
             other => {
                 self.send_err(req, format!("Unsupported DAP command: {other}"))?;
             }
