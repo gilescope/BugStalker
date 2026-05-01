@@ -701,7 +701,7 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1–10 shipped (2026-05-01).** Step 1 wires the
+**Status: steps 1–11 shipped (2026-05-01).** Step 1 wires the
 declarative-spec data path end-to-end; step 2 wires the
 renderer; step 3 unblocks generics + `format = "hex|bin|oct"`;
 step 4 adds `format = "iso8601"` and `format = "duration"`;
@@ -711,10 +711,10 @@ with type-level summaries; step 7 wires every existing DAP
 callsite through to the registry; step 8 bumps the spec wire
 format to v2 and lights up per-variant `summary` + `tag` on
 enums; step 9 ships the `#[bs_viz(name = "...")]` override;
-step 10 makes the **common case** Just Work — the macro now
-records `module_path!()`-prefixed names automatically by
-assembling the spec bytes via a `const fn` at the user crate's
-compile time. The following is live:
+step 10 makes the common case Just Work via a const-fn-
+assembled `module_path!()`-prefixed name; step 11 closes the
+last format gap by applying `format = "utf8"` and `format =
+"hexdump"` to byte-array fields. The following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -974,13 +974,36 @@ Step 10 added:
   both the qualified and the local-only probes resolve to the
   same spec.
 
+Step 11 added:
+
+* **`format = "utf8"` and `format = "hexdump"` applied at
+  render time.** New `format_bytes` helper (with public DAP
+  alias `format_bytes_for_dap`) detects byte-array shapes —
+  `Vec<u8>` / `VecDeque<u8>` (via `SpecializedValue::Vector`),
+  `String` / `&str` (already-decoded UTF-8), and plain
+  `[u8; N]` / `&[u8]`-shaped `Value::Array`. Routes through
+  the existing `render_bytes` helper so output shape matches
+  the rest of the engine: `b"hello"` for utf8, the standard
+  16-bytes-per-row hex grid for hexdump.
+* **Renderer + DAP both wired.** The structure-render branch
+  and the template-substitute closure both try
+  `format_scalar` first (integer formats), fall through to
+  `format_bytes` (byte-array formats), then default. DAP path
+  mirrors with the public aliases.
+* `viz_demo` gains a `Doc { body: Vec<u8>, raw: Vec<u8>, size:
+  u32 }` struct exercising both formats — `body: b"hello world"`,
+  `raw: 00 ff 42 53 56 31`. Integration test asserts both
+  rendered forms appear in the with-spec output.
+
 **Remaining (in plan order):**
 
-1. **`format = "utf8" | "hexdump"` applied at render time.**
-   Need byte-array detection (`Vec<u8>`, `&[u8]`, `[u8; N]`) —
-   the source-byte plumbing is its own slice of work.
-2. **`CustomView` escape hatch** — non-declarative Tier A.
-3. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
+1. **`CustomView` escape hatch** — non-declarative Tier A.
+   `#[bs_viz(custom)]` + `impl CustomView for MyType` lets
+   crate authors hook into the existing `call_debug_fmt`
+   machinery for visualisations that go beyond the
+   declarative spec (custom slot tables, hash-structure walks,
+   etc.).
+2. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
    loaded from `~/.config/bugstalker/visualizers/*.wasm` and from
    `.bs_visualizer_wasm` sections.
 

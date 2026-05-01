@@ -182,7 +182,10 @@ fn render_value_inner(
                     }
                     let rendered = format
                         .filter(|f| *f != Format::Default)
-                        .and_then(|f| format_scalar(&member.value, f))
+                        .and_then(|f| {
+                            format_scalar(&member.value, f)
+                                .or_else(|| format_bytes(&member.value, f))
+                        })
                         .unwrap_or_else(|| {
                             render_value_inner(&member.value, depth + 1, true, viz)
                         });
@@ -284,10 +287,13 @@ fn substitute_template_with_fields(
             .and_then(|name| fields.iter().find(|f| f.name == name))
             .map(|f| f.format)
             .filter(|f| *f != Format::Default);
-        if let Some(fmt) = format
-            && let Some(s) = format_scalar(&m.value, fmt)
-        {
-            return s;
+        if let Some(fmt) = format {
+            if let Some(s) = format_scalar(&m.value, fmt) {
+                return s;
+            }
+            if let Some(s) = format_bytes(&m.value, fmt) {
+                return s;
+            }
         }
         render_value_inner(&m.value, 0, false, None)
     })
@@ -324,23 +330,76 @@ pub fn format_scalar_for_dap(value: &Value, fmt: Format) -> Option<String> {
     format_scalar(value, fmt)
 }
 
+/// Public alias for the DAP path of [`format_bytes`].
+pub fn format_bytes_for_dap(value: &Value, fmt: Format) -> Option<String> {
+    format_bytes(value, fmt)
+}
+
+/// Step 11 — apply `format = "utf8"` or `format = "hexdump"` to a
+/// byte-array value. Recognises:
+///
+/// * `Vec<u8>` / `VecDeque<u8>` — via the specialised `Vector`
+///   variant; reuses BugStalker's existing
+///   [`render_byte_slice_members`] helper which already knows
+///   how to walk the inner array.
+/// * `String` / `&str` — already-decoded UTF-8 in the
+///   specialised variants; we lift its bytes and run them
+///   through [`render_bytes`] for uniform output shape.
+/// * `[u8; N]` / `&[u8]`-shaped `Value::Array` — extracted to a
+///   `Vec<u8>` of u8 scalars and rendered.
+///
+/// Returns `None` for anything that isn't a recognisable byte
+/// shape so the caller falls through to default rendering.
+fn format_bytes(value: &Value, fmt: Format) -> Option<String> {
+    use crate::debugger::variable::render::{ByteRenderMode, render_byte_slice_members, render_bytes};
+    use crate::debugger::variable::value::{SpecializedValue, SupportedScalar};
+    let mode = match fmt {
+        Format::Utf8 => ByteRenderMode::ForceUtf8,
+        Format::Hexdump => ByteRenderMode::ForceHex,
+        _ => return None,
+    };
+    match value {
+        Value::Specialized { value: Some(spec), .. } => match spec {
+            SpecializedValue::Vector(v) | SpecializedValue::VecDeque(v) => {
+                render_byte_slice_members(&v.structure.members, mode)
+            }
+            SpecializedValue::String(s) => Some(render_bytes(s.value.as_bytes(), mode, false)),
+            SpecializedValue::Str(s) => Some(render_bytes(s.value.as_bytes(), mode, false)),
+            _ => None,
+        },
+        Value::Array(arr) => {
+            let items = arr.items.as_ref()?;
+            let mut bytes: Vec<u8> = Vec::with_capacity(items.len().min(1024));
+            for item in items.iter().take(1024) {
+                let Value::Scalar(s) = &item.value else {
+                    return None;
+                };
+                match s.value {
+                    Some(SupportedScalar::U8(b)) => bytes.push(b),
+                    _ => return None,
+                }
+            }
+            let truncated = items.len() > 1024;
+            Some(render_bytes(&bytes, mode, truncated))
+        }
+        _ => None,
+    }
+}
+
 /// Apply a `#[bs_viz(format = "...")]` override to a scalar
 /// value. Returns `Some(rendered)` when the value is a scalar
 /// integer and the format is applicable. Otherwise `None`,
 /// signalling the caller should fall back to default rendering.
 ///
-/// Step 4 conventions for the time-shaped formats:
+/// Format conventions:
 ///
+/// * `hex` / `bin` / `oct` — integer base.
 /// * `iso8601` reads an integer as **Unix epoch seconds** (UTC).
-///   The user explicitly opts in by attaching the attribute, so
-///   we don't need to recognise `SystemTime`'s internal layout
-///   — useful for raw timestamps stored as `i64` / `u64`.
 /// * `duration` reads an integer as **nanoseconds** and renders
 ///   it in the largest sensible unit (ns / µs / ms / s).
-///
-/// `utf8` / `hexdump` need byte-array detection (Vec<u8>, &[u8],
-/// etc.); they fall through to default rendering until that
-/// decoder lands in a follow-up batch.
+/// * `utf8` / `hexdump` operate on byte-array values and route
+///   through [`format_bytes`] instead — `format_scalar` is
+///   integer-only and returns `None` for those.
 fn format_scalar(value: &Value, fmt: Format) -> Option<String> {
     if let Value::Scalar(s) = value {
         let n = s.try_as_number()?;

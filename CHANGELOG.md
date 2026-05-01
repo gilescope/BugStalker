@@ -7,6 +7,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 11 — utf8 + hexdump byte formats):
+  - `format = "utf8"` and `format = "hexdump"` now apply to
+    byte-array-shaped fields. Recognised shapes: `Vec<u8>` /
+    `VecDeque<u8>` (via the `SpecializedValue::Vector` variant
+    BugStalker normalises to), `String` / `&str` (already-
+    decoded UTF-8 in their specialised variants), and plain
+    `[u8; N]` / `&[u8]`-shaped `Value::Array`. Output routes
+    through the existing `render_bytes` helper so shape matches
+    other byte renderings in the engine: `b"hello world"` for
+    utf8, the standard 16-bytes-per-row hex grid (with ASCII
+    column when printable) for hexdump.
+  - New `format_bytes` private helper (with public DAP alias
+    `format_bytes_for_dap`). The structure-render branch and
+    the template-substitute closure both try `format_scalar`
+    first, fall through to `format_bytes`, then default.
+    DAP path mirrors via the alias.
+  - `viz_demo` gains a `Doc { body: Vec<u8>, raw: Vec<u8>,
+    size: u32 }` struct with `format = "utf8"` on `body` and
+    `format = "hexdump"` on `raw`. Integration test asserts
+    `b"hello world"` and `00 ff 42 53 56 31` both appear in
+    the with-spec render.
 - visualisers (Phase 4 Tier-A step 10 — `module_path!()` integrated):
   - `bs-viz-spec` exports two new `const fn` entry points:
     `assemble_with_module_path::<N>(module, local, suffix)` and

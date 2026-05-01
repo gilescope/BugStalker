@@ -77,6 +77,19 @@ pub struct Sentinel;
 #[bs_viz(name = "qualified::Marker", summary = "Marker#{__0}")]
 pub struct Marker(pub u32);
 
+/// Step 11 — `format = "utf8"` and `format = "hexdump"` applied
+/// to byte-array fields. `body` is opted into a UTF-8 string
+/// view; `raw` is opted into a hex dump.
+#[derive(DebugView)]
+#[bs_viz(summary = "Doc({size} bytes)")]
+pub struct Doc {
+    #[bs_viz(format = "utf8")]
+    pub body: Vec<u8>,
+    #[bs_viz(format = "hexdump")]
+    pub raw: Vec<u8>,
+    pub size: u32,
+}
+
 /// Step 6 — enum with type-level summary as fallback.
 /// Step 8 — per-variant `summary` overrides the type-level one
 /// when that variant is active, and `tag = "..."` annotates the
@@ -116,10 +129,15 @@ fn main() {
     let status_ok = Status::Connected(443);
     let status_err = Status::Error("transport reset");
     let marker = Marker(99);
+    let doc = Doc {
+        body: b"hello world".to_vec(),
+        raw: vec![0x00, 0xFF, 0x42, 0x53, 0x56, 0x31],
+        size: 11,
+    };
     // Reference everything so the linker keeps them.
     println!("{} / {} / {} / {}", p.name, c.label, w_i32.inner, ev.seq); // BP_LINE = next line below
     std::hint::black_box((
         &p, &c, &w_i32, &w_str, &ev, &uid, &pt, &sentinel, &status_ok, &status_err,
-        &marker,
+        &marker, &doc,
     ));
 }

@@ -552,13 +552,21 @@ pub fn render_value_to_string_with_viz(
                             })
                             .map(|f| f.format)
                             .filter(|f| *f != bs_viz_spec::Format::Default);
-                        if let Some(fmt) = fmt
-                            && let Some(s) =
+                        if let Some(fmt) = fmt {
+                            if let Some(s) =
                                 crate::ui::generic::variable::format_scalar_for_dap(
                                     &m.value, fmt,
                                 )
-                        {
-                            return s;
+                            {
+                                return s;
+                            }
+                            if let Some(s) =
+                                crate::ui::generic::variable::format_bytes_for_dap(
+                                    &m.value, fmt,
+                                )
+                            {
+                                return s;
+                            }
                         }
                         render_value_to_string_with_viz(&m.value, viz)
                     });
@@ -595,13 +603,21 @@ pub fn render_value_to_string_with_viz(
                             })
                             .map(|f| f.format)
                             .filter(|f| *f != bs_viz_spec::Format::Default);
-                        if let Some(fmt) = fmt
-                            && let Some(s) =
+                        if let Some(fmt) = fmt {
+                            if let Some(s) =
                                 crate::ui::generic::variable::format_scalar_for_dap(
                                     &m.value, fmt,
                                 )
-                        {
-                            return s;
+                            {
+                                return s;
+                            }
+                            if let Some(s) =
+                                crate::ui::generic::variable::format_bytes_for_dap(
+                                    &m.value, fmt,
+                                )
+                            {
+                                return s;
+                            }
                         }
                         render_value_to_string_with_viz(&m.value, viz)
                     });

@@ -27,16 +27,15 @@ fn debug_view_specs_loaded_from_demo_binary() {
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
     let debugger = builder.build(process).unwrap();
 
-    // Nine derives in the demo binary: Person, Counter, Wrap,
-    // Event, UserId, Point, Sentinel, Status, Marker. `Wrap`
-    // is generic — one spec per type *definition*; tuple,
-    // unit, and enum each count as one spec; `Marker` carries
-    // a `name = "..."` override so it registers under
-    // `"qualified::Marker"`.
+    // Ten derives in the demo binary: Person, Counter, Wrap,
+    // Event, UserId, Point, Sentinel, Status, Marker, Doc.
+    // `Wrap` is generic — one spec per type *definition*;
+    // tuple, unit, enum, and byte-array struct each count as
+    // one spec.
     assert_eq!(
         debugger.view_spec_count(),
-        9,
-        "expected 9 specs from viz_demo, got {}",
+        10,
+        "expected 10 specs from viz_demo, got {}",
         debugger.view_spec_count(),
     );
 
@@ -175,9 +174,9 @@ fn debug_view_summary_applied_at_render_time() {
 
     // BP at the `black_box` line — every local in `main` is
     // alive at this point.
-    debugger.set_breakpoint_at_line("main.rs", 121).unwrap();
+    debugger.set_breakpoint_at_line("main.rs", 139).unwrap();
     debugger.start_debugee().unwrap();
-    assert_eq!(info.line.take(), Some(121));
+    assert_eq!(info.line.take(), Some(139));
 
     let viz = debugger.view_registry();
     let locals = debugger.read_local_variables().unwrap();
@@ -374,6 +373,31 @@ fn debug_view_summary_applied_at_render_time() {
     assert!(
         !ok_bare.contains("Connected (port"),
         "viz=None path unexpectedly produced variant summary: {ok_bare}",
+    );
+
+    // Step 11 — `format = "utf8"` and `format = "hexdump"`
+    // applied to byte-array fields. `body` is `Vec<u8>` carrying
+    // ASCII; `raw` carries non-printable bytes. Both go through
+    // `format_bytes` rather than `format_scalar`.
+    let doc_local = locals
+        .iter()
+        .find(|qr| qr.identity().name.as_deref() == Some("doc"))
+        .expect("local `doc` should be in scope");
+    let doc_with_spec = render_value_with_viz(doc_local.value(), Some(viz));
+    assert!(
+        doc_with_spec.contains(r#"b"hello world""#),
+        "format=utf8 not applied to body field: {doc_with_spec}",
+    );
+    assert!(
+        doc_with_spec.contains("00 ff 42 53 56 31"),
+        "format=hexdump not applied to raw field: {doc_with_spec}",
+    );
+    // The non-formatted `size` field still renders as the bare
+    // form. Sanity check we didn't accidentally route every
+    // field through format_bytes.
+    assert!(
+        doc_with_spec.contains("size:"),
+        "size field missing from spec render: {doc_with_spec}",
     );
 
     // Step 9 — `Marker` registers under `"qualified::Marker"`
