@@ -217,6 +217,15 @@ fn ensure_entitled_self_or_reexec() {}
 #[cfg(target_os = "macos")]
 fn ensure_dsym_fresh(prog: &str) {
     use std::process::Command;
+    // Opt-out: the loader's own `ensure_dsym_fresh` (in
+    // `src/debugger/debugee/dwarf/mod.rs`) handles the
+    // `split-debuginfo = "unpacked"` recovery for end users at
+    // attach time. Tests that want to exercise that loader path
+    // explicitly set this env var so the test harness *doesn't*
+    // pre-emptively run dsymutil and mask the loader's work.
+    if std::env::var_os("BS_TEST_NO_AUTODSYM").is_some() {
+        return;
+    }
     let bin = Path::new(prog);
     let bin_meta = match std::fs::metadata(bin) {
         Ok(m) => m,

@@ -767,6 +767,100 @@ impl DebugInformationBuilder {
     // todo configure this path
     const DEBUG_FILES_DIR: &'static str = "/usr/lib/debug";
 
+    /// Compute the path to the DWARF file inside a `.dSYM` bundle:
+    /// `<obj_path>.dSYM/Contents/Resources/DWARF/<basename>`.
+    #[cfg(target_os = "macos")]
+    fn dsym_inner_dwarf_path(obj_path: &Path) -> Option<PathBuf> {
+        let basename = obj_path.file_name()?;
+        let mut candidate = obj_path.as_os_str().to_owned();
+        candidate.push(".dSYM");
+        Some(
+            PathBuf::from(candidate)
+                .join("Contents")
+                .join("Resources")
+                .join("DWARF")
+                .join(basename),
+        )
+    }
+
+    /// macOS / `split-debuginfo = "unpacked"` recovery.
+    ///
+    /// Rust's default macOS layout leaves DWARF inside the per-CU
+    /// `.o` files; the linker writes only `N_OSO` stab pointers
+    /// into the executable. Cargo doesn't run `dsymutil` for you,
+    /// so a fresh `cargo build` gives BugStalker an executable
+    /// with neither inline DWARF nor a sidecar `.dSYM` bundle —
+    /// every breakpoint goes UNVERIFIED and the user has no clue
+    /// why.
+    ///
+    /// This recovery step runs `dsymutil` on first attach when:
+    ///
+    /// * the executable has no `__debug_info` section *and*
+    /// * either no `.dSYM` bundle exists, or the bundle is older
+    ///   than the executable.
+    ///
+    /// `dsymutil` then walks the OSO stabs itself (the same job
+    /// LLDB's stab walker does) and consolidates the `.o` DWARF
+    /// into the bundle. Subsequent attaches hit the bundle
+    /// directly and skip this branch.
+    ///
+    /// Failures (binary not writable, dsymutil missing, etc.) are
+    /// surfaced as `log::warn` and we fall through; the caller
+    /// then degrades to "no debug info" with a clear message
+    /// rather than UNVERIFIED-but-silent breakpoints.
+    #[cfg(target_os = "macos")]
+    fn ensure_dsym_fresh(obj_path: &Path, file: &object::File<'_>) -> Result<(), Error> {
+        use std::process::Command;
+
+        // Already has inline DWARF? Nothing to do.
+        if file.section_by_name("__debug_info").is_some() {
+            return Ok(());
+        }
+
+        let bin_mtime = fs::metadata(obj_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+        let Some(dsym_path) = Self::dsym_inner_dwarf_path(obj_path) else {
+            return Ok(());
+        };
+        let needs_refresh = match fs::metadata(&dsym_path).and_then(|m| m.modified()) {
+            Ok(dsym_mtime) => dsym_mtime < bin_mtime,
+            Err(_) => true,
+        };
+        if !needs_refresh {
+            return Ok(());
+        }
+
+        debug!(
+            target: "dwarf-loader",
+            "{obj_path:?}: no inline DWARF and no fresh .dSYM bundle — \
+             running `dsymutil` to materialise debug info from the \
+             OSO-pointed `.o` files"
+        );
+        match Command::new("dsymutil").arg(obj_path).status() {
+            Ok(s) if s.success() => {
+                debug!(target: "dwarf-loader", "dsymutil produced {dsym_path:?}");
+            }
+            Ok(s) => {
+                log::warn!(
+                    target: "dwarf-loader",
+                    "dsymutil exited with status {s}; debug info will be unavailable. \
+                     If the binary lives in a read-only path, copy it locally and re-run \
+                     `dsymutil <bin>` by hand."
+                );
+            }
+            Err(e) => {
+                log::warn!(
+                    target: "dwarf-loader",
+                    "could not spawn `dsymutil`: {e}. Install Xcode command-line tools \
+                     (`xcode-select --install`) or run `dsymutil <bin>` manually."
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Look for `<obj_path>.dSYM/Contents/Resources/DWARF/<basename>`
     /// — Apple's bundle layout for separate-file DWARF, produced by
     /// `dsymutil`. Cargo's `target/debug/<bin>` does NOT contain
@@ -781,18 +875,9 @@ impl DebugInformationBuilder {
         &self,
         obj_path: &Path,
     ) -> Result<Option<(PathBuf, Mmap)>, Error> {
-        let basename = match obj_path.file_name() {
-            Some(n) => n,
-            None => return Ok(None),
+        let Some(bundle) = Self::dsym_inner_dwarf_path(obj_path) else {
+            return Ok(None);
         };
-        // Try `<obj_path>.dSYM` first (the cargo / dsymutil default).
-        let mut candidate = obj_path.as_os_str().to_owned();
-        candidate.push(".dSYM");
-        let bundle = PathBuf::from(candidate)
-            .join("Contents")
-            .join("Resources")
-            .join("DWARF")
-            .join(basename);
         if !bundle.exists() {
             return Ok(None);
         }
@@ -901,6 +986,11 @@ impl DebugInformationBuilder {
         }
 
         // Order of debug-info lookup:
+        //   0. (macos) auto-run `dsymutil` if the binary has no
+        //      inline DWARF and no fresh dSYM bundle — covers
+        //      Rust's default `split-debuginfo = "unpacked"`
+        //      where DWARF lives in `.o` files referenced via
+        //      Mach-O `N_OSO` stabs.
         //   1. (macos) <obj_path>.dSYM bundle — Apple's separate-file
         //      layout produced by `dsymutil`.
         //   2. (linux) build-id index under /usr/lib/debug/.build-id.
@@ -908,6 +998,14 @@ impl DebugInformationBuilder {
         //   4. fall back to the binary's embedded DWARF.
         let debug_split_file_data;
         let debug_split_file;
+
+        #[cfg(target_os = "macos")]
+        {
+            // Best-effort recovery: failure logged via warn but
+            // doesn't abort the load — we'd rather degrade to
+            // "no debug info" than refuse to attach.
+            let _ = Self::ensure_dsym_fresh(obj_path, file);
+        }
 
         #[cfg(target_os = "macos")]
         let dsym = self.get_dwarf_from_dsym_bundle(obj_path).ok().flatten();

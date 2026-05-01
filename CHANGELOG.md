@@ -7,6 +7,35 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- darwin: auto-recover DWARF for `split-debuginfo = "unpacked"`:
+  - The DWARF loader (`src/debugger/debugee/dwarf/mod.rs`)
+    previously had four lookup paths: `.dSYM` bundle (macOS),
+    `.note.gnu.build-id` (Linux), `.gnu_debuglink` (Linux), and
+    inline DWARF in the executable. None of them cover Rust's
+    *default* macOS layout, where rustc emits DWARF into per-CU
+    `.o` files referenced via Mach-O `N_OSO` stabs and Cargo
+    doesn't run `dsymutil` afterwards. End users running
+    `bs --dap` against a fresh `cargo build` saw every
+    breakpoint go UNVERIFIED with no clue why.
+  - New `Self::ensure_dsym_fresh(obj_path, file)` runs at the
+    start of `build()` on macOS. When the executable has no
+    `__debug_info` section *and* no fresh `.dSYM` bundle (or
+    the bundle is older than the binary), it spawns `dsymutil
+    <obj_path>` to walk the OSO stabs itself and consolidate
+    the `.o` DWARF into the bundle. The existing dSYM-lookup
+    path then picks it up.
+  - Failures (binary not writable, dsymutil missing, etc.)
+    surface via `log::warn` with a clear next-step message and
+    fall through to "no debug info" rather than a silent
+    UNVERIFIED.
+  - New regression test
+    `tests/debugger/viz.rs::debug_view_loader_recovers_dsym_for_split_debuginfo`:
+    nukes the `.dSYM` bundle, attaches BugStalker against a
+    raw `cargo build` binary (with the test-harness's
+    pre-emptive `ensure_dsym_fresh` opted out via the new
+    `BS_TEST_NO_AUTODSYM=1` env var), sets a BP, runs.
+    Without the loader fix the BP would be UNVERIFIED.
+  - Full debugger + dap suites: 173/173 sequentially.
 - visualisers (Phase 4 Tier-A step 11 — utf8 + hexdump byte formats):
   - `format = "utf8"` and `format = "hexdump"` now apply to
     byte-array-shaped fields. Recognised shapes: `Vec<u8>` /

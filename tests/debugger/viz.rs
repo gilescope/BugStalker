@@ -458,3 +458,59 @@ fn debug_view_summary_applied_at_render_time() {
     debugger.continue_debugee().unwrap();
     drop(debugger);
 }
+
+/// Regression test for the `split-debuginfo = "unpacked"` gap:
+/// Rust's default macOS layout leaves DWARF in per-CU `.o` files
+/// pointed at by `N_OSO` stabs. Without a `.dSYM` bundle the
+/// loader used to fall through to "no debug info", and every
+/// breakpoint went UNVERIFIED in DAP. The loader now auto-runs
+/// `dsymutil` on first attach to materialise the bundle.
+///
+/// Test: nuke the bundle, attach, set a breakpoint by line, run.
+/// If the loader regenerated the dSYM the BP resolves; otherwise
+/// `set_breakpoint_at_line` fails.
+#[cfg(target_os = "macos")]
+#[test]
+#[serial]
+fn debug_view_loader_recovers_dsym_for_split_debuginfo() {
+    use std::path::PathBuf;
+    let bin = PathBuf::from(VIZ_DEMO_APP);
+    let mut dsym_dir = bin.clone().into_os_string();
+    dsym_dir.push(".dSYM");
+    let dsym_dir = PathBuf::from(dsym_dir);
+    if dsym_dir.exists() {
+        let _ = std::fs::remove_dir_all(&dsym_dir);
+    }
+    assert!(
+        !dsym_dir.exists(),
+        "test setup should have nuked the dSYM at {dsym_dir:?}",
+    );
+
+    // SAFETY: single-threaded test (`#[serial]`), and we restore
+    // the env var at the end so other tests aren't affected.
+    // `set_var` / `remove_var` are unsafe in edition 2024.
+    unsafe { std::env::set_var("BS_TEST_NO_AUTODSYM", "1"); }
+    let process = prepare_debugee_process(VIZ_DEMO_APP, &[]);
+    unsafe { std::env::remove_var("BS_TEST_NO_AUTODSYM"); }
+
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // The BP at `main.rs:139` only resolves if DWARF was loaded.
+    debugger
+        .set_breakpoint_at_line("main.rs", 139)
+        .expect("loader must auto-run dsymutil and resolve `main.rs:139`");
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(139));
+
+    // Bundle should now exist on disk — the loader's dsymutil
+    // call regenerated it.
+    assert!(
+        dsym_dir.exists(),
+        "loader should have re-created {dsym_dir:?}",
+    );
+
+    debugger.continue_debugee().unwrap();
+    drop(debugger);
+}
