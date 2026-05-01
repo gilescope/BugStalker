@@ -213,6 +213,15 @@ pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
     // SAFETY: mach_task_self() is always valid; raw_task_for_pid
     // takes an out-port and writes to it iff KERN_SUCCESS.
     let kr = unsafe { raw_task_for_pid(mach_task_self(), pid.as_raw(), &mut task) };
+    if kr != mach2::kern_return::KERN_SUCCESS {
+        // `task_for_pid_or_proc` *expects* this to fail for
+        // synthetic per-thread pids and retries with the proc pid,
+        // so log at debug rather than error to avoid spamming the
+        // adapter log on every step.
+        log::debug!(target: "darwin_mach",
+            "task_for_pid: raw_task_for_pid pid={} failed: {}",
+            pid.as_raw(), MachError(kr));
+    }
     check(kr)?;
     debug_assert!(task != 0, "task_for_pid returned KERN_SUCCESS but null port");
     TASK_FOR_PID_EVER_SUCCEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -256,6 +265,16 @@ pub fn vm_read_n(task: task_t, addr: usize, n: usize) -> Result<Vec<u8>, MachErr
             &mut out_size,
         )
     };
+    if kr != mach2::kern_return::KERN_SUCCESS {
+        // Log the (addr, len, region prot) before propagating so a
+        // KERN_FAILURE here tells us *what we tried to read* and
+        // whether the region was even mapped/readable. Cheap when
+        // it matters; never runs on the success path.
+        let prot = vm_region_protections(task, addr);
+        log::error!(target: "darwin_mach",
+            "vm_read_n failed: addr=0x{addr:x} len={n} region={prot:?} kr={}",
+            MachError(kr));
+    }
     check(kr)?;
     buf.truncate(out_size as usize);
     Ok(buf)
@@ -321,8 +340,12 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
     // kernel turn the shared text page into a private CoW copy
     // before applying the new permissions, so the BP we're about
     // to write isn't visible to other processes mapping the same
-    // binary. Result ignored — many pages are already writable.
-    let _ = unsafe {
+    // binary. We don't *bail* on a failed protect (many pages are
+    // already writable, or the kernel rejects W|COPY for hardened
+    // pages but still lets `mach_vm_write` through some other
+    // path) — but we *do* capture the result so a later
+    // `mach_vm_write` failure knows whether the page was widened.
+    let protect_kr = unsafe {
         mach_vm_protect(
             task as vm_task_entry_t,
             addr as mach_vm_address_t,
@@ -331,6 +354,11 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
         )
     };
+    if protect_kr != mach2::kern_return::KERN_SUCCESS {
+        log::error!(target: "darwin_mach",
+            "vm_write_word: mach_vm_protect(R|W|COPY) at 0x{addr:x} failed: {} (page cur_prot=0x{cur_prot:x} max_prot=0x{max_prot:x})",
+            MachError(protect_kr));
+    }
 
     // SAFETY: bytes lives across the call; mach_vm_write copies
     // immediately and doesn't retain the pointer.
@@ -342,7 +370,20 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
             len as u32,
         )
     };
-    check(kr)?;
+    if kr != mach2::kern_return::KERN_SUCCESS {
+        // Surface every diagnostic we have. If the user ever
+        // re-hits this path the error message itself names the
+        // address, the page protection at entry, and whether the
+        // pre-write protect succeeded — enough to triage without
+        // attaching another debugger to bs.
+        return Err(Error::DarwinMach {
+            mach: format!(
+                "vm_write_word @ 0x{addr:x} (cur_prot=0x{cur_prot:x} max_prot=0x{max_prot:x} protect_kr=0x{protect_kr:08x}): {}",
+                MachError(kr)
+            ),
+            backtrace: format!("{}", std::backtrace::Backtrace::force_capture()),
+        });
+    }
 
     // Apple Silicon has split D/I caches with weak coherency for
     // self-modifying code. `mach_vm_write` updates the D-cache but

@@ -813,7 +813,14 @@ impl Breakpoint {
     #[cfg(not(target_os = "linux"))]
     pub fn enable(&self) -> Result<(), Error> {
         use crate::debugger::darwin_mach;
-        let task = darwin_mach::task_for_pid(self.pid)?;
+        // `self.pid` may be a synthetic per-thread pid
+        // (proc_pid + 1_000_000) when the breakpoint comes from a
+        // step-over computed at a stop on a worker thread. Synthetic
+        // pids aren't real kernel pids — task_for_pid rejects them
+        // with KERN_FAILURE. `task_for_pid_or_proc` falls back to
+        // the proc's task port (same task for all threads in the
+        // process), which is what we want for memory ops here.
+        let task = darwin_mach::task_for_pid_or_proc(self.pid)?;
         let addr = self.addr.as_usize();
         let bytes = darwin_mach::vm_read_n(task, addr, std::mem::size_of::<u64>())?;
         let arr: [u8; 8] = bytes
@@ -844,7 +851,14 @@ impl Breakpoint {
     #[cfg(not(target_os = "linux"))]
     pub fn disable(&self) -> Result<(), Error> {
         use crate::debugger::darwin_mach;
-        let task = darwin_mach::task_for_pid(self.pid)?;
+        // `self.pid` may be a synthetic per-thread pid
+        // (proc_pid + 1_000_000) when the breakpoint comes from a
+        // step-over computed at a stop on a worker thread. Synthetic
+        // pids aren't real kernel pids — task_for_pid rejects them
+        // with KERN_FAILURE. `task_for_pid_or_proc` falls back to
+        // the proc's task port (same task for all threads in the
+        // process), which is what we want for memory ops here.
+        let task = darwin_mach::task_for_pid_or_proc(self.pid)?;
         let addr = self.addr.as_usize();
         let bytes = darwin_mach::vm_read_n(task, addr, std::mem::size_of::<u64>())?;
         let arr: [u8; 8] = bytes
