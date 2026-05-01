@@ -106,17 +106,21 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // `"::Name"` is fine — the proc-macro emits Rust source, the
     // compiler evaluates it.
     let ty_ident = &input.ident;
-    // Step 9 — `#[bs_viz(name = "...")]` overrides the recorded
-    // type_name. Without it we fall back to the local-only
-    // ident, which still works via the registry's suffix match
-    // for the unambiguous-name case. Users hitting an ambiguity
-    // bail (two crates each defining `Person`) write the
-    // qualified path themselves until the const-fn-assembled
-    // `module_path!()` integration lands.
-    let local_name = type_attrs
-        .name
-        .clone()
-        .unwrap_or_else(|| ty_ident.to_string());
+    // Step 9 + 10 — type-name resolution.
+    //
+    // - `#[bs_viz(name = "fully::qualified")]` → the recorded
+    //   `type_name` is the user-provided string verbatim. The
+    //   macro emits a `static [u8; N]` initialised by
+    //   `bs_viz_spec::assemble_verbatim`.
+    // - No `name` attr → step 10 composes the recorded name
+    //   from `module_path!()` + `"::"` + the local ident at the
+    //   user crate's compile time, via
+    //   `bs_viz_spec::assemble_with_module_path`. The registry
+    //   then sees the same fully-qualified form the v0
+    //   demangler produces, and exact-match resolution Just
+    //   Works without a suffix-match fallback.
+    let explicit_name = type_attrs.name.clone();
+    let local_ident_str = ty_ident.to_string();
 
     // Encode at proc-macro time using a placeholder type_name;
     // patch the bytes at the language level by rebuilding the
@@ -146,19 +150,25 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         None => Vec::new(),
     };
 
-    let spec = TypeViewSpec {
-        type_name: local_name.clone(),
+    // Encode the proc-macro-known portion of the payload (every
+    // byte after the type_name str). The runtime type_name part
+    // is composed at user-crate compile time by the const-fn
+    // assembler.
+    let suffix_spec = TypeViewSpec {
+        // type_name doesn't matter for the suffix encoding.
+        type_name: String::new(),
         summary,
         fields: field_specs,
         variants: variant_specs,
     };
-    let bytes = bs_viz_spec::encode(&spec);
-    let byte_lit = LitByteStr::new(&bytes, ty_ident.span());
-    let n = bytes.len();
+    let suffix_bytes = bs_viz_spec::encode_payload_suffix(&suffix_spec);
+    let suffix_lit = LitByteStr::new(&suffix_bytes, ty_ident.span());
+    let suffix_len = suffix_bytes.len();
 
-    // Synthesise a unique static identifier so two derives in
+    // Synthesise unique static identifiers so two derives in
     // one crate don't collide.
-    let static_ident = quote::format_ident!("__BS_VIZ_SPEC_{}", ty_ident);
+    let suffix_ident = quote::format_ident!("__BS_VIZ_SUFFIX_{}", ty_ident);
+    let spec_ident = quote::format_ident!("__BS_VIZ_SPEC_{}", ty_ident);
 
     // Edition 2024 made `link_section` and `used` unsafe
     // attributes, so wrap them in `unsafe(...)`. The form is
@@ -171,13 +181,53 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         #[used]
     };
 
-    Ok(quote! {
-        #[allow(non_upper_case_globals)]
-        const _: () = {
-            #section_attrs
-            static #static_ident: [u8; #n] = *#byte_lit;
-        };
-    })
+    let body = match explicit_name {
+        Some(name) => {
+            // Verbatim: total = 13 + name.len() + suffix_len.
+            quote! {
+                #[allow(non_upper_case_globals)]
+                const _: () = {
+                    const __NAME: &::core::primitive::str = #name;
+                    const __SUFFIX_LEN: ::core::primitive::usize = #suffix_len;
+                    const __SUFFIX: [::core::primitive::u8; __SUFFIX_LEN] = *#suffix_lit;
+                    const __TOTAL: ::core::primitive::usize =
+                        13 + __NAME.len() + __SUFFIX_LEN;
+                    #section_attrs
+                    static #spec_ident: [::core::primitive::u8; __TOTAL] =
+                        ::bs_viz_sdk::__internal::assemble_verbatim::<__TOTAL>(
+                            __NAME, &__SUFFIX,
+                        );
+                    // Suppress unused-name lint when this static
+                    // is the only reference to it.
+                    let _ = &#spec_ident;
+                };
+            }
+        }
+        None => {
+            // module_path!()-composed: total = 15 + module.len()
+            // + local.len() + suffix_len.
+            let _ = suffix_ident; // silence unused warning when not branched
+            quote! {
+                #[allow(non_upper_case_globals)]
+                const _: () = {
+                    const __MODULE: &::core::primitive::str = ::core::module_path!();
+                    const __LOCAL: &::core::primitive::str = #local_ident_str;
+                    const __SUFFIX_LEN: ::core::primitive::usize = #suffix_len;
+                    const __SUFFIX: [::core::primitive::u8; __SUFFIX_LEN] = *#suffix_lit;
+                    const __TOTAL: ::core::primitive::usize =
+                        15 + __MODULE.len() + __LOCAL.len() + __SUFFIX_LEN;
+                    #section_attrs
+                    static #spec_ident: [::core::primitive::u8; __TOTAL] =
+                        ::bs_viz_sdk::__internal::assemble_with_module_path::<__TOTAL>(
+                            __MODULE, __LOCAL, &__SUFFIX,
+                        );
+                    let _ = &#spec_ident;
+                };
+            }
+        }
+    };
+
+    Ok(body)
 }
 
 #[derive(Default)]

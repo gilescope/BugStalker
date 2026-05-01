@@ -40,12 +40,15 @@ fn debug_view_specs_loaded_from_demo_binary() {
         debugger.view_spec_count(),
     );
 
-    // Person — exact match on the local-name stored by the
-    // macro, plus suffix match against a fully-qualified probe.
+    // Person — step 10 records the fully-qualified
+    // `module_path!()`-prefixed name. The registry's reverse-
+    // suffix match also resolves the local-only `Person`
+    // probe, so both queries hit the same spec.
     let person = debugger
         .view_spec_for("Person")
         .expect("Person spec should be in the registry");
-    assert_eq!(person.type_name, "Person");
+    assert_eq!(person.type_name, "viz_demo::Person");
+    assert!(debugger.view_spec_for("viz_demo::Person").is_some());
     assert_eq!(
         person.summary.as_deref(),
         Some("Person({name}, age {age})"),

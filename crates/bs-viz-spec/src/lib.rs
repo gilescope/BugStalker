@@ -204,23 +204,7 @@ fn write_field_list(out: &mut Vec<u8>, fields: &[FieldSpec]) {
 pub fn encode(spec: &TypeViewSpec) -> Vec<u8> {
     let mut payload = Vec::new();
     write_str(&mut payload, &spec.type_name);
-    write_opt_str(&mut payload, spec.summary.as_deref());
-    write_field_list(&mut payload, &spec.fields);
-
-    // V2 trailer: variants block. Always emitted (length 0 for
-    // non-enums) so the decoder can rely on its presence.
-    let n_variants: u32 = spec
-        .variants
-        .len()
-        .try_into()
-        .expect("more than u32::MAX variants is implausible");
-    payload.extend_from_slice(&n_variants.to_le_bytes());
-    for v in &spec.variants {
-        write_str(&mut payload, &v.name);
-        write_opt_str(&mut payload, v.summary.as_deref());
-        write_opt_str(&mut payload, v.tag.as_deref());
-        write_field_list(&mut payload, &v.fields);
-    }
+    payload.extend_from_slice(&encode_payload_suffix(spec));
 
     let mut out = Vec::with_capacity(4 + 1 + 4 + payload.len());
     out.extend_from_slice(&MAGIC);
@@ -231,6 +215,149 @@ pub fn encode(spec: &TypeViewSpec) -> Vec<u8> {
         .expect("a single spec payload exceeding u32::MAX bytes is implausible");
     out.extend_from_slice(&payload_len.to_le_bytes());
     out.extend_from_slice(&payload);
+    out
+}
+
+/// Encode the post-`type_name` portion of the payload — summary,
+/// fields, variants. Used by the proc-macro to pre-encode every
+/// part of a spec entry that's known at expansion time. The
+/// generated derive then assembles the final entry at user-crate
+/// compile time via [`assemble_with_module_path`], plugging in
+/// the `module_path!()`-resolved type-name prefix that the proc-
+/// macro can't see.
+pub fn encode_payload_suffix(spec: &TypeViewSpec) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_opt_str(&mut out, spec.summary.as_deref());
+    write_field_list(&mut out, &spec.fields);
+    let n_variants: u32 = spec
+        .variants
+        .len()
+        .try_into()
+        .expect("more than u32::MAX variants is implausible");
+    out.extend_from_slice(&n_variants.to_le_bytes());
+    for v in &spec.variants {
+        write_str(&mut out, &v.name);
+        write_opt_str(&mut out, v.summary.as_deref());
+        write_opt_str(&mut out, v.tag.as_deref());
+        write_field_list(&mut out, &v.fields);
+    }
+    out
+}
+
+/// Const-fn version of `encode` that assembles a spec entry at
+/// the user crate's compile time, plugging in a runtime-known
+/// `module_path` + `local_name` pair as the recorded
+/// `type_name`. Returns a fixed-size array so the bytes can sit
+/// in a `static` placed in the `.bs_viz_spec` / `__bs_viz_spec`
+/// section.
+///
+/// The total size `N` must equal:
+///   `15 + module.len() + local.len() + suffix.len()`
+/// — header (9) + type_name length prefix (4) + module bytes +
+/// `"::"` separator (2) + local bytes + the suffix payload.
+/// `bs-viz-derive` computes this via plain `const` arithmetic.
+///
+/// **`module` and `local` must each be valid UTF-8 byte slices.**
+/// The const fn doesn't validate — callers in the proc-macro
+/// always pass `&str` forms.
+pub const fn assemble_with_module_path<const N: usize>(
+    module: &str,
+    local: &str,
+    suffix: &[u8],
+) -> [u8; N] {
+    let mut out = [0u8; N];
+    // Magic.
+    out[0] = MAGIC[0];
+    out[1] = MAGIC[1];
+    out[2] = MAGIC[2];
+    out[3] = MAGIC[3];
+    // Version.
+    out[4] = VERSION;
+    // Payload length = N - 9. The compiler will fail to
+    // construct the static if N < 9; const generics make that a
+    // compile-time error.
+    let payload_len = (N - 9) as u32;
+    let pl = payload_len.to_le_bytes();
+    out[5] = pl[0];
+    out[6] = pl[1];
+    out[7] = pl[2];
+    out[8] = pl[3];
+
+    // type_name length prefix (str: u32 len + bytes).
+    let m = module.as_bytes();
+    let l = local.as_bytes();
+    let type_name_len = (m.len() + 2 + l.len()) as u32;
+    let tnl = type_name_len.to_le_bytes();
+    out[9] = tnl[0];
+    out[10] = tnl[1];
+    out[11] = tnl[2];
+    out[12] = tnl[3];
+
+    // Module bytes.
+    let mut i = 0;
+    while i < m.len() {
+        out[13 + i] = m[i];
+        i += 1;
+    }
+    // `::` separator.
+    out[13 + m.len()] = b':';
+    out[13 + m.len() + 1] = b':';
+    // Local name bytes.
+    let off = 13 + m.len() + 2;
+    let mut i = 0;
+    while i < l.len() {
+        out[off + i] = l[i];
+        i += 1;
+    }
+    // Suffix bytes (proc-macro-encoded summary + fields +
+    // variants).
+    let suf_off = off + l.len();
+    let mut i = 0;
+    while i < suffix.len() {
+        out[suf_off + i] = suffix[i];
+        i += 1;
+    }
+    out
+}
+
+/// Const-fn variant for the `name = "..."` override case where
+/// the user supplied the full type name verbatim — no
+/// `module_path!()` composition needed.
+pub const fn assemble_verbatim<const N: usize>(
+    type_name: &str,
+    suffix: &[u8],
+) -> [u8; N] {
+    let mut out = [0u8; N];
+    out[0] = MAGIC[0];
+    out[1] = MAGIC[1];
+    out[2] = MAGIC[2];
+    out[3] = MAGIC[3];
+    out[4] = VERSION;
+    let payload_len = (N - 9) as u32;
+    let pl = payload_len.to_le_bytes();
+    out[5] = pl[0];
+    out[6] = pl[1];
+    out[7] = pl[2];
+    out[8] = pl[3];
+
+    let t = type_name.as_bytes();
+    let type_name_len = t.len() as u32;
+    let tnl = type_name_len.to_le_bytes();
+    out[9] = tnl[0];
+    out[10] = tnl[1];
+    out[11] = tnl[2];
+    out[12] = tnl[3];
+    let mut i = 0;
+    while i < t.len() {
+        out[13 + i] = t[i];
+        i += 1;
+    }
+    let suf_off = 13 + t.len();
+    let mut i = 0;
+    while i < suffix.len() {
+        out[suf_off + i] = suffix[i];
+        i += 1;
+    }
     out
 }
 
@@ -557,6 +684,71 @@ mod tests {
             decode_one(truncated),
             Err(DecodeError::Truncated { .. })
         ));
+    }
+
+    #[test]
+    fn assemble_with_module_path_matches_encode() {
+        // Step 10: the const-fn assembly path must produce
+        // *exactly* the same bytes as the runtime `encode`
+        // function, given the same inputs. This is the contract
+        // that lets the proc-macro generate a static array
+        // initialised at user-crate compile time and have the
+        // section reader at debug time decode it identically.
+        let spec = TypeViewSpec {
+            type_name: "my_crate::Person".to_string(),
+            summary: Some("Person({name})".to_string()),
+            fields: vec![FieldSpec {
+                name: "name".to_string(),
+                rename: None,
+                hidden: false,
+                format: Format::Default,
+            }],
+            variants: vec![],
+        };
+        let encoded = encode(&spec);
+        let suffix = encode_payload_suffix(&spec);
+        // Formula: header(9) + type_name_str_prefix(4) + module
+        // bytes + "::"(2) + local bytes + suffix.
+        let module = "my_crate";
+        let local = "Person";
+        const TOTAL: usize = 15 + "my_crate".len() + "Person".len() + 38;
+        assert_eq!(
+            TOTAL,
+            encoded.len(),
+            "size formula must match `encode` (suffix len was {})",
+            suffix.len(),
+        );
+        let assembled: [u8; TOTAL] =
+            assemble_with_module_path::<TOTAL>(module, local, &suffix);
+        assert_eq!(&assembled[..], &encoded[..]);
+    }
+
+    #[test]
+    fn assemble_verbatim_matches_encode() {
+        let spec = TypeViewSpec {
+            type_name: "qualified::Marker".to_string(),
+            summary: Some("Marker#{__0}".to_string()),
+            fields: vec![FieldSpec {
+                name: "__0".to_string(),
+                rename: None,
+                hidden: false,
+                format: Format::Default,
+            }],
+            variants: vec![],
+        };
+        let encoded = encode(&spec);
+        let suffix = encode_payload_suffix(&spec);
+        // Formula: header(9) + type_name_str_prefix(4) + name
+        // bytes + suffix.
+        const TOTAL: usize = 13 + "qualified::Marker".len() + 35;
+        assert_eq!(
+            TOTAL,
+            encoded.len(),
+            "size formula must match `encode` (suffix len was {})",
+            suffix.len(),
+        );
+        let assembled: [u8; TOTAL] = assemble_verbatim::<TOTAL>(&spec.type_name, &suffix);
+        assert_eq!(&assembled[..], &encoded[..]);
     }
 
     #[test]

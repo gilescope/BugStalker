@@ -701,7 +701,7 @@ crate.
 
 **Plan:** [`doc/plans/phase-4-wasm-visualizers.md`](plans/phase-4-wasm-visualizers.md).
 
-**Status: steps 1–9 shipped (2026-05-01).** Step 1 wires the
+**Status: steps 1–10 shipped (2026-05-01).** Step 1 wires the
 declarative-spec data path end-to-end; step 2 wires the
 renderer; step 3 unblocks generics + `format = "hex|bin|oct"`;
 step 4 adds `format = "iso8601"` and `format = "duration"`;
@@ -709,11 +709,12 @@ step 5 unblocks tuple + unit structs and fixes the silent bug
 where templates skipped field formats; step 6 unblocks enums
 with type-level summaries; step 7 wires every existing DAP
 callsite through to the registry; step 8 bumps the spec wire
-format to v2 and lights up per-variant `summary` overrides +
-`tag = "..."` state-tag chips on enums; step 9 ships the
-`#[bs_viz(name = "...")]` type-name override as the
-authoritative escape hatch for suffix-match ambiguity. The
-following is live:
+format to v2 and lights up per-variant `summary` + `tag` on
+enums; step 9 ships the `#[bs_viz(name = "...")]` override;
+step 10 makes the **common case** Just Work — the macro now
+records `module_path!()`-prefixed names automatically by
+assembling the spec bytes via a `const fn` at the user crate's
+compile time. The following is live:
 
 * `crates/bs-viz-spec/` — wire format (`MAGIC` `BSV1`, version 1,
   length-prefixed entries) plus encode/decode + 6 unit tests.
@@ -941,16 +942,45 @@ Step 9 added:
   const-fn machinery; deferred until the explicit `name` escape
   hatch shows real usage signal.
 
+Step 10 added:
+
+* **Const-fn-assembled spec bytes.** `bs-viz-spec` exports two
+  new `const fn`s: `assemble_with_module_path::<N>(module,
+  local, suffix)` and `assemble_verbatim::<N>(name, suffix)`.
+  Both produce a `[u8; N]` byte-for-byte identical to the
+  runtime `encode` output — proven by two roundtrip unit
+  tests that compare `assemble_*` output against `encode`.
+* **`bs-viz-derive` emits a const-fn-initialised static.** The
+  macro splits the encoding into a proc-macro-known SUFFIX
+  (everything after the type_name str) and a runtime-known
+  prefix. The user crate's compiler resolves
+  `module_path!()`, multiplies the size formula, and
+  initialises `static SPEC: [u8; TOTAL]` from the const fn. No
+  runtime work in the debuggee — the bytes live in `.rodata`.
+* **`bs-viz-sdk` re-exports the const fns** under
+  `__internal::` so the macro's generated code has a stable,
+  hidden path to call them. Crate authors don't see this; the
+  derive does.
+* **Reverse-suffix lookup in the registry.** Step 10 made the
+  common-case registered name fully-qualified
+  (`viz_demo::Person`), so existing tests / debug-CLI lookups
+  that pass the local name (`Person`) get a clean reverse-
+  suffix match. The forward-suffix branch survives for
+  pre-step-10 binaries and the `name = "..."` short-key
+  override case.
+* `viz_demo::Person` etc. now register under their full
+  module-prefixed names. The integration test asserts the new
+  shape (`person.type_name == "viz_demo::Person"`) and that
+  both the qualified and the local-only probes resolve to the
+  same spec.
+
 **Remaining (in plan order):**
 
-1. **`module_path!()` integrated into the macro itself** — the
-   const-fn-assembled approach so users don't have to write the
-   `name = "..."` override by hand for the common case.
-2. **`format = "utf8" | "hexdump"` applied at render time.**
+1. **`format = "utf8" | "hexdump"` applied at render time.**
    Need byte-array detection (`Vec<u8>`, `&[u8]`, `[u8; N]`) —
    the source-byte plumbing is its own slice of work.
-3. **`CustomView` escape hatch** — non-declarative Tier A.
-4. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
+2. **`CustomView` escape hatch** — non-declarative Tier A.
+3. **Tier B (wasm)** — wasmtime-backed sandboxed visualisers
    loaded from `~/.config/bugstalker/visualizers/*.wasm` and from
    `.bs_visualizer_wasm` sections.
 

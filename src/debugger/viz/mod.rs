@@ -181,40 +181,45 @@ impl VizRegistry {
     ///    macro emits one spec per type *definition*, not per
     ///    monomorphisation; the renderer hands us the
     ///    monomorphised name from the v0 demangler, so we strip
-    ///    `<...>` (with proper depth tracking — `HashMap<K,
-    ///    Vec<i32>>` has nested `<>` pairs) before retrying.
-    /// 3. **Suffix match against `::<query>`.** The proc-macro
-    ///    currently emits the *local* type name (e.g. `Person`)
-    ///    rather than the fully-qualified one
-    ///    (`my_crate::Person`). The renderer asks with the
-    ///    fully-qualified form, so a query of
-    ///    `my_crate::Person` matches a registered `Person`. If
-    ///    multiple specs end with the same suffix, the lookup
-    ///    is ambiguous and returns `None` — caller should treat
-    ///    "ambiguous" the same as "no spec" so we don't apply
-    ///    the wrong template silently. Once the macro records
-    ///    `module_path!()` (later batch) this fallback becomes
-    ///    unreachable.
+    ///    `<...>` (depth-aware — `HashMap<K, Vec<i32>>` has
+    ///    nested `<>` pairs) before retrying.
+    /// 3. **Suffix match — both directions.** Step 10 made the
+    ///    macro record `module_path!()`-prefixed names, so the
+    ///    common case is now `(query == key)` exactly. Two
+    ///    fallbacks remain useful:
+    ///    * **Forward** (`query.ends_with(key)`): registered
+    ///      `Person`, queried `crate::Person` — covers
+    ///      pre-step-10 binaries and the `name = "..."` override
+    ///      where the user picked a short key.
+    ///    * **Reverse** (`key.ends_with(query)`): registered
+    ///      `viz_demo::Person`, queried `Person` — covers
+    ///      tests / debug-CLI lookups that pass the local name.
+    ///    Both branches require a `::` separator at the join
+    ///    so `MyPerson` doesn't match `Person`. Ambiguous
+    ///    matches (>1 hit) bail to `None` so we never apply the
+    ///    wrong spec silently.
     pub fn find(&self, query: &str) -> Option<&TypeViewSpec> {
         if let Some(spec) = self.by_name.get(query) {
             return Some(spec);
         }
-        // Generic-stripped exact + suffix match.
         let stripped = strip_generic_args(query);
         if stripped != query {
             if let Some(spec) = self.by_name.get(stripped) {
                 return Some(spec);
             }
         }
-        // Suffix match — operates on the already-stripped form
-        // so `my_crate::Wrap<i32>` matches a registered `Wrap`.
         let mut hit: Option<&TypeViewSpec> = None;
         for (key, spec) in &self.by_name {
-            if stripped.len() > key.len() + 2
+            let forward = stripped.len() > key.len() + 2
                 && stripped.ends_with(key)
-                && stripped.as_bytes()[stripped.len() - key.len() - 2..stripped.len() - key.len()]
-                    == *b"::"
-            {
+                && stripped.as_bytes()
+                    [stripped.len() - key.len() - 2..stripped.len() - key.len()]
+                    == *b"::";
+            let reverse = key.len() > stripped.len() + 2
+                && key.ends_with(stripped)
+                && key.as_bytes()[key.len() - stripped.len() - 2..key.len() - stripped.len()]
+                    == *b"::";
+            if forward || reverse {
                 if hit.is_some() {
                     return None;
                 }

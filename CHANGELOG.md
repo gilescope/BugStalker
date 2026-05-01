@@ -7,6 +7,35 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- visualisers (Phase 4 Tier-A step 10 — `module_path!()` integrated):
+  - `bs-viz-spec` exports two new `const fn` entry points:
+    `assemble_with_module_path::<N>(module, local, suffix)` and
+    `assemble_verbatim::<N>(name, suffix)`. Both produce a
+    `[u8; N]` byte-for-byte identical to the runtime `encode`
+    output (proven by two new roundtrip unit tests).
+  - `bs-viz-derive` no longer emits the spec as a literal byte
+    string filled in at proc-macro time. Instead it emits a
+    `static [u8; TOTAL]` initialised by the const fn at the
+    *user crate's* compile time, with `module_path!()` and the
+    local stringified ident plugged in. Net effect: the recorded
+    `type_name` is now the fully-qualified
+    `module_path!()`-prefixed form (e.g. `viz_demo::Person`)
+    that the v0 demangler also produces, so exact-match lookup
+    Just Works without a suffix-match fallback in the common
+    case.
+  - `bs-viz-sdk` exposes the const fns through a hidden
+    `__internal::` module so the derive's generated code has a
+    stable path to call them. Not part of the public SDK
+    contract.
+  - Registry's `find` gained reverse-suffix matching
+    (`key.ends_with(query)` with `::` separator) so existing
+    tests and debug-CLI lookups passing the local-only name
+    keep resolving cleanly.
+  - `viz_demo::Person` etc. now register under their full
+    module-prefixed names; integration test asserts the new
+    shape and that both qualified and local-only probes hit
+    the same spec.
+  - Full debugger + dap suites: 172/172 sequentially.
 - visualisers (Phase 4 Tier-A step 9 — `name = "..."` override):
   - New `#[bs_viz(name = "fully::qualified::Path")]` type-level
     attribute. When set, overrides the recorded `type_name` in

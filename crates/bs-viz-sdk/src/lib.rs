@@ -67,3 +67,12 @@
 
 pub use bs_viz_derive::DebugView;
 pub use bs_viz_spec::{FieldSpec, Format, TypeViewSpec};
+
+/// Internal API surface used by the `#[derive(DebugView)]`
+/// expansion. Stable as long as the derive points at it; not
+/// part of the public SDK contract — anything here can change
+/// between minor releases without notice.
+#[doc(hidden)]
+pub mod __internal {
+    pub use bs_viz_spec::{assemble_verbatim, assemble_with_module_path};
+}
