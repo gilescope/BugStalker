@@ -73,7 +73,7 @@ impl MachError {
             2 => "KERN_PROTECTION_FAILURE — page perms reject the op (e.g. write to r-x without VM_PROT_COPY)",
             3 => "KERN_NO_SPACE",
             4 => "KERN_INVALID_ARGUMENT — bad task/thread port, wrong state flavour, or out-of-range count",
-            5 => "KERN_FAILURE — generic; for task_for_pid this almost always means missing com.apple.security.cs.debugger entitlement on the *caller*",
+            5 => "KERN_FAILURE — generic Mach catch-all; the meaning depends on the calling op (task_for_pid: missing cs.debugger entitlement; thread_set_state on arm64: thread not suspended, hardened-runtime restriction, or stale port; task_resume: already running)",
             6 => "KERN_RESOURCE_SHORTAGE",
             7 => "KERN_NOT_RECEIVER",
             8 => "KERN_NO_ACCESS",

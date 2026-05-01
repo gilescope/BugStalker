@@ -1387,8 +1387,21 @@ impl Tracer {
         // the caller asked to step. Falls back to first_thread_of
         // for legacy single-thread paths that haven't been
         // registered yet (early init).
-        let focus = darwin_mach::thread_port_for_pid_or_first(pid)?;
-        darwin_mach::arm_set_single_step(focus, true)?;
+        //
+        // Each Mach call below gets an `inspect_err` site-tag so a
+        // failure gives us the exact op (Apple's KERN_FAILURE on
+        // `thread_set_state` vs `task_resume` is the same kr code
+        // but two completely different bugs). Surfaces both via
+        // `log::error!` and stderr — stderr lands in VS Code's
+        // Debug Console without any RUST_LOG env wrangling.
+        let focus = darwin_mach::thread_port_for_pid_or_first(pid).inspect_err(|e| {
+            log::error!(target: "darwin_mach", "single_step: thread_port_for_pid_or_first: {e}");
+            eprintln!("[bs single_step] thread_port_for_pid_or_first: {e}");
+        })?;
+        darwin_mach::arm_set_single_step(focus, true).inspect_err(|e| {
+            log::error!(target: "darwin_mach", "single_step: arm_set_single_step(true): {e}");
+            eprintln!("[bs single_step] arm_set_single_step(true): {e}");
+        })?;
 
         // Suspend every other thread so only `focus` runs while we
         // step. Without this, a worker thread can hit one of our
@@ -1409,7 +1422,10 @@ impl Tracer {
         }
 
         // Resume — the kernel executes one instruction then traps.
-        darwin_mach::task_resume(state.task)?;
+        darwin_mach::task_resume(state.task).inspect_err(|e| {
+            log::error!(target: "darwin_mach", "single_step: task_resume: {e}");
+            eprintln!("[bs single_step] task_resume: {e}");
+        })?;
 
         // Block until the resulting Mach exception lands. With
         // `MDSCR_EL1.SS=1 + SPSR.SS=1` the kernel reports a software
