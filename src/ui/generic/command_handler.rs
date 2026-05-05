@@ -310,6 +310,14 @@ impl<Y: YesQuestion, C: Completer, U: ProgramTaker> CommandHandler<'_, Y, C, U> 
                 }
                 self.printer.println("");
             }
+            Command::ApplyPatch(patch_cmd) => {
+                let report = command::apply_patch::Handler::new(self.debugger)
+                    .handle(patch_cmd)?;
+                self.printer.println(format!(
+                    "applied {} entries ({} bytes)",
+                    report.entries_applied, report.bytes_written
+                ));
+            }
             Command::Register(reg_cmd) => {
                 let response = RegisterHandler::new(self.debugger).handle(&reg_cmd)?;
                 response.iter().for_each(|register| {

@@ -5,6 +5,7 @@
 //! Contains commands and corresponding command handlers. Command is a some sort of request to
 //! debugger that defines an action and a list of input arguments.
 
+pub mod apply_patch;
 pub mod r#async;
 pub mod backtrace;
 pub mod r#break;
@@ -57,6 +58,7 @@ pub enum Command {
     Breakpoint(r#break::Command),
     Watchpoint(watch::Command),
     Memory(memory::Command),
+    ApplyPatch(apply_patch::Command),
     Register(register::Command),
     Thread(thread::Command),
     SharedLib,
