@@ -16,8 +16,15 @@
 //! storage".
 
 pub mod checkpoint;
+pub mod event;
 pub mod manifest;
 pub mod segment;
+pub mod trace_reader;
+pub mod trace_writer;
 pub mod version;
 
+pub use event::Event;
+pub use manifest::{Manifest, ManifestParseError};
+pub use trace_reader::{TraceReadError, TraceReader, SegmentReader};
+pub use trace_writer::{TraceWriteError, TraceWriter};
 pub use version::{FormatVersion, MAX_SUPPORTED_FORMAT_VERSION, TRACE_MAGIC};

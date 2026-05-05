@@ -9,6 +9,28 @@
 
 use rkyv::{Archive, Deserialize, Serialize};
 
+/// Filename of the trace manifest at the trace directory root.
+pub const MANIFEST_FILENAME: &str = "manifest.txt";
+
+/// Build the filename for segment number `idx`. 6-digit zero-padded
+/// so a directory listing sorts in chronological order.
+#[inline]
+pub fn segment_filename(idx: u64) -> String {
+    format!("event-{idx:06}.lz4")
+}
+
+/// Inverse of [`segment_filename`] — parse `event-NNNNNN.lz4` →
+/// `Some(NNNNNN)`. Returns `None` for any other filename shape so
+/// the reader can ignore stray files (manifest, checkpoints, etc.).
+#[inline]
+pub fn parse_segment_filename(name: &str) -> Option<u64> {
+    let stem = name.strip_prefix("event-")?.strip_suffix(".lz4")?;
+    if stem.len() != 6 {
+        return None;
+    }
+    stem.parse().ok()
+}
+
 /// Header at the start of every event segment file.
 ///
 /// rkyv-archived: replay mmaps the segment and accesses the header

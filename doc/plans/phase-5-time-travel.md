@@ -206,17 +206,22 @@ aarch64 is 3G; PT integration is 3H.
 - Manifest carries: build-id of recorded binary (cross-checked at
   replay), kernel version, CPU feature set, recording engine
   version, initial environment
-- Event records: variable-length, length-prefixed, zstd-compressed
-  per segment via the **pure-Rust `ruzstd` crate**
-  (<https://github.com/KillingSpark/zstd-rs>) at
-  `CompressionLevel::Fastest` (≈ level 1). ruzstd's encoder is, in
-  the maintainer's words, "usable, but does not yet reach the speed,
-  ratio or configurability of the original zstd library" — that's
-  acceptable for replay traces, where recording speed matters more
-  than density. Segment size ~16 MB; rotated on size or time. No C
-  linkage. The on-disk format is RFC 8478 stable, so a future swap
-  to a faster pure-Rust encoder (or upstream improvements to ruzstd)
-  is a drop-in change.
+- Event records: variable-length, length-prefixed, lz4-compressed
+  per segment via the **pure-Rust `lz4_flex` crate**
+  (<https://github.com/pseitz/lz4_flex>) using the LZ4 frame
+  format. ruzstd was the original choice but the published crate
+  is decoder-only; we'd otherwise need a separate pure-Rust zstd
+  encoder, of which there is no mature option in 2026. lz4_flex
+  ships encode + decode in one crate, no-unsafe-by-default, MIT,
+  and is faster than zstd at any level — the trade is ratio
+  (lz4 typically compresses ~30 % less tightly than zstd-1) for
+  speed (lz4 encode is 2–3× faster than zstd-1). For trace
+  recording where the run-time overhead is the headline metric,
+  this trade is the right one. Segment size ~16 MB; rotated on
+  size or time. No C linkage. The on-disk format is the LZ4
+  Frame Format (<https://github.com/lz4/lz4/blob/release/doc/lz4_Frame_format.md>);
+  a future swap to a faster encoder of the same format is a
+  drop-in change.
 - Periodic full-process snapshots (every N seconds or M syscalls)
   enable replay seek without scanning from start
 - Format versioning from day 1; bump on incompatible change
@@ -403,8 +408,8 @@ crates/bs-replay-driver/         # 3I — BugStalker integration
 
 A program doing 1000 syscalls/second with average 100-byte returns
 records at ~100 KB/s + protocol overhead → ~6 MB/min uncompressed,
-~2–3 MB/min after `ruzstd` Fastest-level compression (slightly
-worse ratio than C zstd at level 3, comparable to LZ4). A 30-minute
+~3–4 MB/min after `lz4_flex` frame compression (about 30 % looser
+than zstd-fastest, traded for ~2–3× faster encode). A 30-minute
 session produces ~60–90 MB. I/O-heavy programs (e.g. file servers)
 can record at 10 MB/s+; cap the trace size with rotation policy.
 
@@ -427,11 +432,12 @@ can record at 10 MB/s+; cap the trace size with rotation policy.
    `dev-dependencies` may include rr (for differential tests) and
    GPL libraries (for cross-checking only); release builds do not
    link any GPL code.
-7. **Trace compression: pure-Rust `ruzstd`** at
-   `CompressionLevel::Fastest`. The on-disk format is RFC 8478
-   stable so we can swap encoders later (faster pure-Rust impl,
-   upstream ruzstd improvements, etc.) without touching the trace
-   format. No C linkage in Phase 5.
+7. **Trace compression: pure-Rust `lz4_flex`** in LZ4 frame
+   format. ruzstd was the original pick but the crate is
+   decoder-only; lz4_flex ships encode + decode together. The
+   on-disk format is the LZ4 Frame Format, stable, so a future
+   faster encoder of the same format is a drop-in change. No C
+   linkage in Phase 5.
 
 ### `io_uring` is in scope
 
@@ -603,8 +609,8 @@ and full record-and-replay incrementally over the year.
 - **Mach checkpoint divergence.** Apple's COW behaviour is less
   predictable than Linux's. Validate carefully.
 - **Trace file size.** Tier 3 traces can be huge for I/O-heavy
-  programs. Compression at record time (pure-Rust `ruzstd` at
-  Fastest level) is essential; rotation policy bounds the worst
+  programs. Compression at record time (pure-Rust `lz4_flex`
+  frame format) is essential; rotation policy bounds the worst
   case.
 - **Multi-threaded determinism.** Single-CPU serialisation is the
   only reliable approach; cost is ~5× slowdown on CPU-bound
@@ -663,8 +669,8 @@ time-travel feels invisible.
 - aarch64 hardware capabilities — <https://docs.kernel.org/arch/arm64/elf_hwcaps.html>.
 - Linux kernel signals — `signal(7)` — <https://man7.org/linux/man-pages/man7/signal.7.html>.
 - Intel® 64 and IA-32 Architectures Software Developer's Manual, Volume 1 — <https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>. RDTSC, RDRAND, CPUID semantics.
-- zstd compressed data format — RFC 8478 — <https://datatracker.ietf.org/doc/html/rfc8478>. Trace segment compression.
-- `ruzstd` (KillingSpark's `zstd-rs`) — <https://github.com/KillingSpark/zstd-rs>. Pure-Rust zstd encoder/decoder. We use `CompressionLevel::Fastest` for trace recording.
+- LZ4 Frame Format — <https://github.com/lz4/lz4/blob/release/doc/lz4_Frame_format.md>. Trace segment compression on-disk format.
+- `lz4_flex` — <https://github.com/pseitz/lz4_flex>. Pure-Rust LZ4 encoder + decoder, no-unsafe-by-default. We use the frame format API for streaming segment writes.
 - Apple `dyld` reference — <https://github.com/apple-oss-distributions/dyld>. `DYLD_INSERT_LIBRARIES` semantics for Darwin best-effort recording.
 - Apple `EndpointSecurity` framework — Apple Developer documentation. Not used (system extension required) but documented for completeness.
 - gVisor architecture — <https://gvisor.dev/docs/>. Apache-2.0 reference for syscall-interposition design (no code copy).
@@ -766,15 +772,15 @@ Tier 3 record-and-replay introduces no C dependencies. Specifically:
 - vDSO patching: pure Rust binary patching via raw memory writes
   through `process_vm_writev`; no helper library needed.
 - `io_uring` SQ/CQ tracking: `userfaultfd` via rustix; no C dep.
-- Compression: `ruzstd` (pure Rust;
-  <https://github.com/KillingSpark/zstd-rs>) at
-  `CompressionLevel::Fastest`. The encoder is, per its maintainer,
-  "usable, but does not yet reach the speed, ratio or
-  configurability of the original zstd library" — fine for replay
-  traces, where recording speed matters more than density. Output
-  is RFC 8478-compliant zstd, so a future faster encoder (whether
-  upstream ruzstd improvements or our own) is a drop-in change with
-  no on-disk format impact. Phase 5 has **zero C dependencies**.
+- Compression: `lz4_flex` (pure Rust;
+  <https://github.com/pseitz/lz4_flex>) using the LZ4 frame
+  format. ruzstd 0.8 is decoder-only on crates.io; lz4_flex
+  ships encode + decode in one crate, no-unsafe-by-default,
+  MIT. Trade-off accepted: ratio ~30 % looser than zstd-1, in
+  exchange for ~2–3× faster encode — record-time overhead is
+  the headline metric. Output is the standard LZ4 Frame Format,
+  so a future faster encoder of the same format is a drop-in
+  change. Phase 5 has **zero C dependencies**.
 - Disassembly (where required, e.g. for vDSO entry-point detection):
   `iced-x86` (pure Rust) on x86; `bad64` (pure Rust) or `disarm64`
   on aarch64.

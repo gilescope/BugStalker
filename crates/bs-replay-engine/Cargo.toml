@@ -33,6 +33,15 @@ rkyv = { version = "0.8", default-features = false, features = [
     "little_endian",
     "pointer_width_64",
 ] }
+# Compression: pure-Rust LZ4 frame format. See plan § "Pure-Rust
+# policy" for the lz4_flex-vs-ruzstd rationale.
+lz4_flex = { version = "0.13", default-features = false, features = [
+    "std",
+    "frame",
+    "safe-encode",
+    "safe-decode",
+    "checked-decode",
+] }
 
 [dev-dependencies]
 proptest.workspace = true
