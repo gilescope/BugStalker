@@ -21,11 +21,13 @@ pub mod manifest;
 pub mod segment;
 pub mod trace_reader;
 pub mod trace_writer;
+pub mod validator;
 pub mod version;
 
 pub use event::Event;
 pub use manifest::{Manifest, ManifestParseError};
 pub use segment::{Segment, SegmentHeader};
 pub use trace_reader::{SegmentReader, TraceReadError, TraceReader};
-pub use trace_writer::{TraceWriteError, TraceWriter, DEFAULT_SEGMENT_SIZE_BYTES};
+pub use trace_writer::{DEFAULT_SEGMENT_SIZE_BYTES, TraceWriteError, TraceWriter};
+pub use validator::{validate, Diag, DiagKind, Severity, ValidationReport};
 pub use version::{FormatVersion, MAX_SUPPORTED_FORMAT_VERSION, TRACE_MAGIC};
