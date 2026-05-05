@@ -1,4 +1,4 @@
-# Phase 6 — Time-travel debugging
+# Phase 5 — Time-travel debugging
 
 Reverse step. Set a watchpoint and rewind to the write that put the
 bad value there. Replay the last few seconds with different
@@ -16,18 +16,18 @@ three at very different cost points.
 | 2 | `fork(2)` checkpoint replay | nil until checkpoint | minutes | best-effort |
 | 3 | Full record-and-replay (rr-style) | ~10–30 % CPU | hours | exact |
 
-Implement in tier order. Tier 1 ships with Phase 5 essentially for
+Implement in tier order. Tier 1 ships with Phase 6 essentially for
 free. Tier 2 is moderate effort, immediately useful. Tier 3 is a
 multi-month commitment but delivers the canonical experience users
 expect from `rr`.
 
 ## Tier 1 — Intel PT reverse step
 
-The trace buffer Phase 5 already captures (`crates/bs-perf/` Intel PT
+The trace buffer Phase 6 captures (`crates/bs-perf/` Intel PT
 back-end) is *also* a complete record of what the CPU did. The PT
-decoder produces a sequence of executed instructions; we only used it
-for cycle attribution in Phase 5, but the same sequence supports
-reverse stepping.
+decoder produces a sequence of executed instructions; Phase 6 uses it
+for cycle attribution, but the same sequence supports reverse stepping
+here.
 
 ### What the user sees
 
@@ -74,7 +74,7 @@ These limits are exactly why Tier 2 and Tier 3 exist.
 
 ### Effort
 
-~2 weeks engineer-time on top of Phase 5's PT integration. Bulk of
+~2 weeks engineer-time on top of Phase 6's PT integration. Bulk of
 work is the UX commands and the `rcontinue` breakpoint scanning.
 
 ## Tier 2 — Checkpoint-based replay
@@ -303,7 +303,7 @@ aarch64 is 3G; PT integration is 3H.
 
 #### 3H. PT integration
 
-- When Intel PT is available (Phase 5 substrate), the PT trace
+- When Intel PT is available (Phase 6 substrate), the PT trace
   *replaces* much of what 3F has to log: instruction counts between
   context switches come from PT, syscall boundaries from PT branch
   records
@@ -431,7 +431,7 @@ can record at 10 MB/s+; cap the trace size with rotation policy.
    `CompressionLevel::Fastest`. The on-disk format is RFC 8478
    stable so we can swap encoders later (faster pure-Rust impl,
    upstream ruzstd improvements, etc.) without touching the trace
-   format. No C linkage in Phase 6.
+   format. No C linkage in Phase 5.
 
 ### `io_uring` is in scope
 
@@ -511,7 +511,7 @@ their machine.
   Tier 3 logs `io_uring`/`epoll` events, so async timing is
   deterministic. Tier 2 may schedule tasks differently on replay; flag
   this in UI.
-- **Phase 5 (perf overlay).** Replay-mode runs can show the *original*
+- **Phase 6 (perf overlay).** Replay-mode runs can show the *original*
   per-line cycle distribution, not the replay's. The PT trace is part
   of the recording.
 - **Phase 4 (visualisers).** No interaction needed; visualisers just
@@ -543,7 +543,7 @@ their machine.
 
 ## Acceptance criteria
 
-- Tier 1 ships in the same release as Phase 5's PT integration.
+- Tier 1 ships in the same release as Phase 6's PT integration.
 - Tier 2 works on Linux and Darwin (with the Mach fallback path).
 - Tier 3 single-threaded MVP (3A + 3B + 3C + 3D + 3E + 3I) ships as
   the first major Tier 3 milestone, ~5 months in.
@@ -774,7 +774,7 @@ Tier 3 record-and-replay introduces no C dependencies. Specifically:
   traces, where recording speed matters more than density. Output
   is RFC 8478-compliant zstd, so a future faster encoder (whether
   upstream ruzstd improvements or our own) is a drop-in change with
-  no on-disk format impact. Phase 6 has **zero C dependencies**.
+  no on-disk format impact. Phase 5 has **zero C dependencies**.
 - Disassembly (where required, e.g. for vDSO entry-point detection):
   `iced-x86` (pure Rust) on x86; `bad64` (pure Rust) or `disarm64`
   on aarch64.

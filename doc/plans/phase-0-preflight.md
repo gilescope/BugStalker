@@ -21,7 +21,7 @@ must be in place before the first feature PR merges.
                                     │
                        ┌────────────┼────────────┐
                        ▼                         ▼
-                   Phase 4                   Phase 5
+                   Phase 4                   Phase 6
                 (visualisers)            (perf overlay)
                        │                         │
                        └────────────┬────────────┘
@@ -30,9 +30,9 @@ must be in place before the first feature PR merges.
                           (linker accelerators)
                                     │
                                     ▼
-                                Phase 6
+                                Phase 5
                             (time travel)
-                            tier 1: needs Phase 5 PT
+                            tier 1: needs Phase 6 PT
                             tier 2: independent
                             tier 3: independent
 ```
@@ -43,9 +43,9 @@ Recommended start order:
 2. Phase 8's `bs-test-harness` extraction and CI matrix start in parallel with Phase 0.
 3. Phase 1 and Phase 2 are parallel (independent feature work).
 4. Phase 3 must wait for Phase 2 (needs the parsed-AST API).
-5. Phases 4, 5 are parallel after Phase 3 lands.
+5. Phases 4, 6 are parallel after Phase 3 lands.
 6. Phase 7 needs the spec format from Phase 4 Tier A and the vtable list from Phase 3.
-7. Phase 6 Tier 1 needs Phase 5's PT integration; Tiers 2 and 3 are independent.
+7. Phase 5 Tier 1 needs Phase 6's PT integration; Tiers 2 and 3 are independent.
 
 ## Workspace conversion
 
@@ -98,7 +98,7 @@ Existing files at repo root:
 - `Makefile` — point developer entry points at `cargo nextest`
   (per project memory: 20× faster on Darwin).
 - `flake.nix` / `flake.lock` — already present; nightly Rust + qemu +
-  libipt-rs build deps are **deferred to Phase 5** (when the
+  libipt-rs build deps are **deferred to Phase 6** (when the
   `intel-pt` feature is first exercised); Phase 0 leaves the flake
   untouched.
 
@@ -149,8 +149,8 @@ CLI handlers may print.
 > (`crates/rust-mangle-tree/benches/parse.rs`,
 > `crates/bs-perf/benches/decode.rs`,
 > `crates/bs-replay-engine/benches/record_replay.rs`) are **deferred**
-> to the phase that adds the corresponding crate (Phase 2 / Phase 5 /
-> Phase 6 respectively).
+> to the phase that adds the corresponding crate (Phase 2 / Phase 6 /
+> Phase 5 respectively).
 
 Each crate that has a hot path adds a `benches/` directory using `criterion`
 (dev-dep):

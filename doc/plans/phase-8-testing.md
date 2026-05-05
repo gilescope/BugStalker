@@ -194,16 +194,7 @@ submodule / binary oracle), and which phase consumes it.
 | Visual Studio Natvis samples | Microsoft published samples | MIT (verify per file) | reference | Compare expressivity; do not vendor closed-license. |
 | Wasm SDK examples | `bytecodealliance/component-model` | Apache-2.0 with LLVM Exception | submodule | WIT contract patterns. |
 
-### Phase 5 (perf overlay)
-
-| Corpus | Source | License | Mode | Notes |
-| ------ | ------ | ------- | ---- | ----- |
-| `samply` test workloads | `mstange/samply` | Apache-2.0 OR MIT | submodule | Reference for cycles-sampling correctness. |
-| `libipt` PT decoder tests | `intel/libipt` | BSD-3-Clause | submodule | PT-trace decoder test corpus. |
-| `wholesym` test fixtures | `mstange/wholesym` | Apache-2.0 OR MIT | submodule | Symbol resolution under split-debuginfo. |
-| `perf` testsuite | `torvalds/linux:tools/perf/tests/` | GPL-2 | **NOT VENDORED** — binary oracle only | Run `perf record` on the same workload, compare aggregated cycle attribution at the file/line level (not source-coupled). |
-
-### Phase 6 (time travel)
+### Phase 5 (time travel)
 
 | Corpus | Source | License | Mode | Notes |
 | ------ | ------ | ------- | ---- | ----- |
@@ -213,6 +204,15 @@ submodule / binary oracle), and which phase consumes it.
 | `syzkaller` syscall corpus | `google/syzkaller` | Apache-2.0 | submodule (corpus dir only) | Adversarial syscall sequences — fuzz our recorder against them. |
 | Linux kernel selftests | `torvalds/linux:tools/testing/selftests/` | GPL-2 | **NOT VENDORED** — binary oracle | Run them under our recorder, ensure record-replay round-trip preserves their pass/fail outcome. |
 | `rr` itself | `rr-debugger/rr` | GPL-2 | **CI ORACLE ONLY** | Apt-installed in CI; never linked, never read. Differential test compares syscall logs after normalisation. |
+
+### Phase 6 (perf overlay)
+
+| Corpus | Source | License | Mode | Notes |
+| ------ | ------ | ------- | ---- | ----- |
+| `samply` test workloads | `mstange/samply` | Apache-2.0 OR MIT | submodule | Reference for cycles-sampling correctness. |
+| `libipt` PT decoder tests | `intel/libipt` | BSD-3-Clause | submodule | PT-trace decoder test corpus. |
+| `wholesym` test fixtures | `mstange/wholesym` | Apache-2.0 OR MIT | submodule | Symbol resolution under split-debuginfo. |
+| `perf` testsuite | `torvalds/linux:tools/perf/tests/` | GPL-2 | **NOT VENDORED** — binary oracle only | Run `perf record` on the same workload, compare aggregated cycle attribution at the file/line level (not source-coupled). |
 
 ### Phase 7 (linker contract)
 
@@ -292,7 +292,7 @@ Three oracles, three phases:
   purpose").
 - Run on every PR; surface unexpected divergences as test failures.
 
-### `rr` oracle (Phase 6 Tier 3)
+### `rr` oracle (Phase 5 Tier 3)
 
 - Record the same workload through `rr` and our engine.
 - Both produce a syscall log; normalise (drop timestamps, normalise
@@ -331,10 +331,10 @@ Property targets per phase:
   the DWARF-discriminant path when both apply.
 - Phase 4: visualiser interpreter never crashes on adversarial spec
   encoding.
-- Phase 5: ring drain never reads past tail pointer regardless of
-  producer interleaving.
-- Phase 6: record→replay never produces a different PC trace from
+- Phase 5: record→replay never produces a different PC trace from
   the recorded one (the property is determinism itself).
+- Phase 6: ring drain never reads past tail pointer regardless of
+  producer interleaving.
 
 ## Fuzzing
 
@@ -365,7 +365,7 @@ A nightly job runs the soak suite:
 - **Perf regression**: time `tests/debugger/variables.rs` end-to-
   end with overlay off. Compare to baseline; alert on >10 %
   regression.
-- **Replay determinism soak** (Phase 6): record a 30-minute tokio
+- **Replay determinism soak** (Phase 5): record a 30-minute tokio
   HTTP server workload; replay 100 times; assert identical PC
   trace at every breakpoint each time.
 
@@ -380,8 +380,8 @@ automatically with the failing run's logs attached.
 | 2 mangle | `crates/rust-mangle-tree/tests/` (corpus + differential + property + fuzz), corpus submodules under `tests/fixtures/submodules/` | none |
 | 3 dyn/async | `tests/debugger/dyn_trait.rs`, `tests/debugger/async_await.rs`, `tests/fixtures/debuggees/dyn_trait_chain/`, `tests/fixtures/debuggees/async_await/` | extend `niche` tests in `variables.rs` |
 | 4 visualisers | `crates/bs-viz-host/tests/`, `tests/debugger/wasm_visualizers.rs`, derive-macro UI tests via `trybuild` | none |
-| 5 perf | `crates/bs-perf/tests/`, `tests/debugger/perf_overlay.rs`, `tests/debugger/perf_overlay_no_slowdown.rs` | none |
-| 6 time-travel | `crates/bs-replay-engine/tests/`, `tests/debugger/replay_*.rs`, gVisor + criu + syzkaller submodules, rr CI oracle | none |
+| 5 time-travel | `crates/bs-replay-engine/tests/`, `tests/debugger/replay_*.rs`, gVisor + criu + syzkaller submodules, rr CI oracle | none |
+| 6 perf | `crates/bs-perf/tests/`, `tests/debugger/perf_overlay.rs`, `tests/debugger/perf_overlay_no_slowdown.rs` | none |
 | 7 linker | `tests/fixtures/wild-linked/`, section round-trip tests in `crates/bs-debug-sections/tests/`, version-skew tests | extend `tests/debugger/symbol.rs` for accelerated lookup |
 
 ## Determinism requirements

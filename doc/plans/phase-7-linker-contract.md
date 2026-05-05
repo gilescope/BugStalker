@@ -24,8 +24,8 @@ The architectural rule:
 | `.bs_monos` | `[(generic_path_hash → DIE offset)]` | Phase 3 type recovery | 10× |
 | `.bs_coroutines` | `[(coroutine_type_id → [(variant_idx → file:line:col)])]` | Phase 3 async | enables column info |
 | `.bs_paths` | path-prefix table for source files | All phases | smaller binaries, relocatable debug |
-| `.bs_drop_glue` | sorted `[(drop_fn_addr → type_id)]` | Phase 5 attribution | profile readability |
-| `.bs_inline_tree` | flattened inline-call tree | Phase 5 inlined-frame attribution | exact attribution |
+| `.bs_drop_glue` | sorted `[(drop_fn_addr → type_id)]` | Phase 6 attribution | profile readability |
+| `.bs_inline_tree` | flattened inline-call tree | Phase 6 inlined-frame attribution | exact attribution |
 
 Each is a sorted-by-key array with a small fixed header (magic,
 version, count, alignment). BugStalker memory-maps the section and

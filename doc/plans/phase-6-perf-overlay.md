@@ -1,4 +1,4 @@
-# Phase 5 — Performance overlay
+# Phase 6 — Performance overlay
 
 When stopped at a breakpoint, show per-line cost since the last stop.
 The architecture must impose **zero observable slowdown** on
@@ -186,7 +186,7 @@ arm-spe = ["perf", "bs-perf/arm-spe"]           # future, pure Rust
 ```
 
 A user running `cargo build` with no flags gets zero C dependencies
-from Phase 5. Opting into `--features intel-pt` is the single
+from Phase 6. Opting into `--features intel-pt` is the single
 explicit step that introduces C linkage.
 
 ## Decoder
@@ -433,5 +433,5 @@ our process, which is acceptable; aborting the debuggee would not be.
 
 The Intel PT trace window we capture here is *also* the substrate for
 free reverse-stepping. That is covered in
-`doc/plans/phase-6-time-travel.md` — Phase 5 produces the trace, Phase 6
+`doc/plans/phase-5-time-travel.md` — Phase 6 produces the trace, Phase 5
 exposes time-travel UX over it.
