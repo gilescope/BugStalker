@@ -1,0 +1,38 @@
+[package]
+name = "bs-replay-engine"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "BugStalker time-travel — Tier 3 deterministic record-and-replay engine (Phase 5)."
+
+# On-disk encoder: rkyv (events + segments + checkpoints).
+#
+# Why rkyv and not serde+bincode/postcard/bitcode/borsh:
+#   - Replay reads the trace top-to-bottom many times. rkyv's zero-
+#     copy archives mean "deserialize" is a pointer cast; replay
+#     mmap()s the segment and walks events without parsing.
+#   - Recording is bounded by seccomp-notify roundtrip + ptrace,
+#     not by encoding speed; every contender is fast enough on the
+#     write side. The win is on the read side.
+#   - Pure Rust, MIT, mature in 2026 (0.8.x stable line).
+#   - Deterministic with the `aligned` + `little_endian` features
+#     pinned, which matches the manifest's "replay-host CPU
+#     features must be a superset" rule.
+#
+# Manifest stays a tiny hand-rolled key/value text file: it's a
+# support-diagnostic surface where human-readability beats a
+# framework dep.
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+rkyv = { version = "0.8", default-features = false, features = [
+    "std",
+    "bytecheck",
+    "little_endian",
+    "pointer_width_64",
+] }
+
+[dev-dependencies]
+proptest.workspace = true
