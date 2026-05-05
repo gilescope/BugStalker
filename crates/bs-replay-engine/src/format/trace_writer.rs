@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! `TraceWriter` — append events to a trace directory.
 //!
-//! One archive per segment: events accumulate in memory; on rotation
-//! (or finish) the buffer is rkyv-archived as `Vec<Event>`,
-//! lz4-frame-compressed, and written to `event-NNNNNN.lz4`. Segments
-//! are immutable once finalised.
-//!
-//! Sub-phase 3A scaffold. Real size-driven rotation lands later;
-//! today the caller decides when to rotate.
+//! Events accumulate in memory; on rotation (size-driven, or on
+//! demand by the caller) the buffer is wrapped in a `Segment`
+//! `{header, events}`, rkyv-archived, lz4-frame-compressed, and
+//! written to `event-NNNNNN.lz4`. Segments are immutable once
+//! finalised.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -18,14 +16,22 @@ use rkyv::rancor::Error as RkyvError;
 
 use super::event::Event;
 use super::manifest::Manifest;
-use super::segment::{segment_filename, MANIFEST_FILENAME};
+use super::segment::{segment_filename, Segment, SegmentHeader, MANIFEST_FILENAME};
+
+/// Default segment-size cap before auto-rotation, in *uncompressed*
+/// bytes. Tracks the plan's "~16 MB segments" target. Conservative
+/// — the running estimate over-counts slightly, so the actual
+/// compressed file is comfortably under this.
+pub const DEFAULT_SEGMENT_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Append events to a trace directory.
 #[derive(Debug)]
 pub struct TraceWriter {
     dir: PathBuf,
     pending: Vec<Event>,
+    pending_size_bytes: usize,
     next_segment: u64,
+    segment_size_threshold: usize,
 }
 
 impl TraceWriter {
@@ -40,12 +46,35 @@ impl TraceWriter {
         fs::create_dir(&dir)?;
         let manifest_path = dir.join(MANIFEST_FILENAME);
         fs::write(&manifest_path, manifest.to_text())?;
-        Ok(Self { dir, pending: Vec::new(), next_segment: 1 })
+        Ok(Self {
+            dir,
+            pending: Vec::new(),
+            pending_size_bytes: 0,
+            next_segment: 1,
+            segment_size_threshold: DEFAULT_SEGMENT_SIZE_BYTES,
+        })
+    }
+
+    /// Override the auto-rotate threshold (in uncompressed bytes).
+    /// Mostly useful in tests; production callers can leave the
+    /// default.
+    pub fn with_segment_size(mut self, threshold: usize) -> Self {
+        self.segment_size_threshold = threshold.max(1);
+        self
     }
 
     /// Append `event` to the in-memory buffer of the current segment.
-    pub fn write_event(&mut self, event: Event) {
+    /// Auto-rotates when the running size estimate crosses the
+    /// configured threshold.
+    pub fn write_event(&mut self, event: Event) -> Result<(), TraceWriteError> {
+        self.pending_size_bytes = self
+            .pending_size_bytes
+            .saturating_add(event.approx_archive_size());
         self.pending.push(event);
+        if self.pending_size_bytes >= self.segment_size_threshold {
+            self.rotate()?;
+        }
+        Ok(())
     }
 
     /// Flush the in-memory buffer to the next segment file. No-op
@@ -54,7 +83,15 @@ impl TraceWriter {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let archived = rkyv::to_bytes::<RkyvError>(&self.pending)
+        let events = std::mem::take(&mut self.pending);
+        let segment = Segment {
+            header: SegmentHeader {
+                index: self.next_segment,
+                event_count: events.len() as u64,
+            },
+            events,
+        };
+        let archived = rkyv::to_bytes::<RkyvError>(&segment)
             .map_err(TraceWriteError::Archive)?;
         let path = self.dir.join(segment_filename(self.next_segment));
         let file = File::create(&path)?;
@@ -64,7 +101,7 @@ impl TraceWriter {
             .finish()
             .map_err(|e| TraceWriteError::Lz4(format!("{e}")))?
             .flush()?;
-        self.pending.clear();
+        self.pending_size_bytes = 0;
         self.next_segment += 1;
         Ok(())
     }
@@ -72,6 +109,12 @@ impl TraceWriter {
     /// Flush any pending events and close the writer.
     pub fn finish(mut self) -> Result<(), TraceWriteError> {
         self.rotate()
+    }
+
+    /// Index that the *next* segment to be written will carry.
+    /// Useful for tests that want to assert rotation behaviour.
+    pub fn next_segment_index(&self) -> u64 {
+        self.next_segment
     }
 }
 

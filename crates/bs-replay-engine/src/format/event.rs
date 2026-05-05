@@ -26,3 +26,19 @@ pub enum Event {
         data: u64,
     },
 }
+
+impl Event {
+    /// Upper-bound estimate of this event's contribution to the
+    /// segment archive in bytes. Used by the writer to decide when
+    /// to rotate before compression. Slight over-estimation is
+    /// safe; under-estimation is not (could overshoot the segment
+    /// size cap).
+    pub fn approx_archive_size(&self) -> usize {
+        // rkyv enum tag overhead + alignment slack. Conservative.
+        const VARIANT_OVERHEAD: usize = 16;
+        match self {
+            // 4-byte tag + 8-byte data + alignment.
+            Self::Marker { .. } => VARIANT_OVERHEAD + 4 + 8,
+        }
+    }
+}

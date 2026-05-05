@@ -39,7 +39,9 @@ fn roundtrip_one_segment_one_hundred_events() {
 
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
     for i in 0..100u32 {
-        writer.write_event(Event::Marker { tag: i, data: u64::from(i) * 7 + 1 });
+        writer
+            .write_event(Event::Marker { tag: i, data: u64::from(i) * 7 + 1 })
+            .unwrap();
     }
     writer.finish().unwrap();
 
@@ -70,15 +72,15 @@ fn roundtrip_multiple_segments_via_explicit_rotate() {
 
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
     for i in 0..10u32 {
-        writer.write_event(Event::Marker { tag: i, data: 1 });
+        writer.write_event(Event::Marker { tag: i, data: 1 }).unwrap();
     }
     writer.rotate().unwrap();
     for i in 10..25u32 {
-        writer.write_event(Event::Marker { tag: i, data: 2 });
+        writer.write_event(Event::Marker { tag: i, data: 2 }).unwrap();
     }
     writer.rotate().unwrap();
     for i in 25..27u32 {
-        writer.write_event(Event::Marker { tag: i, data: 3 });
+        writer.write_event(Event::Marker { tag: i, data: 3 }).unwrap();
     }
     writer.finish().unwrap();
 
@@ -109,8 +111,8 @@ fn segment_archived_view_is_zero_copy() {
     let manifest = sample_manifest();
 
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
-    writer.write_event(Event::Marker { tag: 1, data: 11 });
-    writer.write_event(Event::Marker { tag: 2, data: 22 });
+    writer.write_event(Event::Marker { tag: 1, data: 11 }).unwrap();
+    writer.write_event(Event::Marker { tag: 2, data: 22 }).unwrap();
     writer.finish().unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();
@@ -147,6 +149,76 @@ fn create_refuses_existing_directory() {
     let err = TraceWriter::create(&dir, &manifest).unwrap_err();
     let s = format!("{err}");
     assert!(s.contains("I/O") || s.contains("exists"), "got: {s}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn auto_rotates_when_estimated_size_exceeds_threshold() {
+    // One Marker is conservatively sized at 28 bytes by
+    // approx_archive_size. Setting the threshold to 56 bytes means
+    // every two events triggers a rotation: 5 events → 3 segments
+    // (2, 2, 1).
+    let dir = temp_trace_dir("auto-rotate");
+    let manifest = sample_manifest();
+
+    let mut writer = TraceWriter::create(&dir, &manifest)
+        .unwrap()
+        .with_segment_size(56);
+    for i in 0..5u32 {
+        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    assert_eq!(reader.segment_indices(), &[1, 2, 3]);
+    let counts: Vec<usize> = reader
+        .segment_indices()
+        .iter()
+        .map(|&i| reader.open_segment(i).unwrap().events_owned().unwrap().len())
+        .collect();
+    assert_eq!(counts, vec![2, 2, 1]);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn segment_header_index_mismatch_is_caught() {
+    // Write a single segment, then rename event-000001.lz4 to
+    // event-000099.lz4. The header still says index=1, the filename
+    // now claims 99 — open_segment(99) must surface HeaderMismatch.
+    let dir = temp_trace_dir("hdr-mismatch");
+    let manifest = sample_manifest();
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+    writer.finish().unwrap();
+    fs::rename(dir.join("event-000001.lz4"), dir.join("event-000099.lz4"))
+        .unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    assert_eq!(reader.segment_indices(), &[99]);
+    let err = reader.open_segment(99).unwrap_err();
+    let s = format!("{err}");
+    assert!(s.contains("file/header disagree"), "got: {s}");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn segment_reader_exposes_header() {
+    let dir = temp_trace_dir("hdr-expose");
+    let manifest = sample_manifest();
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    for _ in 0..3 {
+        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let seg = reader.open_segment(1).unwrap();
+    let hdr = seg.header().unwrap();
+    assert_eq!(hdr.index.to_native(), 1);
+    assert_eq!(hdr.event_count.to_native(), 3);
 
     fs::remove_dir_all(&dir).ok();
 }

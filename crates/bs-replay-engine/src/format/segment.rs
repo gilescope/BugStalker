@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
-//! Numbered, length-prefixed, zstd-compressed event segment.
+//! Numbered, lz4-frame-compressed event segment.
 //!
-//! Skeleton only. Segment layout per
-//! `doc/plans/phase-5-time-travel.md` § "3A. Trace format and storage":
-//! variable-length, length-prefixed records, zstd-compressed via
-//! pure-Rust `ruzstd` at `CompressionLevel::Fastest`. Segment size
-//! ~16 MB; rotated on size or time.
+//! Layout per `doc/plans/phase-5-time-travel.md` § "3A. Trace
+//! format and storage": rkyv-archived `Segment { header, events }`
+//! root, lz4-frame-compressed at rest. Segment size ~16 MB;
+//! rotated on size (or on demand by the writer's caller).
 
 use rkyv::{Archive, Deserialize, Serialize};
+
+use super::event::Event;
 
 /// Filename of the trace manifest at the trace directory root.
 pub const MANIFEST_FILENAME: &str = "manifest.txt";
@@ -31,10 +32,11 @@ pub fn parse_segment_filename(name: &str) -> Option<u64> {
     stem.parse().ok()
 }
 
-/// Header at the start of every event segment file.
+/// Header at the start of every event segment.
 ///
-/// rkyv-archived: replay mmaps the segment and accesses the header
-/// (and event records) through the archived view, no parsing pass.
+/// rkyv-archived as part of the [`Segment`] root: replay
+/// decompresses the segment file once and accesses the header (and
+/// event records) through the archived view, no parsing pass.
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct SegmentHeader {
@@ -44,6 +46,18 @@ pub struct SegmentHeader {
     /// Number of events stored in this segment after decompression.
     /// Phase 5 invariant: `segment.events.len() > 0`.
     pub event_count: u64,
+}
+
+/// Archive root of one segment file: header + the events that were
+/// written into it. The header's `event_count` mirrors `events.len()`
+/// — the reader checks they agree at open time.
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub struct Segment {
+    /// Per-segment metadata.
+    pub header: SegmentHeader,
+    /// Events recorded into this segment, in record order.
+    pub events: Vec<Event>,
 }
 
 #[cfg(test)]

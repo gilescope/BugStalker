@@ -2,11 +2,12 @@
 //! `TraceReader` — open a trace directory and walk it.
 //!
 //! Each segment file is lz4-frame-decompressed once into an owned
-//! buffer; rkyv-archived events are then accessed *zero-copy* as
-//! borrowed references into that buffer. The amortised cost of
-//! decompression is paid per segment, not per event — and replay
-//! re-reads the same segment many times during a debugging session,
-//! so the per-event walk cost stays at pointer-arithmetic speed.
+//! buffer; the rkyv-archived `Segment` and its events are then
+//! accessed *zero-copy* as borrowed references into that buffer.
+//! The amortised cost of decompression is paid per segment, not
+//! per event — and replay re-reads the same segment many times
+//! during a debugging session, so the per-event walk cost stays
+//! at pointer-arithmetic speed.
 
 use std::fs::{self, File};
 use std::io::Read;
@@ -18,7 +19,9 @@ use rkyv::vec::ArchivedVec;
 
 use super::event::{ArchivedEvent, Event};
 use super::manifest::{Manifest, ManifestParseError};
-use super::segment::{parse_segment_filename, MANIFEST_FILENAME};
+use super::segment::{
+    parse_segment_filename, ArchivedSegment, ArchivedSegmentHeader, Segment, MANIFEST_FILENAME,
+};
 
 /// Read-only handle to a trace directory.
 #[derive(Debug)]
@@ -29,9 +32,10 @@ pub struct TraceReader {
 }
 
 impl TraceReader {
-    /// Open the trace at `dir`. Validates the manifest version and
-    /// enumerates segment files but does not read them — segments
-    /// are decompressed on demand by [`Self::open_segment`].
+    /// Open the trace at `dir`. Validates the manifest version,
+    /// enumerates segment files, and asserts segment indices are
+    /// strictly monotonic (Phase 5 invariant: `segment_index >=
+    /// prev_segment_index`).
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, TraceReadError> {
         let dir = dir.as_ref().to_path_buf();
         let manifest_path = dir.join(MANIFEST_FILENAME);
@@ -52,11 +56,19 @@ impl TraceReader {
             }
         }
         segments.sort_unstable();
+        // Strict-monotonic check: `parse_segment_filename` only
+        // accepts six-digit names so duplicates would have to come
+        // from the same on-disk filename, which the filesystem
+        // already excludes — but the assertion costs nothing and
+        // makes the invariant explicit.
+        for w in segments.windows(2) {
+            debug_assert!(w[1] > w[0], "segment indices not strict-monotonic");
+        }
 
         Ok(Self { dir, manifest, segments })
     }
 
-    /// The trace's manifest. Cheap; pre-parsed at [`Self::open`] time.
+    /// The trace's manifest. Cheap; pre-parsed at [`Self::open`].
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
@@ -67,7 +79,8 @@ impl TraceReader {
     }
 
     /// Decompress segment `idx` and return a reader over its events.
-    /// `idx` must be one of [`Self::segment_indices`].
+    /// Validates the segment header at open: `header.index == idx`
+    /// and `header.event_count == events.len()`.
     pub fn open_segment(&self, idx: u64) -> Result<SegmentReader, TraceReadError> {
         let path = self.dir.join(super::segment::segment_filename(idx));
         let file = File::open(&path)
@@ -77,6 +90,27 @@ impl TraceReader {
         decoder
             .read_to_end(&mut decompressed)
             .map_err(|e| TraceReadError::SegmentIo(path.clone(), e))?;
+
+        let archived =
+            rkyv::access::<ArchivedSegment, RkyvError>(&decompressed)
+                .map_err(TraceReadError::Archive)?;
+        let stored_idx = archived.header.index.to_native();
+        let stored_count = archived.header.event_count.to_native();
+        let actual_count = archived.events.len() as u64;
+        if stored_idx != idx {
+            return Err(TraceReadError::HeaderMismatch {
+                file_index: idx,
+                header_index: stored_idx,
+            });
+        }
+        if stored_count != actual_count {
+            return Err(TraceReadError::EventCountMismatch {
+                segment_index: idx,
+                header_count: stored_count,
+                actual_count,
+            });
+        }
+
         Ok(SegmentReader { decompressed })
     }
 }
@@ -89,19 +123,30 @@ pub struct SegmentReader {
 }
 
 impl SegmentReader {
+    /// Borrowed zero-copy view of the segment's archive root.
+    /// Header invariants have already been checked at open time.
+    pub fn segment(&self) -> Result<&ArchivedSegment, TraceReadError> {
+        rkyv::access::<ArchivedSegment, RkyvError>(&self.decompressed)
+            .map_err(TraceReadError::Archive)
+    }
+
+    /// Borrowed zero-copy view of the header.
+    pub fn header(&self) -> Result<&ArchivedSegmentHeader, TraceReadError> {
+        Ok(&self.segment()?.header)
+    }
+
     /// Borrowed zero-copy view of all events in this segment.
     pub fn events(&self) -> Result<&ArchivedVec<ArchivedEvent>, TraceReadError> {
-        rkyv::access::<ArchivedVec<ArchivedEvent>, RkyvError>(&self.decompressed)
-            .map_err(TraceReadError::Archive)
+        Ok(&self.segment()?.events)
     }
 
     /// Eagerly deserialize every event in this segment to owned
     /// values. Convenient for tests; production replay should
     /// prefer [`Self::events`] and walk the archived view.
     pub fn events_owned(&self) -> Result<Vec<Event>, TraceReadError> {
-        let archived = self.events()?;
-        rkyv::deserialize::<Vec<Event>, RkyvError>(archived)
-            .map_err(TraceReadError::Archive)
+        let segment: Segment = rkyv::from_bytes::<Segment, RkyvError>(&self.decompressed)
+            .map_err(TraceReadError::Archive)?;
+        Ok(segment.events)
     }
 }
 
@@ -126,4 +171,26 @@ pub enum TraceReadError {
     /// rkyv archive validation failed.
     #[error("trace archive: {0}")]
     Archive(RkyvError),
+    /// Segment header's `index` did not match its filename.
+    #[error(
+        "segment {file_index} header reports index {header_index}; file/header disagree"
+    )]
+    HeaderMismatch {
+        /// Index parsed from the filename.
+        file_index: u64,
+        /// Index stored in the segment header.
+        header_index: u64,
+    },
+    /// Segment header's `event_count` did not match the actual event vec length.
+    #[error(
+        "segment {segment_index} header reports {header_count} events but {actual_count} are stored"
+    )]
+    EventCountMismatch {
+        /// Index of the offending segment.
+        segment_index: u64,
+        /// Count claimed by the header.
+        header_count: u64,
+        /// Count of events actually stored.
+        actual_count: u64,
+    },
 }

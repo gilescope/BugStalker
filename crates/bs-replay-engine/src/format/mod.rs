@@ -25,6 +25,7 @@ pub mod version;
 
 pub use event::Event;
 pub use manifest::{Manifest, ManifestParseError};
-pub use trace_reader::{TraceReadError, TraceReader, SegmentReader};
-pub use trace_writer::{TraceWriteError, TraceWriter};
+pub use segment::{Segment, SegmentHeader};
+pub use trace_reader::{SegmentReader, TraceReadError, TraceReader};
+pub use trace_writer::{TraceWriteError, TraceWriter, DEFAULT_SEGMENT_SIZE_BYTES};
 pub use version::{FormatVersion, MAX_SUPPORTED_FORMAT_VERSION, TRACE_MAGIC};
