@@ -54,8 +54,25 @@ pub struct PatchEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Read `path`, parse as wild-patch, write each entry at
-    /// `base + entry.offset`.
-    ApplyPatch { path: PathBuf, base: uintptr_t },
+    /// `base + entry.offset`. If `base` is `None`, ask the debugger
+    /// to translate each entry's file offset to a runtime address
+    /// itself (using the loaded executable's mapping).
+    ApplyPatch {
+        path: PathBuf,
+        base: Option<uintptr_t>,
+    },
+    /// Apply the patch every time `path`'s mtime changes. Polls
+    /// every 250 ms; blocks the REPL until the user kills BugStalker
+    /// (Ctrl-C / SIGINT). v0 limitation: the watch holds the main
+    /// thread, so other debugger commands are unavailable while it's
+    /// running. Useful for "edit + cargo build + auto-apply" workflows
+    /// where the user has the BugStalker terminal dedicated to
+    /// watching.
+    WatchPatch {
+        path: PathBuf,
+        base: Option<uintptr_t>,
+        interval_ms: u64,
+    },
 }
 
 /// Result reported back to the UI: counts only, not the bytes themselves.
@@ -76,28 +93,98 @@ impl<'a> Handler<'a> {
 
     pub fn handle(&self, cmd: Command) -> command::CommandResult<ApplyReport> {
         match cmd {
-            Command::ApplyPatch { path, base } => {
-                let text = std::fs::read_to_string(&path).map_err(|e| {
-                    command::CommandError::Parsing(format!(
-                        "failed to read patch file {}: {e}",
-                        path.display()
-                    ))
-                })?;
-                let entries = parse_wild_patch(&text).map_err(|msg| {
-                    command::CommandError::Parsing(format!(
-                        "failed to parse patch file {}: {msg}",
-                        path.display()
-                    ))
-                })?;
+            Command::ApplyPatch { path, base } => self.apply_once(&path, base),
+            Command::WatchPatch {
+                path,
+                base,
+                interval_ms,
+            } => self.watch_loop(&path, base, interval_ms),
+        }
+    }
 
-                let mut report = ApplyReport::default();
-                for entry in &entries {
-                    let target = base.wrapping_add(entry.offset as uintptr_t);
-                    write_aligned(self.dbg, target, &entry.bytes)?;
-                    report.entries_applied += 1;
-                    report.bytes_written += entry.bytes.len();
+    fn apply_once(
+        &self,
+        path: &std::path::Path,
+        base: Option<uintptr_t>,
+    ) -> command::CommandResult<ApplyReport> {
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            command::CommandError::Parsing(format!(
+                "failed to read patch file {}: {e}",
+                path.display()
+            ))
+        })?;
+        let entries = parse_wild_patch(&text).map_err(|msg| {
+            command::CommandError::Parsing(format!(
+                "failed to parse patch file {}: {msg}",
+                path.display()
+            ))
+        })?;
+
+        let mut report = ApplyReport::default();
+        for entry in &entries {
+            let target = match base {
+                Some(b) => b.wrapping_add(entry.offset as uintptr_t),
+                None => self
+                    .dbg
+                    .debugee()
+                    .file_offset_to_runtime(entry.offset)
+                    .ok_or_else(|| {
+                        command::CommandError::Parsing(format!(
+                            "could not auto-detect runtime address for file offset \
+                             0x{:x}: main executable not mapped yet",
+                            entry.offset
+                        ))
+                    })?,
+            };
+            write_aligned(self.dbg, target, &entry.bytes)?;
+            report.entries_applied += 1;
+            report.bytes_written += entry.bytes.len();
+        }
+        Ok(report)
+    }
+
+    fn watch_loop(
+        &self,
+        path: &std::path::Path,
+        base: Option<uintptr_t>,
+        interval_ms: u64,
+    ) -> command::CommandResult<ApplyReport> {
+        // Apply once up front (so the user gets immediate feedback if
+        // the file already exists / parses).
+        let initial = self.apply_once(path, base)?;
+        eprintln!(
+            "[watch-patch] initial apply: {} entries, {} bytes. \
+             Polling {} every {} ms; Ctrl-C to stop.",
+            initial.entries_applied,
+            initial.bytes_written,
+            path.display(),
+            interval_ms,
+        );
+
+        let mut last_mtime = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let interval = std::time::Duration::from_millis(interval_ms);
+        let mut total = initial;
+
+        loop {
+            std::thread::sleep(interval);
+            let now_mtime = std::fs::metadata(path)
+                .ok()
+                .and_then(|m| m.modified().ok());
+            if now_mtime != last_mtime {
+                last_mtime = now_mtime;
+                match self.apply_once(path, base) {
+                    Ok(rep) => {
+                        eprintln!(
+                            "[watch-patch] reapplied: {} entries, {} bytes",
+                            rep.entries_applied, rep.bytes_written
+                        );
+                        total.entries_applied += rep.entries_applied;
+                        total.bytes_written += rep.bytes_written;
+                    }
+                    Err(e) => eprintln!("[watch-patch] reapply failed: {e}"),
                 }
-                Ok(report)
             }
         }
     }

@@ -248,6 +248,41 @@ impl Debugee {
         self.execution_status
     }
 
+    /// Path to the main executable being debugged.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Translate a file offset within the main executable (the kind
+    /// `wild --emit-patch` outputs) into the runtime virtual address
+    /// it ended up at in the running process. Returns `None` if the
+    /// executable hasn't been mapped yet (debugee.run not called).
+    ///
+    /// Linux PIE: simple — `load_base + file_offset`. (DWARF and the
+    /// patch share the same RVA space.)
+    ///
+    /// macOS Mach-O: `slide + vmaddr + (file_offset - text_fileoff)`.
+    /// Wild's tier-4 padding emits patch offsets relative to the file,
+    /// and on typical Mach-O the `__TEXT` segment is mapped at file
+    /// offset 0 with `vmaddr = 0x100000000`. We hard-code that here
+    /// for the common case; binaries with custom `__TEXT.fileoff` or
+    /// `__TEXT.vmaddr` would need a more thorough calculation that
+    /// reads the load commands at runtime.
+    pub fn file_offset_to_runtime(&self, file_offset: u64) -> Option<usize> {
+        let path = self.path.canonicalize().unwrap_or_else(|_| self.path.clone());
+        let mapping = self.dwarf_registry.find_mapping_offset_by_path(&path)?;
+        #[cfg(target_os = "linux")]
+        {
+            Some(mapping + file_offset as usize)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // typical Mach-O __TEXT.vmaddr on aarch64 / x86_64
+            const MACHO_TEXT_VMADDR_DEFAULT: usize = 0x1_0000_0000;
+            Some(mapping + MACHO_TEXT_VMADDR_DEFAULT + file_offset as usize)
+        }
+    }
+
     /// Return true if debugging process in progress
     pub fn is_in_progress(&self) -> bool {
         self.execution_status == ExecutionStatus::InProgress

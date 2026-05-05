@@ -324,6 +324,15 @@ impl DwarfRegistry {
         self.mappings.get(dwarf.pathname()).copied()
     }
 
+    /// Look up the load mapping (semantics: load_base on Linux,
+    /// slide on macOS) by an exact `PathBuf` key. Used by
+    /// `Debugee::file_offset_to_runtime` to find the main exe's
+    /// mapping. Caller is responsible for canonicalizing the path
+    /// to match what `update_mappings` recorded.
+    pub fn find_mapping_offset_by_path(&self, path: &std::path::Path) -> Option<usize> {
+        self.mappings.get(path).copied()
+    }
+
 
     /// Find main executable object debug information.
     pub fn find_main_program_dwarf(&self) -> Option<&DebugInformation> {

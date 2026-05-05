@@ -71,6 +71,7 @@ pub const SHARED_LIB_COMMAND: &str = "sharedlib";
 pub const SHARED_LIB_COMMAND_INFO_SUBCOMMAND: &str = "info";
 pub const SOURCE_COMMAND: &str = "source";
 pub const APPLY_PATCH_COMMAND: &str = "apply-patch";
+pub const WATCH_PATCH_COMMAND: &str = "watch-patch";
 pub const SOURCE_COMMAND_DISASM_SUBCOMMAND: &str = "asm";
 pub const SOURCE_COMMAND_FUNCTION_SUBCOMMAND: &str = "fn";
 pub const ORACLE_COMMAND: &str = "oracle";
@@ -609,24 +610,40 @@ impl Command {
             .padded()
             .boxed();
 
-        // `apply-patch <path> <hex-base>` — read a wild-emitted patch
-        // file and write each byte run into the running process at
-        // `base + entry.offset`. See ui/command/apply_patch.rs.
+        // `apply-patch <path> [<hex-base>]` — read a wild-emitted patch
+        // file and write each byte run into the running process. With
+        // `<hex-base>`, write at `base + entry.offset`; without, ask the
+        // debugger to translate via the loaded executable's mapping.
+        // See ui/command/apply_patch.rs.
+        let apply_patch_path = any()
+            .filter(|c: &char| !c.is_whitespace())
+            .repeated()
+            .at_least(1)
+            .to_slice()
+            .map(|s: &str| s.to_string());
         let apply_patch = op_w_arg(APPLY_PATCH_COMMAND)
-            .ignore_then(
-                any()
-                    .filter(|c: &char| !c.is_whitespace())
-                    .repeated()
-                    .at_least(1)
-                    .to_slice()
-                    .map(|s: &str| s.to_string()),
-            )
-            .then_ignore(whitespace())
-            .then(hex())
+            .ignore_then(apply_patch_path.clone())
+            .then(whitespace().ignore_then(hex()).or_not())
             .map(|(path, base)| {
                 Command::ApplyPatch(apply_patch::Command::ApplyPatch {
                     path: std::path::PathBuf::from(path),
-                    base: base as nix::libc::uintptr_t,
+                    base: base.map(|b| b as nix::libc::uintptr_t),
+                })
+            })
+            .padded()
+            .boxed();
+
+        // `watch-patch <path> [<hex-base>]` — apply patch on first
+        // call, then poll the file's mtime every 250 ms and re-apply
+        // on change. Blocks the REPL.
+        let watch_patch = op_w_arg(WATCH_PATCH_COMMAND)
+            .ignore_then(apply_patch_path)
+            .then(whitespace().ignore_then(hex()).or_not())
+            .map(|(path, base)| {
+                Command::ApplyPatch(apply_patch::Command::WatchPatch {
+                    path: std::path::PathBuf::from(path),
+                    base: base.map(|b| b as nix::libc::uintptr_t),
+                    interval_ms: 250,
                 })
             })
             .padded()
@@ -657,6 +674,7 @@ impl Command {
             command(TRIGGER_COMMAND, trigger),
             command(CALL_COMMAND, call),
             command(APPLY_PATCH_COMMAND, apply_patch),
+            command(WATCH_PATCH_COMMAND, watch_patch),
         ))
     }
 
