@@ -70,6 +70,34 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// Return the features this manifest names that `host_features`
+    /// does *not* contain. Empty `Vec` means the host can replay
+    /// the trace as far as CPU features are concerned.
+    ///
+    /// Plan §Invariants: "CPU feature subset: replay host must
+    /// support the recording's features." A non-empty result
+    /// means the host is missing capabilities the recorder used —
+    /// replay would either trap on an unknown instruction or
+    /// silently misexecute.
+    ///
+    /// String comparison is case-sensitive — match what
+    /// `cpu_features` was populated with at record time. (Real
+    /// recorders should source both ends from the same enumerator
+    /// to avoid skew, e.g. `/proc/cpuinfo` flags or `cpuid` leafs
+    /// canonicalised to one casing.)
+    pub fn missing_host_features<S: AsRef<str>>(&self, host_features: &[S]) -> Vec<String> {
+        self.cpu_features
+            .iter()
+            .filter(|f| !host_features.iter().any(|h| h.as_ref() == f.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Convenience — true iff [`Self::missing_host_features`] is empty.
+    pub fn is_replayable_on<S: AsRef<str>>(&self, host_features: &[S]) -> bool {
+        self.missing_host_features(host_features).is_empty()
+    }
+
     /// Render the manifest to its on-disk text form.
     pub fn to_text(&self) -> String {
         let mut out = String::with_capacity(512);
@@ -256,6 +284,42 @@ mod tests {
             initial_cwd: "/home/giles".to_owned(),
             initial_args: vec!["--flag".into(), "--also".into()],
         }
+    }
+
+    #[test]
+    fn missing_host_features_empty_when_host_is_superset() {
+        let m = sample();
+        let host = ["sse2", "sse4_2", "avx", "avx2"];
+        assert!(m.missing_host_features(&host).is_empty());
+        assert!(m.is_replayable_on(&host));
+    }
+
+    #[test]
+    fn missing_host_features_lists_gaps() {
+        let m = sample(); // wants sse2, sse4_2
+        let host = ["sse2"];
+        let missing = m.missing_host_features(&host);
+        assert_eq!(missing, vec!["sse4_2"]);
+        assert!(!m.is_replayable_on(&host));
+    }
+
+    #[test]
+    fn missing_host_features_handles_empty_recording() {
+        let mut m = sample();
+        m.cpu_features.clear();
+        // A trace that named no required features is replayable
+        // anywhere — even on a host with zero advertised features.
+        let host: [&str; 0] = [];
+        assert!(m.is_replayable_on(&host));
+        assert!(m.missing_host_features(&host).is_empty());
+    }
+
+    #[test]
+    fn missing_host_features_is_case_sensitive() {
+        let m = sample(); // wants "sse2"
+        let host = ["SSE2"]; // wrong case
+        let missing = m.missing_host_features(&host);
+        assert!(missing.contains(&"sse2".to_owned()));
     }
 
     #[test]

@@ -150,6 +150,55 @@ fn driver_exposes_underlying_reader_for_advanced_queries() {
 }
 
 #[test]
+fn driver_check_host_compatibility_passes_when_host_is_superset() {
+    let dir = temp_dir("host-ok");
+    let mut m = manifest();
+    m.cpu_features = vec!["sse2".into(), "avx".into()];
+    {
+        let writer = TraceWriter::create(&dir, &m).unwrap();
+        writer.finish().unwrap();
+    }
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    let host = ["sse2", "sse4_2", "avx", "avx2"]; // superset
+    replayer.check_host_compatibility(&host).unwrap();
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn driver_check_host_compatibility_fails_with_missing_listed() {
+    let dir = temp_dir("host-bad");
+    let mut m = manifest();
+    m.cpu_features = vec!["sse2".into(), "avx".into(), "avx2".into()];
+    {
+        let writer = TraceWriter::create(&dir, &m).unwrap();
+        writer.finish().unwrap();
+    }
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    let host = ["sse2"]; // host lacks avx and avx2
+    let err = replayer.check_host_compatibility(&host).unwrap_err();
+    assert_eq!(err.missing, vec!["avx".to_owned(), "avx2".to_owned()]);
+    let s = format!("{err}");
+    assert!(s.contains("avx"), "got: {s}");
+    assert!(s.contains("avx2"), "got: {s}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn driver_check_host_compatibility_passes_when_recording_named_no_features() {
+    let dir = temp_dir("host-empty");
+    let mut m = manifest();
+    m.cpu_features.clear();
+    {
+        let writer = TraceWriter::create(&dir, &m).unwrap();
+        writer.finish().unwrap();
+    }
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    let host: [&str; 0] = [];
+    replayer.check_host_compatibility(&host).unwrap();
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn driver_manifest_round_trips_through_open() {
     let dir = temp_dir("manifest");
     let m = manifest();

@@ -86,6 +86,28 @@ impl TraceReplayer {
     pub fn reader(&self) -> &TraceReader {
         &self.reader
     }
+
+    /// Verify the host can replay this trace's recorded CPU
+    /// features. Plan §Invariants: replay host must support the
+    /// recording's features. Fails with [`HostMismatchError`]
+    /// naming every feature the host lacks; returns `Ok(())` if
+    /// the host is a strict or equal superset.
+    ///
+    /// `host_features` is supplied by the caller because feature
+    /// enumeration is host-OS specific (e.g. `/proc/cpuinfo` flags
+    /// on Linux, `sysctl hw.optional.*` on Darwin). The driver
+    /// stays portable; recipe-level helpers can land later.
+    pub fn check_host_compatibility<S: AsRef<str>>(
+        &self,
+        host_features: &[S],
+    ) -> Result<(), HostMismatchError> {
+        let missing = self.manifest().missing_host_features(host_features);
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(HostMismatchError { missing })
+        }
+    }
 }
 
 /// Driver-level error. Currently a thin wrapper around the engine
@@ -96,4 +118,22 @@ pub enum ReplayError {
     /// The trace engine returned an error.
     #[error("trace engine: {0}")]
     Engine(TraceReadError),
+}
+
+/// Replay-time host/recording mismatch. Names every CPU feature
+/// the recording used that the replay host doesn't have.
+#[derive(thiserror::Error, Debug, Eq, PartialEq, Clone)]
+pub struct HostMismatchError {
+    /// Features the recording used that this host lacks.
+    pub missing: Vec<String>,
+}
+
+impl core::fmt::Display for HostMismatchError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "replay host is missing CPU features the recording used: {}",
+            self.missing.join(", "),
+        )
+    }
 }
