@@ -7,6 +7,87 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 — trace engine + Tier 1 reverse-step skeleton):
+  - Three new workspace crates land the trace stack the plan
+    architecture diagram prescribes. See `doc/phase-5-overview.md`
+    for the synthesis (architecture, user-story walkthrough,
+    public-API quick-reference, status grid for every plan
+    sub-phase, where the next contributor starts).
+  - `bs-replay-engine` — format layer. `Manifest` (key/value text
+    with `recorded_at` optional), `FormatVersion` + `b"BSREPLAY"`
+    magic, `Event { Marker | Syscall | Signal }` (rkyv-archived
+    enum, additive variant order so old traces always re-read),
+    `Segment { header, events }` archive root, trace-internal
+    `Checkpoint { header, payload }` snapshot files, lz4-frame
+    compressed segments. `TraceWriter` with auto-rotation at the
+    configurable size threshold (`DEFAULT_SEGMENT_SIZE_BYTES`,
+    16 MB by default) plus `take_checkpoint(payload)`.
+    `TraceReader` with lazy-cached `segment_event_ranges` and
+    `checkpoint_headers`, `segment_for_event(idx)` and
+    `find_checkpoint_at_or_before(target)` binary-search seeks,
+    `cursor / cursor_at` walk surface. `EventCursor` yields owned
+    `Event`s one at a time across segment boundaries.
+    `validate(dir)` / `validate_with(dir, opts)` doctor with
+    stable greppable diag codes (`manifest-missing`,
+    `segment-corrupt`, `build-id-mismatch`,
+    `host-feature-missing`, …).
+  - `bs-replay` — Tier 2 ring orchestrator. `CheckpointMechanism`
+    trait abstracts platform-specific take/kill;
+    `CheckpointRing<M>` is the capacity-bounded FIFO with
+    drop-oldest-via-kill eviction and `find_at_or_before` lookup.
+    `MockCheckpointMechanism` lets the orchestration logic be
+    proven on any host; Linux `ForkCheckpointMechanism` and
+    Darwin `MachCheckpointMechanism` are stubs awaiting their
+    respective test paths.
+  - `bs-replay-driver` — sub-phase 3I integration seam.
+    `TraceReplayer` (open / `next_event` / `seek_to` / `position`
+    / `find_checkpoint_at_or_before` / `manifest`) is the
+    surface a future fake-tracee plugs into. `ReverseDebugger`
+    wraps it with the Tier 1 navigation shape: `step / rstep /
+    run_forward / rcontinue` plus event-index breakpoints.
+    `host_features()` enumerates `/proc/cpuinfo` flags on
+    Linux (`HostDetectError::Unsupported` elsewhere — no fake
+    detection). `capture_host_manifest(build_id)` mirror of the
+    enumerator at write time. `check_replayability(host_features,
+    expected_build_id)` runs both plan-named host invariants in
+    stable order.
+  - `bs/replay*` DAP request shapes wired up: `dap_checkpoint_list`,
+    `dap_jump` (with `JumpTarget::Checkpoint | EventIndex` so the
+    DAP server doesn't overload one numeric field), and
+    `dap_timeline` (sparse waypoints from current data).
+    `bs/replayRecord` and `bs/replayLoad` ship as type-only stubs
+    pending the recorder + attach machinery.
+  - `replay-doctor` binary (under `bs-replay-driver`) — a real
+    runnable support tool. `replay-doctor [--check-host]
+    [--build-id <hex>] <DIR>` exits 0 / 1 / 2 (replayable / errors
+    / argv parse) so CI can branch on it. Hand-rolled arg parser
+    (no clap dep for ~30 lines).
+  - Pure-Rust policy upheld. ruzstd 0.8 on crates.io is decoder-
+    only so compression swapped to `lz4_flex` (frame format,
+    encode + decode, no-unsafe-by-default). rkyv 0.8 carries the
+    binary records; manifest is hand-rolled key/value text.
+    `cargo tree -p bs-replay-engine` pulls in zero `*-sys`
+    crates — Phase 5 has no C dependencies.
+  - Plan §Invariants spelled out as `debug_assert!`s on the
+    write/read paths (segment.events.len() > 0,
+    header.event_count == events.len(), monotonic counters,
+    pending-buffer-empty after rotate, ring capacity
+    upper-bounded). `validate` returns `ValidationReport`s with
+    severity-ordered findings (errors before warnings before
+    info totals).
+  - Property tests (proptest, 64 cases each):
+    `record_replay_event_sequence_is_identical`,
+    `record_replay_survives_arbitrary_rotations`,
+    `manifest_text_roundtrip` (caught two real parser bugs in
+    step 10: `=` in env keys + `value.trim()` eating leading
+    whitespace), `checkpoint_seek_is_at_or_before`,
+    `rotation_threshold_does_not_change_event_sequence`,
+    `seek_to_equals_cursor_at`.
+  - `doc/plans/phase-5-time-travel.md` ↔ `doc/plans/phase-6-perf-overlay.md`
+    swapped at the start of the session: time-travel becomes
+    Phase 5, perf-overlay becomes Phase 6. Cross-refs in
+    `phase-0`, `phase-7`, `phase-8` updated accordingly.
+  - 133 / 133 tests green across the three Phase 5 crates.
 - visualisers (Phase 4 Tier-A step 13 — `bs/visualiserToggle` DAP):
   - New `bs/visualiserToggle` custom DAP request flips a
     registered Tier-A visualiser on or off per-session.
