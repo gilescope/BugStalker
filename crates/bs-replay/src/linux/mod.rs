@@ -11,9 +11,9 @@ pub mod proc_maps;
 pub mod proc_mem;
 
 pub use checkpoint_capture::{
-    capture_writable_state, from_payload, to_payload, CaptureError, CapturedRegion,
-    DecodeError, WritableState,
+    capture_writable_state, from_payload, restore_writable_state, to_payload, CaptureError,
+    CapturedRegion, DecodeError, RestoreReport, WritableState,
 };
 pub use fork_self::{ForkHandle, ForkMechanismError, LinuxForkSelfMechanism};
 pub use proc_maps::{read_proc_maps, MemoryRegion, Permissions, ProcMapsError};
-pub use proc_mem::{read_bytes_at, read_region, ProcMemError};
+pub use proc_mem::{read_bytes_at, read_region, write_bytes_at, ProcMemError};

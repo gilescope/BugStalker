@@ -28,7 +28,7 @@
 use nix::unistd::Pid;
 
 use super::proc_maps::{read_proc_maps, MemoryRegion, ProcMapsError};
-use super::proc_mem::{read_region, ProcMemError};
+use super::proc_mem::{read_region, write_bytes_at, ProcMemError};
 
 /// One captured writable region: its start address + raw bytes.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -112,6 +112,51 @@ pub fn capture_writable_state(pid: Pid) -> Result<WritableState, CaptureError> {
         }
     }
     Ok(WritableState { regions })
+}
+
+/// Restore the captured writable state into `pid`'s address
+/// space. Each region's bytes are pwrite64'd at its captured
+/// start address.
+///
+/// Returns `(written, skipped)` — count of regions written
+/// successfully and count that failed individually. A region
+/// failure is *not* fatal because some regions in a capture may
+/// no longer exist in the target (e.g. heap shrunk between
+/// capture and restore) — the caller decides whether to treat
+/// the skip count as a hard failure.
+///
+/// The caller must already have ptrace-attached the target.
+pub fn restore_writable_state(
+    pid: Pid,
+    state: &WritableState,
+) -> Result<RestoreReport, ProcMemError> {
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+    for r in &state.regions {
+        match write_bytes_at(pid, r.start, &r.bytes) {
+            Ok(()) => written += 1,
+            Err(_) => {
+                tracing::debug!(
+                    target: "bs_replay",
+                    "restore: skipping region 0x{:x} ({} bytes)",
+                    r.start, r.bytes.len(),
+                );
+                skipped += 1;
+            }
+        }
+    }
+    Ok(RestoreReport { written, skipped })
+}
+
+/// Result of [`restore_writable_state`]: how many regions were
+/// successfully restored vs. silently skipped.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct RestoreReport {
+    /// Regions whose bytes were written into the target.
+    pub written: usize,
+    /// Regions that failed to write (e.g. unmapped at restore
+    /// time). Caller decides whether this is fatal.
+    pub skipped: usize,
 }
 
 /// True iff the region should be carried in the checkpoint
@@ -243,6 +288,61 @@ mod tests {
             from_payload(&buf),
             Err(DecodeError::RegionLengthMismatch { index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn restore_writes_each_region_back() {
+        // Build a synthetic WritableState whose one region targets
+        // an actual heap-allocated buffer in the parent. After
+        // fork+SEIZE+restore, the child's view of that buffer must
+        // contain the pattern from the synthetic state.
+        let buf: Vec<u8> = vec![0xff; 64];
+        let addr = buf.as_ptr() as u64;
+        let pattern: Vec<u8> = (0..32u8).collect(); // 0..32 byte progression
+
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        sleep(Duration::from_millis(50));
+        if let Err(e) = mech.seize(&h) {
+            let s = format!("{e:?}");
+            if s.contains("EPERM") {
+                eprintln!("skipping restore test: YAMA blocked seize");
+                mech.kill(h).expect("kill failed");
+                return;
+            }
+            panic!("seize failed: {e:?}");
+        }
+
+        let state = WritableState {
+            regions: vec![CapturedRegion {
+                start: addr,
+                bytes: pattern.clone(),
+            }],
+        };
+        let report = match restore_writable_state(h.pid, &state) {
+            Ok(r) => r,
+            Err(e) => {
+                let s = format!("{e:?}");
+                if s.contains("EACCES") || s.contains("EPERM") {
+                    eprintln!("skipping restore test: {e:?}");
+                    mech.kill(h).expect("kill failed");
+                    return;
+                }
+                panic!("restore failed: {e:?}");
+            }
+        };
+        assert_eq!(report.written, 1);
+        assert_eq!(report.skipped, 0);
+
+        // Read back from the child to confirm the bytes landed.
+        let read_back = super::super::proc_mem::read_bytes_at(h.pid, addr, pattern.len())
+            .expect("read failed");
+        assert_eq!(read_back, pattern, "restore did not land the bytes");
+
+        // Parent's heap is unchanged thanks to COW.
+        assert_eq!(buf, vec![0xff; 64], "parent buffer modified — COW broke");
+
+        mech.kill(h).expect("kill failed");
     }
 
     #[test]

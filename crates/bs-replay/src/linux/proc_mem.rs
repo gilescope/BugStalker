@@ -52,6 +52,29 @@ pub fn read_region(
     read_bytes_at(pid, region.start, len)
 }
 
+/// Write `bytes` into `pid`'s virtual address space at `address`.
+/// Symmetric to [`read_bytes_at`]. The caller must already have
+/// ptrace-attached the target so the kernel allows the write.
+pub fn write_bytes_at(
+    pid: Pid,
+    address: u64,
+    bytes: &[u8],
+) -> Result<(), ProcMemError> {
+    let path = format!("/proc/{}/mem", pid.as_raw());
+    let f = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .map_err(|e| ProcMemError::Open { pid: pid.as_raw(), source: e })?;
+    f.write_all_at(bytes, address)
+        .map_err(|e| ProcMemError::Read {
+            pid: pid.as_raw(),
+            address,
+            len: bytes.len(),
+            source: e,
+        })?;
+    Ok(())
+}
+
 /// Errors arising from `/proc/<pid>/mem` reads.
 #[derive(thiserror::Error, Debug)]
 pub enum ProcMemError {
@@ -189,6 +212,54 @@ mod tests {
             &MAGIC[..],
             "MAGIC not found at expected offset within region bytes",
         );
+        mech.kill(h).expect("kill failed");
+    }
+
+    #[test]
+    fn write_then_read_roundtrips_in_seized_child() {
+        // Heap-allocate a buffer; the address is shared (same VA)
+        // with the post-fork child. write_bytes_at into the
+        // child's copy and read it back to confirm the kernel
+        // actually wrote the bytes there.
+        let buf: Vec<u8> = vec![0u8; 64];
+        let addr = buf.as_ptr() as u64;
+
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        sleep(Duration::from_millis(50));
+        if let Err(e) = mech.seize(&h) {
+            let s = format!("{e:?}");
+            if s.contains("EPERM") {
+                eprintln!("skipping write_then_read test: YAMA blocked seize");
+                mech.kill(h).expect("kill failed");
+                return;
+            }
+            panic!("seize failed: {e:?}");
+        }
+
+        let pattern = [0xab; 16];
+        match write_bytes_at(h.pid, addr, &pattern) {
+            Ok(()) => {}
+            Err(e) if skip_if_yama(&e) => {
+                eprintln!("skipping write test: {e:?}");
+                mech.kill(h).expect("kill failed");
+                return;
+            }
+            Err(e) => panic!("write_bytes_at failed: {e:?}"),
+        };
+        let read_back = read_bytes_at(h.pid, addr, pattern.len()).expect("read failed");
+        assert_eq!(
+            read_back, pattern,
+            "write then read mismatch at 0x{addr:x}",
+        );
+
+        // Parent's view is unchanged — COW means the child's
+        // write didn't propagate back.
+        assert_eq!(
+            buf, vec![0u8; 64],
+            "parent's heap buffer was modified — fork should have COW'd",
+        );
+
         mech.kill(h).expect("kill failed");
     }
 
