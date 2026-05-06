@@ -25,3 +25,9 @@ mach2 = "0.6"
 
 [dev-dependencies]
 proptest.workspace = true
+# Cross-crate integration test: stash a Tier 2 capture's payload
+# in a Tier 3 trace and round-trip the whole thing. dev-dep keeps
+# the dependency direction (bs-replay-driver → bs-replay,
+# bs-replay-engine) clean while still letting bs-replay's tests
+# exercise the bridge.
+bs-replay-engine = { path = "../bs-replay-engine" }
