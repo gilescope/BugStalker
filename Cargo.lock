@@ -256,6 +256,7 @@ dependencies = [
 name = "bs-replay"
 version = "0.0.1"
 dependencies = [
+ "bs-replay-engine",
  "libc",
  "mach2 0.6.0",
  "nix 0.27.1",
@@ -269,6 +270,7 @@ dependencies = [
 name = "bs-replay-driver"
 version = "0.0.1"
 dependencies = [
+ "bs-replay",
  "bs-replay-engine",
  "chrono",
  "libc",

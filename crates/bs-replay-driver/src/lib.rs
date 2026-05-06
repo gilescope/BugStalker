@@ -25,6 +25,8 @@
 pub mod capture;
 pub mod dap;
 pub mod host;
+#[cfg(target_os = "linux")]
+pub mod record;
 pub mod replayer;
 pub mod reverse;
 

@@ -11,6 +11,11 @@ description = "BugStalker time-travel — sub-phase 3I integration seam between 
 thiserror.workspace = true
 tracing.workspace = true
 bs-replay-engine = { path = "../bs-replay-engine" }
+# Tier 2 fork-checkpoint primitives. bs-replay compiles cross-
+# platform (its Linux-only items are cfg-gated internally), so
+# this dep is unconditional; the driver's record::capture_one_shot
+# is itself cfg(target_os = "linux") for the recorder side.
+bs-replay = { path = "../bs-replay" }
 # RFC 3339 timestamp generation for capture_host_manifest. The
 # format crate doesn't validate the encoding so chrono stays an
 # implementation detail of the driver — the engine never sees it.
