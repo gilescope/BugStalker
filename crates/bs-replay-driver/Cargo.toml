@@ -52,3 +52,11 @@ path = "src/bin/replay-record.rs"
 [[bin]]
 name = "replay-load"
 path = "src/bin/replay-load.rs"
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "recorder_throughput"
+path = "benches/recorder_throughput.rs"
+harness = false
