@@ -57,6 +57,11 @@ pub mod record_primitives {
     #[cfg(target_os = "linux")]
     #[doc(inline)]
     pub use bs_replay_engine::record::linux::{
+        exit_stop::{
+            classify_wstatus, get_regs, merge_pre_post, ptrace_cont, ptrace_syscall,
+            record_syscall_with_exit, result_register_x86_64, set_regs,
+            wait_for_next_stop, ExitStopError, StopKind, UserRegsX86_64,
+        },
         instrs::{
             classify_at_pc, event_for_instruction_trap, set_tsc_trap_for_self, InstrKind,
         },
