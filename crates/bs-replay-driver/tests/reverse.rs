@@ -52,6 +52,59 @@ fn marker_tag(ev: &Event) -> u32 {
 }
 
 #[test]
+fn current_pc_tracks_pcmarker_through_rstep() {
+    // Trace:
+    //   event 0: PcMarker(0xaa)
+    //   event 1: Marker
+    //   event 2: PcMarker(0xbb)
+    //   event 3: Marker
+    let dir = temp_dir("current-pc");
+    let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+    writer.write_event(Event::PcMarker { pc: 0xaa }).unwrap();
+    writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+    writer.write_event(Event::PcMarker { pc: 0xbb }).unwrap();
+    writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+    writer.finish().unwrap();
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    let mut rdb = ReverseDebugger::new(replayer);
+
+    // Position 0: nothing consumed → None.
+    assert_eq!(rdb.position(), 0);
+    assert_eq!(rdb.current_pc().unwrap(), None);
+
+    // Step forward through events 0..4.
+    rdb.step().unwrap(); // consume event 0 (PcMarker 0xaa)
+    assert_eq!(rdb.current_pc().unwrap(), Some(0xaa));
+    rdb.step().unwrap(); // consume event 1 (Marker)
+    assert_eq!(rdb.current_pc().unwrap(), Some(0xaa));
+    rdb.step().unwrap(); // consume event 2 (PcMarker 0xbb)
+    assert_eq!(rdb.current_pc().unwrap(), Some(0xbb));
+    rdb.step().unwrap(); // consume event 3 (Marker)
+    assert_eq!(rdb.current_pc().unwrap(), Some(0xbb));
+
+    // rstep back to event 1 (consumed events 0..1), PC was 0xaa.
+    rdb.seek_to(1);
+    assert_eq!(rdb.current_pc().unwrap(), Some(0xaa));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn current_pc_is_none_when_no_pcmarker_emitted() {
+    let dir = temp_dir("no-pcmarker");
+    let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+    writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+    writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+    writer.finish().unwrap();
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    let mut rdb = ReverseDebugger::new(replayer);
+    rdb.step().unwrap();
+    rdb.step().unwrap();
+    assert_eq!(rdb.current_pc().unwrap(), None);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn rstep_at_position_zero_returns_none() {
     let dir = temp_dir("rstep-zero");
     make_trace(&dir, 5);

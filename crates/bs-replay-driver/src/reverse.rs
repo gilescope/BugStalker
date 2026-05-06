@@ -60,6 +60,25 @@ impl ReverseDebugger {
         self.replayer.position()
     }
 
+    /// PC active at the current playhead — the most recent
+    /// [`bs_replay_engine::format::Event::PcMarker`] PC at or
+    /// before the position. `None` if no PcMarker fired in the
+    /// trace before this point.
+    ///
+    /// Tier 1 display callers resolve the returned PC to a
+    /// file:line via DWARF (BugStalker's existing infrastructure)
+    /// and render `now at <file>:<line>` after each rstep / step.
+    pub fn current_pc(&self) -> Result<Option<u64>, ReplayError> {
+        let pos = self.position();
+        if pos == 0 {
+            return Ok(None);
+        }
+        self.replayer
+            .reader()
+            .pc_at_or_before(pos - 1)
+            .map_err(ReplayError::Engine)
+    }
+
     /// Move the playhead without yielding events.
     pub fn seek_to(&mut self, event_index: u64) {
         self.replayer.seek_to(event_index);

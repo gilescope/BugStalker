@@ -575,6 +575,54 @@ fn pc_marker_archived_view_uses_endian_aware_accessor() {
 }
 
 #[test]
+fn pc_at_or_before_returns_latest_pcmarker_in_prefix() {
+    let dir = temp_trace_dir("pc-at-or-before");
+    let manifest = sample_manifest();
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    // event 0: PcMarker(0xaa)
+    // event 1: Marker
+    // event 2: PcMarker(0xbb)
+    // event 3: Marker
+    // event 4: Marker
+    writer.write_event(Event::PcMarker { pc: 0xaa }).unwrap();
+    writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+    writer.write_event(Event::PcMarker { pc: 0xbb }).unwrap();
+    writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+    writer.write_event(Event::Marker { tag: 3, data: 0 }).unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    assert_eq!(reader.pc_at_or_before(0).unwrap(), Some(0xaa));
+    assert_eq!(reader.pc_at_or_before(1).unwrap(), Some(0xaa));
+    assert_eq!(reader.pc_at_or_before(2).unwrap(), Some(0xbb));
+    assert_eq!(reader.pc_at_or_before(3).unwrap(), Some(0xbb));
+    assert_eq!(reader.pc_at_or_before(4).unwrap(), Some(0xbb));
+    // Past end of trace — last PcMarker still wins.
+    assert_eq!(reader.pc_at_or_before(99).unwrap(), Some(0xbb));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pc_at_or_before_returns_none_when_no_pcmarker_in_prefix() {
+    let dir = temp_trace_dir("pc-no-marker");
+    let manifest = sample_manifest();
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    // No PcMarker before event 2.
+    writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+    writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+    writer.write_event(Event::PcMarker { pc: 0xcc }).unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    assert_eq!(reader.pc_at_or_before(0).unwrap(), None);
+    assert_eq!(reader.pc_at_or_before(1).unwrap(), None);
+    assert_eq!(reader.pc_at_or_before(2).unwrap(), Some(0xcc));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn marker_through_instructiontrap_traces_still_read_after_pcmarker_added() {
     // Forward-compat *fourth* extension: a trace mixing all four
     // pre-existing variants (Marker / Syscall / Signal /

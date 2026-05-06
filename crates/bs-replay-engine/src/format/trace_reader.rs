@@ -205,6 +205,31 @@ impl TraceReader {
         Ok(self.checkpoint_headers.get().expect("just set"))
     }
 
+    /// Most recent [`Event::PcMarker`] PC at or before
+    /// `event_index`, or `None` if no PcMarker fired in that
+    /// prefix. The Tier 1 display primitive — a future renderer
+    /// resolves the returned PC to file:line via DWARF.
+    ///
+    /// Walks events 0..=event_index linearly. For long traces a
+    /// future iteration could index PcMarker positions at open
+    /// time (parallel to `segment_event_ranges`); first cut keeps
+    /// the implementation simple.
+    pub fn pc_at_or_before(
+        &self,
+        event_index: u64,
+    ) -> Result<Option<u64>, TraceReadError> {
+        let mut cursor = self.cursor();
+        let mut last_pc: Option<u64> = None;
+        for _ in 0..=event_index {
+            match cursor.next()? {
+                Some(Event::PcMarker { pc }) => last_pc = Some(pc),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        Ok(last_pc)
+    }
+
     /// Find the latest checkpoint whose `event_index <=
     /// target_event_index`. Returns `None` if no checkpoint
     /// covers that target (i.e. all checkpoints are after the
