@@ -72,17 +72,33 @@
   * VSCode [extension](https://marketplace.visualstudio.com/items?itemName=BugStalker.bugstalker)
   * Two modes: stdio (embedded) and TCP (remote)
   * See [DAP Documentation](./doc/DAP.md) for details
-* **Time-travel debugging scaffolding (Phase 5):**
-  * Trace format + writer/reader/validator/cursor in
-    [`bs-replay-engine`](./crates/bs-replay-engine/)
-  * Tier 2 fork-checkpoint ring orchestrator in
-    [`bs-replay`](./crates/bs-replay/)
-  * Integration seam + Tier 1 reverse-step navigation +
-    `bs/replay*` DAP shapes + `replay-doctor` CLI in
-    [`bs-replay-driver`](./crates/bs-replay-driver/)
-  * 135 / 135 tests across the three crates; see
-    [Phase 5 overview](./doc/phase-5-overview.md) for the
-    architecture and status of every plan sub-phase
+* **Time-travel debugging (Phase 5):**
+  * **Tier 1 reverse step** — navigation over a recorded trace
+    (`step` / `rstep` / `rcontinue` / breakpoint scan).
+  * **Tier 2 fork checkpoints** — Linux `fork(2)` + Darwin
+    `mach_vm_remap`-style snapshotter; ring buffer of up to 32
+    checkpoints with drop-oldest-via-SIGKILL eviction.
+  * **Tier 3 deterministic record + replay** — Linux x86-64.
+    PTRACE-only recorder captures every syscall (entry+exit
+    pairs), every signal, every classified non-deterministic
+    instruction (RDTSC/RDRAND/CPUID); replay-side seccomp NOTIF
+    intercepts every syscall and supplies the recorded result
+    via `process_vm_writev`. Pure-Rust trace format
+    (`rkyv` + `lz4_flex`); zero `*-sys` deps.
+  * **User-facing CLIs**: `replay-record /tmp/trace.bs --
+    /your/program`, then `replay-load /tmp/trace.bs --
+    /your/program` reproduces the recorded execution. See
+    [doc/phase-5-usage.md](./doc/phase-5-usage.md) for the
+    walkthrough.
+  * **Five workspace crates**: [`bs-syscall-spec`](./crates/bs-syscall-spec/),
+    [`bs-syscall-macro`](./crates/bs-syscall-macro/),
+    [`bs-replay-engine`](./crates/bs-replay-engine/),
+    [`bs-replay`](./crates/bs-replay/),
+    [`bs-replay-driver`](./crates/bs-replay-driver/) +
+    `bs/replay*` DAP shapes for IDE integration.
+  * **200+ tests** across the five crates;
+    [Phase 5 overview](./doc/phase-5-overview.md) tracks the
+    status of every plan sub-phase.
 * **And many more powerful features!**
 
 ---
