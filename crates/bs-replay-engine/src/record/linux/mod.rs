@@ -16,6 +16,7 @@ pub mod exit_stop;
 pub mod instrs;
 pub mod ptrace_driver;
 pub mod record_child;
+pub mod record_session;
 pub mod seccomp;
 pub mod signals;
 pub mod thread_sched;

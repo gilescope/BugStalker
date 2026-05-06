@@ -82,12 +82,11 @@ pub enum RecordError {
 
 use std::ffi::CString;
 
-use bs_replay_engine::record::linux::exit_stop::{
-    ptrace_cont, ptrace_syscall, record_syscall_with_exit, wait_for_next_stop,
-    ExitStopError, StopKind,
-};
 use bs_replay_engine::record::linux::ptrace_driver::ProcMemReader;
-use bs_replay_engine::record::linux::record_child::{self, RecordChild, SpawnError};
+use bs_replay_engine::record::linux::record_session::{
+    self, record_to_completion, spawn_recorded_child, RecordSessionError, RecordSummary,
+    SpawnError, Terminal,
+};
 
 /// How a recorded program ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +137,7 @@ impl Default for RecordOptions {
 /// Errors arising from [`record_program`].
 #[derive(thiserror::Error, Debug)]
 pub enum RecordProgramError {
-    /// `RecordChild::spawn` failed.
+    /// `spawn_recorded_child` failed.
     #[error("spawn: {0}")]
     Spawn(#[from] SpawnError),
     /// Couldn't open `/proc/<pid>/mem`. yama (kernel.yama.
@@ -150,6 +149,9 @@ pub enum RecordProgramError {
     /// permission-denied at create time).
     #[error("trace: {0}")]
     Trace(TraceWriteError),
+    /// Recorder loop produced an error mid-session.
+    #[error("recorder: {0}")]
+    Session(RecordSessionError),
 }
 
 /// Record the program at `argv[0]` with the supplied `envp`,
@@ -159,17 +161,16 @@ pub enum RecordProgramError {
 /// Composes:
 ///
 /// 1. `TraceWriter::create(trace_dir, manifest)`.
-/// 2. `record_child::spawn(argv, envp)` — RecordChild lifecycle.
+/// 2. `record_session::spawn_recorded_child(argv, envp)` —
+///    PTRACE-only fork+exec (no seccomp filter; that's the
+///    replay path's job).
 /// 3. `ProcMemReader::open(child.pid())`.
-/// 4. Loop driving `record_syscall_with_exit` (the step 7b
-///    primitive) until the child exits or the iteration cap
-///    fires.
+/// 4. `record_to_completion` drives `step_until_event` until
+///    the tracee exits or the iteration cap fires; emits
+///    Event::Syscall / Event::Signal / Event::InstructionTrap
+///    along the way.
 ///
-/// Step 70 handles only syscall-stops cleanly; signal-delivery
-/// stops fall through to `ptrace_cont`, ptrace-events fall
-/// through to `ptrace_syscall`. The next commit (step 71's
-/// signal-stop dispatcher) replaces those routings with proper
-/// Event::Signal / Event::InstructionTrap emit.
+/// Returns per-event counts + how the recording ended.
 pub fn record_program(
     trace_dir: impl AsRef<Path>,
     manifest: &Manifest,
@@ -180,87 +181,33 @@ pub fn record_program(
     let mut writer =
         TraceWriter::create(&trace_dir, manifest).map_err(RecordProgramError::Trace)?;
 
-    let child = record_child::spawn(argv, envp)?;
+    let mut child = spawn_recorded_child(argv, envp)?;
     let pid = child.pid();
     let reader = ProcMemReader::open(pid).map_err(RecordProgramError::ProcMem)?;
 
-    let mut report = RecordReport {
-        syscall_events: 0,
-        signal_events: 0,
-        instruction_traps: 0,
-        iterations: 0,
-        exit_status: ExitStatus::IterationCap(0),
-    };
-
-    'recorder: for _ in 0..options.max_iterations {
-        report.iterations += 1;
-        match record_syscall_with_exit(pid, child.listener(), &reader, &mut writer) {
-            Ok(_) => {
-                report.syscall_events += 1;
-            }
-            Err(ExitStopError::UnexpectedStop { kind, .. }) => match kind {
-                StopKind::Exited { code } => {
-                    report.exit_status = ExitStatus::Exited(code);
-                    break 'recorder;
-                }
-                StopKind::Signalled { sig } => {
-                    report.exit_status = ExitStatus::Signalled(sig);
-                    break 'recorder;
-                }
-                StopKind::SignalDelivery { .. } => {
-                    // Routed; signal-event emit lands in step 71.
-                    if let Err(e) = ptrace_cont(pid, 0) {
-                        tracing::warn!("record_program: ptrace_cont failed: {e}");
-                        break 'recorder;
-                    }
-                }
-                StopKind::PtraceEvent { .. } => {
-                    if let Err(e) = ptrace_syscall(pid, 0) {
-                        tracing::warn!("record_program: ptrace_syscall failed: {e}");
-                        break 'recorder;
-                    }
-                }
-                StopKind::SyscallStop => {
-                    // Shouldn't reach — record_syscall_with_exit
-                    // would have handled it.
-                    tracing::warn!(
-                        "record_program: unexpected SyscallStop reaching outer loop"
-                    );
-                }
-            },
-            Err(ExitStopError::Recv(_)) | Err(ExitStopError::Recorder(_)) => {
-                // Listener fd became invalid (typical on tracee
-                // exit between turns). Reap the exit status
-                // and break.
-                if let Ok((kind, _)) = wait_for_next_stop(pid) {
-                    match kind {
-                        StopKind::Exited { code } => {
-                            report.exit_status = ExitStatus::Exited(code);
-                        }
-                        StopKind::Signalled { sig } => {
-                            report.exit_status = ExitStatus::Signalled(sig);
-                        }
-                        _ => {}
-                    }
-                }
-                break 'recorder;
-            }
-            Err(ExitStopError::Wait(_))
-            | Err(ExitStopError::GetRegs(_))
-            | Err(ExitStopError::Write(_)) => {
-                // Stale tracee or full disk — bail with
-                // whatever exit status we can get.
-                break 'recorder;
-            }
-        }
-    }
-
-    if matches!(report.exit_status, ExitStatus::IterationCap(_)) {
-        report.exit_status = ExitStatus::IterationCap(report.iterations);
-    }
+    let summary: RecordSummary =
+        record_to_completion(&mut child, &reader, &mut writer, options.max_iterations)
+            .map_err(RecordProgramError::Session)?;
 
     let _ = child.detach();
     writer.finish().map_err(RecordProgramError::Trace)?;
 
-    Ok(report)
+    Ok(RecordReport {
+        syscall_events: summary.syscalls,
+        signal_events: summary.signals,
+        instruction_traps: summary.instruction_traps,
+        iterations: summary.steps,
+        exit_status: match summary.terminal {
+            Some(Terminal::Exited(code)) => ExitStatus::Exited(code),
+            Some(Terminal::Signalled(sig)) => ExitStatus::Signalled(sig),
+            Some(Terminal::IterationCap(n)) => ExitStatus::IterationCap(n),
+            None => ExitStatus::IterationCap(summary.steps),
+        },
+    })
 }
+
+// Suppress unused warning on the legacy step 7b record helper
+// re-export — it's still in the public surface for the replay
+// path's reference.
+#[allow(unused_imports)]
+use bs_replay_engine::record::linux::record_child::{self as _legacy_record_child};

@@ -76,7 +76,12 @@ pub mod record_primitives {
             RecorderError, SeccompData, SeccompNotif, SeccompNotifResp,
             RESULT_NOT_CAPTURED_YET, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
         },
-        record_child::{spawn as spawn_record_child, RecordChild, SpawnError},
+        record_child::{spawn as spawn_record_child, RecordChild},
+        record_session::{
+            call_frame_from_regs, ptrace_getsiginfo, record_to_completion,
+            spawn_recorded_child, step_until_event, RecordSessionError, RecordSummary,
+            RecordedChild, RecordedEventKind, SpawnError, Terminal,
+        },
         seccomp::install_trap_all_listener,
         signals::{
             event_for_signal, signal_from_event, validate_replay_plan, SignalCapture,
