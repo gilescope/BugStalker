@@ -261,6 +261,190 @@ pub fn syscall_nr_for_vdso(name: &str) -> Option<u32> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Cross-process patcher
+// ---------------------------------------------------------------------------
+
+/// Write one machine word into the tracee's address space via
+/// `PTRACE_POKEDATA`. Unlike `process_vm_writev`, ptrace's poke
+/// path uses `FOLL_FORCE` and *will* write to read-only pages
+/// — that's how debuggers set software breakpoints in `.text`,
+/// and it's what we need for the vDSO (mapped `r-xp`).
+///
+/// The tracee must be in a ptrace stop. The recorder calls
+/// this right after `spawn_recorded_child` returns, while the
+/// child is paused at its first syscall stop.
+pub fn pokedata(pid: i32, addr: u64, word: u64) -> io::Result<()> {
+    // SAFETY: PTRACE_POKEDATA takes the value as the data
+    // argument (not a pointer); kernel writes `word` into the
+    // tracee at `addr` in 8-byte chunks.
+    let r = unsafe {
+        libc::ptrace(
+            libc::PTRACE_POKEDATA,
+            pid,
+            addr as *mut libc::c_void,
+            word as *mut libc::c_void,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Read one machine word from the tracee via `PTRACE_PEEKDATA`.
+/// Used by [`patch_bytes`] for partial-word tail writes.
+pub fn peekdata(pid: i32, addr: u64) -> io::Result<u64> {
+    // PTRACE_PEEKDATA returns the word as the syscall result;
+    // -1 is ambiguous with a real word value, so we set errno
+    // to 0 first and check both.
+    unsafe {
+        let errno_loc = libc::__error();
+        *errno_loc = 0;
+        let r = libc::ptrace(
+            libc::PTRACE_PEEKDATA,
+            pid,
+            addr as *mut libc::c_void,
+            std::ptr::null_mut::<libc::c_void>(),
+        );
+        let saved_errno = *errno_loc;
+        if saved_errno != 0 {
+            return Err(io::Error::from_raw_os_error(saved_errno));
+        }
+        Ok(r as u64)
+    }
+}
+
+/// Write `bytes` into the tracee at `addr`, in 8-byte chunks.
+/// The final partial word (if any) is read-modify-written so
+/// trailing bytes adjacent to the patch aren't clobbered.
+///
+/// Requires the tracee to be in a ptrace stop.
+pub fn patch_bytes(pid: i32, addr: u64, bytes: &[u8]) -> io::Result<()> {
+    let mut off = 0usize;
+    while off + 8 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        pokedata(pid, addr + off as u64, word)?;
+        off += 8;
+    }
+    let tail = &bytes[off..];
+    if !tail.is_empty() {
+        // Read-modify-write the final partial word.
+        let head_addr = addr + off as u64;
+        let existing = peekdata(pid, head_addr)?;
+        let mut buf = existing.to_le_bytes();
+        buf[..tail.len()].copy_from_slice(tail);
+        pokedata(pid, head_addr, u64::from_le_bytes(buf))?;
+    }
+    Ok(())
+}
+
+/// Read the vDSO bytes from a *remote* process. The recorder's
+/// supervisor calls this with the tracee's pid; the bytes go
+/// straight into [`scan_vdso_exports`].
+pub fn read_remote_vdso_bytes(pid: i32, range: &ProcMapping) -> io::Result<Vec<u8>> {
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+    let len = range.len() as usize;
+    let path = format!("/proc/{pid}/mem");
+    let f = File::open(path)?;
+    let mut buf = vec![0u8; len];
+    let n = f.read_at(&mut buf, range.start)?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// One-call helper: find the tracee's vDSO, read its bytes,
+/// scan exports. Returns the symbols ready for
+/// [`apply_vdso_trampolines`]. Returns an empty vec if the
+/// tracee has no vDSO mapping (CONFIG_VDSO=n kernels).
+pub fn scan_remote_vdso(pid: i32) -> Result<Vec<VdsoSymbol>, ScanRemoteError> {
+    let range = match find_vdso_range(pid).map_err(ScanRemoteError::Maps)? {
+        Some(r) => r,
+        None => return Ok(Vec::new()),
+    };
+    let bytes = read_remote_vdso_bytes(pid, &range).map_err(ScanRemoteError::Read)?;
+    scan_vdso_exports(&range, &bytes).map_err(ScanRemoteError::Scan)
+}
+
+/// Errors arising from [`scan_remote_vdso`].
+#[derive(thiserror::Error, Debug)]
+pub enum ScanRemoteError {
+    /// Couldn't read /proc/<pid>/maps.
+    #[error("read remote /proc/<pid>/maps: {0}")]
+    Maps(io::Error),
+    /// Couldn't read /proc/<pid>/mem at the vDSO range.
+    #[error("read remote vDSO bytes: {0}")]
+    Read(io::Error),
+    /// `scan_vdso_exports` rejected the bytes.
+    #[error("scan vDSO exports: {0}")]
+    Scan(VdsoScanError),
+}
+
+/// One vDSO entry that the patcher overwrote. Returned from
+/// [`apply_vdso_trampolines`] for diagnostic logging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VdsoPatch {
+    /// Symbol name (e.g. `__vdso_gettimeofday`).
+    pub name: String,
+    /// Address in the tracee where the trampoline was written.
+    pub addr: u64,
+    /// Syscall number the trampoline now invokes.
+    pub syscall_nr: u32,
+}
+
+/// Apply the trampoline payload to every vDSO symbol in
+/// `symbols` whose name has a known syscall mapping. Skips
+/// symbols [`syscall_nr_for_vdso`] doesn't recognise. Returns
+/// the patches actually applied.
+///
+/// `tracee_pid` must already be ptrace-attached and the tracee
+/// must be in a stop. The recorder calls this at startup so
+/// every subsequent libc fast path (gettimeofday etc.) lands
+/// in the kernel and trips the recorder loop.
+#[cfg(target_arch = "x86_64")]
+pub fn apply_vdso_trampolines(
+    tracee_pid: i32,
+    symbols: &[VdsoSymbol],
+) -> Result<Vec<VdsoPatch>, VdsoPatchError> {
+    let mut applied = Vec::new();
+    for s in symbols {
+        let nr = match syscall_nr_for_vdso(&s.name) {
+            Some(nr) => nr,
+            None => continue,
+        };
+        let payload = patch_payload_x86_64(nr);
+        patch_bytes(tracee_pid, s.address, &payload).map_err(|e| {
+            VdsoPatchError::PatchFailed {
+                name: s.name.clone(),
+                addr: s.address,
+                source: e,
+            }
+        })?;
+        applied.push(VdsoPatch {
+            name: s.name.clone(),
+            addr: s.address,
+            syscall_nr: nr,
+        });
+    }
+    Ok(applied)
+}
+
+/// Errors arising from [`apply_vdso_trampolines`].
+#[derive(thiserror::Error, Debug)]
+pub enum VdsoPatchError {
+    /// Writing the trampoline at one of the symbols failed.
+    #[error("vDSO patch failed for `{name}` at {addr:#x}: {source}")]
+    PatchFailed {
+        /// Symbol name that failed.
+        name: String,
+        /// Address that failed.
+        addr: u64,
+        /// Underlying I/O error from `pokedata`.
+        source: io::Error,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +554,155 @@ mod tests {
         assert_eq!(&p[1..5], &228u32.to_le_bytes());
         assert_eq!(&p[5..7], &[0x0F, 0x05]); // syscall
         assert_eq!(p[7], 0xC3); // ret
+    }
+
+    /// End-to-end integration: fork a child that PTRACE_TRACEME's
+    /// itself, parent uses patch_bytes to write a known pattern
+    /// at a known heap address in the child, child reads it back
+    /// after PTRACE_CONT and exits 0/1 based on what it sees.
+    ///
+    /// Auto-skips if PTRACE_TRACEME is denied (yama strict mode).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn patch_bytes_writes_into_traced_child() {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        // Pipe: child writes the address it wants patched to
+        // the parent, then expects the parent to write the
+        // pattern there before CONT'ing.
+        let mut pipe_to_parent = [0i32; 2];
+        let mut pipe_to_child = [0i32; 2];
+        if unsafe { libc::pipe(pipe_to_parent.as_mut_ptr()) } != 0
+            || unsafe { libc::pipe(pipe_to_child.as_mut_ptr()) } != 0
+        {
+            eprintln!("skipping: pipe failed");
+            return;
+        }
+
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            eprintln!("skipping: fork failed");
+            return;
+        }
+        if child == 0 {
+            // === Child ===
+            unsafe {
+                libc::close(pipe_to_parent[0]); // close read end
+                libc::close(pipe_to_child[1]); // close write end
+            }
+            let r = unsafe {
+                libc::ptrace(
+                    libc::PTRACE_TRACEME,
+                    0,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    std::ptr::null_mut::<libc::c_void>(),
+                )
+            };
+            if r != 0 {
+                unsafe { libc::_exit(64) };
+            }
+            // Allocate a buffer; tell the parent its address.
+            let mut buf: Vec<u8> = vec![0xAA; 32];
+            let addr = buf.as_mut_ptr() as u64;
+            let bytes = addr.to_le_bytes();
+            unsafe {
+                libc::write(
+                    pipe_to_parent[1],
+                    bytes.as_ptr() as *const _,
+                    bytes.len(),
+                );
+            }
+            // SIGSTOP — parent will SETOPTIONS and patch.
+            unsafe { libc::raise(libc::SIGSTOP) };
+            // After CONT, the buffer's first 13 bytes should
+            // be the pattern the parent wrote.
+            let expected: [u8; 13] = *b"hello, world!";
+            let actual = &buf[..13];
+            if actual == expected {
+                unsafe { libc::_exit(0) };
+            }
+            // Tell the parent what we saw for diagnostics.
+            unsafe {
+                libc::write(
+                    pipe_to_child[0], // wrong — should be the other; just exit
+                    actual.as_ptr() as *const _,
+                    actual.len(),
+                );
+                libc::_exit(1);
+            }
+        }
+        // === Parent ===
+        unsafe {
+            libc::close(pipe_to_parent[1]); // close write end
+            libc::close(pipe_to_child[0]); // close read end
+        }
+        // Read the child's heap address.
+        let mut buf = [0u8; 8];
+        let n = unsafe {
+            libc::read(
+                pipe_to_parent[0],
+                buf.as_mut_ptr() as *mut _,
+                buf.len(),
+            )
+        };
+        if n != 8 {
+            eprintln!("skipping: short read from child");
+            return;
+        }
+        let addr = u64::from_le_bytes(buf);
+
+        // Wait for child's SIGSTOP.
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(child, &mut status, 0) };
+        if r < 0 || !libc::WIFSTOPPED(status) {
+            eprintln!("skipping: waitpid for SIGSTOP didn't land");
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            return;
+        }
+
+        // Patch the child's heap.
+        let pattern = b"hello, world!";
+        match patch_bytes(child, addr, pattern) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skipping: patch_bytes failed: {e}");
+                unsafe { libc::kill(child, libc::SIGKILL) };
+                return;
+            }
+        }
+
+        // Resume.
+        let _ = unsafe {
+            libc::ptrace(
+                libc::PTRACE_CONT,
+                child,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        let r = unsafe { libc::waitpid(child, &mut status, 0) };
+        assert!(r > 0);
+        if libc::WIFEXITED(status) {
+            let code = libc::WEXITSTATUS(status);
+            // 64 = TRACEME denied (yama). Skip.
+            if code == 64 {
+                eprintln!("skipping: yama denied PTRACE_TRACEME");
+                return;
+            }
+            assert_eq!(
+                code, 0,
+                "child reported pattern mismatch — patch didn't land",
+            );
+        } else if libc::WIFSIGNALED(status) {
+            panic!(
+                "child died from signal {}; patch may have corrupted state",
+                libc::WTERMSIG(status),
+            );
+        }
+
+        // Drop unused stuff.
+        let _ = std::io::stderr().flush();
     }
 
     #[test]

@@ -100,9 +100,12 @@ pub mod record_primitives {
             AffinityMask, SingleCpuPin,
         },
         vdso_patch::{
-            find_vdso_range, find_vdso_range_for_self, read_proc_maps,
-            read_proc_maps_for_self, scan_vdso_exports, syscall_nr_for_vdso,
-            ProcMapping, VdsoScanError, VdsoSymbol, VDSO_TARGET_SYMBOLS,
+            apply_vdso_trampolines, find_vdso_range, find_vdso_range_for_self,
+            patch_bytes as patch_remote_bytes, peekdata, pokedata,
+            read_proc_maps, read_proc_maps_for_self, read_remote_vdso_bytes,
+            scan_remote_vdso, scan_vdso_exports, syscall_nr_for_vdso,
+            ProcMapping, ScanRemoteError, VdsoPatch, VdsoPatchError, VdsoScanError,
+            VdsoSymbol, VDSO_TARGET_SYMBOLS,
         },
     };
 }
