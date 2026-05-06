@@ -4,11 +4,16 @@
 //! See `doc/plans/phase-5-time-travel.md` § "Tier 2 — Checkpoint-based
 //! replay".
 
+pub mod checkpoint_capture;
 pub mod fork_checkpoint;
 pub mod fork_self;
 pub mod proc_maps;
 pub mod proc_mem;
 
+pub use checkpoint_capture::{
+    capture_writable_state, from_payload, to_payload, CaptureError, CapturedRegion,
+    DecodeError, WritableState,
+};
 pub use fork_self::{ForkHandle, ForkMechanismError, LinuxForkSelfMechanism};
 pub use proc_maps::{read_proc_maps, MemoryRegion, Permissions, ProcMapsError};
 pub use proc_mem::{read_bytes_at, read_region, ProcMemError};
