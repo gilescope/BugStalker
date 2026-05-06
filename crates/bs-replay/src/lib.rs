@@ -26,15 +26,22 @@
 //! original. For UI work and pure-compute bugs this is enough.
 //! For race conditions, callers must escalate to Tier 3.
 
-#![deny(missing_docs)]
+// rkyv's Archive derive emits generated structs we can't doc; keep
+// this `warn` not `deny` for parity with bs-replay-engine.
+#![warn(missing_docs)]
 
 pub mod replay;
+pub mod ring;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
 
 #[cfg(target_os = "macos")]
 pub mod darwin;
+
+pub use ring::{
+    CheckpointMechanism, CheckpointRing, MockCheckpointMechanism, MockError, RingError,
+};
 
 /// Upper bound on the checkpoint ring buffer.
 ///
