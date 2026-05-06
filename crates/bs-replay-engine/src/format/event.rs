@@ -92,6 +92,50 @@ pub enum Event {
         /// Opaque `siginfo_t` bytes for `PTRACE_SETSIGINFO`.
         siginfo: Vec<u8>,
     },
+    /// One non-deterministic-instruction trap. Sub-phase 3D
+    /// captures these via `PR_SET_TSC = PR_TSC_SIGSEGV` (RDTSC*),
+    /// CPUID emulation, and `#UD` traps for `RDRAND`/`RDSEED`
+    /// when their CPUID feature bit is masked off at fork. Wire
+    /// format only at this layer; recorder is sub-phase 3D.
+    ///
+    /// Single variant for all five instruction kinds — the
+    /// replayer dispatches on `kind` and the format crate stays
+    /// neutral. The `result` vector's per-kind shape is a
+    /// recorder/replayer contract:
+    ///
+    /// - `Rdtsc` / `Rdtscp` — one `u64` (the timestamp counter).
+    /// - `Rdrand` / `Rdseed` — two `u64`s; the value, then `1`
+    ///   on success or `0` on the kernel's CF=0 path.
+    /// - `Cpuid` — four `u64`s holding `eax`, `ebx`, `ecx`, `edx`.
+    InstructionTrap {
+        /// PC where the trap fired.
+        pc: u64,
+        /// Which instruction was trapped.
+        kind: InstructionTrapKind,
+        /// Result words the replay engine must reproduce.
+        /// Per-kind shape is the recorder's contract.
+        result: Vec<u64>,
+    },
+}
+
+/// Which non-deterministic instruction triggered an
+/// [`Event::InstructionTrap`]. Recorders shouldn't expose any
+/// other instruction here without a format-version bump — the
+/// variant set is part of the wire contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub enum InstructionTrapKind {
+    /// `RDTSC`. Reads the host TSC into `EDX:EAX`.
+    Rdtsc,
+    /// `RDTSCP`. Like `RDTSC` plus reads the IA32_TSC_AUX MSR
+    /// into `ECX`.
+    Rdtscp,
+    /// `RDRAND`. Reads a hardware-RNG word into a GP register.
+    Rdrand,
+    /// `RDSEED`. Like `RDRAND` but reads from the seed pool.
+    Rdseed,
+    /// `CPUID`. Reads CPU-feature info into `EAX:EBX:ECX:EDX`.
+    Cpuid,
 }
 
 impl Event {
@@ -115,6 +159,11 @@ impl Event {
             // 4-byte sig_no + 8-byte pc + Vec<u8> overhead + payload.
             Self::Signal { siginfo, .. } => {
                 VARIANT_OVERHEAD + 4 + 8 + 16 + siginfo.len()
+            }
+            // 8-byte pc + 1-byte kind discriminant + Vec<u64> overhead
+            // + 8 × words.
+            Self::InstructionTrap { result, .. } => {
+                VARIANT_OVERHEAD + 8 + 1 + 16 + 8 * result.len()
             }
         }
     }

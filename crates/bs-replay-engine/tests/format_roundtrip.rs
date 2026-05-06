@@ -433,6 +433,140 @@ fn signal_archived_view_uses_endian_aware_accessors() {
 }
 
 #[test]
+fn instruction_trap_event_roundtrip_per_kind() {
+    use bs_replay_engine::format::event::InstructionTrapKind;
+
+    let dir = temp_trace_dir("itrap-kinds");
+    let manifest = sample_manifest();
+
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    // RDTSC: one u64 result.
+    writer
+        .write_event(Event::InstructionTrap {
+            pc: 0x4000_1000,
+            kind: InstructionTrapKind::Rdtsc,
+            result: vec![0xdead_beef_cafe_babe],
+        })
+        .unwrap();
+    // RDRAND: value + success flag.
+    writer
+        .write_event(Event::InstructionTrap {
+            pc: 0x4000_1010,
+            kind: InstructionTrapKind::Rdrand,
+            result: vec![0x123456_789a, 1],
+        })
+        .unwrap();
+    // CPUID: eax/ebx/ecx/edx.
+    writer
+        .write_event(Event::InstructionTrap {
+            pc: 0x4000_1020,
+            kind: InstructionTrapKind::Cpuid,
+            result: vec![1, 2, 3, 4],
+        })
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let evs = reader.open_segment(1).unwrap().events_owned().unwrap();
+    assert_eq!(evs.len(), 3);
+    match &evs[0] {
+        Event::InstructionTrap { pc, kind, result } => {
+            assert_eq!(*pc, 0x4000_1000);
+            assert_eq!(*kind, InstructionTrapKind::Rdtsc);
+            assert_eq!(result, &vec![0xdead_beef_cafe_babe]);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+    match &evs[1] {
+        Event::InstructionTrap { kind, result, .. } => {
+            assert_eq!(*kind, InstructionTrapKind::Rdrand);
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[1], 1);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+    match &evs[2] {
+        Event::InstructionTrap { kind, result, .. } => {
+            assert_eq!(*kind, InstructionTrapKind::Cpuid);
+            assert_eq!(result, &vec![1u64, 2, 3, 4]);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn instruction_trap_archived_view_uses_endian_aware_accessors() {
+    use bs_replay_engine::format::event::{ArchivedEvent, InstructionTrapKind};
+
+    let dir = temp_trace_dir("itrap-archived");
+    let manifest = sample_manifest();
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer
+        .write_event(Event::InstructionTrap {
+            pc: 0xff00_aa55,
+            kind: InstructionTrapKind::Rdtscp,
+            result: vec![42, 1234],
+        })
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let segment = reader.open_segment(1).unwrap();
+    let archived = segment.events().unwrap();
+    match &archived[0] {
+        ArchivedEvent::InstructionTrap { pc, kind: _, result } => {
+            assert_eq!(pc.to_native(), 0xff00_aa55);
+            assert_eq!(result.len(), 2);
+            assert_eq!(result[0].to_native(), 42);
+            assert_eq!(result[1].to_native(), 1234);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn marker_syscall_signal_only_traces_still_read_after_instructiontrap_added() {
+    // Forward-compat *third* extension: a trace that wrote
+    // Marker + Syscall + Signal (variants 0–2) before
+    // InstructionTrap existed at variant 3 still parses
+    // identically. Each new variant since v1 has been an additive
+    // append; this test would catch any future PR that broke the
+    // variant ordering even after three rounds of growth.
+    let dir = temp_trace_dir("3-stable");
+    let manifest = sample_manifest();
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer.write_event(Event::Marker { tag: 1, data: 100 }).unwrap();
+    writer
+        .write_event(Event::Syscall {
+            nr: 0,
+            args: [3, 0, 8, 0, 0, 0],
+            result: 8,
+            output: vec![0xaa; 8],
+        })
+        .unwrap();
+    writer
+        .write_event(Event::Signal {
+            sig_no: 11,
+            pc: 0x4000_5678,
+            siginfo: vec![0xbb; 16],
+        })
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let evs = reader.open_segment(1).unwrap().events_owned().unwrap();
+    assert!(matches!(evs[0], Event::Marker { tag: 1, data: 100 }));
+    assert!(matches!(evs[1], Event::Syscall { nr: 0, .. }));
+    assert!(matches!(evs[2], Event::Signal { sig_no: 11, .. }));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn marker_and_syscall_only_traces_still_read_after_signal_added() {
     // Forward-compat acceptance: a trace that wrote Marker + Syscall
     // (variants 0 and 1) before Signal existed still parses
