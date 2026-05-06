@@ -356,6 +356,127 @@ fn marker_only_traces_still_read_after_syscall_added() {
 }
 
 #[test]
+fn signal_event_roundtrip_preserves_siginfo_bytes() {
+    let dir = temp_trace_dir("signal-roundtrip");
+    let manifest = sample_manifest();
+
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    let siginfo = vec![0xab; 128]; // Linux x86-64 siginfo_t is 128 bytes
+    writer
+        .write_event(Event::Signal {
+            sig_no: 11, // SIGSEGV
+            pc: 0x4000_1234,
+            siginfo: siginfo.clone(),
+        })
+        .unwrap();
+    writer
+        .write_event(Event::Signal {
+            sig_no: 17, // SIGCHLD with empty siginfo (recorder might skip)
+            pc: 0x4000_5678,
+            siginfo: Vec::new(),
+        })
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let evs = reader.open_segment(1).unwrap().events_owned().unwrap();
+    assert_eq!(evs.len(), 2);
+    match &evs[0] {
+        Event::Signal { sig_no, pc, siginfo: bytes } => {
+            assert_eq!(*sig_no, 11);
+            assert_eq!(*pc, 0x4000_1234);
+            assert_eq!(bytes, &siginfo);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+    match &evs[1] {
+        Event::Signal { sig_no, siginfo: bytes, .. } => {
+            assert_eq!(*sig_no, 17);
+            assert!(bytes.is_empty());
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn signal_archived_view_uses_endian_aware_accessors() {
+    use bs_replay_engine::format::event::ArchivedEvent;
+    let dir = temp_trace_dir("signal-archived");
+    let manifest = sample_manifest();
+
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer
+        .write_event(Event::Signal {
+            sig_no: 9, // SIGKILL
+            pc: 0xff00_aa55,
+            siginfo: vec![1, 2, 3, 4],
+        })
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let segment = reader.open_segment(1).unwrap();
+    let archived = segment.events().unwrap();
+    match &archived[0] {
+        ArchivedEvent::Signal { sig_no, pc, siginfo } => {
+            assert_eq!(sig_no.to_native(), 9);
+            assert_eq!(pc.to_native(), 0xff00_aa55);
+            assert_eq!(siginfo.as_slice(), &[1u8, 2, 3, 4]);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn marker_and_syscall_only_traces_still_read_after_signal_added() {
+    // Forward-compat acceptance: a trace that wrote Marker + Syscall
+    // (variants 0 and 1) before Signal existed still parses
+    // identically now that Signal exists at variant 2. This is the
+    // *second* extension of the Event enum since v1, so it
+    // exercises the "additive forever" promise harder than the
+    // original step-5 test.
+    let dir = temp_trace_dir("marker-syscall-stable");
+    let manifest = sample_manifest();
+
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer.write_event(Event::Marker { tag: 0, data: 100 }).unwrap();
+    writer.write_event(Event::Syscall {
+        nr: 0,
+        args: [3, 0, 16, 0, 0, 0],
+        result: 16,
+        output: vec![0xaa; 16],
+    }).unwrap();
+    writer.write_event(Event::Marker { tag: 1, data: 200 }).unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let evs = reader.open_segment(1).unwrap().events_owned().unwrap();
+    assert_eq!(evs.len(), 3);
+    match &evs[0] {
+        Event::Marker { tag: 0, data: 100 } => {}
+        other => panic!(
+            "Marker at index 0 decoded as wrong variant: {other:?} \
+             — adding Signal at variant 2 was supposed to be additive; \
+             if this fires the variant ordering broke",
+        ),
+    }
+    match &evs[1] {
+        Event::Syscall { nr: 0, result: 16, .. } => {}
+        other => panic!("Syscall at index 1 decoded as: {other:?}"),
+    }
+    match &evs[2] {
+        Event::Marker { tag: 1, data: 200 } => {}
+        other => panic!("Marker at index 2 decoded as: {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn mixed_marker_and_syscall_traces_in_one_segment() {
     let dir = temp_trace_dir("mixed");
     let manifest = sample_manifest();

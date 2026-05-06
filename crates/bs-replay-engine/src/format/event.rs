@@ -68,6 +68,30 @@ pub enum Event {
         /// Empty when the syscall has no out-pointer side effects.
         output: Vec<u8>,
     },
+    /// One signal-delivery observation. Sub-phase 3E records these
+    /// from `PTRACE_O_TRACESYSGOOD` + signal-delivery-stops; the
+    /// wire format is here today so the cursor/replayer pipeline
+    /// can be exercised against signal-bearing traces.
+    ///
+    /// Async signals carry the exact PC where the kernel delivered
+    /// them (recovered via PMU instruction counters or PT). Sync
+    /// faults (SIGSEGV from a bad load, etc.) replay implicitly
+    /// because the same instructions run and re-produce the fault;
+    /// for those the PC is advisory.
+    ///
+    /// `siginfo` is opaque platform-layout bytes — typically
+    /// `siginfo_t` (128 bytes on Linux x86-64) so replay can use
+    /// `PTRACE_SETSIGINFO` to deliver an identical signal. The
+    /// format crate doesn't decode it; that's the recorder /
+    /// replayer's contract.
+    Signal {
+        /// Signal number (`SIGINT`, `SIGSEGV`, etc.).
+        sig_no: u32,
+        /// PC at delivery time.
+        pc: u64,
+        /// Opaque `siginfo_t` bytes for `PTRACE_SETSIGINFO`.
+        siginfo: Vec<u8>,
+    },
 }
 
 impl Event {
@@ -87,6 +111,10 @@ impl Event {
             // the payload bytes themselves.
             Self::Syscall { output, .. } => {
                 VARIANT_OVERHEAD + 4 + 6 * 8 + 8 + 16 + output.len()
+            }
+            // 4-byte sig_no + 8-byte pc + Vec<u8> overhead + payload.
+            Self::Signal { siginfo, .. } => {
+                VARIANT_OVERHEAD + 4 + 8 + 16 + siginfo.len()
             }
         }
     }
