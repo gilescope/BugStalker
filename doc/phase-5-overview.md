@@ -155,19 +155,19 @@ let resp = replayer.dap_timeline(&ReplayTimelineRequest::default())?;
 | Plan section                                | Status                       | Why / what's pending                                          |
 | ------------------------------------------- | ---------------------------- | ------------------------------------------------------------- |
 | §"Tier 1 — Intel PT reverse step"           | navigation shipped           | Display ("at src/handler.rs:42") needs Phase 6 PT capture     |
-| §"Tier 2 — Checkpoint-based replay"         | ring + capture/restore       | Linux fork(2) + memory restore real; Mach side stub           |
-| §"Tier 3 — Clean-room record-and-replay"    | recorder primitives shipped  | End-to-end fork+exec+listener-handover wiring is the next step |
+| §"Tier 2 — Checkpoint-based replay"         | Linux + Darwin shipped       | Linux fork(2) + Darwin mach_vm_remap-style capture/restore both functional |
+| §"Tier 3 — Clean-room record-and-replay"    | recorder lifecycle shipped   | RecordChild fork+exec+SCM_RIGHTS handover + smoke test wired  |
 | Sub-phase 3A: trace format                  | shipped                      | manifest, segments, checkpoints, validator, properties        |
-| Sub-phase 3B: syscall record                | macro-driven primitives      | Steps 53–57: curated 31 + long-tail ~260 + catch-all + seccomp install + entry-args ptrace driver |
+| Sub-phase 3B: syscall record                | macro-driven + result capture | Steps 53–57: curated 31 + long-tail ~260 + catch-all + seccomp install + entry-args ptrace driver. Step 63: PTRACE_GETREGS exit-stop result capture (replaces RESULT_NOT_CAPTURED_YET sentinel). Step 64: RecordChild lifecycle. Step 65: smoke test. |
 | Sub-phase 3C: replay                        | shim shipped                 | apply_recorded_event + mismatch detector + ProcMemWriter      |
-| Sub-phase 3D: non-deterministic instrs      | recorder primitives shipped  | set_tsc_trap + iced-x86 classify + event_for_instruction_trap |
+| Sub-phase 3D: non-deterministic instrs      | recorder + vDSO detector     | set_tsc_trap + iced-x86 classify + event_for_instruction_trap. Step 67: vDSO entry-point detector (find_vdso_range, scan_vdso_exports, patch_payload_x86_64). |
 | Sub-phase 3E: signals                       | record/replay primitives     | SignalCapture + SignalReplayPlan + length validation tripwire |
 | Sub-phase 3F: multi-thread serialisation    | single-CPU pin shipped       | PMU-based instr-retired counts wait on 3H PT integration      |
-| Sub-phase 3G: aarch64 port                  | not started                  | Needs 3B–3F (3D primitives are x86-only)                      |
+| Sub-phase 3G: aarch64 port                  | syscall table shipped        | data/syscall_aarch64.tbl + dual-arch dispatch via Arch enum   |
 | Sub-phase 3H: PT-assisted recording         | not started                  | Needs Phase 6 PT capture                                      |
 | Sub-phase 3I: BugStalker driver integration | scaffold + DAP shipped       | Recorder primitives re-exported via driver; full `replayRecord` handler waits on the supervisor lifecycle wiring |
 | §"DAP integration"                          | shapes + handlers            | JSON wiring is the DAP server's concern (one `From` per type) |
-| §"Pure-Rust policy"                         | upheld                       | rkyv + lz4_flex + iced-x86; **zero C deps in Phase 5**        |
+| §"Pure-Rust policy"                         | upheld                       | rkyv + lz4_flex + iced-x86 + object; **zero C deps in Phase 5** |
 
 ## Public API surface — quick reference
 

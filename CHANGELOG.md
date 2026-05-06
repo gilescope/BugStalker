@@ -7,6 +7,97 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 sub-phases 3B step 7b → 3D follow-up,
+  Tier 2 Darwin, 3G prep — recorder lifecycle & cross-platform
+  reach):
+  - Syscall-exit-stop result capture (sub-phase 3B step 7b,
+    step 63). `bs-replay-engine::record::linux::exit_stop`.
+    Adds the supervisor's PTRACE_GETREGS/SETREGS plumbing,
+    UserRegsX86_64 layout-asserted struct (27 u64 fields,
+    216 B), classify_wstatus discrimination of syscall-stop /
+    signal-delivery / ptrace-event / exited / signalled, and
+    the merge_pre_post fuser. record_syscall_with_exit
+    composes recv_notif → capture_pre → respond_continue →
+    wait_for_next_stop → get_regs → capture_post →
+    merge → write_event into one supervisor turn that
+    produces a fully-detailed Event::Syscall (replaces the
+    RESULT_NOT_CAPTURED_YET sentinel with the real RAX value
+    and adds curated OutBuf bytes the kernel just wrote).
+  - RecordChild fork+exec+listener handover (step 64).
+    `bs-replay-engine::record::linux::record_child`. Solves
+    the recorder's chicken-and-egg: the seccomp listener fd
+    lives in the *tracee* (kernel queues notifications
+    against the installing process), but the supervisor runs
+    in the parent. socketpair(AF_UNIX) + sendmsg(SCM_RIGHTS)
+    hands the fd over after the child installs the filter.
+    Lifecycle: fork → child PTRACE_TRACEME →
+    install_trap_all_listener → SCM_RIGHTS send → SIGSTOP
+    barrier → execve; parent recv → waitpid SIGSTOP →
+    PTRACE_SETOPTIONS TRACESYSGOOD|TRACEEXEC →
+    PTRACE_SYSCALL. Drop semantics best-effort detach +
+    waitpid(WNOHANG) so abandoned RecordChilds don't leave
+    zombies. Hand-rolled SCM_RIGHTS plumbing keeps the
+    pure-rustix-+-libc surface intact.
+  - End-to-end recorder smoke test (step 65).
+    `crates/bs-replay-engine/tests/recorder_smoke.rs`.
+    Linux-only. Spawns /bin/true via record_child, drives
+    record_syscall_with_exit until the child exits, closes
+    the writer, re-opens via TraceReader and walks every
+    event asserting Event::Syscall + decode round-trip.
+    Auto-skips on EPERM/EACCES/ENOSYS, kernel < 5.5, yama
+    ptrace_scope blocks, missing /bin/true. Iteration cap
+    of 2,000 syscalls bounds runtime; signal cap of 64
+    prevents runaway-signal infinite loops. Companion
+    sanity test record_syscall_with_exit_rejects_bad_fd_cleanly
+    proves the error path doesn't panic on a /dev/null
+    listener.
+  - aarch64 syscall table (sub-phase 3G prep, step 66).
+    Vendored data/syscall_aarch64.tbl covering the
+    asm-generic/unistd.h numbering (Linux 4.0 → 6.6,
+    nrs 0–451). build.rs emits LONG_TAIL_AARCH64 alongside
+    LONG_TAIL_X86_64 — same parser, same validation
+    (sorted, unique names, identifier characters,
+    file:line-precise diagnostics). New API: enum Arch
+    { X86_64, Aarch64 }, Arch::host() compile-time
+    detection, Arch::long_tail() dispatch,
+    lookup_long_tail_aarch64, lookup_long_tail(arch, nr),
+    name_for_aarch64. Tripwire test
+    aarch64_and_x86_64_disagree_on_most_numbers asserts
+    shared names (read/write/clone/execve/futex/exit) carry
+    different numbers across arches — catches a vendoring
+    mistake where someone copy-pastes one table into the
+    other.
+  - vDSO entry-point detector (sub-phase 3D follow-up,
+    step 67). `bs-replay-engine::record::linux::vdso_patch`.
+    glibc's gettimeofday/clock_gettime/time/getcpu fast
+    paths route through the kernel vDSO instead of issuing
+    real syscalls; without patching them, the seccomp filter
+    never sees them and replay diverges. Lands the detection
+    half: ProcMapping parser, find_vdso_range[_for_self],
+    read_self_vdso_bytes, scan_vdso_exports (walks the vDSO's
+    dyn-symbol table via the `object` crate's ELF parser),
+    patch_payload_x86_64(syscall_nr) generates the 8-byte
+    `mov $nr, %eax; syscall; ret` trampoline, and
+    syscall_nr_for_vdso maps the four target names. The
+    actual remote write (process_vm_writev + per-page
+    mprotect on the tracee) is the next focused commit.
+  - Mach checkpoint Darwin scaffold (Tier 2 macOS, step 68).
+    Replaces the stub at bs-replay/src/darwin/checkpoint.rs
+    with a working snapshotter. Apple has no fork-with-ptrace,
+    so we walk VM regions via mach_vm_region_recurse,
+    snapshot writable+capturable ones via
+    mach_vm_read_overwrite, and restore via mach_vm_write.
+    API mirrors the Linux Tier 2 shape:
+    capture_writable_state(pid), restore_writable_state(pid,
+    &state), to_payload/from_payload (byte-identical wire
+    format with the Linux side, manifest's kernel_release
+    tags the platform). Filter logic: writable +
+    !shared_with_other_tasks (SM_TRUESHARED /
+    SM_SHARED_ALIASED). task_for_pid is gated; the error
+    surfaces as MachError::TaskForPid with a clear
+    "codesign with com.apple.security.cs.debugger or run
+    as root" diagnostic. 9 new tests on Darwin (was 9 → 19
+    bs-replay tests).
 - time-travel (Phase 5 sub-phases 3B–3F — recorder & replay shim):
   - Macro-driven Linux syscall coverage (sub-phase 3B,
     steps 53–55). The curated table of 31 hot syscalls
