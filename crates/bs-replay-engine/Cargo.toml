@@ -59,3 +59,13 @@ proptest.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 rustix = { workspace = true, features = ["fs", "process", "thread"] }
+# x86 disassembly for sub-phase 3D — the supervisor needs to
+# look at the instruction at a SIGSEGV/SIGILL PC and decide
+# whether it's a non-deterministic instruction (RDTSC, RDTSCP,
+# RDRAND, RDSEED, CPUID). iced-x86 is pure Rust, MIT, no C
+# linkage. Plan §Pure-Rust policy lists it explicitly.
+iced-x86 = { version = "1.21", default-features = false, features = [
+    "std",
+    "decoder",
+    "intel",
+] }
