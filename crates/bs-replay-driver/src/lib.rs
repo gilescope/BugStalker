@@ -23,10 +23,12 @@
 #![warn(missing_docs)]
 
 pub mod replayer;
+pub mod reverse;
 
 pub use replayer::{
     BuildIdMismatch, HostMismatchError, ReplayError, ReplayabilityError, TraceReplayer,
 };
+pub use reverse::ReverseDebugger;
 
 /// Re-export the engine for downstream consumers — most callers
 /// want both the driver and the engine's types.
