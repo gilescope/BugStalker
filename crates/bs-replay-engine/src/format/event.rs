@@ -116,6 +116,30 @@ pub enum Event {
         /// Per-kind shape is the recorder's contract.
         result: Vec<u64>,
     },
+    /// PC marker — "the recorder observed the tracee at this PC
+    /// here in the event stream". Lets Tier 1 reverse-step
+    /// display `now at <file>:<line>` after the consumer
+    /// resolves PC → source via DWARF (BugStalker's existing
+    /// infrastructure). Variant index 4 — appended per the
+    /// additive-forever rule.
+    ///
+    /// File / line / column resolution intentionally lives
+    /// outside the trace format. The trace stores PCs (compact,
+    /// fixed size, no string table needed); the debugger's
+    /// existing DWARF tooling does the lookup at display time.
+    /// This keeps the trace small and avoids embedding source-
+    /// path strings that would bloat with every basic-block
+    /// crossing.
+    ///
+    /// Recorder cadence: real PcMarker emission lands when 3B
+    /// (syscall record) lands — between successive syscalls is a
+    /// natural place to sample the PC. Once Phase 6's PT trace
+    /// is available, decode produces a fine-grained PC sequence
+    /// that compresses naturally.
+    PcMarker {
+        /// Program counter at this point in the recorded stream.
+        pc: u64,
+    },
 }
 
 /// Which non-deterministic instruction triggered an
@@ -165,6 +189,8 @@ impl Event {
             Self::InstructionTrap { result, .. } => {
                 VARIANT_OVERHEAD + 8 + 1 + 16 + 8 * result.len()
             }
+            // Single u64 + variant overhead.
+            Self::PcMarker { .. } => VARIANT_OVERHEAD + 8,
         }
     }
 }

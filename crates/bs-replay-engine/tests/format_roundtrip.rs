@@ -529,6 +529,93 @@ fn instruction_trap_archived_view_uses_endian_aware_accessors() {
 }
 
 #[test]
+fn pc_marker_event_roundtrip() {
+    let dir = temp_trace_dir("pc-marker");
+    let manifest = sample_manifest();
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer.write_event(Event::PcMarker { pc: 0x4000_0000 }).unwrap();
+    writer.write_event(Event::PcMarker { pc: 0xff00_aa55 }).unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let evs = reader.open_segment(1).unwrap().events_owned().unwrap();
+    assert_eq!(evs.len(), 2);
+    match &evs[0] {
+        Event::PcMarker { pc } => assert_eq!(*pc, 0x4000_0000),
+        other => panic!("unexpected variant: {other:?}"),
+    }
+    match &evs[1] {
+        Event::PcMarker { pc } => assert_eq!(*pc, 0xff00_aa55),
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn pc_marker_archived_view_uses_endian_aware_accessor() {
+    use bs_replay_engine::format::event::ArchivedEvent;
+    let dir = temp_trace_dir("pc-marker-archived");
+    let manifest = sample_manifest();
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer.write_event(Event::PcMarker { pc: 0xdead_beef_cafe_babe }).unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let segment = reader.open_segment(1).unwrap();
+    let archived = segment.events().unwrap();
+    match &archived[0] {
+        ArchivedEvent::PcMarker { pc } => {
+            assert_eq!(pc.to_native(), 0xdead_beef_cafe_babe);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn marker_through_instructiontrap_traces_still_read_after_pcmarker_added() {
+    // Forward-compat *fourth* extension: a trace mixing all four
+    // pre-existing variants (Marker / Syscall / Signal /
+    // InstructionTrap, indices 0–3) parses identically now that
+    // PcMarker exists at index 4. Catches any future PR that
+    // breaks the additive-only rule.
+    use bs_replay_engine::format::event::InstructionTrapKind;
+
+    let dir = temp_trace_dir("4-stable");
+    let manifest = sample_manifest();
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer.write_event(Event::Marker { tag: 1, data: 100 }).unwrap();
+    writer.write_event(Event::Syscall {
+        nr: 0,
+        args: [3, 0, 8, 0, 0, 0],
+        result: 8,
+        output: vec![0xaa; 8],
+    }).unwrap();
+    writer.write_event(Event::Signal {
+        sig_no: 11,
+        pc: 0x4000_5678,
+        siginfo: vec![0xbb; 16],
+    }).unwrap();
+    writer.write_event(Event::InstructionTrap {
+        pc: 0x4000_9abc,
+        kind: InstructionTrapKind::Rdtsc,
+        result: vec![0xdead_beef_cafe_babe],
+    }).unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let evs = reader.open_segment(1).unwrap().events_owned().unwrap();
+    assert!(matches!(evs[0], Event::Marker { tag: 1, data: 100 }));
+    assert!(matches!(evs[1], Event::Syscall { nr: 0, .. }));
+    assert!(matches!(evs[2], Event::Signal { sig_no: 11, .. }));
+    assert!(matches!(evs[3], Event::InstructionTrap { kind: InstructionTrapKind::Rdtsc, .. }));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn marker_syscall_signal_only_traces_still_read_after_instructiontrap_added() {
     // Forward-compat *third* extension: a trace that wrote
     // Marker + Syscall + Signal (variants 0–2) before
