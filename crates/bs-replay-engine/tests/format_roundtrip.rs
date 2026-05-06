@@ -20,6 +20,7 @@ fn sample_manifest() -> Manifest {
         initial_env: vec![("PATH".into(), "/usr/bin".into())],
         initial_cwd: "/tmp".to_owned(),
         initial_args: vec!["--probe".into()],
+        recorded_at: None,
     }
 }
 

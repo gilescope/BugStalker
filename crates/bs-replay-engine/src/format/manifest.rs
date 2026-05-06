@@ -67,6 +67,13 @@ pub struct Manifest {
     pub initial_cwd: String,
     /// Process arguments at record start (`argv` minus argv[0]).
     pub initial_args: Vec<String>,
+    /// Wall-clock instant the recording started, conventionally
+    /// ISO-8601 / RFC 3339 (e.g. `2026-05-06T18:42:00Z`). The
+    /// format crate does not validate the encoding — callers
+    /// pick what they want and stay consistent. `None` for
+    /// traces written before this field existed; new writers
+    /// should populate it.
+    pub recorded_at: Option<String>,
 }
 
 impl Manifest {
@@ -124,6 +131,9 @@ impl Manifest {
             );
             writeln!(out, "env: {}={}", escape(k), escape(v)).unwrap();
         }
+        if let Some(ts) = &self.recorded_at {
+            writeln!(out, "recorded_at: {}", escape(ts)).unwrap();
+        }
         out
     }
 
@@ -135,6 +145,7 @@ impl Manifest {
         let mut format_version: Option<FormatVersion> = None;
         let mut build_id: Option<String> = None;
         let mut kernel_release: Option<String> = None;
+        let mut recorded_at: Option<String> = None;
         let mut engine_version: Option<String> = None;
         let mut initial_cwd: Option<String> = None;
         let mut cpu_features: Vec<String> = Vec::new();
@@ -183,6 +194,7 @@ impl Manifest {
                     })?;
                     initial_env.push((k.to_owned(), v.to_owned()));
                 }
+                "recorded_at" => recorded_at = Some(value),
                 other => {
                     return Err(ManifestParseError::malformed(
                         line_no,
@@ -206,6 +218,7 @@ impl Manifest {
             initial_cwd: initial_cwd
                 .ok_or_else(|| ManifestParseError::missing("initial_cwd"))?,
             initial_args,
+            recorded_at,
         })
     }
 }
@@ -283,7 +296,39 @@ mod tests {
             ],
             initial_cwd: "/home/giles".to_owned(),
             initial_args: vec!["--flag".into(), "--also".into()],
+            recorded_at: None,
         }
+    }
+
+    #[test]
+    fn recorded_at_round_trips_when_present() {
+        let mut m = sample();
+        m.recorded_at = Some("2026-05-06T18:42:00Z".to_owned());
+        let s = m.to_text();
+        let back = Manifest::from_text(&s).unwrap();
+        assert_eq!(back.recorded_at, Some("2026-05-06T18:42:00Z".to_owned()));
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn recorded_at_absent_means_old_v1_trace() {
+        // A manifest text written before recorded_at existed must
+        // parse cleanly with recorded_at = None — the additive-
+        // optional contract.
+        let s = "format_version: 1\n\
+                 build_id: ab\n\
+                 kernel_release: r\n\
+                 engine_version: e\n\
+                 initial_cwd: /\n";
+        let m = Manifest::from_text(s).unwrap();
+        assert_eq!(m.recorded_at, None);
+    }
+
+    #[test]
+    fn recorded_at_emitted_only_when_some() {
+        let m = sample(); // recorded_at = None
+        let s = m.to_text();
+        assert!(!s.contains("recorded_at"), "should not emit empty recorded_at line");
     }
 
     #[test]

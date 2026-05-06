@@ -44,6 +44,7 @@ fn fixed_manifest() -> Manifest {
         initial_env: vec![],
         initial_cwd: "/tmp".to_owned(),
         initial_args: vec![],
+        recorded_at: None,
     }
 }
 
@@ -80,6 +81,10 @@ fn arb_manifest() -> impl Strategy<Value = Manifest> {
         ),
         safe_string,
         prop::collection::vec(safe_string.prop_map(|s: String| s), 0..6),
+        // recorded_at: None or Some(safe-string) — the format
+        // crate doesn't validate ISO-8601, so the generator is
+        // free to use any safe string.
+        proptest::option::of(safe_string),
     )
         .prop_map(
             |(
@@ -90,7 +95,17 @@ fn arb_manifest() -> impl Strategy<Value = Manifest> {
                 initial_env,
                 initial_cwd,
                 initial_args,
-            ): (String, String, Vec<String>, String, Vec<(String, String)>, String, Vec<String>)| {
+                recorded_at,
+            ): (
+                String,
+                String,
+                Vec<String>,
+                String,
+                Vec<(String, String)>,
+                String,
+                Vec<String>,
+                Option<String>,
+            )| {
                 Manifest {
                     format_version: FormatVersion::V1,
                     build_id,
@@ -100,6 +115,7 @@ fn arb_manifest() -> impl Strategy<Value = Manifest> {
                     initial_env,
                     initial_cwd,
                     initial_args,
+                    recorded_at,
                 }
             },
         )

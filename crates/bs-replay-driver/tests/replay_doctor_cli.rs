@@ -22,6 +22,7 @@ fn manifest() -> Manifest {
         initial_env: vec![],
         initial_cwd: "/tmp".to_owned(),
         initial_args: vec![],
+        recorded_at: None,
     }
 }
 

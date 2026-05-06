@@ -51,6 +51,9 @@ pub fn capture_host_manifest(build_id: impl Into<String>) -> Manifest {
         initial_env,
         initial_cwd,
         initial_args,
+        // chrono-driven ISO-8601 capture lands in a follow-up
+        // iteration. Until then the field is honestly None.
+        recorded_at: None,
     }
 }
 
