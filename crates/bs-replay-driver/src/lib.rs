@@ -27,6 +27,8 @@ pub mod dap;
 pub mod host;
 #[cfg(target_os = "linux")]
 pub mod record;
+#[cfg(target_os = "linux")]
+pub mod replay;
 pub mod replayer;
 pub mod reverse;
 
@@ -35,6 +37,11 @@ pub use capture::capture_host_manifest;
 pub use record::{
     record_program, ExitStatus as RecorderExitStatus, RecordOptions, RecordProgramError,
     RecordReport,
+};
+#[cfg(target_os = "linux")]
+pub use replay::{
+    replay_program, ReplayExit, ReplayOptions, ReplayProgramError, ReplayReport,
+    ShimRefusedReason,
 };
 pub use host::{host_features, HostDetectError};
 pub use replayer::{

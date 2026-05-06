@@ -346,7 +346,12 @@ fn parent_setup(pid: i32, sock: OwnedFd) -> Result<RecordChild, SpawnError> {
 // SCM_RIGHTS fd handover
 // ---------------------------------------------------------------------------
 
-fn send_fd(sock: &OwnedFd, fd: RawFd) -> io::Result<()> {
+/// Send a file descriptor over a unix-domain socket via
+/// SCM_RIGHTS. Used by both [`spawn`] (child→parent listener
+/// handover) and the replay-side [`crate::replay::linux::replay_child`]
+/// path. Public-in-crate so the replay module can reuse it
+/// without duplicating the cmsg plumbing.
+pub(crate) fn send_fd(sock: &OwnedFd, fd: RawFd) -> io::Result<()> {
     // One byte of payload — the receiver must do a one-byte
     // recvmsg, otherwise the kernel won't deliver the cmsg.
     let dummy: u8 = 0;
@@ -386,7 +391,9 @@ fn send_fd(sock: &OwnedFd, fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-fn recv_fd(sock: &OwnedFd) -> io::Result<OwnedFd> {
+/// Receive a file descriptor sent via [`send_fd`]. Same public-
+/// in-crate visibility for the same reason.
+pub(crate) fn recv_fd(sock: &OwnedFd) -> io::Result<OwnedFd> {
     let mut dummy: u8 = 0;
     let mut iov = libc::iovec {
         iov_base: &mut dummy as *mut u8 as *mut _,

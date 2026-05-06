@@ -10,4 +10,5 @@
 //!
 //! `scheduler` is deferred to a follow-up batch.
 
+pub mod replay_child;
 pub mod shim;
