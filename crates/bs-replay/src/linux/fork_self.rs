@@ -79,6 +79,35 @@ impl LinuxForkSelfMechanism {
         Ok(())
     }
 
+    /// `PTRACE_SEIZE` the suspended child without disturbing
+    /// its existing stop state. Plan §"Tier 2" step (b). The
+    /// child must already be alive (i.e. not yet `kill()`ed)
+    /// and is normally still sitting in `T` (stopped) state from
+    /// the self-raised SIGSTOP.
+    ///
+    /// Default `Options` — the caller upgrades to e.g.
+    /// `PTRACE_O_TRACESYSGOOD` later via the public
+    /// `nix::sys::ptrace::setoptions` if it wants syscall-stop
+    /// distinction. Phase 5 leaves that to the consumer (sub-
+    /// phase 3B will set it).
+    pub fn seize(&mut self, handle: &ForkHandle) -> Result<(), ForkMechanismError> {
+        nix::sys::ptrace::seize(handle.pid, nix::sys::ptrace::Options::empty())?;
+        Ok(())
+    }
+
+    /// `PTRACE_CONT` the seized child, optionally delivering a
+    /// signal. The tracee resumes execution and the next stop
+    /// is observable via `wait_for_exit` or any of the
+    /// `nix::sys::wait::*` paths.
+    pub fn ptrace_cont(
+        &mut self,
+        handle: &ForkHandle,
+        deliver_signal: Option<Signal>,
+    ) -> Result<(), ForkMechanismError> {
+        nix::sys::ptrace::cont(handle.pid, deliver_signal)?;
+        Ok(())
+    }
+
     /// Block until the child exits, reap it, and return the
     /// final wait status. Consumes the handle.
     ///
@@ -260,6 +289,73 @@ mod tests {
                 "child {} survived drain",
                 pid,
             );
+        }
+    }
+
+    #[test]
+    fn seize_does_not_disturb_existing_stop() {
+        // PTRACE_SEIZE on an already-stopped tracee leaves it in
+        // group-stop. The /proc state should still read as 't'
+        // (stopped, traced) after the seize.
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        sleep(Duration::from_millis(50));
+        match mech.seize(&h) {
+            Ok(()) => {}
+            Err(e) => {
+                let s = format!("{e:?}");
+                if s.contains("EPERM") {
+                    eprintln!(
+                        "skipping seize test: kernel YAMA scope blocks self-trace ({e:?})",
+                    );
+                    mech.kill(h).expect("kill failed");
+                    return;
+                }
+                panic!("seize failed: {e:?}");
+            }
+        }
+        sleep(Duration::from_millis(50));
+        let state = child_state(h.pid);
+        assert!(
+            matches!(state, Some('T') | Some('t')),
+            "expected stopped state ('T'/'t') post-seize, got {state:?}",
+        );
+        // Clean up via the kill path — kill sends SIGKILL, the
+        // ptrace attach is implicitly torn down by the child's
+        // death.
+        mech.kill(h).expect("kill failed");
+    }
+
+    #[test]
+    fn seize_then_cont_lets_child_run_to_natural_exit() {
+        // The fork_self child does `raise(SIGSTOP); exit(0)`.
+        // After ptrace SEIZE + CONT, the child returns from
+        // raise() and runs the exit(0) tail. wait_for_exit
+        // observes Exited(_, 0).
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        sleep(Duration::from_millis(50));
+        match mech.seize(&h) {
+            Ok(()) => {}
+            Err(e) => {
+                let s = format!("{e:?}");
+                if s.contains("EPERM") {
+                    eprintln!(
+                        "skipping seize+cont test: YAMA blocks self-trace ({e:?})",
+                    );
+                    mech.kill(h).expect("kill failed");
+                    return;
+                }
+                panic!("seize failed: {e:?}");
+            }
+        }
+        // PTRACE_CONT wakes the seized tracee. No signal
+        // delivered (None) — the SIGSTOP it sent itself was
+        // already processed by the kernel's stop machinery.
+        mech.ptrace_cont(&h, None).expect("ptrace_cont failed");
+        match mech.wait_for_exit(h).expect("wait_for_exit failed") {
+            WaitStatus::Exited(_pid, 0) => {}
+            other => panic!("expected Exited(_, 0), got {other:?}"),
         }
     }
 
