@@ -11,6 +11,10 @@ description = "BugStalker time-travel — sub-phase 3I integration seam between 
 thiserror.workspace = true
 tracing.workspace = true
 bs-replay-engine = { path = "../bs-replay-engine" }
+# RFC 3339 timestamp generation for capture_host_manifest. The
+# format crate doesn't validate the encoding so chrono stays an
+# implementation detail of the driver — the engine never sees it.
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 
 # Small support CLI — see crate-level docs.
 [[bin]]

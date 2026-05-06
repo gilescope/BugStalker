@@ -51,9 +51,11 @@ pub fn capture_host_manifest(build_id: impl Into<String>) -> Manifest {
         initial_env,
         initial_cwd,
         initial_args,
-        // chrono-driven ISO-8601 capture lands in a follow-up
-        // iteration. Until then the field is honestly None.
-        recorded_at: None,
+        // RFC 3339 / ISO-8601 wall-clock instant. The format
+        // crate stores it as an opaque string; chrono is a driver-
+        // level implementation detail. UTC chosen so traces are
+        // comparable across hosts in different time zones.
+        recorded_at: Some(chrono::Utc::now().to_rfc3339()),
     }
 }
 
@@ -115,6 +117,27 @@ mod tests {
         // Honest about not detecting — no fake string.
         let m = capture_host_manifest("k");
         assert_eq!(m.kernel_release, "unknown");
+    }
+
+    #[test]
+    fn recorded_at_is_populated_and_rfc3339() {
+        let m = capture_host_manifest("ts");
+        let ts = m.recorded_at.expect("recorded_at must be Some after step 27");
+        // Round-trip through chrono confirms the format is what
+        // we claim. UTC means the offset must be `+00:00` or `Z`.
+        let parsed = chrono::DateTime::parse_from_rfc3339(&ts)
+            .expect("recorded_at not RFC 3339");
+        assert_eq!(parsed.timezone(), chrono::FixedOffset::east_opt(0).unwrap());
+    }
+
+    #[test]
+    fn recorded_at_round_trips_through_manifest_text() {
+        // The format crate stores recorded_at as an opaque string,
+        // but a captured timestamp must survive serialise + parse.
+        let m = capture_host_manifest("rt-ts");
+        let s = m.to_text();
+        let back = Manifest::from_text(&s).unwrap();
+        assert_eq!(back.recorded_at, m.recorded_at);
     }
 
     #[test]
