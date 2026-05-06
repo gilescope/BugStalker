@@ -346,6 +346,122 @@ mod tests {
     }
 
     #[test]
+    fn end_to_end_fork_a_capture_restore_into_fork_b() {
+        // The big-picture proof: capture state from one fork (A),
+        // perturb a second fresh fork (B), restore A's state into
+        // B, and confirm B's writable bytes + registers now match
+        // A's. This is the integration test for the whole Tier 2
+        // capture/restore loop assembled in steps 35–43.
+        use crate::linux::proc_mem::{read_bytes_at, write_bytes_at};
+        use crate::linux::proc_regs::{
+            capture_registers, restore_registers,
+        };
+
+        // Heap-allocate a buffer the parent owns. Both forks see
+        // it at the same VA (address-space layout shared at fork
+        // time); both initial copies have all-zero contents.
+        let buf: Vec<u8> = vec![0u8; 128];
+        let addr = buf.as_ptr() as u64;
+
+        let mut mech = LinuxForkSelfMechanism::new();
+
+        // === A: the "checkpoint source" ===
+        let a = mech.take(0).expect("fork A failed");
+        sleep(Duration::from_millis(50));
+        if let Err(e) = mech.seize(&a) {
+            let s = format!("{e:?}");
+            if s.contains("EPERM") {
+                eprintln!("skipping e2e test: YAMA blocked seize");
+                mech.kill(a).expect("kill A");
+                return;
+            }
+            panic!("seize A failed: {e:?}");
+        }
+
+        // Capture A's state.
+        let a_state = match capture_writable_state(a.pid) {
+            Ok(s) => s,
+            Err(e) => {
+                let s = format!("{e:?}");
+                if s.contains("EACCES") || s.contains("EPERM") {
+                    eprintln!("skipping e2e test: capture A: {e:?}");
+                    mech.kill(a).expect("kill A");
+                    return;
+                }
+                panic!("capture A failed: {e:?}");
+            }
+        };
+        let a_regs = capture_registers(a.pid).expect("capture A regs");
+        let a_bytes_at_addr = read_bytes_at(a.pid, addr, buf.len())
+            .expect("read A buf");
+        // Sanity: A's buffer should be all-zero (initial state).
+        assert!(a_bytes_at_addr.iter().all(|&b| b == 0));
+
+        // === B: the "fresh fork to restore into" ===
+        let b = mech.take(0).expect("fork B failed");
+        sleep(Duration::from_millis(50));
+        if let Err(e) = mech.seize(&b) {
+            eprintln!("skipping e2e test: seize B: {e:?}");
+            mech.kill(a).expect("kill A");
+            mech.kill(b).expect("kill B");
+            return;
+        }
+
+        // Perturb B at addr — write a sentinel that's clearly
+        // distinct from A's all-zero content. After this, B's
+        // copy of that page diverges from A's via COW.
+        let sentinel = vec![0xab; buf.len()];
+        write_bytes_at(b.pid, addr, &sentinel)
+            .expect("write sentinel to B");
+        let b_pre = read_bytes_at(b.pid, addr, buf.len())
+            .expect("read B pre-restore");
+        assert_eq!(b_pre, sentinel, "perturbation should have landed");
+
+        // Restore A's full writable state into B.
+        let report = restore_writable_state(b.pid, &a_state)
+            .expect("restore failed");
+        assert!(report.written > 0, "restore must have written something");
+
+        // Memory check: B's bytes at addr should now match A's.
+        let b_post = read_bytes_at(b.pid, addr, buf.len())
+            .expect("read B post-restore");
+        assert_eq!(
+            b_post, a_bytes_at_addr,
+            "B's bytes at addr should match A's after restore",
+        );
+
+        // Register check: restore A's registers into B; recapture;
+        // assert byte-equality. Memory restore alone leaves regs
+        // unchanged (B inherited regs from its own fork moment),
+        // so this isolates the register half of the loop.
+        restore_registers(b.pid, &a_regs).expect("restore A regs into B");
+        let b_regs = capture_registers(b.pid).expect("capture B regs");
+        let a_bs = unsafe {
+            std::slice::from_raw_parts(
+                &a_regs.regs as *const _ as *const u8,
+                std::mem::size_of::<libc::user_regs_struct>(),
+            )
+        };
+        let b_bs = unsafe {
+            std::slice::from_raw_parts(
+                &b_regs.regs as *const _ as *const u8,
+                std::mem::size_of::<libc::user_regs_struct>(),
+            )
+        };
+        assert_eq!(a_bs, b_bs, "B's regs should match A's after restore");
+
+        mech.kill(a).expect("kill A");
+        mech.kill(b).expect("kill B");
+
+        // Parent's view of buf is still all-zero — neither fork's
+        // mutations bled back through COW.
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "parent's buffer should be unchanged",
+        );
+    }
+
+    #[test]
     fn capture_on_seized_child_returns_non_empty_state() {
         let mut mech = LinuxForkSelfMechanism::new();
         let h = mech.take(0).expect("fork failed");
