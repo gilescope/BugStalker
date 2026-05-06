@@ -149,17 +149,74 @@ pub struct GenericSyscall {
 }
 
 include!(concat!(env!("OUT_DIR"), "/long_tail_x86_64.rs"));
+include!(concat!(env!("OUT_DIR"), "/long_tail_aarch64.rs"));
+
+/// Architectures the recorder knows about. The curated table
+/// reuses the same syscall *names* across architectures (most
+/// real Rust programs hit syscalls that exist on both x86-64
+/// and aarch64); the per-arch numbering comes from the
+/// long-tail tables that pair name → `nr`.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum Arch {
+    /// Linux x86-64 — `arch/x86/entry/syscalls/syscall_64.tbl`.
+    X86_64,
+    /// Linux aarch64 — `<asm-generic/unistd.h>`.
+    Aarch64,
+}
+
+impl Arch {
+    /// Detect the host architecture at compile time. Always
+    /// `Some` on a supported host; `None` would indicate a
+    /// future architecture this crate hasn't grown a table
+    /// for.
+    pub const fn host() -> Option<Self> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Some(Arch::X86_64)
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            Some(Arch::Aarch64)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            None
+        }
+    }
+
+    /// The arch's long-tail table.
+    pub const fn long_tail(self) -> &'static [GenericSyscall] {
+        match self {
+            Arch::X86_64 => LONG_TAIL_X86_64,
+            Arch::Aarch64 => LONG_TAIL_AARCH64,
+        }
+    }
+}
 
 /// Look up the long-tail entry for an x86-64 syscall number.
 /// Falls through to the catch-all if even the long-tail table
 /// has no name for the given `nr`.
 pub fn lookup_long_tail_x86_64(nr: u32) -> Option<&'static GenericSyscall> {
-    // Long tail is sorted by `nr` (build.rs validates this) so a
-    // binary search is cheap and stable.
-    LONG_TAIL_X86_64
+    binary_search(LONG_TAIL_X86_64, nr)
+}
+
+/// aarch64 counterpart of [`lookup_long_tail_x86_64`].
+pub fn lookup_long_tail_aarch64(nr: u32) -> Option<&'static GenericSyscall> {
+    binary_search(LONG_TAIL_AARCH64, nr)
+}
+
+/// Architecture-parameterised long-tail lookup. Equivalent to
+/// the per-arch helpers; useful when the architecture is a
+/// runtime parameter (e.g. cross-arch trace replay tools).
+pub fn lookup_long_tail(arch: Arch, nr: u32) -> Option<&'static GenericSyscall> {
+    binary_search(arch.long_tail(), nr)
+}
+
+fn binary_search(table: &'static [GenericSyscall], nr: u32) -> Option<&'static GenericSyscall> {
+    table
         .binary_search_by_key(&nr, |g| g.nr)
         .ok()
-        .map(|i| &LONG_TAIL_X86_64[i])
+        .map(|i| &table[i])
 }
 
 /// Best-effort name lookup — try the curated table first, fall
@@ -171,6 +228,18 @@ pub fn name_for_x86_64(nr: u32) -> Option<&'static str> {
         return Some(s.name);
     }
     lookup_long_tail_x86_64(nr).map(|g| g.name)
+}
+
+/// aarch64 counterpart of [`name_for_x86_64`]. The curated
+/// `KNOWN_X86_64` table's *names* are largely portable to
+/// aarch64 (open/read/write/clone/futex/… exist on both), but
+/// the *numbers* differ — so this function uses the curated
+/// names while consulting the aarch64 long-tail for the
+/// numbering.
+pub fn name_for_aarch64(nr: u32) -> Option<&'static str> {
+    // The curated table is x86-64-numbered, so we can't use it
+    // directly here — go straight to the aarch64 long tail.
+    lookup_long_tail_aarch64(nr).map(|g| g.name)
 }
 
 /// Curated subset of Linux x86-64 syscalls the recorder ships
@@ -429,6 +498,115 @@ mod tests {
         // 4096 is well past the highest defined nr — neither
         // table covers it.
         assert_eq!(name_for_x86_64(4096), None);
+    }
+
+    #[test]
+    fn long_tail_aarch64_is_sorted_and_nontrivial() {
+        assert!(
+            LONG_TAIL_AARCH64.len() >= 200,
+            "aarch64 long-tail dropped to {} entries; expected ≥200",
+            LONG_TAIL_AARCH64.len(),
+        );
+        for w in LONG_TAIL_AARCH64.windows(2) {
+            assert!(
+                w[0].nr < w[1].nr,
+                "aarch64 long-tail not sorted: {} (nr {}) before {} (nr {})",
+                w[0].name, w[0].nr, w[1].name, w[1].nr,
+            );
+        }
+    }
+
+    #[test]
+    fn long_tail_aarch64_finds_well_known_syscalls() {
+        // aarch64 has *different numbers* from x86-64 for most
+        // shared syscalls — read is 63 on aarch64, 0 on x86-64.
+        for (nr, name) in [
+            (0, "io_setup"),
+            (56, "openat"),
+            (57, "close"),
+            (63, "read"),
+            (64, "write"),
+            (93, "exit"),
+            (94, "exit_group"),
+            (98, "futex"),
+            (220, "clone"),
+            (221, "execve"),
+            (222, "mmap"),
+            (425, "io_uring_setup"),
+            (449, "futex_waitv"),
+        ] {
+            let g = lookup_long_tail_aarch64(nr)
+                .unwrap_or_else(|| panic!("aarch64 long-tail missing __NR_{nr} ({name})"));
+            assert_eq!(
+                g.name, name,
+                "aarch64 long-tail entry for {nr} mis-labelled (got {})",
+                g.name,
+            );
+        }
+    }
+
+    #[test]
+    fn aarch64_and_x86_64_disagree_on_most_numbers() {
+        // The whole point of the second table — numbering
+        // differs even for syscalls of the same name. Pick a
+        // few commonly-tripped-on examples.
+        for name in ["read", "write", "clone", "execve", "futex", "exit"] {
+            let x86 = lookup_x86_64_by_name(name).map(|s| s.nr);
+            let arm = LONG_TAIL_AARCH64
+                .iter()
+                .find(|g| g.name == name)
+                .map(|g| g.nr);
+            match (x86, arm) {
+                (Some(a), Some(b)) => assert_ne!(
+                    a, b,
+                    "expected x86-64 nr({name})={a} ≠ aarch64 nr({name})={b}; \
+                     both tables agreeing means a vendoring mistake",
+                ),
+                _ => panic!("`{name}` should appear in both tables"),
+            }
+        }
+    }
+
+    #[test]
+    fn arch_long_tail_dispatches_correctly() {
+        // Behaviour-level checks — two tables with different
+        // numbering for the same names. (Pointer-identity isn't
+        // a reliable equality predicate on const slices because
+        // rustc may dedup-or-rematerialise the storage.)
+        let x = Arch::X86_64.long_tail();
+        let a = Arch::Aarch64.long_tail();
+        assert_eq!(x.len(), LONG_TAIL_X86_64.len());
+        assert_eq!(a.len(), LONG_TAIL_AARCH64.len());
+        // lookup_long_tail and the per-arch helpers agree on
+        // canonical low-numbered entries.
+        assert_eq!(
+            lookup_long_tail(Arch::X86_64, 0).map(|g| g.name),
+            Some("read"),
+        );
+        assert_eq!(
+            lookup_long_tail(Arch::Aarch64, 63).map(|g| g.name),
+            Some("read"),
+        );
+        // The dispatch differs from the wrong arch — this is
+        // the test that catches a swapped switch-arm.
+        assert_eq!(
+            lookup_long_tail(Arch::X86_64, 63).map(|g| g.name),
+            Some("uname"),
+            "x86-64 nr 63 is uname; if you got aarch64's `read` the dispatch is swapped",
+        );
+        assert_eq!(
+            lookup_long_tail(Arch::Aarch64, 0).map(|g| g.name),
+            Some("io_setup"),
+            "aarch64 nr 0 is io_setup; if you got `read` the dispatch is swapped",
+        );
+    }
+
+    #[test]
+    fn arch_host_is_one_of_the_supported_set() {
+        // Tests run on x86-64 or aarch64 — anything else means
+        // the crate needs a new table.
+        let h = Arch::host();
+        assert!(matches!(h, Some(Arch::X86_64) | Some(Arch::Aarch64)));
     }
 
     #[test]

@@ -1,56 +1,71 @@
 // SPDX-License-Identifier: MIT
-//! Build-time codegen for the long-tail x86-64 syscall table.
+//! Build-time codegen for the long-tail syscall tables.
 //!
-//! Reads `data/syscall_64.tbl`, parses `<nr> <name>` lines, and
-//! emits a `LONG_TAIL_X86_64: &[GenericSyscall]` const slice
-//! into `$OUT_DIR/long_tail_x86_64.rs`. The lib's `include!`
-//! pulls it in.
+//! Reads `data/syscall_64.tbl` and `data/syscall_aarch64.tbl`,
+//! parses `<nr> <name>` lines, and emits two const slices:
 //!
-//! Validations performed at build time:
+//! - `LONG_TAIL_X86_64: &[GenericSyscall]`
+//! - `LONG_TAIL_AARCH64: &[GenericSyscall]`
 //!
-//! - Numbers strictly increasing — anyone editing the table out
-//!   of order finds out immediately rather than hitting a
-//!   silent linear-scan bug at runtime.
-//! - No duplicate names.
+//! The lib's `include!`s pull both in. Anyone editing either
+//! table:
+//!
+//! - Numbers strictly increasing.
+//! - No duplicate names *within* a table.
 //! - Identifiers contain only `[A-Za-z0-9_]`.
 //!
 //! Errors print with file/line so the build failure points to
-//! the offending row (rustc-level kindness — see CLAUDE.md
-//! "Detailed diagnostics are good").
+//! the offending row (rustc-level kindness).
 
 use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-const TABLE_RELATIVE: &str = "data/syscall_64.tbl";
+const X86_64_TABLE: &str = "data/syscall_64.tbl";
+const AARCH64_TABLE: &str = "data/syscall_aarch64.tbl";
 
 fn main() {
-    println!("cargo:rerun-if-changed={TABLE_RELATIVE}");
+    println!("cargo:rerun-if-changed={X86_64_TABLE}");
+    println!("cargo:rerun-if-changed={AARCH64_TABLE}");
     println!("cargo:rerun-if-changed=build.rs");
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR")
         .expect("CARGO_MANIFEST_DIR not set by cargo");
-    let table_path = PathBuf::from(&manifest_dir).join(TABLE_RELATIVE);
-    let raw = fs::read_to_string(&table_path).unwrap_or_else(|e| {
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set by cargo");
+    let out = PathBuf::from(out_dir);
+
+    emit_table(
+        &PathBuf::from(&manifest_dir).join(X86_64_TABLE),
+        &out.join("long_tail_x86_64.rs"),
+        "LONG_TAIL_X86_64",
+        "x86-64",
+    );
+    emit_table(
+        &PathBuf::from(&manifest_dir).join(AARCH64_TABLE),
+        &out.join("long_tail_aarch64.rs"),
+        "LONG_TAIL_AARCH64",
+        "aarch64",
+    );
+}
+
+fn emit_table(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    const_name: &str,
+    arch_label: &str,
+) {
+    let raw = fs::read_to_string(src).unwrap_or_else(|e| {
         panic!(
-            "couldn't read syscall table at {}: {e}\n\
+            "couldn't read {arch_label} syscall table at {}: {e}\n\
              — verify the file exists and is committed to the repo.",
-            table_path.display(),
+            src.display(),
         )
     });
-
-    let entries = parse_table(&raw, &table_path).unwrap_or_else(|e| {
-        // Fail the build with file:line:reason — rustc-level
-        // kindness lets the editor jump straight to the offender.
-        panic!("{e}");
-    });
-
-    let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set by cargo");
-    let out_path = PathBuf::from(out_dir).join("long_tail_x86_64.rs");
-    let body = render(&entries);
-    fs::write(&out_path, body).unwrap_or_else(|e| {
-        panic!("couldn't write generated table to {}: {e}", out_path.display())
+    let entries = parse_table(&raw, src).unwrap_or_else(|e| panic!("{e}"));
+    let body = render(&entries, const_name, arch_label, src);
+    fs::write(dst, body).unwrap_or_else(|e| {
+        panic!("couldn't write generated table to {}: {e}", dst.display())
     });
 }
 
@@ -131,28 +146,34 @@ fn is_valid_ident(s: &str) -> bool {
         && !s.starts_with(|c: char| c.is_ascii_digit())
 }
 
-fn render(entries: &[Entry]) -> String {
+fn render(
+    entries: &[Entry],
+    const_name: &str,
+    arch_label: &str,
+    src: &std::path::Path,
+) -> String {
     use std::fmt::Write;
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "// Auto-generated from data/syscall_64.tbl by build.rs.\n\
-         // Do not edit by hand; edit the source table instead."
+        "// Auto-generated from {} by build.rs.\n\
+         // Do not edit by hand; edit the source table instead.",
+        src.display(),
     );
-    let _ = writeln!(s, "/// Long-tail x86-64 syscalls — name + number only.");
+    let _ = writeln!(s, "/// Long-tail {arch_label} syscalls — name + number only.");
     let _ = writeln!(
         s,
         "/// The recorder uses this for syscalls outside the curated\n\
-         /// [`KNOWN_X86_64`] table. Sorted by `nr`."
+         /// table. Sorted by `nr`."
     );
     let _ = writeln!(
         s,
-        "pub const LONG_TAIL_X86_64: &[GenericSyscall] = &[",
+        "pub const {const_name}: &[GenericSyscall] = &[",
     );
     for e in entries {
         let _ = writeln!(
             s,
-            "    GenericSyscall {{ nr: {}, name: {:?} }}, // line {} of data/syscall_64.tbl",
+            "    GenericSyscall {{ nr: {}, name: {:?} }}, // line {}",
             e.nr, e.name, e.src_line,
         );
     }
