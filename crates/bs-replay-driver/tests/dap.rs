@@ -158,6 +158,106 @@ fn dap_timeline_reports_total_events_and_checkpoint_waypoints() {
     fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn dap_capture_writes_a_decodable_checkpoint() {
+    use bs_replay_driver::dap::{capture, ReplayCaptureRequest};
+    use bs_replay_driver::engine::format::TraceReader;
+
+    let dir = temp_dir("dap-capture");
+    let req = ReplayCaptureRequest {
+        trace_path: dir.to_string_lossy().into_owned(),
+        key: 7,
+    };
+    let resp = match capture(&req) {
+        Ok(r) => r,
+        Err(e) => {
+            let s = format!("{e:?}");
+            if s.contains("EPERM") || s.contains("EACCES") {
+                eprintln!("skipping dap_capture: {e:?}");
+                return;
+            }
+            panic!("capture failed: {e:?}");
+        }
+    };
+    assert_eq!(resp.checkpoint_index, 1);
+    assert!(resp.payload_bytes > 0);
+
+    // Sanity-reopen via the engine to confirm the trace landed.
+    let reader = TraceReader::open(&dir).expect("reopen failed");
+    assert_eq!(reader.checkpoint_indices(), &[1u64]);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dap_capture_then_restore_into_fresh_fork_round_trips() {
+    use bs_replay::linux::fork_self::LinuxForkSelfMechanism;
+    use bs_replay::linux::proc_mem::{read_bytes_at, write_bytes_at};
+    use bs_replay::ring::CheckpointMechanism;
+    use bs_replay_driver::dap::{
+        capture, restore, ReplayCaptureRequest, ReplayRestoreRequest,
+    };
+
+    // The headline DAP-driven flow: capture into a trace, then
+    // restore from that same trace into a fresh fork. End-to-end
+    // through the DAP-shaped public surface.
+
+    // Heap buffer the parent shares with both forks at the same VA.
+    let buf: Vec<u8> = vec![0u8; 64];
+    let addr = buf.as_ptr() as u64;
+
+    let dir = temp_dir("dap-cap-restore");
+    let req = ReplayCaptureRequest {
+        trace_path: dir.to_string_lossy().into_owned(),
+        key: 0,
+    };
+    let cap_resp = match capture(&req) {
+        Ok(r) => r,
+        Err(e) => {
+            let s = format!("{e:?}");
+            if s.contains("EPERM") || s.contains("EACCES") {
+                eprintln!("skipping dap_capture_then_restore: {e:?}");
+                return;
+            }
+            panic!("capture failed: {e:?}");
+        }
+    };
+
+    // Take a fresh fork and SEIZE it as the restore target.
+    let mut mech = LinuxForkSelfMechanism::new();
+    let target = mech.take(0).expect("fork target");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    if let Err(e) = mech.seize(&target) {
+        eprintln!("skipping dap_capture_then_restore: seize: {e:?}");
+        mech.kill(target).expect("kill target");
+        fs::remove_dir_all(&dir).ok();
+        return;
+    }
+
+    // Perturb the target so we can prove restore brought capture's
+    // bytes back.
+    let sentinel = vec![0xab; buf.len()];
+    write_bytes_at(target.pid, addr, &sentinel).expect("perturb target");
+
+    // Restore via the DAP handler.
+    let restore_req = ReplayRestoreRequest {
+        trace_path: dir.to_string_lossy().into_owned(),
+        checkpoint_index: cap_resp.checkpoint_index,
+        target_pid: target.pid.as_raw(),
+    };
+    let restore_resp = restore(&restore_req).expect("restore failed");
+    assert!(restore_resp.regions_written > 0);
+
+    // Target's bytes at addr now should match the captured A's
+    // (which were all zero — fork happened before we touched buf).
+    let post = read_bytes_at(target.pid, addr, buf.len()).expect("read post");
+    assert_eq!(post, vec![0u8; buf.len()]);
+
+    mech.kill(target).expect("kill target");
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn dap_load_returns_replayer_plus_summary_for_a_real_trace() {
     let dir = temp_dir("load-ok");

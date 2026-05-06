@@ -159,6 +159,122 @@ pub struct ReplayRecordResponse {
 }
 
 // ---------------------------------------------------------------------------
+// bs/replayCapture — Tier 2 snapshot into a fresh trace dir (Linux only handler)
+// ---------------------------------------------------------------------------
+
+/// Request: snapshot one Tier 2 checkpoint (memory + registers)
+/// into a fresh trace directory.
+///
+/// Linux-only at the handler level; the wire shape is portable so
+/// non-Linux DAP servers can still represent the request.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReplayCaptureRequest {
+    /// Path to a fresh trace dir to create. Refuses to overwrite.
+    pub trace_path: String,
+    /// Caller-defined key — typically the event index at the
+    /// moment of capture.
+    pub key: u64,
+}
+
+/// Response.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReplayCaptureResponse {
+    /// 1-based index of the checkpoint inside the trace.
+    pub checkpoint_index: u64,
+    /// Size of the encoded Tier 2 state payload, in bytes.
+    pub payload_bytes: u64,
+}
+
+/// Handle `bs/replayCapture`. Linux only — the handler calls
+/// into `bs_replay::linux` (fork+SIGSTOP+SEIZE+memory+regs).
+#[cfg(target_os = "linux")]
+pub fn capture(
+    req: &ReplayCaptureRequest,
+) -> Result<ReplayCaptureResponse, crate::record::RecordError> {
+    let manifest = crate::capture::capture_host_manifest(format!("key-{}", req.key));
+    let report = crate::record::capture_one_shot(&req.trace_path, &manifest, req.key)?;
+    Ok(ReplayCaptureResponse {
+        checkpoint_index: report.checkpoint_index,
+        payload_bytes: report.payload_bytes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// bs/replayRestore — write a recorded checkpoint into a target process
+// ---------------------------------------------------------------------------
+
+/// Request: restore a recorded checkpoint into an
+/// already-ptrace-attached target process. Caller is responsible
+/// for SEIZE'ing the target before calling.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReplayRestoreRequest {
+    /// Path to the trace directory containing the checkpoint.
+    pub trace_path: String,
+    /// 1-based checkpoint index to restore from.
+    pub checkpoint_index: u64,
+    /// PID of the (already-SEIZE'd) target to restore into.
+    pub target_pid: i32,
+}
+
+/// Response.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ReplayRestoreResponse {
+    /// Memory regions whose bytes were written into the target.
+    pub regions_written: u64,
+    /// Memory regions that failed to write (e.g. unmapped at
+    /// restore time). Caller decides whether this is acceptable.
+    pub regions_skipped: u64,
+}
+
+/// Handle `bs/replayRestore`. Linux only.
+#[cfg(target_os = "linux")]
+pub fn restore(
+    req: &ReplayRestoreRequest,
+) -> Result<ReplayRestoreResponse, RestoreError> {
+    use bs_replay::linux::checkpoint_capture::restore_writable_state;
+    use bs_replay::linux::proc_regs::restore_registers;
+    use bs_replay::linux::tier2;
+    use bs_replay_engine::format::TraceReader;
+
+    let reader = TraceReader::open(&req.trace_path)
+        .map_err(RestoreError::TraceOpen)?;
+    let cp = reader
+        .open_checkpoint(req.checkpoint_index)
+        .map_err(RestoreError::CheckpointOpen)?;
+    let state = tier2::from_payload(&cp.payload)
+        .map_err(RestoreError::Decode)?;
+    let target = nix::unistd::Pid::from_raw(req.target_pid);
+    let report = restore_writable_state(target, &state.writable)
+        .map_err(RestoreError::RestoreMem)?;
+    restore_registers(target, &state.regs).map_err(RestoreError::RestoreReg)?;
+    Ok(ReplayRestoreResponse {
+        regions_written: report.written as u64,
+        regions_skipped: report.skipped as u64,
+    })
+}
+
+/// Errors arising from `restore`.
+#[cfg(target_os = "linux")]
+#[derive(thiserror::Error, Debug)]
+pub enum RestoreError {
+    /// Couldn't open the trace dir.
+    #[error("trace open: {0}")]
+    TraceOpen(bs_replay_engine::format::TraceReadError),
+    /// Couldn't open the named checkpoint inside the trace.
+    #[error("checkpoint open: {0}")]
+    CheckpointOpen(bs_replay_engine::format::TraceReadError),
+    /// Decoding the Tier 2 payload failed.
+    #[error("decode: {0}")]
+    Decode(bs_replay::linux::tier2::Tier2DecodeError),
+    /// Memory restore failed.
+    #[error("restore memory: {0}")]
+    RestoreMem(bs_replay::linux::proc_mem::ProcMemError),
+    /// Register restore failed.
+    #[error("restore registers: {0}")]
+    RestoreReg(bs_replay::linux::proc_regs::RegError),
+}
+
+// ---------------------------------------------------------------------------
 // bs/replayLoad — open a trace and report summary stats
 // ---------------------------------------------------------------------------
 
