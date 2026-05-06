@@ -31,6 +31,15 @@
 //! read it. The body of the trace uses rkyv for the speed; for
 //! 10 fields written once we don't pull in a serialization
 //! framework just to learn its quirks.
+//!
+//! ## env-key contract
+//!
+//! Environment-variable *keys* must not contain `=` — the `env: `
+//! line uses the first `=` as the K/V separator and there is no
+//! escape. This matches POSIX, which forbids `=` in env names
+//! (`putenv`/`setenv` would themselves reject it). The writer
+//! debug-asserts the contract; release builds silently produce a
+//! malformed manifest if violated.
 
 use core::fmt;
 use core::fmt::Write as _;
@@ -77,6 +86,14 @@ impl Manifest {
             writeln!(out, "initial_arg: {}", escape(a)).unwrap();
         }
         for (k, v) in &self.initial_env {
+            // env-key contract: POSIX forbids `=` in env names and
+            // the manifest format depends on that to split K/V. A
+            // future format version could escape `=` if a use case
+            // ever justifies it; for now we just enforce.
+            debug_assert!(
+                !k.contains('='),
+                "env key {k:?} contains `=` — manifest cannot round-trip it",
+            );
             writeln!(out, "env: {}={}", escape(k), escape(v)).unwrap();
         }
         out
@@ -106,7 +123,12 @@ impl Manifest {
                 ManifestParseError::malformed(line_no, "expected `key: value`")
             })?;
             let key = key.trim();
-            let value = unescape(value.trim());
+            // Strip exactly the one separator space the writer emits.
+            // `trim()` would discard intentional leading whitespace
+            // a caller put inside a value; we want to round-trip
+            // every valid String, so consume one space at most.
+            let raw_value = value.strip_prefix(' ').unwrap_or(value);
+            let value = unescape(raw_value);
 
             match key {
                 "format_version" => {
