@@ -199,6 +199,84 @@ fn driver_check_host_compatibility_passes_when_recording_named_no_features() {
 }
 
 #[test]
+fn driver_check_build_id_passes_on_match() {
+    let dir = temp_dir("build-id-ok");
+    let m = manifest();
+    let recorded = m.build_id.clone();
+    {
+        let writer = TraceWriter::create(&dir, &m).unwrap();
+        writer.finish().unwrap();
+    }
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    replayer.check_build_id(&recorded).unwrap();
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn driver_check_build_id_surfaces_both_sides() {
+    let dir = temp_dir("build-id-bad");
+    let m = manifest();
+    {
+        let writer = TraceWriter::create(&dir, &m).unwrap();
+        writer.finish().unwrap();
+    }
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    let err = replayer
+        .check_build_id("00000000")
+        .unwrap_err();
+    assert_eq!(err.recorded, m.build_id);
+    assert_eq!(err.actual, "00000000");
+    let s = format!("{err}");
+    assert!(s.contains(&m.build_id), "got: {s}");
+    assert!(s.contains("00000000"), "got: {s}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn driver_check_replayability_runs_both_checks_in_stable_order() {
+    use bs_replay_driver::ReplayabilityError;
+
+    let dir = temp_dir("replayability");
+    let mut m = manifest();
+    m.cpu_features = vec!["sse2".into()];
+    {
+        let writer = TraceWriter::create(&dir, &m).unwrap();
+        writer.finish().unwrap();
+    }
+    let replayer = TraceReplayer::open(&dir).unwrap();
+
+    // Both wrong → build-id error wins (stable order).
+    let host_features: [&str; 0] = [];
+    let err = replayer
+        .check_replayability(&host_features, Some("00000000"))
+        .unwrap_err();
+    match err {
+        ReplayabilityError::BuildId(_) => { /* expected: build-id checked first */ }
+        other => panic!("expected BuildId variant, got {other:?}"),
+    }
+
+    // Build-id right, features wrong → HostFeatures error.
+    let err = replayer
+        .check_replayability(&host_features, Some(&m.build_id))
+        .unwrap_err();
+    match err {
+        ReplayabilityError::HostFeatures(_) => {}
+        other => panic!("expected HostFeatures variant, got {other:?}"),
+    }
+
+    // Both right → Ok.
+    let host = ["sse2", "avx"];
+    replayer
+        .check_replayability(&host, Some(&m.build_id))
+        .unwrap();
+
+    // No build-id supplied → only feature check runs.
+    replayer.check_replayability(&host, None).unwrap();
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn driver_manifest_round_trips_through_open() {
     let dir = temp_dir("manifest");
     let m = manifest();

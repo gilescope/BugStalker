@@ -24,7 +24,9 @@
 
 pub mod replayer;
 
-pub use replayer::{HostMismatchError, ReplayError, TraceReplayer};
+pub use replayer::{
+    BuildIdMismatch, HostMismatchError, ReplayError, ReplayabilityError, TraceReplayer,
+};
 
 /// Re-export the engine for downstream consumers — most callers
 /// want both the driver and the engine's types.

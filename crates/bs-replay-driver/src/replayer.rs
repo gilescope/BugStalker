@@ -108,6 +108,49 @@ impl TraceReplayer {
             Err(HostMismatchError { missing })
         }
     }
+
+    /// Verify the binary the caller is about to replay against
+    /// matches the build-id stamped into the manifest at record
+    /// time. Plan: "build-id of recorded binary (cross-checked at
+    /// replay)". A mismatch means the caller likely rebuilt the
+    /// binary between recording and replay; instructions, layout,
+    /// and DWARF have all moved, and replay would be silently
+    /// wrong. Fail fast with both ids surfaced.
+    ///
+    /// Comparison is byte-exact — the caller is responsible for
+    /// canonicalising hex case (lower vs upper) at record and
+    /// replay sides.
+    pub fn check_build_id(
+        &self,
+        host_build_id: &str,
+    ) -> Result<(), BuildIdMismatch> {
+        if self.manifest().build_id == host_build_id {
+            Ok(())
+        } else {
+            Err(BuildIdMismatch {
+                recorded: self.manifest().build_id.clone(),
+                actual: host_build_id.to_owned(),
+            })
+        }
+    }
+
+    /// Convenience: run every replay-time host invariant the
+    /// driver currently knows about. Returns the first error
+    /// encountered as a [`ReplayabilityError`]. Order is
+    /// deliberately stable so a CI failure pinpoints the same
+    /// reason across runs.
+    pub fn check_replayability<S: AsRef<str>>(
+        &self,
+        host_features: &[S],
+        expected_build_id: Option<&str>,
+    ) -> Result<(), ReplayabilityError> {
+        if let Some(bid) = expected_build_id {
+            self.check_build_id(bid).map_err(ReplayabilityError::BuildId)?;
+        }
+        self.check_host_compatibility(host_features)
+            .map_err(ReplayabilityError::HostFeatures)?;
+        Ok(())
+    }
 }
 
 /// Driver-level error. Currently a thin wrapper around the engine
@@ -136,4 +179,37 @@ impl core::fmt::Display for HostMismatchError {
             self.missing.join(", "),
         )
     }
+}
+
+/// Build-id mismatch between the binary the manifest names and the
+/// binary the caller is about to replay against.
+#[derive(thiserror::Error, Debug, Eq, PartialEq, Clone)]
+pub struct BuildIdMismatch {
+    /// Build-id the manifest stamped at record time.
+    pub recorded: String,
+    /// Build-id the caller supplied at replay time.
+    pub actual: String,
+}
+
+impl core::fmt::Display for BuildIdMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "binary build-id changed between record and replay; \
+             recorded={recorded}, actual={actual}",
+            recorded = self.recorded,
+            actual = self.actual,
+        )
+    }
+}
+
+/// Aggregate failure for `check_replayability`.
+#[derive(thiserror::Error, Debug, Eq, PartialEq, Clone)]
+pub enum ReplayabilityError {
+    /// Build-id stamped at record time does not match the host's.
+    #[error(transparent)]
+    BuildId(BuildIdMismatch),
+    /// Host CPU is missing features the recording used.
+    #[error(transparent)]
+    HostFeatures(HostMismatchError),
 }
