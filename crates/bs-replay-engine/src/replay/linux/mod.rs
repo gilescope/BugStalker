@@ -8,4 +8,6 @@
 //! - `scheduler` — drives threads in recorded order at recorded
 //!   instruction counts (3F).
 //!
-//! Deferred to follow-up batches.
+//! `scheduler` is deferred to a follow-up batch.
+
+pub mod shim;
