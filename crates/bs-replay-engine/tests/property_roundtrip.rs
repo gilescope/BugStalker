@@ -216,4 +216,75 @@ proptest! {
         }
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// Auto-rotation determinism: same event sequence written with
+    /// arbitrary segment-size thresholds must read back identically.
+    /// Stresses the rotation logic for thresholds tiny enough to
+    /// rotate every event up to thresholds large enough to never
+    /// rotate.
+    #[test]
+    fn rotation_threshold_does_not_change_event_sequence(
+        events in prop::collection::vec(arb_event(), 0..30),
+        threshold in 1usize..2_000_000,
+    ) {
+        let dir = fresh_dir("rot-thresh");
+        {
+            let mut writer = TraceWriter::create(&dir, &fixed_manifest())
+                .unwrap()
+                .with_segment_size(threshold);
+            for ev in &events {
+                writer.write_event(ev.clone()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let reader = TraceReader::open(&dir).unwrap();
+        let mut cur = reader.cursor();
+        let mut got = Vec::new();
+        while let Some(ev) = cur.next().unwrap() {
+            got.push(ev);
+        }
+        prop_assert_eq!(events, got);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Seek equivalence: starting from event index K via `seek_to`
+    /// on a fresh cursor must yield the same suffix as starting
+    /// from K via `cursor_at`. Both internally take different code
+    /// paths (cursor_at constructs at K; seek_to drops cached state
+    /// then advances) so this catches divergence between them.
+    #[test]
+    fn seek_to_equals_cursor_at(
+        events in prop::collection::vec(arb_event(), 1..30),
+        start in any::<u64>(),
+    ) {
+        let n = events.len() as u64;
+        let start = start % (n + 1); // 0..=n inclusive (n yields empty suffix)
+
+        let dir = fresh_dir("seek-eq");
+        {
+            let mut writer = TraceWriter::create(&dir, &fixed_manifest())
+                .unwrap();
+            for ev in &events {
+                writer.write_event(ev.clone()).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let reader = TraceReader::open(&dir).unwrap();
+
+        let mut a = reader.cursor_at(start);
+        let mut a_seq = Vec::new();
+        while let Some(ev) = a.next().unwrap() {
+            a_seq.push(ev);
+        }
+
+        let mut b = reader.cursor();
+        b.seek_to(start);
+        let mut b_seq = Vec::new();
+        while let Some(ev) = b.next().unwrap() {
+            b_seq.push(ev);
+        }
+
+        prop_assert_eq!(a_seq, b_seq);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
