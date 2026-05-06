@@ -9,6 +9,7 @@ pub mod fork_checkpoint;
 pub mod fork_self;
 pub mod proc_maps;
 pub mod proc_mem;
+pub mod proc_regs;
 
 pub use checkpoint_capture::{
     capture_writable_state, from_payload, restore_writable_state, to_payload, CaptureError,
@@ -17,3 +18,4 @@ pub use checkpoint_capture::{
 pub use fork_self::{ForkHandle, ForkMechanismError, LinuxForkSelfMechanism};
 pub use proc_maps::{read_proc_maps, MemoryRegion, Permissions, ProcMapsError};
 pub use proc_mem::{read_bytes_at, read_region, write_bytes_at, ProcMemError};
+pub use proc_regs::{capture_registers, restore_registers, RegError, RegisterState};

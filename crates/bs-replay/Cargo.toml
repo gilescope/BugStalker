@@ -17,6 +17,8 @@ rustix = { workspace = true, features = ["process", "thread", "fs"] }
 # bugstalker crate already pins nix 0.27 with overlapping
 # features; matching that here.
 nix = { version = "0.27.1", features = ["process", "signal", "ptrace"] }
+# libc::user_regs_struct for the ptrace getregs/setregs path.
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
