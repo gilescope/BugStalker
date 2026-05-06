@@ -23,6 +23,7 @@
 #![warn(missing_docs)]
 
 pub mod capture;
+pub mod dap;
 pub mod host;
 pub mod replayer;
 pub mod reverse;
