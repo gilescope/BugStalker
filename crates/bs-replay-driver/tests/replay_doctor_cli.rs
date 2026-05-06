@@ -129,8 +129,13 @@ fn doctor_help_exits_zero_and_prints_usage() {
 #[test]
 fn doctor_load_flag_prints_summary_one_liner() {
     let dir = temp_dir("load-summary");
+    let m = {
+        let mut m = manifest();
+        m.recorded_at = Some("2026-05-06T12:00:00Z".to_owned());
+        m
+    };
     {
-        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        let mut writer = TraceWriter::create(&dir, &m).unwrap();
         for i in 0..7u32 {
             writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
         }
@@ -155,6 +160,34 @@ fn doctor_load_flag_prints_summary_one_liner() {
     );
     assert!(stdout.contains("2 segments"), "got: {stdout}");
     assert!(stdout.contains("1 checkpoints"), "got: {stdout}");
+    assert!(stdout.contains(&format!("build-id: {}", m.build_id)), "got: {stdout}");
+    assert!(
+        stdout.contains("recorded-at: 2026-05-06T12:00:00Z"),
+        "got: {stdout}",
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn doctor_load_omits_recorded_at_line_when_none() {
+    let dir = temp_dir("load-no-ts");
+    {
+        // sample manifest() leaves recorded_at = None.
+        let writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        writer.finish().unwrap();
+    }
+    let out = Command::new(doctor_bin())
+        .arg("--load")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("recorded-at:"),
+        "should not emit recorded-at line when None, got: {stdout}",
+    );
+    assert!(stdout.contains("build-id:"), "got: {stdout}");
     fs::remove_dir_all(&dir).ok();
 }
 

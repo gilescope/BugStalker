@@ -98,6 +98,10 @@ fn main() -> ExitCode {
                     "{} events / {} segments / {} checkpoints",
                     resp.total_events, resp.total_segments, resp.total_checkpoints,
                 );
+                println!("build-id: {}", resp.build_id);
+                if let Some(ts) = &resp.recorded_at {
+                    println!("recorded-at: {ts}");
+                }
                 return ExitCode::SUCCESS;
             }
             Err(e) => {
