@@ -302,9 +302,30 @@ impl SegmentReader {
         Ok(&self.segment()?.events)
     }
 
+    /// Number of events in this segment (post-archive). Cheap —
+    /// reads only the archived header, no per-event work.
+    pub fn event_count(&self) -> Result<usize, TraceReadError> {
+        Ok(self.events()?.len())
+    }
+
+    /// Deserialize one event by its 0-based offset within this
+    /// segment. Used by [`EventCursor`] to walk events one at a
+    /// time without materialising the whole segment.
+    pub fn event_at(&self, offset: usize) -> Result<Event, TraceReadError> {
+        let archived = self.events()?;
+        let one = archived
+            .get(offset)
+            .ok_or(TraceReadError::EventOffsetOutOfRange {
+                offset,
+                count: archived.len(),
+            })?;
+        rkyv::deserialize::<Event, RkyvError>(one).map_err(TraceReadError::Archive)
+    }
+
     /// Eagerly deserialize every event in this segment to owned
     /// values. Convenient for tests; production replay should
-    /// prefer [`Self::events`] and walk the archived view.
+    /// prefer [`Self::events`] (zero-copy) or [`Self::event_at`]
+    /// (one at a time).
     pub fn events_owned(&self) -> Result<Vec<Event>, TraceReadError> {
         let segment: Segment = rkyv::from_bytes::<Segment, RkyvError>(&self.decompressed)
             .map_err(TraceReadError::Archive)?;
@@ -367,5 +388,14 @@ pub enum TraceReadError {
         file_index: u64,
         /// Index stored in the checkpoint header.
         header_index: u64,
+    },
+    /// `SegmentReader::event_at` was called with an offset past the
+    /// segment's event count.
+    #[error("event offset {offset} out of range (segment has {count} events)")]
+    EventOffsetOutOfRange {
+        /// Offset requested.
+        offset: usize,
+        /// Number of events the segment carries.
+        count: usize,
     },
 }

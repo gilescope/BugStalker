@@ -17,6 +17,7 @@
 
 pub mod checkpoint;
 pub mod event;
+pub mod event_cursor;
 pub mod manifest;
 pub mod segment;
 pub mod trace_reader;
@@ -26,6 +27,7 @@ pub mod version;
 
 pub use checkpoint::{Checkpoint, CheckpointHeader, CheckpointIoError};
 pub use event::Event;
+pub use event_cursor::EventCursor;
 pub use manifest::{Manifest, ManifestParseError};
 pub use segment::{Segment, SegmentHeader};
 pub use trace_reader::{SegmentRange, SegmentReader, TraceReadError, TraceReader};
