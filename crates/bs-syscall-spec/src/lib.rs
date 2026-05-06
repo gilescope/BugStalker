@@ -132,6 +132,47 @@ pub enum ReturnKind {
     Never,
 }
 
+/// Long-tail entry — name + number only. The recorder pairs
+/// these with the catch-all primitive (six argument registers
+/// + a fixed window of bytes around any pointer-shaped arg).
+///
+/// Generated at build time from `data/syscall_64.tbl` by
+/// `build.rs`. The file format is documented in the data file's
+/// header; updating means appending a `<nr> <name>` row and
+/// rebuilding.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct GenericSyscall {
+    /// `__NR_*` syscall number on x86-64.
+    pub nr: u32,
+    /// `man 2`-style name.
+    pub name: &'static str,
+}
+
+include!(concat!(env!("OUT_DIR"), "/long_tail_x86_64.rs"));
+
+/// Look up the long-tail entry for an x86-64 syscall number.
+/// Falls through to the catch-all if even the long-tail table
+/// has no name for the given `nr`.
+pub fn lookup_long_tail_x86_64(nr: u32) -> Option<&'static GenericSyscall> {
+    // Long tail is sorted by `nr` (build.rs validates this) so a
+    // binary search is cheap and stable.
+    LONG_TAIL_X86_64
+        .binary_search_by_key(&nr, |g| g.nr)
+        .ok()
+        .map(|i| &LONG_TAIL_X86_64[i])
+}
+
+/// Best-effort name lookup — try the curated table first, fall
+/// back to the long tail. Returns `None` only when neither
+/// knows the syscall (catch-all territory; the recorder logs
+/// `syscall_<nr>`).
+pub fn name_for_x86_64(nr: u32) -> Option<&'static str> {
+    if let Some(s) = lookup_x86_64(nr) {
+        return Some(s.name);
+    }
+    lookup_long_tail_x86_64(nr).map(|g| g.name)
+}
+
 /// Curated subset of Linux x86-64 syscalls the recorder ships
 /// with hand-vetted parameter shapes. The `syscall! { … }` macro
 /// expands this list into a `&[SyscallSpec]` const-initializer
@@ -338,6 +379,71 @@ mod tests {
             let by_nr = lookup_x86_64(s.nr).expect("missing by-nr lookup");
             assert_eq!(by_nr.name, s.name);
             assert_eq!(by_nr.nr, s.nr);
+        }
+    }
+
+    #[test]
+    fn long_tail_table_is_sorted_and_nontrivial() {
+        // build.rs guarantees this; the test is a tripwire that
+        // catches an editor's stray reorder before it reaches a
+        // user.
+        assert!(
+            LONG_TAIL_X86_64.len() >= 200,
+            "long-tail table dropped to {} entries; expected ≥200 \
+             for Linux ABI baseline coverage",
+            LONG_TAIL_X86_64.len(),
+        );
+        for w in LONG_TAIL_X86_64.windows(2) {
+            assert!(
+                w[0].nr < w[1].nr,
+                "long-tail not sorted: {} (nr {}) before {} (nr {})",
+                w[0].name, w[0].nr, w[1].name, w[1].nr,
+            );
+        }
+    }
+
+    #[test]
+    fn long_tail_lookup_finds_well_known_syscalls() {
+        for (nr, name) in [
+            (1, "write"),
+            (60, "exit"),
+            (157, "prctl"),
+            (231, "exit_group"),
+            (317, "seccomp"),
+            (435, "clone3"),
+            (439, "faccessat2"),
+            (449, "futex_waitv"),
+        ] {
+            let g = lookup_long_tail_x86_64(nr)
+                .unwrap_or_else(|| panic!("long-tail missing __NR_{nr} ({name})"));
+            assert_eq!(g.name, name, "long-tail entry for {nr} mis-labelled");
+        }
+    }
+
+    #[test]
+    fn name_for_x86_64_prefers_curated_then_long_tail() {
+        // `read` lives in both tables (curated overrides long
+        // tail). `prctl` is long-tail-only.
+        assert_eq!(name_for_x86_64(0), Some("read"));
+        assert_eq!(name_for_x86_64(157), Some("prctl"));
+        // 4096 is well past the highest defined nr — neither
+        // table covers it.
+        assert_eq!(name_for_x86_64(4096), None);
+    }
+
+    #[test]
+    fn long_tail_does_not_contradict_curated() {
+        // For every curated entry that also has a long-tail
+        // peer, the names agree. Catches a typo in either table
+        // before it produces a confusing trace event.
+        for s in KNOWN_X86_64 {
+            if let Some(g) = lookup_long_tail_x86_64(s.nr) {
+                assert_eq!(
+                    g.name, s.name,
+                    "name mismatch at nr {}: curated says `{}`, long tail says `{}`",
+                    s.nr, s.name, g.name,
+                );
+            }
         }
     }
 
