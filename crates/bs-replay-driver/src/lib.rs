@@ -31,6 +31,11 @@ pub mod replayer;
 pub mod reverse;
 
 pub use capture::capture_host_manifest;
+#[cfg(target_os = "linux")]
+pub use record::{
+    record_program, ExitStatus as RecorderExitStatus, RecordOptions, RecordProgramError,
+    RecordReport,
+};
 pub use host::{host_features, HostDetectError};
 pub use replayer::{
     BuildIdMismatch, HostMismatchError, ReplayError, ReplayabilityError, TraceReplayer,
