@@ -64,6 +64,47 @@ impl LinuxForkSelfMechanism {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Send `SIGCONT` to the suspended child. Plan §"Tier 2"
+    /// step (d) — replay sets a breakpoint, then SIGCONTs and
+    /// lets the child run forward. This method handles the
+    /// SIGCONT half; ptrace-attach + breakpoint setting is the
+    /// caller's job (BugStalker's existing tracee plumbing).
+    ///
+    /// Does **not** consume the handle — the caller is still
+    /// responsible for either [`Self::wait_for_exit`] or
+    /// [`Self::kill`]ing it later.
+    pub fn resume(&mut self, handle: &ForkHandle) -> Result<(), ForkMechanismError> {
+        signal::kill(handle.pid, Signal::SIGCONT)?;
+        Ok(())
+    }
+
+    /// Block until the child exits, reap it, and return the
+    /// final wait status. Consumes the handle.
+    ///
+    /// Useful in two replay-flow shapes:
+    ///
+    /// - "Run to natural end" — SIGCONT the child via
+    ///   [`Self::resume`], then `wait_for_exit` to let it
+    ///   complete cleanly.
+    /// - "Synchronise on completion" — used by tests and by
+    ///   future driver code that wants to confirm a checkpoint's
+    ///   workload is done before moving on.
+    pub fn wait_for_exit(
+        &mut self,
+        handle: ForkHandle,
+    ) -> Result<WaitStatus, ForkMechanismError> {
+        loop {
+            match waitpid(handle.pid, None) {
+                Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
+                    return Ok(status);
+                }
+                Ok(_) => continue, // intermediate stop / continue events
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
 }
 
 impl CheckpointMechanism for LinuxForkSelfMechanism {
@@ -219,6 +260,45 @@ mod tests {
                 "child {} survived drain",
                 pid,
             );
+        }
+    }
+
+    #[test]
+    fn resume_then_wait_for_exit_reports_zero() {
+        // The fork_self child does `raise(SIGSTOP); exit(0)`. If
+        // we resume() it, the SIGCONT lets raise() return and the
+        // child immediately runs exit(0). wait_for_exit then sees
+        // Exited(_, 0).
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        // Give the kernel a tick to deliver the self-SIGSTOP.
+        sleep(Duration::from_millis(50));
+        mech.resume(&h).expect("SIGCONT failed");
+        match mech.wait_for_exit(h).expect("wait_for_exit failed") {
+            WaitStatus::Exited(_pid, 0) => {} // expected
+            other => panic!("expected Exited(_, 0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_does_not_consume_handle() {
+        // Caller can still kill() after resume(). (After resume,
+        // the child may have exited naturally already; kill()
+        // tolerates ESRCH/ECHILD per the existing test.)
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        sleep(Duration::from_millis(50));
+        mech.resume(&h).expect("SIGCONT failed");
+        // Race: the child may exit before kill arrives.
+        match mech.kill(h) {
+            Ok(()) => {}
+            Err(e) => {
+                let s = format!("{e:?}");
+                assert!(
+                    s.contains("ESRCH") || s.contains("ECHILD"),
+                    "unexpected error: {e:?}",
+                );
+            }
         }
     }
 
