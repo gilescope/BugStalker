@@ -75,11 +75,24 @@ impl TraceWriter {
     /// Auto-rotates when the running size estimate crosses the
     /// configured threshold.
     pub fn write_event(&mut self, event: Event) -> Result<(), TraceWriteError> {
-        self.pending_size_bytes = self
-            .pending_size_bytes
-            .saturating_add(event.approx_archive_size());
+        let before = self.pending_size_bytes;
+        let increment = event.approx_archive_size();
+        self.pending_size_bytes = before.saturating_add(increment);
+        // Plan §Invariants: "Aggregator counters monotonic-non-
+        // decreasing during a session." Same shape applies to the
+        // writer's pending-size estimate.
+        debug_assert!(
+            self.pending_size_bytes >= before,
+            "pending_size_bytes saturated backwards: {before} → {}",
+            self.pending_size_bytes,
+        );
         self.pending.push(event);
+        let prev_events_written = self.events_written;
         self.events_written += 1;
+        debug_assert!(
+            self.events_written > prev_events_written,
+            "events_written counter overflowed",
+        );
         if self.pending_size_bytes >= self.segment_size_threshold {
             self.rotate()?;
         }
@@ -98,6 +111,14 @@ impl TraceWriter {
     /// at exactly that offset.
     pub fn take_checkpoint(&mut self, payload: Vec<u8>) -> Result<(), TraceWriteError> {
         self.rotate()?;
+        // Plan §Invariants: rotate() flushed everything in-flight,
+        // so the buffer must be empty before we stamp event_index.
+        debug_assert!(
+            self.pending.is_empty(),
+            "rotate() left {} pending events; checkpoint event_index would be wrong",
+            self.pending.len(),
+        );
+        debug_assert!(self.next_checkpoint > 0, "checkpoint counter is 1-based");
         let checkpoint = Checkpoint {
             header: CheckpointHeader {
                 index: self.next_checkpoint,
@@ -120,6 +141,12 @@ impl TraceWriter {
             return Ok(());
         }
         let events = std::mem::take(&mut self.pending);
+        // Plan §Invariants: "segment.events.len() > 0".
+        debug_assert!(
+            !events.is_empty(),
+            "empty-segment guard above should have already returned",
+        );
+        debug_assert!(self.next_segment > 0, "segment counter is 1-based");
         let segment = Segment {
             header: SegmentHeader {
                 index: self.next_segment,
@@ -127,6 +154,12 @@ impl TraceWriter {
             },
             events,
         };
+        // Plan §Invariants: "header.event_count == events.len()".
+        debug_assert_eq!(
+            segment.header.event_count as usize,
+            segment.events.len(),
+            "SegmentHeader.event_count desynced from events.len()",
+        );
         let archived = rkyv::to_bytes::<RkyvError>(&segment)
             .map_err(TraceWriteError::Archive)?;
         let path = self.dir.join(segment_filename(self.next_segment));
