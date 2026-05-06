@@ -235,14 +235,59 @@ aarch64 is 3G; PT integration is 3H.
   allows the syscall (`SECCOMP_USER_NOTIF_FLAG_CONTINUE`), then
   reads result registers and any output buffers via `process_vm_readv`
 - All of this written to the trace as a syscall event
-- ~340 Linux x86-64 syscalls; we handle each by reading the right
-  output buffers (e.g. `read(fd, buf, n)` → log `n` bytes from `buf`
-  on success)
 - Includes `io_uring` recording: SQ/CQ shared-memory tracking via
   `userfaultfd`, per-SQE/CQE event logging, replay writes recorded
   CQEs back into the shared ring memory at recorded timestamps. See
   the `io_uring` design note below
-- Effort: ~9 weeks (the long tail of "every syscall, every flavour")
+
+##### Syscall coverage via codegen — not by hand
+
+~340 Linux x86-64 syscalls is too many to hand-roll one variant
+per syscall. The right shape is a declarative DSL the macro
+consumes:
+
+```rust
+syscall! {
+    read(fd: u32, buf: out_buf(len = ret), nbyte: u64) -> isize;
+    write(fd: u32, buf: in_buf(len = nbyte), nbyte: u64) -> isize;
+    open(path: in_cstr, flags: u32, mode: u16) -> i32;
+    close(fd: u32) -> i32;
+    mmap(addr: u64, len: u64, prot: i32, flags: i32, fd: i32, off: u64) -> u64;
+    // …
+}
+```
+
+The macro emits both the record-side handler (read out-pointer
+buffers via `process_vm_readv`, write a `Event::Syscall` with the
+captured bytes) and the replay-side handler (write recorded
+buffers back via `process_vm_writev`, set return registers from
+the log).
+
+Three-tier coverage strategy:
+
+1. **Hand-curate the top ~30–50 syscalls** real Rust programs hit
+   in practice (read/write/open/close/mmap/brk/futex/clone/
+   epoll_*/io_uring_* etc.). These get explicit DSL entries with
+   precise output-buffer shapes.
+2. **Machine-extract the long tail** from the kernel's
+   `arch/x86/entry/syscalls/syscall_64.tbl` plus prototypes from
+   `<asm/unistd.h>` / `man-pages` / `strace`'s curated table.
+   Generate a `.rs` table the macro consumes; review the output
+   for any syscall whose pointer-arg shape needs hand attention.
+3. **Generic catch-all for the remainder** — record args + a
+   fixed window (say 256 bytes) around any pointer arg, plus
+   the syscall return value. Imperfect — replay of a program
+   using a non-curated syscall with weird out-pointer shape may
+   diverge — but bounded loud failure (mismatch detector) is
+   better than 9 weeks of manual ABI archeology.
+
+Effort revision: ~2 weeks for the macro + DSL + curated 30
+syscalls, +1 week to wire the table extractor and cover the
+long tail with the catch-all. ~3 weeks total, down from the
+naive 9.
+
+Effort: ~3 weeks (was ~9; macro-driven approach replaces the
+"every syscall, every flavour" hand-roll).
 
 #### 3C. Single-threaded replay
 
@@ -462,7 +507,9 @@ Mechanism:
   enter on `IORING_SETUP_SQPOLL`); detect SQPOLL setup and refuse to
   record those rings (rare in practice)
 
-Effort budget: +3 weeks added to 3B (now ~9 weeks total). The shared-
+Effort budget: included in 3B's revised ~3-week macro-driven
+estimate; the `userfaultfd` SQ/CQ tracking is one curated DSL
+entry plus the page-fault handler. The shared-
 memory tracking is the new mechanism; the rest is wiring.
 
 ### Other architectural questions for Tier 3
@@ -576,7 +623,7 @@ Tier 1 and Tier 2 first; Tier 3 is the long pole.
 | Tier 2 fork-checkpoint Linux | 2 weeks |
 | Tier 2 Mach checkpoint Darwin | 2 weeks |
 | Tier 3A trace format | 3 weeks |
-| Tier 3B Linux x86-64 syscall record (incl. `io_uring`) | 9 weeks |
+| Tier 3B Linux x86-64 syscall record (macro-driven, incl. `io_uring`) | 3 weeks |
 | Tier 3C Linux x86-64 replay | 4 weeks |
 | Tier 3D non-deterministic instructions | 3 weeks |
 | Tier 3E signal record/replay | 3 weeks |
@@ -590,12 +637,14 @@ Tier 1 and Tier 2 first; Tier 3 is the long pole.
 | Documentation + bug-repro flow | 2 weeks |
 
 - **Tier 1 + Tier 2 minimum-viable**: ~6 weeks.
-- **Tier 3 single-threaded Linux MVP** (incl. `io_uring`): +22 weeks
-  (~6 months total).
-- **Tier 3 multi-threaded Linux MVP**: +6 weeks (~7.5 months total).
+- **Tier 3 single-threaded Linux MVP** (incl. `io_uring`,
+  macro-driven 3B): +16 weeks (~5 months total). 3B alone
+  shrank from ~9 weeks (hand-roll) to ~3 (codegen) — see the
+  3B section.
+- **Tier 3 multi-threaded Linux MVP**: +6 weeks (~6.5 months total).
 - **Tier 3 cross-platform** (aarch64 + Darwin best-effort): +12 weeks
-  (~10.5 months total).
-- **Full Tier 3** (all sub-phases): ~13 months single-engineer.
+  (~9.5 months total).
+- **Full Tier 3** (all sub-phases): ~12 months single-engineer.
 
 This is a large commitment, planned upfront. Each sub-phase is
 independently shippable; users get reverse-step from Tier 1 in week 2
