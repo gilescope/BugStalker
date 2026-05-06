@@ -42,6 +42,10 @@ lz4_flex = { version = "0.13", default-features = false, features = [
     "safe-decode",
     "checked-decode",
 ] }
+# Syscall metadata. The record module's catch-all primitive
+# dispatches on (nr, ParamKind) to decide what to read out of the
+# tracee. Pure data — no run-time cost beyond the table lookup.
+bs-syscall-spec = { path = "../bs-syscall-spec" }
 
 [dev-dependencies]
 proptest.workspace = true
