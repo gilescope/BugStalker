@@ -182,6 +182,14 @@ pub struct ReplayLoadResponse {
     pub total_segments: u64,
     /// Number of checkpoints.
     pub total_checkpoints: u64,
+    /// Wall-clock instant the recording started (RFC 3339), if
+    /// the writer stamped one. None for traces predating that
+    /// field. UI uses this for "recorded at YYYY-MM-DD" display.
+    pub recorded_at: Option<String>,
+    /// Build-id of the recorded binary. Same hex string the
+    /// manifest carries — DAP clients echo it back to the user
+    /// so they can confirm the right binary is loaded.
+    pub build_id: String,
 }
 
 /// Handle `bs/replayLoad`. Opens the trace at the requested path
@@ -200,12 +208,16 @@ pub fn load(
     let total_events: u64 = segments.iter().map(|r| r.event_count).sum();
     let total_segments = segments.len() as u64;
     let total_checkpoints = replayer.reader().checkpoint_indices().len() as u64;
+    let recorded_at = replayer.manifest().recorded_at.clone();
+    let build_id = replayer.manifest().build_id.clone();
     Ok((
         replayer,
         ReplayLoadResponse {
             total_events,
             total_segments,
             total_checkpoints,
+            recorded_at,
+            build_id,
         },
     ))
 }

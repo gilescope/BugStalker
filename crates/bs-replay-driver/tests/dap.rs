@@ -170,6 +170,10 @@ fn dap_load_returns_replayer_plus_summary_for_a_real_trace() {
     assert_eq!(resp.total_events, 10);
     assert_eq!(resp.total_segments, 3, "checkpoints rotate so 3 segments");
     assert_eq!(resp.total_checkpoints, 2);
+    // Build-id always populated; recorded_at None for the
+    // hand-built test fixture's manifest.
+    assert_eq!(resp.build_id, manifest().build_id);
+    assert_eq!(resp.recorded_at, None);
 
     // The returned replayer is fully usable for follow-up DAP
     // commands — exercise dap_timeline against it to prove.
@@ -179,6 +183,24 @@ fn dap_load_returns_replayer_plus_summary_for_a_real_trace() {
     assert_eq!(timeline.total_events, 10);
     assert_eq!(timeline.waypoints.len(), 2);
 
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dap_load_surfaces_recorded_at_when_present() {
+    let dir = temp_dir("load-recorded-at");
+    let mut m = manifest();
+    m.recorded_at = Some("2026-05-06T10:00:00Z".to_owned());
+    {
+        let mut writer = bs_replay_driver::engine::format::TraceWriter::create(&dir, &m).unwrap();
+        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+        writer.finish().unwrap();
+    }
+    let (_, resp) = load(&ReplayLoadRequest {
+        trace_path: dir.to_string_lossy().into_owned(),
+    })
+    .unwrap();
+    assert_eq!(resp.recorded_at, Some("2026-05-06T10:00:00Z".to_owned()));
     fs::remove_dir_all(&dir).ok();
 }
 
