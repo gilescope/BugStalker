@@ -80,6 +80,10 @@ pub enum DiagKind {
     CheckpointUnreadable,
     /// Checkpoint header index disagrees with filename index.
     CheckpointHeaderIndexMismatch,
+    /// Recorded build-id does not match the host-supplied one.
+    BuildIdMismatch,
+    /// Host CPU lacks features the recording used.
+    HostFeatureMissing,
 }
 
 impl DiagKind {
@@ -102,6 +106,8 @@ impl DiagKind {
             Self::TotalCheckpoints => "total-checkpoints",
             Self::CheckpointUnreadable => "checkpoint-unreadable",
             Self::CheckpointHeaderIndexMismatch => "checkpoint-header-index-mismatch",
+            Self::BuildIdMismatch => "build-id-mismatch",
+            Self::HostFeatureMissing => "host-feature-missing",
         }
     }
 }
@@ -175,12 +181,37 @@ impl fmt::Display for ValidationReport {
     }
 }
 
+/// Optional inputs that let the validator check replay-time host
+/// invariants the trace alone can't speak to: build-id of the
+/// binary the caller is about to replay against, and the CPU
+/// feature list of the replay host.
+#[derive(Debug, Default, Clone)]
+pub struct ValidationOptions<'a> {
+    /// Host-supplied build-id of the binary that will be replayed.
+    /// If `Some`, the validator compares it against the manifest's
+    /// `build_id` field; mismatch → [`DiagKind::BuildIdMismatch`].
+    pub expected_build_id: Option<&'a str>,
+    /// Host-supplied CPU feature list. If `Some`, the validator
+    /// checks the recording's required features are a subset;
+    /// every gap → [`DiagKind::HostFeatureMissing`].
+    pub host_features: Option<&'a [&'a str]>,
+}
+
 /// Walk the trace at `dir` and report every consistency finding.
 ///
-/// Always returns a [`ValidationReport`] — even when nothing of the
-/// trace is readable. If you want a one-line "is it OK?" answer,
-/// call [`ValidationReport::is_replayable`].
+/// Equivalent to [`validate_with`] with default options (no host
+/// checks). Always returns a [`ValidationReport`] — even when
+/// nothing of the trace is readable. If you want a one-line "is
+/// it OK?" answer, call [`ValidationReport::is_replayable`].
 pub fn validate(dir: impl AsRef<Path>) -> ValidationReport {
+    validate_with(dir, &ValidationOptions::default())
+}
+
+/// Like [`validate`], but also runs replay-time host checks
+/// supplied through [`ValidationOptions`]. Use this from a doctor
+/// CLI / integration test where the caller knows the expected
+/// build-id and the host's feature list.
+pub fn validate_with(dir: impl AsRef<Path>, opts: &ValidationOptions<'_>) -> ValidationReport {
     let dir = dir.as_ref();
     let mut report = ValidationReport::default();
 
@@ -236,6 +267,32 @@ pub fn validate(dir: impl AsRef<Path>) -> ValidationReport {
             None
         }
     };
+
+    // ---- Replay-time host checks (only when the manifest parsed) ----
+    if let Some(m) = manifest.as_ref() {
+        if let Some(expected) = opts.expected_build_id {
+            if m.build_id != expected {
+                report.push(
+                    Severity::Error,
+                    DiagKind::BuildIdMismatch,
+                    format!(
+                        "manifest build_id {recorded} disagrees with expected {expected}",
+                        recorded = m.build_id,
+                    ),
+                );
+            }
+        }
+        if let Some(host) = opts.host_features {
+            let missing = m.missing_host_features(host);
+            for feat in missing {
+                report.push(
+                    Severity::Error,
+                    DiagKind::HostFeatureMissing,
+                    format!("host lacks CPU feature `{feat}` used by recording"),
+                );
+            }
+        }
+    }
 
     // ---- Segment enumeration ----
     let segments = match enumerate_segments(dir) {

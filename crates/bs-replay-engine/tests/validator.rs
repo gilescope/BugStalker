@@ -10,7 +10,7 @@ use bs_replay_engine::format::event::Event;
 use bs_replay_engine::format::manifest::Manifest;
 use bs_replay_engine::format::version::FormatVersion;
 use bs_replay_engine::format::{
-    DiagKind, TraceWriter, validate,
+    DiagKind, TraceWriter, ValidationOptions, validate, validate_with,
 };
 
 fn sample_manifest() -> Manifest {
@@ -192,6 +192,78 @@ fn corrupt_segment_bytes_reported() {
 }
 
 #[test]
+fn validate_with_passes_clean_trace_when_host_matches() {
+    let dir = temp_dir("with-ok");
+    write_one_segment_per_event(&dir, 1);
+    let m = sample_manifest();
+    let opts = ValidationOptions {
+        expected_build_id: Some(&m.build_id),
+        host_features: Some(&["sse2", "sse4_2"]),
+    };
+    let report = validate_with(&dir, &opts);
+    assert!(report.is_replayable(), "errors: {:?}", report.errors);
+    assert!(!has(&report, DiagKind::BuildIdMismatch));
+    assert!(!has(&report, DiagKind::HostFeatureMissing));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn validate_with_flags_build_id_mismatch() {
+    let dir = temp_dir("with-bid");
+    write_one_segment_per_event(&dir, 1);
+    let opts = ValidationOptions {
+        expected_build_id: Some("00000000"),
+        host_features: None,
+    };
+    let report = validate_with(&dir, &opts);
+    assert!(!report.is_replayable());
+    let diag = report
+        .errors
+        .iter()
+        .find(|d| d.kind == DiagKind::BuildIdMismatch)
+        .expect("missing build-id-mismatch diag");
+    assert!(diag.message.contains("00000000"), "got: {}", diag.message);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn validate_with_lists_every_missing_host_feature() {
+    let dir = temp_dir("with-feats");
+    let mut m = sample_manifest();
+    m.cpu_features = vec!["sse2".into(), "avx".into(), "avx2".into()];
+    {
+        let mut writer = TraceWriter::create(&dir, &m).unwrap();
+        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+        writer.finish().unwrap();
+    }
+    let opts = ValidationOptions {
+        expected_build_id: None,
+        host_features: Some(&["sse2"]), // missing avx + avx2
+    };
+    let report = validate_with(&dir, &opts);
+    let missing: Vec<&str> = report
+        .errors
+        .iter()
+        .filter(|d| d.kind == DiagKind::HostFeatureMissing)
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(missing.len(), 2, "got {missing:?}");
+    assert!(missing.iter().any(|s| s.contains("avx")));
+    assert!(missing.iter().any(|s| s.contains("avx2")));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn validate_with_skips_host_checks_when_options_are_none() {
+    let dir = temp_dir("with-none");
+    write_one_segment_per_event(&dir, 1);
+    let report = validate_with(&dir, &ValidationOptions::default());
+    assert!(!has(&report, DiagKind::BuildIdMismatch));
+    assert!(!has(&report, DiagKind::HostFeatureMissing));
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn diag_codes_are_stable_strings() {
     // Support workflows grep on these codes; pin them.
     assert_eq!(DiagKind::ManifestMissing.code(), "manifest-missing");
@@ -201,6 +273,8 @@ fn diag_codes_are_stable_strings() {
         "segment-header-index-mismatch",
     );
     assert_eq!(DiagKind::TotalSegments.code(), "total-segments");
+    assert_eq!(DiagKind::BuildIdMismatch.code(), "build-id-mismatch");
+    assert_eq!(DiagKind::HostFeatureMissing.code(), "host-feature-missing");
 }
 
 #[test]
