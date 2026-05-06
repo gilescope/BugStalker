@@ -12,5 +12,5 @@
 //! - `thread_sched` — single-CPU serialisation (3F).
 //! - `pt_assist` — Phase 6 PT trace consumption (3H).
 
+pub mod ptrace_driver;
 pub mod seccomp;
-// pub mod ptrace_driver;  // step 7 — landing in the next commit
