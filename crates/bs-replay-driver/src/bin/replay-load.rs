@@ -160,9 +160,11 @@ mod linux_main {
         match replay_program(trace_dir, argv, envp, options) {
             Ok(report) => {
                 eprintln!(
-                    "replay-load: {} syscalls applied / {} signals skipped / \
-                     {} instr-traps skipped / {} steps / {} bytes written",
+                    "replay-load: {} syscalls applied / {} signals delivered / \
+                     {} signals skipped / {} instr-traps skipped / \
+                     {} steps / {} bytes written",
                     report.syscalls_applied,
+                    report.signals_delivered,
                     report.signals_skipped,
                     report.instruction_traps_skipped,
                     report.iterations,

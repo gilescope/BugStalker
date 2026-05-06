@@ -66,12 +66,15 @@ pub enum ShimRefusedReason {
 pub struct ReplayReport {
     /// `Event::Syscall` events successfully applied.
     pub syscalls_applied: u64,
-    /// `Event::Signal` events skipped (not yet replayed —
-    /// step 71's signal replay needs cross-process
-    /// PTRACE_SETSIGINFO; lands in a follow-up).
+    /// `Event::Signal` events delivered to the tracee via
+    /// `kill(2)` (best-effort — not PC-precise).
+    pub signals_delivered: u64,
+    /// `Event::Signal` events that couldn't be delivered
+    /// (target dead, EPERM, etc.).
     pub signals_skipped: u64,
     /// `Event::InstructionTrap` events skipped (replay-side
-    /// RAX rewrite + step-past lands with the signal replay).
+    /// RAX rewrite needs cross-process PTRACE_SETREGS; queued
+    /// for follow-up).
     pub instruction_traps_skipped: u64,
     /// Total ioctl turns the supervisor executed.
     pub iterations: u64,
@@ -152,15 +155,22 @@ pub fn replay_program(
             }
         };
 
-        // Walk the trace until we find the next Event::Syscall;
-        // intermediate Signal/InstructionTrap events are
-        // counted but not replayed (yet).
+        // Walk the trace until we find the next Event::Syscall.
+        // Signal events along the way get best-effort delivery
+        // via kill(2) — not PC-precise but sometimes sufficient
+        // for replay-time signal exposure.
+        // InstructionTrap events stay skipped pending the
+        // replay-side RAX rewrite path.
         let event = loop {
             match cursor.next() {
                 Ok(Some(e)) => match e {
                     Event::Syscall { .. } => break Some(e),
-                    Event::Signal { .. } => {
-                        report.signals_skipped += 1;
+                    Event::Signal { sig_no, .. } => {
+                        if deliver_signal_best_effort(pid, sig_no) {
+                            report.signals_delivered += 1;
+                        } else {
+                            report.signals_skipped += 1;
+                        }
                         continue;
                     }
                     Event::InstructionTrap { .. } => {
@@ -251,6 +261,27 @@ fn classify_shim_error(err: &ReplayShimError) -> ShimRefusedReason {
         RE::Decode(d) => ShimRefusedReason::Decode(format!("{d}")),
         RE::UnexpectedEvent { got } => ShimRefusedReason::UnsupportedEvent(got.clone()),
     }
+}
+
+/// Best-effort cross-process signal delivery via `kill(2)`.
+/// Returns true on success, false on any failure (target dead,
+/// EPERM, EINVAL for invalid signal number).
+///
+/// Limitation: not PC-precise. The signal arrives at the
+/// tracee's next signal-checkpoint, not at the exact PC where
+/// it was originally recorded. For most replay use cases
+/// (timer-driven SIGALRM, external SIGTERM) this is fine; for
+/// race-condition reproduction, it isn't. A PC-precise variant
+/// would require PTRACE_SETSIGINFO + a single-step rendezvous
+/// with the recorded delivery PC.
+fn deliver_signal_best_effort(pid: i32, sig_no: u32) -> bool {
+    if sig_no == 0 || sig_no > 64 {
+        return false;
+    }
+    // SAFETY: kill is a syscall taking a pid + signal number;
+    // no buffer dereferences.
+    let r = unsafe { libc::kill(pid, sig_no as i32) };
+    r == 0
 }
 
 fn reap_exit(pid: i32) -> Option<ReplayExit> {
