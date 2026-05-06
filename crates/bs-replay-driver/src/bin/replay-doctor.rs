@@ -11,11 +11,12 @@
 
 use std::process::ExitCode;
 
+use bs_replay_driver::dap::{load, ReplayLoadRequest};
 use bs_replay_driver::host::host_features;
 use bs_replay_engine::format::{validate_with, ValidationOptions};
 
 const USAGE: &str = "\
-replay-doctor — validate a Phase 5 trace directory.
+replay-doctor — validate or summarise a Phase 5 trace directory.
 
 Usage:
     replay-doctor [OPTIONS] <DIR>
@@ -26,11 +27,14 @@ Options:
                              host lacks.
     --build-id <hex>         Cross-check the manifest's build_id
                              against this expected value.
+    --load                   Skip the full validation report and
+                             print just the bs/replayLoad summary
+                             (events / segments / checkpoints).
     -h, --help               Show this help.
 
 Exit codes:
-    0  trace is replayable
-    1  trace has errors
+    0  trace is replayable / summary printed
+    1  trace has errors / load failed
     2  argument parse error
 ";
 
@@ -39,6 +43,7 @@ struct Cli {
     dir: Option<String>,
     check_host: bool,
     build_id: Option<String>,
+    load: bool,
 }
 
 fn parse() -> Result<Cli, String> {
@@ -51,6 +56,7 @@ fn parse() -> Result<Cli, String> {
                 std::process::exit(0);
             }
             "--check-host" => cli.check_host = true,
+            "--load" => cli.load = true,
             "--build-id" => {
                 cli.build_id = Some(args.next().ok_or_else(|| {
                     "--build-id requires a hex argument".to_owned()
@@ -83,6 +89,24 @@ fn main() -> ExitCode {
         }
     };
 
+    let dir = cli.dir.as_deref().expect("validated by parse()");
+
+    if cli.load {
+        match load(&ReplayLoadRequest { trace_path: dir.to_owned() }) {
+            Ok((_replayer, resp)) => {
+                println!(
+                    "{} events / {} segments / {} checkpoints",
+                    resp.total_events, resp.total_segments, resp.total_checkpoints,
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(e) => {
+                eprintln!("replay-doctor: load failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     let host_owned: Option<Vec<String>> = if cli.check_host {
         match host_features() {
             Ok(v) => Some(v),
@@ -104,7 +128,6 @@ fn main() -> ExitCode {
         host_features: host_refs.as_deref(),
     };
 
-    let dir = cli.dir.as_deref().expect("validated by parse()");
     let report = validate_with(dir, &opts);
     print!("{report}");
     if report.is_replayable() {

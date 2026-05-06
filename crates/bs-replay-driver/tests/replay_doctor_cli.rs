@@ -123,6 +123,51 @@ fn doctor_help_exits_zero_and_prints_usage() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("replay-doctor"));
     assert!(stdout.contains("--check-host"));
+    assert!(stdout.contains("--load"));
+}
+
+#[test]
+fn doctor_load_flag_prints_summary_one_liner() {
+    let dir = temp_dir("load-summary");
+    {
+        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        for i in 0..7u32 {
+            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        }
+        writer.take_checkpoint(b"a".to_vec()).unwrap();
+        for i in 7..10u32 {
+            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let out = Command::new(doctor_bin())
+        .arg("--load")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stdout: {}", String::from_utf8_lossy(&out.stdout));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // The trace held 10 events split into 2 segments by the
+    // checkpoint-forced rotation, plus 1 checkpoint.
+    assert!(
+        stdout.contains("10 events"),
+        "expected `10 events` in output, got: {stdout}",
+    );
+    assert!(stdout.contains("2 segments"), "got: {stdout}");
+    assert!(stdout.contains("1 checkpoints"), "got: {stdout}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn doctor_load_flag_on_missing_dir_exits_one() {
+    let out = Command::new(doctor_bin())
+        .arg("--load")
+        .arg("/no/such/dir/exists/here")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("load failed"), "stderr: {stderr}");
 }
 
 #[test]
