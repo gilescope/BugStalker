@@ -6,8 +6,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use bs_replay_driver::dap::{
-    JumpTarget, ReplayCheckpointListRequest, ReplayJumpRequest, ReplayTimelineRequest,
-    TimelineWaypoint,
+    JumpTarget, ReplayCheckpointListRequest, ReplayJumpRequest, ReplayLoadRequest,
+    ReplayTimelineRequest, TimelineWaypoint, load,
 };
 use bs_replay_driver::engine::format::event::Event;
 use bs_replay_driver::engine::format::manifest::Manifest;
@@ -155,6 +155,65 @@ fn dap_timeline_reports_total_events_and_checkpoint_waypoints() {
             assert_eq!(*event_index, 7);
         }
     }
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dap_load_returns_replayer_plus_summary_for_a_real_trace() {
+    let dir = temp_dir("load-ok");
+    make_trace_with_two_checkpoints(&dir);
+    let req = ReplayLoadRequest {
+        trace_path: dir.to_string_lossy().into_owned(),
+    };
+    let (replayer, resp) = load(&req).unwrap();
+
+    assert_eq!(resp.total_events, 10);
+    assert_eq!(resp.total_segments, 3, "checkpoints rotate so 3 segments");
+    assert_eq!(resp.total_checkpoints, 2);
+
+    // The returned replayer is fully usable for follow-up DAP
+    // commands — exercise dap_timeline against it to prove.
+    let timeline = replayer
+        .dap_timeline(&ReplayTimelineRequest::default())
+        .unwrap();
+    assert_eq!(timeline.total_events, 10);
+    assert_eq!(timeline.waypoints.len(), 2);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn dap_load_on_missing_directory_propagates_engine_error() {
+    let req = ReplayLoadRequest {
+        trace_path: "/nope/this/dir/should/not/exist".to_owned(),
+    };
+    let err = load(&req).unwrap_err();
+    let s = format!("{err}");
+    // Engine error path: the inner ManifestIo is what the user sees.
+    assert!(
+        s.contains("manifest") || s.contains("trace"),
+        "unexpected: {s}",
+    );
+}
+
+#[test]
+fn dap_load_summary_matches_reader_native_indices() {
+    // Same trace, two ways: load() vs reading TraceReader's index
+    // slices directly. They must agree.
+    let dir = temp_dir("load-vs-native");
+    make_trace_with_two_checkpoints(&dir);
+    let req = ReplayLoadRequest {
+        trace_path: dir.to_string_lossy().into_owned(),
+    };
+    let (replayer, resp) = load(&req).unwrap();
+    assert_eq!(
+        resp.total_segments,
+        replayer.reader().segment_indices().len() as u64,
+    );
+    assert_eq!(
+        resp.total_checkpoints,
+        replayer.reader().checkpoint_indices().len() as u64,
+    );
     fs::remove_dir_all(&dir).ok();
 }
 

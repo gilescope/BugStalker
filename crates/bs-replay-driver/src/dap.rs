@@ -159,12 +159,14 @@ pub struct ReplayRecordResponse {
 }
 
 // ---------------------------------------------------------------------------
-// bs/replayLoad — type-only stub (needs debugger attach machinery)
+// bs/replayLoad — open a trace and report summary stats
 // ---------------------------------------------------------------------------
 
 /// Request: load a saved trace and attach the debugger to its
-/// virtual tracee. Wire-shape only — sub-phase 3I real fake-tracee
-/// integration is not yet in place.
+/// virtual tracee. The handler opens the trace and returns
+/// summary counts; the *attach* leg (sub-phase 3I fake-tracee)
+/// happens downstream from the DAP server using the returned
+/// [`TraceReplayer`].
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplayLoadRequest {
     /// Path to the trace directory on disk.
@@ -180,6 +182,32 @@ pub struct ReplayLoadResponse {
     pub total_segments: u64,
     /// Number of checkpoints.
     pub total_checkpoints: u64,
+}
+
+/// Handle `bs/replayLoad`. Opens the trace at the requested path
+/// and reports its summary stats; returns the [`TraceReplayer`]
+/// the caller stashes for subsequent [`bs/replayJump`](dap_jump)
+/// and friends. Free function rather than a method because the
+/// request *constructs* the replayer rather than acting on one.
+pub fn load(
+    req: &ReplayLoadRequest,
+) -> Result<(TraceReplayer, ReplayLoadResponse), ReplayError> {
+    let replayer = TraceReplayer::open(&req.trace_path)?;
+    let segments = replayer
+        .reader()
+        .segment_event_ranges()
+        .map_err(ReplayError::Engine)?;
+    let total_events: u64 = segments.iter().map(|r| r.event_count).sum();
+    let total_segments = segments.len() as u64;
+    let total_checkpoints = replayer.reader().checkpoint_indices().len() as u64;
+    Ok((
+        replayer,
+        ReplayLoadResponse {
+            total_events,
+            total_segments,
+            total_checkpoints,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
