@@ -301,6 +301,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs-syscall-spec"
+version = "0.0.1"
+
+[[package]]
 name = "bs-test-harness"
 version = "0.0.0"
 dependencies = [

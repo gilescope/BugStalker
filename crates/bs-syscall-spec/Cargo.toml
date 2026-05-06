@@ -1,0 +1,16 @@
+[package]
+name = "bs-syscall-spec"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "BugStalker time-travel — Linux syscall specifications for the sub-phase 3B recorder (Phase 5)."
+
+[dependencies]
+# No deps — spec is plain data. The macro that consumes this
+# (sub-phase 3B's syscall! { … } DSL) lives in a separate
+# proc-macro crate.
+
+[dev-dependencies]
+# Integrity tests only need std assertions.
