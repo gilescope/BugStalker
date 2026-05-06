@@ -49,3 +49,13 @@ bs-syscall-spec = { path = "../bs-syscall-spec" }
 
 [dev-dependencies]
 proptest.workspace = true
+
+# Linux-only deps for the seccomp-bpf user-notify recorder
+# (sub-phase 3B step 6) and the ptrace driver (step 7). Pure
+# wrappers — libc gives us the syscall numbers and the
+# `seccomp_data` / `sock_filter` layouts; rustix wraps fork +
+# wait + signal control with a safer surface. No C link beyond
+# libc itself which is already in the dep tree.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rustix = { workspace = true, features = ["fs", "process", "thread"] }
