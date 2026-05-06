@@ -59,6 +59,7 @@ fn roundtrip_one_segment_one_hundred_events() {
                 assert_eq!(*tag, i as u32);
                 assert_eq!(*data, (i as u64) * 7 + 1);
             }
+            other => panic!("unexpected variant: {other:?}"),
         }
     }
 
@@ -95,6 +96,7 @@ fn roundtrip_multiple_segments_via_explicit_rotate() {
             let evs = seg.events_owned().unwrap();
             let data = match evs[0] {
                 Event::Marker { data, .. } => data,
+                ref other => panic!("unexpected variant: {other:?}"),
             };
             (evs.len(), data)
         })
@@ -129,12 +131,14 @@ fn segment_archived_view_is_zero_copy() {
             assert_eq!(tag.to_native(), 1);
             assert_eq!(data.to_native(), 11);
         }
+        other => panic!("unexpected variant: {other:?}"),
     }
     match &archived[1] {
         ArchivedEvent::Marker { tag, data } => {
             assert_eq!(tag.to_native(), 2);
             assert_eq!(data.to_native(), 22);
         }
+        other => panic!("unexpected variant: {other:?}"),
     }
 
     fs::remove_dir_all(&dir).ok();
@@ -219,6 +223,159 @@ fn segment_reader_exposes_header() {
     let hdr = seg.header().unwrap();
     assert_eq!(hdr.index.to_native(), 1);
     assert_eq!(hdr.event_count.to_native(), 3);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn syscall_event_roundtrip_preserves_args_result_and_output() {
+    let dir = temp_trace_dir("syscall-roundtrip");
+    let manifest = sample_manifest();
+
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer
+        .write_event(Event::Syscall {
+            // Linux x86-64 __NR_read = 0; pretend a read returned 13
+            // bytes with the literal payload below.
+            nr: 0,
+            args: [3, 0xdead_beef, 13, 0, 0, 0],
+            result: 13,
+            output: b"hello, world!".to_vec(),
+        })
+        .unwrap();
+    writer
+        .write_event(Event::Syscall {
+            // __NR_close = 3; no output buffer.
+            nr: 3,
+            args: [3, 0, 0, 0, 0, 0],
+            result: 0,
+            output: Vec::new(),
+        })
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let segment = reader.open_segment(1).unwrap();
+    let evs = segment.events_owned().unwrap();
+    assert_eq!(evs.len(), 2);
+    match &evs[0] {
+        Event::Syscall { nr, args, result, output } => {
+            assert_eq!(*nr, 0);
+            assert_eq!(args[0], 3);
+            assert_eq!(args[1], 0xdead_beef);
+            assert_eq!(args[2], 13);
+            assert_eq!(*result, 13);
+            assert_eq!(output, b"hello, world!");
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+    match &evs[1] {
+        Event::Syscall { nr, result, output, .. } => {
+            assert_eq!(*nr, 3);
+            assert_eq!(*result, 0);
+            assert!(output.is_empty());
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn syscall_archived_view_uses_endian_aware_accessors() {
+    use bs_replay_engine::format::event::ArchivedEvent;
+    let dir = temp_trace_dir("syscall-archived");
+    let manifest = sample_manifest();
+
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer
+        .write_event(Event::Syscall {
+            nr: 42,
+            args: [1, 2, 3, 4, 5, 6],
+            result: -2, // -ENOENT pretend
+            output: vec![0xab, 0xcd],
+        })
+        .unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let segment = reader.open_segment(1).unwrap();
+    let archived = segment.events().unwrap();
+    match &archived[0] {
+        ArchivedEvent::Syscall { nr, args, result, output } => {
+            assert_eq!(nr.to_native(), 42);
+            // Each archived arg is a little-endian u64; .to_native()
+            // does the host-order conversion.
+            for (i, a) in args.iter().enumerate() {
+                assert_eq!(a.to_native(), (i + 1) as u64);
+            }
+            assert_eq!(result.to_native(), -2);
+            assert_eq!(output.as_slice(), &[0xab, 0xcd]);
+        }
+        other => panic!("unexpected variant: {other:?}"),
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn marker_only_traces_still_read_after_syscall_added() {
+    // Forward-compat acceptance: a trace that wrote only Marker
+    // (variant 0) before Syscall existed still parses identically
+    // now that Syscall exists at variant 1. rkyv's enum encoding
+    // is "variant index byte + body" so leaving Marker at index 0
+    // is the load-bearing decision.
+    let dir = temp_trace_dir("variant-zero-stable");
+    let manifest = sample_manifest();
+
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    for i in 0..5u32 {
+        writer.write_event(Event::Marker { tag: i, data: u64::from(i) }).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let evs = reader.open_segment(1).unwrap().events_owned().unwrap();
+    assert_eq!(evs.len(), 5);
+    for (i, ev) in evs.iter().enumerate() {
+        match ev {
+            Event::Marker { tag, data } => {
+                assert_eq!(*tag, i as u32);
+                assert_eq!(*data, i as u64);
+            }
+            other => panic!(
+                "Marker-only trace decoded as wrong variant: {other:?} \
+                 — adding Syscall at the *end* of the enum was supposed \
+                 to be additive; if this fires the variant ordering \
+                 broke and the on-disk format is no longer v1-compatible",
+            ),
+        }
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn mixed_marker_and_syscall_traces_in_one_segment() {
+    let dir = temp_trace_dir("mixed");
+    let manifest = sample_manifest();
+
+    let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
+    writer.write_event(Event::Marker { tag: 1, data: 1 }).unwrap();
+    writer.write_event(Event::Syscall {
+        nr: 0,
+        args: [0; 6],
+        result: 0,
+        output: vec![1, 2, 3],
+    }).unwrap();
+    writer.write_event(Event::Marker { tag: 2, data: 2 }).unwrap();
+    writer.finish().unwrap();
+
+    let reader = TraceReader::open(&dir).unwrap();
+    let evs = reader.open_segment(1).unwrap().events_owned().unwrap();
+    assert!(matches!(evs[0], Event::Marker { tag: 1, .. }));
+    assert!(matches!(evs[1], Event::Syscall { nr: 0, .. }));
+    assert!(matches!(evs[2], Event::Marker { tag: 2, .. }));
 
     fs::remove_dir_all(&dir).ok();
 }
