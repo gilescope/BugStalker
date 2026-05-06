@@ -204,6 +204,112 @@ fn doctor_load_flag_on_missing_dir_exits_one() {
 }
 
 #[test]
+fn doctor_counts_lists_every_event_kind() {
+    let dir = temp_dir("counts");
+    {
+        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+        writer.write_event(Event::PcMarker { pc: 0xCAFE_F00D }).unwrap();
+        writer.write_event(Event::Syscall {
+            nr: 1,
+            args: [2, 0xCAFE_BA00, 5, 0, 0, 0],
+            result: 5,
+            output: Vec::new(),
+        }).unwrap();
+        writer.finish().unwrap();
+    }
+    let out = Command::new(doctor_bin())
+        .arg("--counts")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Syscall"), "stdout: {stdout}");
+    assert!(stdout.contains("Marker"));
+    assert!(stdout.contains("PcMarker"));
+    assert!(stdout.contains("total"));
+    // Syscall should be 1, Marker should be 2, PcMarker 1.
+    assert!(
+        stdout.contains("Syscall          : 1"),
+        "expected exactly 1 syscall in counts: {stdout}"
+    );
+    assert!(
+        stdout.contains("Marker           : 2"),
+        "expected exactly 2 markers: {stdout}"
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn doctor_dump_events_renders_each_kind_in_order() {
+    let dir = temp_dir("dump");
+    {
+        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        writer.write_event(Event::Marker { tag: 0xFF, data: 42 }).unwrap();
+        writer.write_event(Event::PcMarker { pc: 0xC0DE_F00D }).unwrap();
+        writer.write_event(Event::Syscall {
+            nr: 1,
+            args: [2, 0xCAFE, 5, 0, 0, 0],
+            result: 5,
+            output: vec![],
+        }).unwrap();
+        writer.finish().unwrap();
+    }
+    let out = Command::new(doctor_bin())
+        .arg("--dump-events")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Each event should produce one line tagged with its kind.
+    assert!(stdout.contains("Marker"), "stdout: {stdout}");
+    assert!(stdout.contains("PcMarker"));
+    assert!(stdout.contains("Syscall"));
+    // Syscall line should resolve nr=1 to "write" via the
+    // bs-syscall-spec curated table.
+    assert!(
+        stdout.contains("write"),
+        "syscall name not resolved in dump: {stdout}"
+    );
+    // PcMarker line should print the hex PC.
+    assert!(stdout.contains("0xc0de"), "PC not formatted in hex: {stdout}");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn doctor_dump_events_with_explicit_n_caps_output() {
+    let dir = temp_dir("dump-n");
+    {
+        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        for i in 0..10 {
+            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let out = Command::new(doctor_bin())
+        .arg("--dump-events")
+        .arg("3")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let marker_lines = stdout.lines().filter(|l| l.contains("Marker")).count();
+    assert_eq!(
+        marker_lines, 3,
+        "expected 3 marker lines for --dump-events 3, got {marker_lines}: {stdout}"
+    );
+    assert!(
+        stdout.contains("stopping after 3 events"),
+        "expected truncation note: {stdout}",
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn doctor_check_host_flag_does_not_panic_on_unsupported_os() {
     // On macOS host_features() returns Unsupported. The doctor
     // should fall back to skipping the host check rather than
