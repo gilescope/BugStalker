@@ -7,6 +7,47 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 polish round — vDSO patcher, doctor
+  diagnostics, signal replay, recorder bench):
+  - vDSO remote patcher (step 78). Completes 3D's writer half:
+    `pokedata` / `peekdata` / `patch_bytes` / `apply_vdso_trampolines`
+    / `scan_remote_vdso`. PTRACE_POKEDATA's FOLL_FORCE bypasses
+    the read-only page bit; integration test forks a TRACEME
+    child and verifies cross-process write lands. Wired into
+    the public API but not auto-applied by record_program (opt-in
+    until end-to-end vDSO-patched replay is validated).
+  - Best-effort signal replay (step 82). `replay_program` now
+    delivers `Event::Signal` to the tracee via `kill(2)` while
+    walking the trace between syscall notifications. Not
+    PC-precise but sometimes sufficient (timer SIGALRM,
+    external SIGTERM). `ReplayReport` gains `signals_delivered`;
+    `signals_skipped` now strictly means "couldn't be delivered".
+    The PC-precise variant via PTRACE_SETSIGINFO + single-step
+    rendezvous is the queued follow-up.
+  - `replay-doctor --counts` and `--dump-events [N]` (step 83).
+    Two new diagnostic flags so users can inspect a trace
+    without writing Rust. `--counts` walks every event and
+    prints a per-kind histogram (Syscall / Signal /
+    InstructionTrap / Marker / PcMarker + total). `--dump-events`
+    prints the first N events in human-readable form, with
+    syscall names resolved via `bs-syscall-spec`'s curated +
+    long-tail tables, signal numbers translated to names, and
+    PCs formatted in hex. `--dump-events 0` dumps every event.
+  - Recorder throughput bench (step 84).
+    `crates/bs-replay-driver/benches/recorder_throughput.rs`
+    drives `record_program` against `/bin/true` and measures
+    end-to-end record session throughput. Linux-only at the
+    substantive level; Darwin path emits a clean skip.
+    Establishes a baseline so future regressions surface in CI.
+  - Documentation polish (steps 79–81):
+    - All five Phase 5 crates' READMEs refreshed (one new for
+      `bs-syscall-macro`); each reflects steps 53–78.
+    - `doc/phase-5-usage.md` — user-facing walkthrough with
+      bash invocation flow, programmatic API, "what doesn't
+      work yet" matrix, troubleshooting checklist.
+    - Top-level `README.md` Phase 5 section refreshed; lists
+      all five crates, mentions the three CLIs, links to
+      both Phase 5 docs.
 - time-travel (Phase 5 — full record→replay pipeline,
   user-facing CLIs, architecture correction):
   - `record_program(trace_dir, manifest, argv, envp, options)`

@@ -144,15 +144,16 @@ assert_eq!(replay_report.syscalls_applied, record_report.syscall_events);
 
 ## What doesn't work yet
 
-| Limitation                                        | Workaround / status                                 |
-| ------------------------------------------------- | --------------------------------------------------- |
-| `gettimeofday` / `clock_gettime` via vDSO         | call `vdso_patch::apply_vdso_trampolines` manually  |
-| Signals replayed at exact PC                      | `kill(2)`-based delivery is best-effort; PC-precise |
-| `RDTSC` / `RDRAND` / `CPUID` re-injection         | recorded but not yet rewritten into RAX on replay   |
-| Multi-threaded determinism                        | single-CPU pin available; PMU instr counts TODO     |
-| aarch64 record_session                            | syscall table only — full port pending              |
-| Cross-host replay                                 | manifest CPU-feature check refuses incompatible    |
-| Long-tail syscalls with weird out-pointer shapes  | catch-all logs a 256-byte window; bounded loud fail |
+| Limitation                                        | Workaround / status                                  |
+| ------------------------------------------------- | ---------------------------------------------------- |
+| `gettimeofday` / `clock_gettime` via vDSO         | call `vdso_patch::apply_vdso_trampolines` manually   |
+| Signals replayed at exact PC                      | `kill(2)`-based delivery is best-effort (shipped);   |
+|                                                   | PC-precise variant via PTRACE_SETSIGINFO is queued   |
+| `RDTSC` / `RDRAND` / `CPUID` re-injection         | recorded but not yet rewritten into RAX on replay    |
+| Multi-threaded determinism                        | single-CPU pin available; PMU instr counts TODO      |
+| aarch64 record_session                            | syscall table only — full port pending               |
+| Cross-host replay                                 | manifest CPU-feature check refuses incompatible      |
+| Long-tail syscalls with weird out-pointer shapes  | catch-all logs a 256-byte window; bounded loud fail  |
 
 For each of the above, the recorder's wire format already
 carries the necessary fields (`Event::Signal`,
