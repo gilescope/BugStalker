@@ -7,16 +7,29 @@ contributor should pick up.
 
 ## Session status
 
-The first Phase 5 work-session paused here at the natural sub-phase
-boundary. Sub-phase 3A — trace format and storage — is complete;
-sub-phases 3B (recorder) and Tier 2 (real fork-checkpoint
-mechanism) ship as wire-format-and-orchestration only because the
-substantive remaining work needs a Linux runner this dev
-environment lacks. 30 commits across the session, 138 / 138 tests
-green, complete documentation surface (top-level README, this
-overview, three crate READMEs, CHANGELOG entry). The next
-contributor with a Linux test path can pick up at any of the
+Phase 5 sub-phase 3A — trace format and storage — is complete.
+Sub-phases 3B (recorder) and Tier 2 (real fork-checkpoint
+mechanism) ship as wire-format-and-orchestration only; the
+kernel-touching parts await their respective Linux test paths.
+The next contributor can pick up at any of the
 matched-to-environment options below.
+
+### Cross-platform verification
+
+Build + tests green on both supported development hosts:
+
+| Host                   | Command                                    | Result      |
+| ---------------------- | ------------------------------------------ | ----------- |
+| macOS aarch64 (Apple)  | `cargo nextest run -p bs-replay…`          | 144 / 144   |
+| Linux x86_64 (NixOS)   | `cargo test -p bs-replay…`                 | 144 / 144   |
+
+The Linux run also exercises the real `/proc/cpuinfo` enumerator
+(`bs_replay_driver::host_features()`); on the verification host
+it returned 140 unique CPU feature flags. macOS exercises the
+`sysctlbyname` path against `hw.optional.*`. Both ends emit the
+same Linux-canonical feature names so traces recorded on one
+host can have their CPU-feature manifest checked against the
+other without a translation table.
 
 Phase 5 trades multi-month sub-phases against what was tractable
 to implement and test from a macOS-arm64 development host. The
