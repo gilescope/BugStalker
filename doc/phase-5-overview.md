@@ -5,6 +5,19 @@ document reflects what's actually *shipped* in-tree against that
 plan, the architecture the work landed in, and where the next
 contributor should pick up.
 
+## Session status
+
+The first Phase 5 work-session paused here at the natural sub-phase
+boundary. Sub-phase 3A — trace format and storage — is complete;
+sub-phases 3B (recorder) and Tier 2 (real fork-checkpoint
+mechanism) ship as wire-format-and-orchestration only because the
+substantive remaining work needs a Linux runner this dev
+environment lacks. 30 commits across the session, 138 / 138 tests
+green, complete documentation surface (top-level README, this
+overview, three crate READMEs, CHANGELOG entry). The next
+contributor with a Linux test path can pick up at any of the
+matched-to-environment options below.
+
 Phase 5 trades multi-month sub-phases against what was tractable
 to implement and test from a macOS-arm64 development host. The
 result is a load-bearing trace engine + driver layer that's
