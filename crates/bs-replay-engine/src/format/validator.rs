@@ -74,6 +74,12 @@ pub enum DiagKind {
     TotalSegments,
     /// Total event count across all segments.
     TotalEvents,
+    /// Total number of checkpoint snapshot files.
+    TotalCheckpoints,
+    /// Checkpoint file couldn't be read or decoded.
+    CheckpointUnreadable,
+    /// Checkpoint header index disagrees with filename index.
+    CheckpointHeaderIndexMismatch,
 }
 
 impl DiagKind {
@@ -93,6 +99,9 @@ impl DiagKind {
             Self::SegmentEventCountMismatch => "segment-event-count-mismatch",
             Self::TotalSegments => "total-segments",
             Self::TotalEvents => "total-events",
+            Self::TotalCheckpoints => "total-checkpoints",
+            Self::CheckpointUnreadable => "checkpoint-unreadable",
+            Self::CheckpointHeaderIndexMismatch => "checkpoint-header-index-mismatch",
         }
     }
 }
@@ -263,13 +272,42 @@ pub fn validate(dir: impl AsRef<Path>) -> ValidationReport {
         }
     }
 
-    // ---- Per-segment validation ----
+    // ---- Per-segment + per-checkpoint validation ----
     // Re-open via TraceReader to reuse its parsing path. If the
-    // manifest failed entirely we skip per-segment work (no reader
+    // manifest failed entirely we skip the per-file work (no reader
     // can be constructed) — those errors are already on the report.
-    if manifest.is_some() && !segments.is_empty() {
+    // Run even when there are zero segments: a trace might contain
+    // only checkpoints (rare but legal until the recorder gets
+    // wired up).
+    if manifest.is_some() {
         match TraceReader::open(dir) {
             Ok(reader) => {
+                report.push(
+                    Severity::Info,
+                    DiagKind::TotalCheckpoints,
+                    reader.checkpoint_indices().len().to_string(),
+                );
+                for &idx in reader.checkpoint_indices() {
+                    if let Err(e) = reader.open_checkpoint(idx) {
+                        match e {
+                            TraceReadError::CheckpointHeaderMismatch {
+                                file_index,
+                                header_index,
+                            } => report.push(
+                                Severity::Error,
+                                DiagKind::CheckpointHeaderIndexMismatch,
+                                format!(
+                                    "checkpoint file {file_index} carries header index {header_index}",
+                                ),
+                            ),
+                            other => report.push(
+                                Severity::Error,
+                                DiagKind::CheckpointUnreadable,
+                                format!("checkpoint {idx}: {other}"),
+                            ),
+                        }
+                    }
+                }
                 let mut total_events: u64 = 0;
                 for &idx in reader.segment_indices() {
                     match reader.open_segment(idx) {

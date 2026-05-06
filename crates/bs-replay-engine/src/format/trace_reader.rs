@@ -17,6 +17,9 @@ use lz4_flex::frame::FrameDecoder;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::vec::ArchivedVec;
 
+use super::checkpoint::{
+    checkpoint_path, parse_checkpoint_filename, Checkpoint, CheckpointIoError,
+};
 use super::event::{ArchivedEvent, Event};
 use super::manifest::{Manifest, ManifestParseError};
 use super::segment::{
@@ -29,6 +32,7 @@ pub struct TraceReader {
     dir: PathBuf,
     manifest: Manifest,
     segments: Vec<u64>,
+    checkpoints: Vec<u64>,
 }
 
 impl TraceReader {
@@ -47,25 +51,32 @@ impl TraceReader {
         }
 
         let mut segments: Vec<u64> = Vec::new();
+        let mut checkpoints: Vec<u64> = Vec::new();
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             if let Some(name) = entry.file_name().to_str() {
                 if let Some(idx) = parse_segment_filename(name) {
                     segments.push(idx);
+                } else if let Some(idx) = parse_checkpoint_filename(name) {
+                    checkpoints.push(idx);
                 }
             }
         }
         segments.sort_unstable();
-        // Strict-monotonic check: `parse_segment_filename` only
-        // accepts six-digit names so duplicates would have to come
-        // from the same on-disk filename, which the filesystem
-        // already excludes — but the assertion costs nothing and
-        // makes the invariant explicit.
+        checkpoints.sort_unstable();
+        // Strict-monotonic check: filename parsers only accept
+        // six-digit names so duplicates would have to come from
+        // the same on-disk filename, which the filesystem already
+        // excludes — but the assertion costs nothing and makes
+        // the invariant explicit.
         for w in segments.windows(2) {
             debug_assert!(w[1] > w[0], "segment indices not strict-monotonic");
         }
+        for w in checkpoints.windows(2) {
+            debug_assert!(w[1] > w[0], "checkpoint indices not strict-monotonic");
+        }
 
-        Ok(Self { dir, manifest, segments })
+        Ok(Self { dir, manifest, segments, checkpoints })
     }
 
     /// The trace's manifest. Cheap; pre-parsed at [`Self::open`].
@@ -76,6 +87,26 @@ impl TraceReader {
     /// Sorted segment indices present in the trace.
     pub fn segment_indices(&self) -> &[u64] {
         &self.segments
+    }
+
+    /// Sorted checkpoint indices present in the trace.
+    pub fn checkpoint_indices(&self) -> &[u64] {
+        &self.checkpoints
+    }
+
+    /// Read checkpoint `idx` from disk. Validates the header's
+    /// stored index matches the filename — same shape of check the
+    /// segment reader does.
+    pub fn open_checkpoint(&self, idx: u64) -> Result<Checkpoint, TraceReadError> {
+        let path = checkpoint_path(&self.dir, idx);
+        let cp = Checkpoint::read_from(&path).map_err(TraceReadError::Checkpoint)?;
+        if cp.header.index != idx {
+            return Err(TraceReadError::CheckpointHeaderMismatch {
+                file_index: idx,
+                header_index: cp.header.index,
+            });
+        }
+        Ok(cp)
     }
 
     /// Decompress segment `idx` and return a reader over its events.
@@ -192,5 +223,18 @@ pub enum TraceReadError {
         header_count: u64,
         /// Count of events actually stored.
         actual_count: u64,
+    },
+    /// Checkpoint file I/O or archive error.
+    #[error("checkpoint: {0}")]
+    Checkpoint(CheckpointIoError),
+    /// Checkpoint header's `index` did not match its filename.
+    #[error(
+        "checkpoint {file_index} header reports index {header_index}; file/header disagree"
+    )]
+    CheckpointHeaderMismatch {
+        /// Index parsed from the filename.
+        file_index: u64,
+        /// Index stored in the checkpoint header.
+        header_index: u64,
     },
 }

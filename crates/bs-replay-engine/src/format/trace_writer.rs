@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use lz4_flex::frame::FrameEncoder;
 use rkyv::rancor::Error as RkyvError;
 
+use super::checkpoint::{checkpoint_path, Checkpoint, CheckpointHeader, CheckpointIoError};
 use super::event::Event;
 use super::manifest::Manifest;
 use super::segment::{segment_filename, Segment, SegmentHeader, MANIFEST_FILENAME};
@@ -31,6 +32,11 @@ pub struct TraceWriter {
     pending: Vec<Event>,
     pending_size_bytes: usize,
     next_segment: u64,
+    next_checkpoint: u64,
+    /// Total events written across all rotated segments + the
+    /// in-flight buffer. Used to stamp `event_index` into a
+    /// checkpoint header so replay knows where to resume from.
+    events_written: u64,
     segment_size_threshold: usize,
 }
 
@@ -51,6 +57,8 @@ impl TraceWriter {
             pending: Vec::new(),
             pending_size_bytes: 0,
             next_segment: 1,
+            next_checkpoint: 1,
+            events_written: 0,
             segment_size_threshold: DEFAULT_SEGMENT_SIZE_BYTES,
         })
     }
@@ -71,9 +79,37 @@ impl TraceWriter {
             .pending_size_bytes
             .saturating_add(event.approx_archive_size());
         self.pending.push(event);
+        self.events_written += 1;
         if self.pending_size_bytes >= self.segment_size_threshold {
             self.rotate()?;
         }
+        Ok(())
+    }
+
+    /// Take a checkpoint snapshot at the current point in the event
+    /// stream. `payload` is opaque — the format layer just stores
+    /// it. Tier 3 replay (sub-phase 3C) writes the actual memory +
+    /// register snapshot in there.
+    ///
+    /// Forces a segment rotation first so the checkpoint's
+    /// `event_index` is unambiguous: every event up to and
+    /// including `events_written` is on disk in a finalised
+    /// segment, so replay restoring from this checkpoint resumes
+    /// at exactly that offset.
+    pub fn take_checkpoint(&mut self, payload: Vec<u8>) -> Result<(), TraceWriteError> {
+        self.rotate()?;
+        let checkpoint = Checkpoint {
+            header: CheckpointHeader {
+                index: self.next_checkpoint,
+                event_index: self.events_written,
+            },
+            payload,
+        };
+        let path = checkpoint_path(&self.dir, self.next_checkpoint);
+        checkpoint
+            .write_to(&path)
+            .map_err(TraceWriteError::Checkpoint)?;
+        self.next_checkpoint += 1;
         Ok(())
     }
 
@@ -130,4 +166,7 @@ pub enum TraceWriteError {
     /// LZ4 frame encoder failed at finish.
     #[error("trace lz4: {0}")]
     Lz4(String),
+    /// Checkpoint file write failed.
+    #[error("checkpoint: {0}")]
+    Checkpoint(CheckpointIoError),
 }

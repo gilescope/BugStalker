@@ -24,6 +24,7 @@ pub mod trace_writer;
 pub mod validator;
 pub mod version;
 
+pub use checkpoint::{Checkpoint, CheckpointHeader, CheckpointIoError};
 pub use event::Event;
 pub use manifest::{Manifest, ManifestParseError};
 pub use segment::{Segment, SegmentHeader};
