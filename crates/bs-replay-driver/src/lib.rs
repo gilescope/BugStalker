@@ -22,9 +22,11 @@
 
 #![warn(missing_docs)]
 
+pub mod host;
 pub mod replayer;
 pub mod reverse;
 
+pub use host::{host_features, HostDetectError};
 pub use replayer::{
     BuildIdMismatch, HostMismatchError, ReplayError, ReplayabilityError, TraceReplayer,
 };
