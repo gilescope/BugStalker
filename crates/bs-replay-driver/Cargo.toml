@@ -45,3 +45,10 @@ path = "src/bin/replay-doctor.rs"
 [[bin]]
 name = "replay-record"
 path = "src/bin/replay-record.rs"
+
+# replay-load drives the replay shim against a recorded trace
+# + a fresh tracee. Symmetric to replay-record. Linux only at
+# the functional level; on Darwin the binary stub-mains.
+[[bin]]
+name = "replay-load"
+path = "src/bin/replay-load.rs"
