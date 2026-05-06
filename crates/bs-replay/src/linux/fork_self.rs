@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: MIT
+//! `LinuxForkSelfMechanism` — Linux fork(2) + SIGSTOP checkpoint
+//! mechanism.
+//!
+//! Forks the *calling process*. The child raises SIGSTOP on itself
+//! and enters T (stopped) state, frozen at exactly the memory + FD
+//! state of the parent at fork time. Replay would later
+//! `SIGCONT + ptrace::seize` the child and drive it forward; this
+//! mechanism just owns the take/kill lifecycle.
+//!
+//! Where this fits in the plan:
+//!
+//! - The plan's Tier 2 wants to checkpoint the *debuggee*, which
+//!   requires ptrace-injecting a fork() syscall into the
+//!   debuggee's context (subphase 3I-Tier2 work). That's
+//!   substantially larger.
+//! - This mechanism forks BugStalker's *own* process instead.
+//!   It's a real mechanism: the same SIGSTOP-pause / SIGKILL-reap
+//!   shape, the same Pid lifecycle, the same kernel paths. It's
+//!   the building block for the debuggee-targeted version once
+//!   ptrace injection lands.
+//!
+//! ## Safety
+//!
+//! `fork()` in a multi-threaded process is hazardous — only the
+//! calling thread survives in the child, and any mutex held by
+//! another thread becomes permanently locked. The child here
+//! does *nothing* after fork except `raise(SIGSTOP)`, so the
+//! hazard window is bounded to exactly that one syscall, which
+//! is async-signal-safe.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use nix::sys::signal::{self, Signal};
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::{fork, ForkResult, Pid};
+
+use crate::ring::CheckpointMechanism;
+
+/// Handle for one forked-and-stopped child. Mechanism's `kill()`
+/// reaps the PID; dropping this without going through the
+/// mechanism *leaks the child*. The ring's drain() consumes
+/// every handle so production callers get clean reaping; tests
+/// must do the same.
+#[derive(Debug)]
+pub struct ForkHandle {
+    /// PID of the suspended child.
+    pub pid: Pid,
+    /// Wall-clock instant of capture, monotonic seconds since
+    /// UNIX_EPOCH. Caller-visible for diagnostics.
+    pub captured_unix_seconds: u64,
+}
+
+/// Real Linux fork+SIGSTOP mechanism.
+#[derive(Debug, Default)]
+pub struct LinuxForkSelfMechanism {
+    /// Number of children we've created in this session, for
+    /// debugging / diagnostics. Not load-bearing.
+    pub takes: u64,
+}
+
+impl LinuxForkSelfMechanism {
+    /// Construct with zeroed counters.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl CheckpointMechanism for LinuxForkSelfMechanism {
+    type Handle = ForkHandle;
+    type Error = ForkMechanismError;
+
+    fn take(&mut self, _key: u64) -> Result<ForkHandle, ForkMechanismError> {
+        // SAFETY: fork() in a process with other threads is
+        // unsafe in general; the child here calls only
+        // raise(SIGSTOP) which is async-signal-safe, so the
+        // hazard window is empty for this use.
+        match unsafe { fork() }? {
+            ForkResult::Child => {
+                // STOP self; replay later does SIGCONT + ptrace.
+                // raise() never returns once stopped.
+                let _ = signal::raise(Signal::SIGSTOP);
+                // If we somehow get here (parent SIGCONT'd before
+                // attaching), exit cleanly. The mechanism's kill()
+                // path uses SIGKILL so this is the unusual case.
+                std::process::exit(0);
+            }
+            ForkResult::Parent { child } => {
+                self.takes += 1;
+                let captured_unix_seconds = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                Ok(ForkHandle { pid: child, captured_unix_seconds })
+            }
+        }
+    }
+
+    fn kill(&mut self, handle: ForkHandle) -> Result<(), ForkMechanismError> {
+        // Send SIGKILL — bypasses the SIGSTOP-stopped state.
+        signal::kill(handle.pid, Signal::SIGKILL)?;
+        // Reap so we don't leave a zombie. waitpid blocks until
+        // the kernel signals the child has exited; with SIGKILL
+        // that's near-immediate.
+        loop {
+            match waitpid(handle.pid, Some(WaitPidFlag::empty())) {
+                Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) => break,
+                Ok(_) => continue,
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Errors arising from fork/kill/wait.
+#[derive(thiserror::Error, Debug)]
+pub enum ForkMechanismError {
+    /// nix-level errno failure.
+    #[error("nix error: {0}")]
+    Nix(#[from] nix::errno::Errno),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ring::CheckpointRing;
+    use nix::sys::signal::Signal::SIGCONT;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    /// Linux-only by virtue of the parent module's cfg gate. The
+    /// unit-test runner on macOS doesn't reach this file.
+
+    fn child_state(pid: Pid) -> Option<char> {
+        // Read /proc/<pid>/stat to get the state byte. None if
+        // the process disappeared.
+        let path = format!("/proc/{}/stat", pid.as_raw());
+        let s = std::fs::read_to_string(&path).ok()?;
+        // Format: "PID (comm) STATE …"; parse after the closing ')'
+        // because comm can contain spaces.
+        let after = s.rsplit_once(')')?.1.trim_start();
+        after.chars().next()
+    }
+
+    #[test]
+    fn take_creates_a_stopped_child() {
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        // Give the kernel a moment to deliver the SIGSTOP.
+        sleep(Duration::from_millis(50));
+        let state = child_state(h.pid);
+        assert!(
+            matches!(state, Some('T') | Some('t')),
+            "expected stopped state ('T' or 't'), got {state:?} for pid {}",
+            h.pid,
+        );
+        // Clean up.
+        mech.kill(h).expect("kill failed");
+    }
+
+    #[test]
+    fn kill_reaps_the_child_with_no_zombie() {
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        let pid = h.pid;
+        mech.kill(h).expect("kill failed");
+        // After reap the /proc entry should be gone.
+        sleep(Duration::from_millis(50));
+        let path = format!("/proc/{}/stat", pid.as_raw());
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "/proc/{}/stat still present — zombie?",
+            pid,
+        );
+    }
+
+    #[test]
+    fn ring_eviction_kills_oldest_via_real_fork() {
+        let mut ring = CheckpointRing::with_capacity(LinuxForkSelfMechanism::new(), 2);
+        let h0_pid = match ring.take(0) {
+            Ok(h) => h.pid,
+            Err(e) => panic!("take 0 failed: {e:?}"),
+        };
+        let _h1_pid = match ring.take(1) {
+            Ok(h) => h.pid,
+            Err(e) => panic!("take 1 failed: {e:?}"),
+        };
+        // Capacity 2, full now.
+        let _h2_pid = match ring.take(2) {
+            Ok(h) => h.pid,
+            Err(e) => panic!("take 2 failed: {e:?}"),
+        };
+        // Eviction killed h0. Give the reaper time to settle.
+        sleep(Duration::from_millis(50));
+        let path = format!("/proc/{}/stat", h0_pid.as_raw());
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "evicted child {} should have been reaped",
+            h0_pid,
+        );
+        // Drain to clean up the rest.
+        ring.drain().expect("drain failed");
+    }
+
+    #[test]
+    fn drain_kills_every_remaining_child() {
+        let mut ring = CheckpointRing::with_capacity(LinuxForkSelfMechanism::new(), 4);
+        let pids: Vec<Pid> = (0..3)
+            .map(|k| ring.take(k).expect("take failed").pid)
+            .collect();
+        ring.drain().expect("drain failed");
+        sleep(Duration::from_millis(50));
+        for pid in pids {
+            let path = format!("/proc/{}/stat", pid.as_raw());
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "child {} survived drain",
+                pid,
+            );
+        }
+    }
+
+    #[test]
+    fn sigcont_then_kill_still_reaps_cleanly() {
+        // If a caller SIGCONT'd a checkpoint without going through
+        // mechanism.kill, the child would exit naturally. Our
+        // kill() must still reap that case rather than getting
+        // stuck on waitpid.
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        let pid = h.pid;
+        // Wake the child; it'll fall out of raise() and exit.
+        signal::kill(pid, SIGCONT).expect("sigcont failed");
+        sleep(Duration::from_millis(50));
+        // Now kill() should observe an already-exited or
+        // about-to-exit child and reap.
+        match mech.kill(h) {
+            Ok(()) => {}
+            Err(e) => {
+                // ESRCH if the child fully reaped before our
+                // SIGKILL — also acceptable.
+                let s = format!("{e:?}");
+                assert!(
+                    s.contains("ESRCH") || s.contains("ECHILD"),
+                    "unexpected error from kill on already-exited child: {e:?}",
+                );
+            }
+        }
+    }
+}

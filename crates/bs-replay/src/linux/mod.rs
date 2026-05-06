@@ -5,3 +5,6 @@
 //! replay".
 
 pub mod fork_checkpoint;
+pub mod fork_self;
+
+pub use fork_self::{ForkHandle, ForkMechanismError, LinuxForkSelfMechanism};

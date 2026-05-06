@@ -257,6 +257,7 @@ name = "bs-replay"
 version = "0.0.1"
 dependencies = [
  "mach2 0.6.0",
+ "nix 0.27.1",
  "proptest",
  "rustix 0.38.34",
  "thiserror 1.0.69",

@@ -13,6 +13,10 @@ tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["process", "thread", "fs"] }
+# nix gives us safe fork/waitpid/raise + Pid newtype. The root
+# bugstalker crate already pins nix 0.27 with overlapping
+# features; matching that here.
+nix = { version = "0.27.1", features = ["process", "signal"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.6"
