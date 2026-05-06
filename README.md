@@ -72,6 +72,17 @@
   * VSCode [extension](https://marketplace.visualstudio.com/items?itemName=BugStalker.bugstalker)
   * Two modes: stdio (embedded) and TCP (remote)
   * See [DAP Documentation](./doc/DAP.md) for details
+* **Time-travel debugging scaffolding (Phase 5):**
+  * Trace format + writer/reader/validator/cursor in
+    [`bs-replay-engine`](./crates/bs-replay-engine/)
+  * Tier 2 fork-checkpoint ring orchestrator in
+    [`bs-replay`](./crates/bs-replay/)
+  * Integration seam + Tier 1 reverse-step navigation +
+    `bs/replay*` DAP shapes + `replay-doctor` CLI in
+    [`bs-replay-driver`](./crates/bs-replay-driver/)
+  * 135 / 135 tests across the three crates; see
+    [Phase 5 overview](./doc/phase-5-overview.md) for the
+    architecture and status of every plan sub-phase
 * **And many more powerful features!**
 
 ---
