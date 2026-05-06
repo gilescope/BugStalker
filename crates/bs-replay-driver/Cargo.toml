@@ -37,3 +37,11 @@ nix = { version = "0.27.1", features = ["process"] }
 [[bin]]
 name = "replay-doctor"
 path = "src/bin/replay-doctor.rs"
+
+# replay-record drives the Phase 5 recorder against a user
+# program. Linux only at the functional level; on Darwin the
+# binary still builds with a stub main that reports the
+# platform limitation cleanly.
+[[bin]]
+name = "replay-record"
+path = "src/bin/replay-record.rs"
