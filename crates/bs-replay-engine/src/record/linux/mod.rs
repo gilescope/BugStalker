@@ -15,3 +15,4 @@
 pub mod instrs;
 pub mod ptrace_driver;
 pub mod seccomp;
+pub mod signals;
