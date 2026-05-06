@@ -40,3 +40,51 @@ pub use reverse::ReverseDebugger;
 /// Re-export the engine for downstream consumers — most callers
 /// want both the driver and the engine's types.
 pub use bs_replay_engine as engine;
+
+/// Convenience re-exports of the sub-phase 3B recorder
+/// primitives. Consumers driving the recorder loop want
+/// `record_one_syscall` + the `MemoryReader` trait without
+/// reaching into the engine's module tree.
+pub mod record_primitives {
+    #[doc(inline)]
+    pub use bs_replay_engine::record::syscall_capture::{
+        capture_post_syscall, capture_pre_syscall, classify, looks_like_user_pointer,
+        BUFFER_CAP, CallFrame, CapturedKind, CapturedRegion, CapturedSyscall, CaptureTier,
+        DecodeError as CapturedSyscallDecodeError, MemoryReader, Tier, CATCH_ALL_WINDOW,
+        CSTR_CAP,
+    };
+
+    #[cfg(target_os = "linux")]
+    #[doc(inline)]
+    pub use bs_replay_engine::record::linux::{
+        instrs::{
+            classify_at_pc, event_for_instruction_trap, set_tsc_trap_for_self, InstrKind,
+        },
+        ptrace_driver::{
+            capture_from_notif, event_for_capture, frame_from_notif, recv_notif,
+            record_one_syscall, respond_continue, respond_intercept, ProcMemReader,
+            RecorderError, SeccompData, SeccompNotif, SeccompNotifResp,
+            RESULT_NOT_CAPTURED_YET, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+        },
+        seccomp::install_trap_all_listener,
+        signals::{
+            event_for_signal, signal_from_event, validate_replay_plan, SignalCapture,
+            SignalDecodeError, SignalLengthError, SignalReplayError, SignalReplayPlan,
+            SIGINFO_T_LEN_X86_64,
+        },
+        thread_sched::{
+            current_affinity_for_self, pin_to_single_cpu_for_self, AffinityError,
+            AffinityMask, SingleCpuPin,
+        },
+    };
+}
+
+/// Convenience re-exports of the 3C replay-shim primitives.
+#[cfg(target_os = "linux")]
+pub mod replay_primitives {
+    #[doc(inline)]
+    pub use bs_replay_engine::replay::linux::shim::{
+        apply_recorded_event, replay_one_syscall, MemoryWriter, ProcMemWriter,
+        ReplayError as ReplayShimError, ReplayLoopError, ReplayResponse, SyscallMismatch,
+    };
+}

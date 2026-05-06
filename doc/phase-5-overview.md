@@ -152,22 +152,22 @@ let resp = replayer.dap_timeline(&ReplayTimelineRequest::default())?;
 
 ## Status of each plan sub-phase
 
-| Plan section                                | Status                | Why / what's pending                                          |
-| ------------------------------------------- | --------------------- | ------------------------------------------------------------- |
-| §"Tier 1 — Intel PT reverse step"           | navigation shipped    | Display ("at src/handler.rs:42") needs Phase 6 PT capture     |
-| §"Tier 2 — Checkpoint-based replay"         | ring shipped          | Real `fork(2)` mechanism needs Linux ptrace test path         |
-| §"Tier 3 — Clean-room record-and-replay"    | format complete       | Recorder (3B) needs seccomp + a Linux runner                  |
-| Sub-phase 3A: trace format                  | shipped               | manifest, segments, checkpoints, validator, properties        |
-| Sub-phase 3B: syscall record                | wire format only      | `Event::Syscall` defined; seccomp wiring deferred             |
-| Sub-phase 3C: replay                        | TraceReplayer shipped | Real syscall replay needs 3B                                  |
-| Sub-phase 3D: non-deterministic instrs      | not started           | Needs 3B                                                      |
-| Sub-phase 3E: signals                       | wire format only      | `Event::Signal` defined; PTRACE_SETSIGINFO wiring deferred    |
-| Sub-phase 3F: multi-thread serialisation    | not started           | Needs 3B                                                      |
-| Sub-phase 3G: aarch64 port                  | not started           | Needs 3B–3F                                                   |
-| Sub-phase 3H: PT-assisted recording         | not started           | Needs Phase 6 PT capture                                      |
-| Sub-phase 3I: BugStalker driver integration | scaffold shipped      | Real fake-tracee surface = ~3 weeks against tracee.rs         |
-| §"DAP integration"                          | shapes + handlers     | JSON wiring is the DAP server's concern (one `From` per type) |
-| §"Pure-Rust policy"                         | upheld                | rkyv + lz4_flex + ruzstd swap; **zero C deps in Phase 5**     |
+| Plan section                                | Status                       | Why / what's pending                                          |
+| ------------------------------------------- | ---------------------------- | ------------------------------------------------------------- |
+| §"Tier 1 — Intel PT reverse step"           | navigation shipped           | Display ("at src/handler.rs:42") needs Phase 6 PT capture     |
+| §"Tier 2 — Checkpoint-based replay"         | ring + capture/restore       | Linux fork(2) + memory restore real; Mach side stub           |
+| §"Tier 3 — Clean-room record-and-replay"    | recorder primitives shipped  | End-to-end fork+exec+listener-handover wiring is the next step |
+| Sub-phase 3A: trace format                  | shipped                      | manifest, segments, checkpoints, validator, properties        |
+| Sub-phase 3B: syscall record                | macro-driven primitives      | Steps 53–57: curated 31 + long-tail ~260 + catch-all + seccomp install + entry-args ptrace driver |
+| Sub-phase 3C: replay                        | shim shipped                 | apply_recorded_event + mismatch detector + ProcMemWriter      |
+| Sub-phase 3D: non-deterministic instrs      | recorder primitives shipped  | set_tsc_trap + iced-x86 classify + event_for_instruction_trap |
+| Sub-phase 3E: signals                       | record/replay primitives     | SignalCapture + SignalReplayPlan + length validation tripwire |
+| Sub-phase 3F: multi-thread serialisation    | single-CPU pin shipped       | PMU-based instr-retired counts wait on 3H PT integration      |
+| Sub-phase 3G: aarch64 port                  | not started                  | Needs 3B–3F (3D primitives are x86-only)                      |
+| Sub-phase 3H: PT-assisted recording         | not started                  | Needs Phase 6 PT capture                                      |
+| Sub-phase 3I: BugStalker driver integration | scaffold + DAP shipped       | Recorder primitives re-exported via driver; full `replayRecord` handler waits on the supervisor lifecycle wiring |
+| §"DAP integration"                          | shapes + handlers            | JSON wiring is the DAP server's concern (one `From` per type) |
+| §"Pure-Rust policy"                         | upheld                       | rkyv + lz4_flex + iced-x86; **zero C deps in Phase 5**        |
 
 ## Public API surface — quick reference
 
@@ -216,14 +216,27 @@ let resp = replayer.dap_timeline(&ReplayTimelineRequest::default())?;
 ## Test coverage
 
 ```text
+bs-syscall-spec        :  14 tests (macro-generated curated 31, build-time
+                                    long-tail 260+, sort/dedupe/contradiction
+                                    invariants)
+bs-syscall-macro       :   5 tests (DSL grammar coverage, reference shape,
+                                    subset membership)
 bs-replay              :   9 tests (ring orchestration, mock mechanism)
-bs-replay-engine       :  79 tests (format roundtrip × event variants,
+bs-replay-engine       :  79 + N tests (format roundtrip × event variants,
                                     validator, checkpoints, replay-seek,
-                                    event-cursor, properties × 5)
+                                    event-cursor, properties × 5,
+                                    syscall_capture × 13, plus Linux-only
+                                    seccomp/ptrace_driver/instrs/signals/
+                                    thread_sched suites)
 bs-replay-driver       :  45 tests (replayer, reverse, host, capture,
                                     DAP handlers, replay-doctor CLI)
                         ───
-                        133 / 133 green
+                        Darwin run: 165+ green (Linux-only modules
+                                    cfg-gated out)
+                        Linux run : superset including seccomp install
+                                    smoke, ptrace driver layout asserts,
+                                    PR_SET_TSC fork test, sched_setaffinity
+                                    round-trip
 ```
 
 Properties (proptest, 64 cases each):
