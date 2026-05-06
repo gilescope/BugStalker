@@ -12,19 +12,41 @@
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use lz4_flex::frame::FrameDecoder;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::vec::ArchivedVec;
 
 use super::checkpoint::{
-    checkpoint_path, parse_checkpoint_filename, Checkpoint, CheckpointIoError,
+    checkpoint_path, parse_checkpoint_filename, Checkpoint, CheckpointHeader, CheckpointIoError,
 };
 use super::event::{ArchivedEvent, Event};
 use super::manifest::{Manifest, ManifestParseError};
 use super::segment::{
     parse_segment_filename, ArchivedSegment, ArchivedSegmentHeader, Segment, MANIFEST_FILENAME,
 };
+
+/// Range info for one segment: where in the global event-index
+/// space its events live.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct SegmentRange {
+    /// Filename / SegmentHeader.index.
+    pub segment_index: u64,
+    /// Index of the first event stored in this segment, in the
+    /// global event-index space across the whole trace.
+    pub first_event_index: u64,
+    /// Number of events this segment carries.
+    pub event_count: u64,
+}
+
+impl SegmentRange {
+    /// Inclusive range `[first_event_index, first_event_index + event_count)`.
+    pub fn contains(&self, event_index: u64) -> bool {
+        event_index >= self.first_event_index
+            && event_index < self.first_event_index + self.event_count
+    }
+}
 
 /// Read-only handle to a trace directory.
 #[derive(Debug)]
@@ -33,6 +55,15 @@ pub struct TraceReader {
     manifest: Manifest,
     segments: Vec<u64>,
     checkpoints: Vec<u64>,
+    /// Lazily computed per-segment ranges. First call to
+    /// `segment_event_ranges()` decompresses every segment's header
+    /// and populates this; subsequent calls are O(1). `OnceLock`
+    /// not `OnceCell` so a `&TraceReader` shared across threads
+    /// stays `Sync`.
+    segment_ranges: OnceLock<Vec<SegmentRange>>,
+    /// Lazily-computed mirror of every checkpoint header. Same
+    /// pattern as `segment_ranges`.
+    checkpoint_headers: OnceLock<Vec<CheckpointHeader>>,
 }
 
 impl TraceReader {
@@ -76,7 +107,14 @@ impl TraceReader {
             debug_assert!(w[1] > w[0], "checkpoint indices not strict-monotonic");
         }
 
-        Ok(Self { dir, manifest, segments, checkpoints })
+        Ok(Self {
+            dir,
+            manifest,
+            segments,
+            checkpoints,
+            segment_ranges: OnceLock::new(),
+            checkpoint_headers: OnceLock::new(),
+        })
     }
 
     /// The trace's manifest. Cheap; pre-parsed at [`Self::open`].
@@ -92,6 +130,99 @@ impl TraceReader {
     /// Sorted checkpoint indices present in the trace.
     pub fn checkpoint_indices(&self) -> &[u64] {
         &self.checkpoints
+    }
+
+    /// Per-segment event-index ranges across the whole trace.
+    ///
+    /// Computed once lazily on first call (decompresses every
+    /// segment to read its header) and cached. Subsequent calls
+    /// are O(1).
+    pub fn segment_event_ranges(&self) -> Result<&[SegmentRange], TraceReadError> {
+        if let Some(ranges) = self.segment_ranges.get() {
+            return Ok(ranges);
+        }
+        let mut ranges = Vec::with_capacity(self.segments.len());
+        let mut next_event_index: u64 = 0;
+        for &idx in &self.segments {
+            let seg = self.open_segment(idx)?;
+            let header = seg.header()?;
+            let count = header.event_count.to_native();
+            ranges.push(SegmentRange {
+                segment_index: idx,
+                first_event_index: next_event_index,
+                event_count: count,
+            });
+            next_event_index = next_event_index
+                .checked_add(count)
+                .expect("event-index space overflow — trace exceeded u64 events");
+        }
+        // OnceLock::set fails harmlessly if another thread won the
+        // race; both populate identical contents.
+        let _ = self.segment_ranges.set(ranges);
+        Ok(self.segment_ranges.get().expect("just set"))
+    }
+
+    /// Locate the segment containing `event_index`. Returns
+    /// `(segment_index, offset_within_segment)`. `None` if the
+    /// requested event is past the end of the trace.
+    pub fn segment_for_event(
+        &self,
+        event_index: u64,
+    ) -> Result<Option<(u64, u64)>, TraceReadError> {
+        let ranges = self.segment_event_ranges()?;
+        // Binary search for the segment whose range contains
+        // `event_index`. Ranges are sorted by `first_event_index`
+        // and contiguous (each segment's first index = previous
+        // segment's first + count), so partition_point returns
+        // the segment-after; we walk one back.
+        let pos = ranges.partition_point(|r| r.first_event_index <= event_index);
+        if pos == 0 {
+            // event_index is below the first range — only possible
+            // if the trace is empty.
+            return Ok(None);
+        }
+        let r = &ranges[pos - 1];
+        if r.contains(event_index) {
+            Ok(Some((r.segment_index, event_index - r.first_event_index)))
+        } else {
+            // Past end of trace.
+            Ok(None)
+        }
+    }
+
+    /// Headers of every checkpoint. Same lazy/cached shape as
+    /// `segment_event_ranges`.
+    pub fn checkpoint_headers(&self) -> Result<&[CheckpointHeader], TraceReadError> {
+        if let Some(hs) = self.checkpoint_headers.get() {
+            return Ok(hs);
+        }
+        let mut hs = Vec::with_capacity(self.checkpoints.len());
+        for &idx in &self.checkpoints {
+            let cp = self.open_checkpoint(idx)?;
+            hs.push(cp.header.clone());
+        }
+        let _ = self.checkpoint_headers.set(hs);
+        Ok(self.checkpoint_headers.get().expect("just set"))
+    }
+
+    /// Find the latest checkpoint whose `event_index <=
+    /// target_event_index`. Returns `None` if no checkpoint
+    /// covers that target (i.e. all checkpoints are after the
+    /// target, so replay would have to walk from event 0).
+    pub fn find_checkpoint_at_or_before(
+        &self,
+        target_event_index: u64,
+    ) -> Result<Option<CheckpointHeader>, TraceReadError> {
+        let headers = self.checkpoint_headers()?;
+        // Binary-search for the right-most header with
+        // event_index <= target. partition_point puts the dividing
+        // line one *past* the last qualifying entry.
+        let pos = headers.partition_point(|h| h.event_index <= target_event_index);
+        if pos == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(headers[pos - 1].clone()))
+        }
     }
 
     /// Read checkpoint `idx` from disk. Validates the header's

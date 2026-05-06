@@ -28,7 +28,7 @@ pub use checkpoint::{Checkpoint, CheckpointHeader, CheckpointIoError};
 pub use event::Event;
 pub use manifest::{Manifest, ManifestParseError};
 pub use segment::{Segment, SegmentHeader};
-pub use trace_reader::{SegmentReader, TraceReadError, TraceReader};
+pub use trace_reader::{SegmentRange, SegmentReader, TraceReadError, TraceReader};
 pub use trace_writer::{DEFAULT_SEGMENT_SIZE_BYTES, TraceWriteError, TraceWriter};
 pub use validator::{validate, Diag, DiagKind, Severity, ValidationReport};
 pub use version::{FormatVersion, MAX_SUPPORTED_FORMAT_VERSION, TRACE_MAGIC};
