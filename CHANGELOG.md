@@ -7,6 +7,83 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 — full record→replay pipeline,
+  user-facing CLIs, architecture correction):
+  - `record_program(trace_dir, manifest, argv, envp, options)`
+    in `bs-replay-driver` (step 70). One-call recorder entry
+    point composing TraceWriter, RecordChild, ProcMemReader,
+    and the supervisor loop. Returns `RecordReport
+    { syscall_events, signal_events, instruction_traps,
+    iterations, exit_status }` with `ExitStatus::Exited |
+    Signalled | IterationCap`.
+  - PTRACE-only recorder + signal-stop dispatcher (step 71).
+    `bs-replay-engine::record::linux::record_session` —
+    `spawn_recorded_child(argv, envp)` does fork +
+    PTRACE_TRACEME + PTRACE_SETOPTIONS (no seccomp filter on
+    the record path; the NOTIF design that step 7b used is
+    incompatible with PTRACE_O_TRACESYSCALL — `seccomp_unotify(2)`
+    is explicit that NOTIF suppresses the matching syscall
+    stops, which would have made the entry-args-only recorder
+    deadlock on real Linux). The new `step_until_event` is a
+    state machine that handles syscall-entry → syscall-exit
+    pairs (Event::Syscall via merge_pre_post),
+    SIGSEGV/SIGILL at a classified instruction
+    (Event::InstructionTrap with synthesised result vector +
+    RIP advance via PTRACE_SETREGS), arbitrary signal-delivery
+    (Event::Signal with PTRACE_GETSIGINFO + redelivery on next
+    step), exit/signalled (terminal), and ptrace events
+    (PassThrough). `record_to_completion(child, …, max_steps)`
+    drives the loop and returns per-event counts.
+  - End-to-end record→replay determinism test (step 72).
+    `crates/bs-replay-driver/tests/round_trip.rs`: record
+    /bin/true via record_program; for every Event::Syscall in
+    the trace, decode the captured-output blob, build a
+    synthetic SeccompNotif, apply through the 3C replay shim
+    against a MockMemoryWriter, assert no SyscallMismatch +
+    ReplayResponse.result matches recorded + every
+    OutBuf/CatchAll region produced a writer.write call.
+    Fails loud if the trace still carries
+    RESULT_NOT_CAPTURED_YET sentinels (would mean step 71
+    regressed).
+  - `replay-record [OPTIONS] <TRACE_DIR> -- <PROGRAM> [ARG ...]`
+    CLI binary (step 73). Hand-rolled arg parser, `--`
+    separator. Records the program's syscalls into a fresh
+    trace dir. Cross-platform `--help`; Linux-only at the
+    functional level. Exit codes: 0 OK, 1 recorder error, 2
+    argv parse, 3 platform skip, >0 echoes tracee's exit code.
+  - `replay_program(trace_dir, argv, envp, options)` in
+    `bs-replay-driver` (step 74). The high-level *replay*
+    entry point: opens the trace, spawns a fresh
+    NOTIF-trapped child via `spawn_replay_child`
+    (`bs-replay-engine::replay::linux::replay_child`), drives
+    `recv_notif → walk-trace-to-next-Syscall →
+    apply_recorded_event → respond_intercept` until the
+    tracee exits or the trace is exhausted. SCM_RIGHTS
+    plumbing reused from step 64 (`record_child::send_fd /
+    recv_fd` made `pub(crate)`). Returns `ReplayReport
+    { syscalls_applied, signals_skipped,
+    instruction_traps_skipped, iterations, bytes_written, exit }`
+    with `ReplayExit::Exited | Signalled | TraceExhausted |
+    ShimRefused | IterationCap`. `ShimRefusedReason` classifies
+    the four shim error variants (Mismatch, ResultNotCaptured,
+    Decode, UnsupportedEvent) for clean diagnostic display.
+    Signal/InstructionTrap events in the trace are *counted but
+    skipped* — their replay needs cross-process
+    PTRACE_SETSIGINFO + RIP rewrite, queued as a follow-up.
+  - `replay-load [OPTIONS] <TRACE_DIR> -- <PROGRAM> [ARG ...]`
+    CLI binary (step 75). Symmetric peer of `replay-record`.
+    Drives `replay_program`. Same arg-parser shape, same
+    cross-platform `--help`, same exit-code conventions.
+  - Bidirectional record→replay smoke test (step 76).
+    `crates/bs-replay-driver/tests/bidirectional.rs`. Linux-
+    only. Records /bin/true, then replays the trace against a
+    fresh /bin/true via `replay_program`. Lenient on the
+    end-state because real programs aren't deterministic
+    without 3D vDSO patching, 3F single-CPU pinning, and ASLR
+    off (a `ShimRefused(Mismatch)` is logged but doesn't
+    panic). The one state that *does* panic is
+    `ShimRefused(ResultNotCaptured)` — would mean the
+    recorder regressed to entry-args-only mode.
 - time-travel (Phase 5 sub-phases 3B step 7b → 3D follow-up,
   Tier 2 Darwin, 3G prep — recorder lifecycle & cross-platform
   reach):

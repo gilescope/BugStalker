@@ -156,16 +156,16 @@ let resp = replayer.dap_timeline(&ReplayTimelineRequest::default())?;
 | ------------------------------------------- | ---------------------------- | ------------------------------------------------------------- |
 | §"Tier 1 — Intel PT reverse step"           | navigation shipped           | Display ("at src/handler.rs:42") needs Phase 6 PT capture     |
 | §"Tier 2 — Checkpoint-based replay"         | Linux + Darwin shipped       | Linux fork(2) + Darwin mach_vm_remap-style capture/restore both functional |
-| §"Tier 3 — Clean-room record-and-replay"    | recorder lifecycle shipped   | RecordChild fork+exec+SCM_RIGHTS handover + smoke test wired  |
+| §"Tier 3 — Clean-room record-and-replay"    | full record→replay shipped   | record_program + replay_program + replay-record + replay-load CLIs end-to-end |
 | Sub-phase 3A: trace format                  | shipped                      | manifest, segments, checkpoints, validator, properties        |
-| Sub-phase 3B: syscall record                | macro-driven + result capture | Steps 53–57: curated 31 + long-tail ~260 + catch-all + seccomp install + entry-args ptrace driver. Step 63: PTRACE_GETREGS exit-stop result capture (replaces RESULT_NOT_CAPTURED_YET sentinel). Step 64: RecordChild lifecycle. Step 65: smoke test. |
-| Sub-phase 3C: replay                        | shim shipped                 | apply_recorded_event + mismatch detector + ProcMemWriter      |
-| Sub-phase 3D: non-deterministic instrs      | recorder + vDSO detector     | set_tsc_trap + iced-x86 classify + event_for_instruction_trap. Step 67: vDSO entry-point detector (find_vdso_range, scan_vdso_exports, patch_payload_x86_64). |
-| Sub-phase 3E: signals                       | record/replay primitives     | SignalCapture + SignalReplayPlan + length validation tripwire |
+| Sub-phase 3B: syscall record                | PTRACE-only architecture     | Step 71 corrects the NOTIF+TRACESYSCALL deadlock by switching record to PTRACE-only (NOTIF stays for replay). step_until_event handles syscall + signal + instruction-trap + ptrace-event stops as one event-loop. record_program in driver. |
+| Sub-phase 3C: replay                        | full replay path shipped     | shim + replay_child (NOTIF + SCM_RIGHTS handover) + replay_program in driver + replay-load CLI + bidirectional smoke test |
+| Sub-phase 3D: non-deterministic instrs      | recorder dispatcher          | step_until_event emits Event::InstructionTrap on SIGSEGV/SIGILL at a classified PC; advances RIP past the trap; vDSO detector lands but cross-process patcher TODO |
+| Sub-phase 3E: signals                       | recorder dispatcher          | step_until_event emits Event::Signal on SignalDelivery via PTRACE_GETSIGINFO; queues redelivery; replay-side PTRACE_SETSIGINFO is the next focused commit |
 | Sub-phase 3F: multi-thread serialisation    | single-CPU pin shipped       | PMU-based instr-retired counts wait on 3H PT integration      |
 | Sub-phase 3G: aarch64 port                  | syscall table shipped        | data/syscall_aarch64.tbl + dual-arch dispatch via Arch enum   |
 | Sub-phase 3H: PT-assisted recording         | not started                  | Needs Phase 6 PT capture                                      |
-| Sub-phase 3I: BugStalker driver integration | scaffold + DAP shipped       | Recorder primitives re-exported via driver; full `replayRecord` handler waits on the supervisor lifecycle wiring |
+| Sub-phase 3I: BugStalker driver integration | full pipeline + 2 CLIs       | record_program / replay_program + replay-record + replay-load + replay-doctor binaries. DAP shapes still pending JSON wiring. |
 | §"DAP integration"                          | shapes + handlers            | JSON wiring is the DAP server's concern (one `From` per type) |
 | §"Pure-Rust policy"                         | upheld                       | rkyv + lz4_flex + iced-x86 + object; **zero C deps in Phase 5** |
 
