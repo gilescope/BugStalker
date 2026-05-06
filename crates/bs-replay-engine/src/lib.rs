@@ -45,3 +45,8 @@ pub mod driver;
 pub mod format;
 pub mod record;
 pub mod replay;
+
+/// Crate version string. Stamped into the manifest's
+/// `engine_version` field at write time so a trace records which
+/// engine produced it.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
