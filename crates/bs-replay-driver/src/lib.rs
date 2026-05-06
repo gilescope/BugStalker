@@ -82,6 +82,11 @@ pub mod record_primitives {
             current_affinity_for_self, pin_to_single_cpu_for_self, AffinityError,
             AffinityMask, SingleCpuPin,
         },
+        vdso_patch::{
+            find_vdso_range, find_vdso_range_for_self, read_proc_maps,
+            read_proc_maps_for_self, scan_vdso_exports, syscall_nr_for_vdso,
+            ProcMapping, VdsoScanError, VdsoSymbol, VDSO_TARGET_SYMBOLS,
+        },
     };
 }
 

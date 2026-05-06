@@ -69,3 +69,8 @@ iced-x86 = { version = "1.21", default-features = false, features = [
     "decoder",
     "intel",
 ] }
+# ELF parsing for the vDSO entry-point detector (sub-phase 3D
+# follow-up). The workspace pins object 0.32 with default
+# features; we mirror the version exactly to keep the lockfile
+# single-resolved.
+object = "0.32.2"

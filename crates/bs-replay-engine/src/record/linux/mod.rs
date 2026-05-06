@@ -19,3 +19,4 @@ pub mod record_child;
 pub mod seccomp;
 pub mod signals;
 pub mod thread_sched;
+pub mod vdso_patch;
