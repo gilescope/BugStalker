@@ -327,6 +327,56 @@ mod tests {
     }
 
     #[test]
+    fn ptrace_read_recovers_known_bytes_from_seized_child() {
+        // Magic in the parent's `.data` (well, RO data — same
+        // story: lives at a fixed address shared by parent and
+        // child after fork). After SEIZE, ptrace::read at that
+        // address returns the same bytes verbatim. Validates the
+        // foundation for breakpoint-setting (write the trap
+        // instruction at the target PC) and post-stop state
+        // inspection.
+        const MAGIC: [u8; 8] = [
+            0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
+        ];
+
+        let mut mech = LinuxForkSelfMechanism::new();
+        let h = mech.take(0).expect("fork failed");
+        sleep(Duration::from_millis(50));
+        match mech.seize(&h) {
+            Ok(()) => {}
+            Err(e) => {
+                let s = format!("{e:?}");
+                if s.contains("EPERM") {
+                    eprintln!(
+                        "skipping ptrace_read test: YAMA blocks self-trace ({e:?})",
+                    );
+                    mech.kill(h).expect("kill failed");
+                    return;
+                }
+                panic!("seize failed: {e:?}");
+            }
+        }
+
+        // PTRACE_PEEKDATA reads one machine word; on x86_64 that's
+        // 8 bytes. Cast to *mut c_void since the nix API takes
+        // an address as a void pointer.
+        let addr = MAGIC.as_ptr() as *mut std::ffi::c_void;
+        let word: i64 =
+            nix::sys::ptrace::read(h.pid, addr).expect("ptrace::read failed");
+        // Compare to the parent's view by reinterpreting the
+        // word's bytes — same architecture endianness on both
+        // sides since parent + child are the same kernel binary.
+        let bytes = word.to_ne_bytes();
+        assert_eq!(
+            bytes, MAGIC,
+            "ptrace::read returned {:02x?} for MAGIC at {:p}; expected {:02x?}",
+            bytes, MAGIC.as_ptr(), MAGIC,
+        );
+
+        mech.kill(h).expect("kill failed");
+    }
+
+    #[test]
     fn seize_then_cont_lets_child_run_to_natural_exit() {
         // The fork_self child does `raise(SIGSTOP); exit(0)`.
         // After ptrace SEIZE + CONT, the child returns from
