@@ -11,3 +11,8 @@ description = "BugStalker time-travel — sub-phase 3I integration seam between 
 thiserror.workspace = true
 tracing.workspace = true
 bs-replay-engine = { path = "../bs-replay-engine" }
+
+# Small support CLI — see crate-level docs.
+[[bin]]
+name = "replay-doctor"
+path = "src/bin/replay-doctor.rs"
