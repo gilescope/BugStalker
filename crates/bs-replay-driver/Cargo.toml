@@ -16,6 +16,12 @@ bs-replay-engine = { path = "../bs-replay-engine" }
 # implementation detail of the driver — the engine never sees it.
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 
+# Darwin host_features() probes hw.optional.* via sysctlbyname.
+# libc gives us the FFI bindings; the curated key list is in
+# src/host.rs. Linux uses /proc/cpuinfo (std::fs).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 # Small support CLI — see crate-level docs.
 [[bin]]
 name = "replay-doctor"

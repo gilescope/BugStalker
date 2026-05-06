@@ -7,11 +7,14 @@
 //! lists for the host CPU. Each token is one feature name (e.g.
 //! `sse2`, `neon`, `aes`).
 //!
-//! Other OSes return [`HostDetectError::Unsupported`]; the
-//! Darwin path (selected `sysctl hw.optional.*` entries via
-//! `sysctlbyname`) lands in a later iteration when there's a real
-//! macOS consumer asking for it. Callers that already know their
-//! host features can side-step this and supply them directly to
+//! Darwin: probes a curated list of `hw.optional.*` `sysctlbyname`
+//! keys covering both Apple Silicon (neon, arm64, armv8_*) and
+//! Intel-mac (sse2, sse4_2, avx1_0, avx2_0) feature surfaces.
+//! Reports the keys whose value is `1`.
+//!
+//! Other OSes return [`HostDetectError::Unsupported`]. Callers that
+//! already know their host features can side-step this entirely
+//! and supply them directly to
 //! [`crate::TraceReplayer::check_host_compatibility`].
 
 #[cfg(target_os = "linux")]
@@ -31,14 +34,90 @@ fn detect() -> Result<Vec<String>, HostDetectError> {
     Ok(parse_cpuinfo(&text))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn detect() -> Result<Vec<String>, HostDetectError> {
+    Ok(darwin::probe_hw_optional())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn detect() -> Result<Vec<String>, HostDetectError> {
     Err(HostDetectError::Unsupported(format!(
         "host_features() not implemented on {os}; \
-         supply features directly to check_host_compatibility \
-         (e.g. via sysctl hw.optional.* on Darwin)",
+         supply features directly to check_host_compatibility",
         os = std::env::consts::OS,
     )))
+}
+
+#[cfg(target_os = "macos")]
+mod darwin {
+    use std::ffi::CString;
+
+    /// `(canonical_name, sysctl_key)` for the curated probe set.
+    /// Names match the Linux `/proc/cpuinfo` flag where one exists
+    /// so a recording made on Linux can replay on macOS (or vice
+    /// versa) without a feature-name translation table.
+    const CANDIDATES: &[(&str, &str)] = &[
+        // Apple Silicon (aarch64) — `hw.optional.*` keys per
+        // Apple's documented sysctl interface.
+        ("neon", "hw.optional.neon"),
+        ("arm64", "hw.optional.arm64"),
+        ("fp", "hw.optional.floatingpoint"),
+        ("armv8_1_atomics", "hw.optional.armv8_1_atomics"),
+        ("armv8_crc32", "hw.optional.armv8_crc32"),
+        ("armv8_2_fhm", "hw.optional.armv8_2_fhm"),
+        ("armv8_2_sha512", "hw.optional.armv8_2_sha512"),
+        ("armv8_2_sha3", "hw.optional.armv8_2_sha3"),
+        // Intel-mac.
+        ("sse2", "hw.optional.sse2"),
+        ("sse3", "hw.optional.sse3"),
+        ("ssse3", "hw.optional.supplementalsse3"),
+        ("sse4_1", "hw.optional.sse4_1"),
+        ("sse4_2", "hw.optional.sse4_2"),
+        ("avx1_0", "hw.optional.avx1_0"),
+        ("avx2_0", "hw.optional.avx2_0"),
+        ("aes", "hw.optional.aes"),
+    ];
+
+    pub(super) fn probe_hw_optional() -> Vec<String> {
+        let mut out = Vec::new();
+        for &(name, key) in CANDIDATES {
+            if sysctl_int(key) == Some(1) {
+                out.push(name.to_owned());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Read a sysctl entry that returns a single `int`. `None` if
+    /// the key doesn't exist or the call fails for any reason —
+    /// the caller treats absence as "feature not present" which is
+    /// the correct conservative behaviour for replay-host checks.
+    fn sysctl_int(key: &str) -> Option<i32> {
+        let c_key = CString::new(key).ok()?;
+        let mut value: libc::c_int = 0;
+        let mut size: libc::size_t = std::mem::size_of::<libc::c_int>();
+        // SAFETY: c_key is null-terminated; size is initialised to
+        // sizeof(c_int) and the buffer points at a valid c_int.
+        // sysctlbyname writes at most `size` bytes and updates
+        // `size` to bytes written. Failure returns -1 and we drop
+        // the (possibly partial) read.
+        let r = unsafe {
+            libc::sysctlbyname(
+                c_key.as_ptr(),
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r == 0 && size == std::mem::size_of::<libc::c_int>() {
+            Some(value)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -145,14 +224,37 @@ bogomips    : 4800
         assert!(!feats.is_empty(), "expected at least one CPU feature");
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     #[test]
-    fn host_features_on_non_linux_reports_unsupported() {
+    fn host_features_on_macos_returns_some_known_feature() {
+        // Every Mac (Apple Silicon or Intel) advertises *something*
+        // in hw.optional.*. On Apple Silicon we expect at least
+        // `arm64` + `neon`; on Intel we expect at least `sse2`.
+        // Either way the result must be non-empty.
+        let feats = host_features().unwrap();
+        assert!(!feats.is_empty(), "expected at least one CPU feature");
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(
+                feats.iter().any(|f| f == "arm64") || feats.iter().any(|f| f == "neon"),
+                "Apple Silicon should report arm64 or neon, got: {feats:?}",
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(
+                feats.iter().any(|f| f == "sse2"),
+                "Intel mac should report sse2, got: {feats:?}",
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn host_features_on_other_os_reports_unsupported() {
         let err = host_features().unwrap_err();
         match err {
             HostDetectError::Unsupported(msg) => {
-                // Message names the OS so the caller knows what to
-                // implement next.
                 assert!(
                     msg.contains(std::env::consts::OS),
                     "expected OS name in Unsupported message, got: {msg}",
