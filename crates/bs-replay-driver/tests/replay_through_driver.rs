@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: MIT
+//! End-to-end integration: write a trace via the engine, drive
+//! replay through the driver, assert the seen event sequence is
+//! identical. This is the smallest meaningful test of the
+//! integration seam — the engine and the driver agree on the
+//! contract.
+
+use std::fs;
+use std::path::PathBuf;
+
+use bs_replay_driver::engine::format::event::Event;
+use bs_replay_driver::engine::format::manifest::Manifest;
+use bs_replay_driver::engine::format::version::FormatVersion;
+use bs_replay_driver::engine::format::TraceWriter;
+use bs_replay_driver::TraceReplayer;
+
+fn manifest() -> Manifest {
+    Manifest {
+        format_version: FormatVersion::V1,
+        build_id: "deadbeef".repeat(8),
+        kernel_release: "test".to_owned(),
+        cpu_features: vec!["sse2".into()],
+        engine_version: env!("CARGO_PKG_VERSION").to_owned(),
+        initial_env: vec![],
+        initial_cwd: "/tmp".to_owned(),
+        initial_args: vec![],
+    }
+}
+
+fn temp_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "bs-replay-driver-{label}-{}",
+        std::process::id(),
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    dir
+}
+
+fn marker_tag(ev: &Event) -> u32 {
+    match ev {
+        Event::Marker { tag, .. } => *tag,
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn driver_walks_full_trace_in_record_order() {
+    let dir = temp_dir("walk");
+    {
+        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        for i in 0..15u32 {
+            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+            if i == 4 || i == 9 {
+                writer.rotate().unwrap();
+            }
+        }
+        writer.finish().unwrap();
+    }
+    let mut replayer = TraceReplayer::open(&dir).unwrap();
+    assert_eq!(replayer.position(), 0);
+    let mut tags = Vec::new();
+    while let Some(ev) = replayer.next_event().unwrap() {
+        tags.push(marker_tag(&ev));
+    }
+    assert_eq!(tags, (0..15u32).collect::<Vec<_>>());
+    assert_eq!(replayer.position(), 15);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn driver_seek_to_jumps_without_yielding() {
+    let dir = temp_dir("seek");
+    {
+        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        for i in 0..10u32 {
+            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let mut replayer = TraceReplayer::open(&dir).unwrap();
+    replayer.seek_to(7);
+    let ev = replayer.next_event().unwrap().unwrap();
+    assert_eq!(marker_tag(&ev), 7);
+    assert_eq!(replayer.position(), 8);
+    // Past-end seek lets next_event return None cleanly.
+    replayer.seek_to(100);
+    assert!(replayer.next_event().unwrap().is_none());
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn driver_finds_checkpoint_at_or_before_target() {
+    let dir = temp_dir("checkpoint");
+    {
+        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        for i in 0..3u32 {
+            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        }
+        writer.take_checkpoint(b"snap-A".to_vec()).unwrap();
+        for i in 3..8u32 {
+            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        }
+        writer.take_checkpoint(b"snap-B".to_vec()).unwrap();
+        writer.finish().unwrap();
+    }
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    let h = replayer.find_checkpoint_at_or_before(0).unwrap();
+    assert!(h.is_none(), "no checkpoint covers event 0");
+    let h = replayer.find_checkpoint_at_or_before(3).unwrap().unwrap();
+    assert_eq!(h.index, 1);
+    let h = replayer.find_checkpoint_at_or_before(50).unwrap().unwrap();
+    assert_eq!(h.index, 2, "latest checkpoint wins");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn driver_position_advances_per_next_event_only() {
+    let dir = temp_dir("position");
+    {
+        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer.finish().unwrap();
+    }
+    let mut replayer = TraceReplayer::open(&dir).unwrap();
+    assert_eq!(replayer.position(), 0);
+    replayer.next_event().unwrap();
+    assert_eq!(replayer.position(), 1);
+    // next_event past end does NOT bump the counter.
+    replayer.seek_to(99);
+    assert_eq!(replayer.position(), 99);
+    let _ = replayer.next_event().unwrap();
+    assert_eq!(replayer.position(), 99, "past-end next() must not advance");
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn driver_exposes_underlying_reader_for_advanced_queries() {
+    let dir = temp_dir("reader-borrow");
+    {
+        let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
+        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+        writer.rotate().unwrap();
+        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer.finish().unwrap();
+    }
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    assert_eq!(replayer.reader().segment_indices(), &[1, 2]);
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn driver_manifest_round_trips_through_open() {
+    let dir = temp_dir("manifest");
+    let m = manifest();
+    {
+        let writer = TraceWriter::create(&dir, &m).unwrap();
+        writer.finish().unwrap();
+    }
+    let replayer = TraceReplayer::open(&dir).unwrap();
+    assert_eq!(replayer.manifest().build_id, m.build_id);
+    assert_eq!(replayer.manifest().format_version, FormatVersion::V1);
+    fs::remove_dir_all(&dir).ok();
+}
