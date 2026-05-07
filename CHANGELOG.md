@@ -7,6 +7,87 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 — DAP record handler + aarch64 vDSO
+  trampoline + CPUID-input-aware synthesis):
+  - `bs/replayRecord` DAP handler (step 108). The type-only
+    stub at `crates/bs-replay-driver/src/dap.rs:135` becomes a
+    real Linux handler wrapping `record_program`. The wire
+    shape carries `argv`, `envp`, `build_id`, `kernel_label`,
+    and `options` (mirroring `RecordOptions`); the response
+    reports per-event counts plus an `ExitKind` enum
+    (`Exited` / `Signalled` / `IterationCap`). Validation runs
+    as a pure-Rust pre-flight: `EmptyArgv`, `ArgvNul`, `EnvNul`,
+    `EnvKeyContainsEquals` — all exercised by inline tests
+    plus an end-to-end round-trip that records `/bin/true`
+    through the handler. Off-Linux: the shapes are still
+    unconditionally exported so DAP servers compiled on
+    Darwin can represent the request and return their own
+    "not supported on this platform" error. Closes the last
+    "stub" item in sub-phase 3I.
+  - aarch64 vDSO trampoline payload (step 109).
+    `patch_payload_aarch64(syscall_nr) → [u8; 12]` emits three
+    32-bit instructions (`MOVZ X8, #imm16` + `SVC #0` +
+    `RET`), enough to redirect every vDSO-replaced syscall
+    into the kernel — a single MOVZ covers the Linux generic
+    syscall numbering (highest is `gettimeofday = 169`) and a
+    `debug_assert` guards the constraint. aarch64 vDSO export
+    names use `__kernel_*` (`arch/arm64/kernel/vdso/vdso.lds.S`)
+    distinct from x86_64's `__vdso_*`; both name families
+    coexist in `VDSO_TARGET_SYMBOLS` and `syscall_nr_for_vdso`
+    is now arch-conditional with off-arch names returning
+    `None`. `__kernel_rt_sigreturn` is deliberately omitted —
+    patching it would break signal delivery.
+    `apply_vdso_trampolines` is no longer x86_64-gated; it
+    selects the per-arch payload internally and is exposed on
+    both Linux/x86_64 and Linux/aarch64. The driver crate's
+    `record.rs` and the convenience re-export in `lib.rs` were
+    widened to match. Six new unit tests cover payload
+    bit-packing, zero-immediate edge case, and the per-arch
+    name → syscall-number mapping (off-arch names always
+    return `None`).
+  - CPUID-input-aware synthesis (step 110). Step 106 wired
+    the `ARCH_SET_CPUID = 0` trigger but the recorder still
+    answered every trapped CPUID with four zero registers —
+    libc/openssl startup probes saw "no features at all" and
+    crashed, making `--disable-cpuid` effectively unusable on
+    real programs. This step closes that loop. New
+    `pub fn cpuid_synthesised(input_eax, input_ecx) → [u32; 4]`
+    runs native CPUID with the trapped tracee's `(eax, ecx)`
+    inputs and applies two feature-bit masks before returning
+    the four output registers: leaf 1 ECX bit 30 (RDRAND) and
+    leaf 7 sub-leaf 0 EBX bit 18 (RDSEED). Mask is essential —
+    with `ARCH_SET_CPUID` set, the tracee's CPUID is
+    intercepted but RDRAND/RDSEED themselves are not, so they
+    execute natively and produce non-deterministic bytes the
+    replay can't reproduce. Lying about feature availability
+    forces libc/openssl down the syscall-based getrandom() /
+    getentropy() path (which the seccomp recorder already
+    observes); the same lie is told to record and replay.
+    `record_session.rs` gains
+    `synthesise_cpuid_result_at_regs(&UserRegsX86_64)` which
+    extracts `(rax, rcx)` from the trapped saved registers,
+    calls `cpuid_synthesised`, and packs the four outputs
+    into the result vector; `handle_signal_delivery`
+    dispatches CPUID through the new helper while other
+    instruction kinds keep the dest-id path. The `--disable-cpuid`
+    doc-comment loses its "WARNING: enabling this without
+    recorder-side CPUID synthesis can crash the tracee"
+    caveat — the flag is now opt-in for validation breadth,
+    not for safety. Five new x86_64-only tests cover the
+    leaf-0 vendor string, the two feature masks, an
+    untouched-leaf invariant, and an active-stripping check
+    that runs only on hosts which actually advertise RDRAND.
+- bytehound integration plan (Phase 10).
+  `doc/plans/phase-10-bytehound-integration.md` — 13-week
+  plan, three-tier (post-mortem `.dat` replay, live preload
+  attach, time-travel splice with Phase 5). Cross-platform
+  from day one — Linux is the primary target, Darwin is
+  co-equal. Tier 1 works on Darwin against Linux-recorded
+  files the day this ships; Tiers 2/3 on Darwin gate on
+  bytehound's upstream macOS port. `bs-heap` stays pure
+  Rust; bytehound is an external runtime, same relationship
+  Phase 5 has with rr. Cross-references Phase 5 (timeline
+  splice) and Phase 6 (combined gutter overlay).
 - time-travel (Phase 5 — aarch64-linux cross-compile + CPUID
   trap):
   - bs-replay's `proc_regs` Tier 2 register restore ported to
