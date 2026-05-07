@@ -7,6 +7,56 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 — PC-precise replay + dest-register
+  fidelity + aarch64 prep):
+  - PC-precise signal replay (step 100). Bounded single-step
+    rendezvous: the supervisor now reads the tracee's RIP and,
+    if it's behind the recorded delivery PC, single-steps via
+    `PTRACE_SINGLESTEP` (up to 64 instructions) until they
+    match — then PTRACE_SETSIGINFO + PTRACE_CONT(sig) lands
+    the signal at the recorded PC. Falls back to deliver-at-
+    current-PC on `AbortedSyscall` (listener fd became
+    readable mid-step), `AbortedStop` (got SIGSEGV from an
+    instruction trap), `PastIt` (RIP already past target),
+    `CapHit`, or `TraceeGone`. Listener-readability check
+    before each step prevents seccomp-NOTIF deadlock.
+    `bs-replay-engine::record::linux::exit_stop::ptrace_singlestep`
+    is the new wrapper. `ReplayReport` gains
+    `signals_pc_precise` (strict subset of `signals_delivered`).
+  - RDRAND/RDSEED dest register capture (step 101).
+    `instrs::classify_at_pc_full` returns the destination
+    register's stable id (0..=15 for RAX..R15) along with the
+    InstrKind. Recorder writes the id as a 3rd word in
+    `Event::InstructionTrap.result` for RDRAND/RDSEED. Replay
+    decodes it and writes the recorded value to the right
+    `UserRegsX86_64` field. Backwards-compatible: traces
+    predating step 101 with two-element results decode to
+    dest_id = 0 (RAX), matching the pre-fix default.
+  - aarch64 user_regs + call_frame extraction (step 102).
+    `bs-replay-engine::record::linux::regs_aarch64` —
+    `UserRegsAarch64 { regs[31], sp, pc, pstate }` (272 B,
+    layout-asserted), `get_regs_aarch64 / set_regs_aarch64`
+    via `PTRACE_GETREGSET + NT_PRSTATUS + iovec`,
+    `call_frame_from_regs` (nr ← x8, args ← x0..x5),
+    `result_register` (sign-extend x0). Off-arch builds get
+    `ENOSYS`-returning stubs so cross-arch dispatch can
+    compile.
+  - record_session arch dispatch (step 103). Compile-time
+    `Regs` type alias + helpers (`read_regs / write_regs /
+    frame_from / result_from / pc_of / set_pc`). step_until_event
+    uses them exclusively; the instruction-trap branch stays
+    cfg(target_arch = "x86_64"). Linux build hygiene fixes:
+    `exit_stop::record_syscall_with_exit` (legacy NOTIF path),
+    `get_regs`, `set_regs` are now cfg-gated to x86_64;
+    `record_session::SpawnError` defined in-file (was
+    referenced but never declared — latent since step 71; only
+    Darwin-cfg-gated builds compiled before);
+    `From<ExitStopError>` arms fixed (drop bogus `Recv`
+    variant); `vdso_patch::peekdata` uses `__errno_location`
+    on Linux (was Darwin's `__error`); `scan_vdso_exports`
+    uses object 0.32's `raw_header` (was non-existent
+    `elf_header`). Result: `bs-replay-engine` cross-compiles
+    cleanly to aarch64-unknown-linux-gnu (was 14 errors).
 - time-travel (Phase 5 — replay-side ptrace surface):
   - `spawn_replay_child` opts into `PTRACE_SEIZE` (step 94).
     `ReplaySpawnOptions { ptrace_attach: bool }`. After SCM_RIGHTS
