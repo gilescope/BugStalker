@@ -106,7 +106,7 @@ pub struct ReplayOptions {
     /// [`crate::record::RecordOptions`] for symmetry.
     pub max_iterations: u64,
     /// If true, PTRACE_SEIZE the replay tracee at spawn so the
-    /// supervisor has authority to PTRACE_SETSIGINFO (PC-
+    /// supervisor has authority to PTRACE_SETSIGINFO (content-
     /// precise signal replay), PTRACE_SETREGS (instruction-
     /// trap replay), and PTRACE_POKEDATA (cross-process vDSO
     /// patching). Replay loop multiplexes the listener fd
@@ -114,6 +114,14 @@ pub struct ReplayOptions {
     /// Default `false` — current shipping behaviour preserved
     /// for callers who don't need the extra ptrace channel.
     pub ptrace_attach: bool,
+    /// If true, patch the replay tracee's vDSO at startup so
+    /// libc's gettimeofday/clock_gettime/time/getcpu fast paths
+    /// route through real syscalls — matching what the recorder
+    /// captured (provided the recording also had
+    /// `RecordOptions::patch_vdso = true`). Implies
+    /// `ptrace_attach = true` since the patcher uses
+    /// `PTRACE_POKEDATA`. Default `false`.
+    pub patch_vdso: bool,
 }
 
 impl Default for ReplayOptions {
@@ -121,6 +129,7 @@ impl Default for ReplayOptions {
         Self {
             max_iterations: 2_000_000,
             ptrace_attach: false,
+            patch_vdso: false,
         }
     }
 }
@@ -156,7 +165,8 @@ pub fn replay_program(
     options: ReplayOptions,
 ) -> Result<ReplayReport, ReplayProgramError> {
     let reader = TraceReader::open(&trace_dir)?;
-    let child = if options.ptrace_attach {
+    let need_ptrace = options.ptrace_attach || options.patch_vdso;
+    let child = if need_ptrace {
         spawn_replay_child_with(
             argv,
             envp,
@@ -167,6 +177,33 @@ pub fn replay_program(
     };
     let pid = child.pid();
     let mut writer = ProcMemWriter::new(pid);
+
+    if options.patch_vdso && child.is_ptraced() {
+        // The vDSO patcher runs from the supervisor side via
+        // PTRACE_POKEDATA; tracee must be ptraced. Errors are
+        // soft-fail (log + continue) — patching is opt-in and
+        // a missing patch only means time-related calls won't
+        // route through the recorder, not that replay breaks.
+        match bs_replay_engine::record::linux::vdso_patch::scan_remote_vdso(pid) {
+            Ok(symbols) if !symbols.is_empty() => {
+                if let Err(e) =
+                    bs_replay_engine::record::linux::vdso_patch::apply_vdso_trampolines(
+                        pid, &symbols,
+                    )
+                {
+                    tracing::warn!(
+                        "replay_program: vDSO patch failed (non-fatal): {e}"
+                    );
+                }
+            }
+            Ok(_) => {} // no symbols — host kernel without vDSO
+            Err(e) => {
+                tracing::warn!(
+                    "replay_program: vDSO scan failed (non-fatal): {e}"
+                );
+            }
+        }
+    }
     let listener_fd = std::os::fd::AsRawFd::as_raw_fd(&child.listener());
     let ptraced = child.is_ptraced();
 

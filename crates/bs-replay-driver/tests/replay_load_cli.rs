@@ -47,6 +47,15 @@ fn help_long_flag_prints_usage_and_exits_zero() {
         stdout.contains("--inherit-args"),
         "missing --inherit-args in help: {stdout}",
     );
+    // Ptrace + vDSO patch flags too.
+    assert!(
+        stdout.contains("--ptrace-attach"),
+        "missing --ptrace-attach in help: {stdout}",
+    );
+    assert!(
+        stdout.contains("--patch-vdso"),
+        "missing --patch-vdso in help: {stdout}",
+    );
 }
 
 #[test]

@@ -34,6 +34,20 @@ Options:
                              The PROGRAM positional is still
                              required (defines argv[0] / which
                              binary to spawn).
+    --ptrace-attach          PTRACE_SEIZE the replay tracee so the
+                             supervisor can deliver content-precise
+                             signals (PTRACE_SETSIGINFO), replay
+                             non-deterministic instruction traps
+                             (PTRACE_SETREGS), and patch the vDSO.
+                             Default off — non-ptraced replay still
+                             uses kill(2)-based best-effort signal
+                             delivery and skips InstructionTrap
+                             events.
+    --patch-vdso             Patch the replay tracee's vDSO at
+                             startup so libc's time fast paths
+                             route through real syscalls — match
+                             a recording made with --patch-vdso.
+                             Implies --ptrace-attach.
     -h, --help               Show this help.
 
 The TRACE_DIR must already exist and have been produced by a
@@ -66,6 +80,8 @@ mod linux_main {
         pub max_iterations: Option<u64>,
         pub inherit_env: bool,
         pub inherit_args: bool,
+        pub ptrace_attach: bool,
+        pub patch_vdso: bool,
     }
 
     pub fn parse() -> Result<Cli, String> {
@@ -94,6 +110,13 @@ mod linux_main {
                 }
                 "--inherit-env" => cli.inherit_env = true,
                 "--inherit-args" => cli.inherit_args = true,
+                "--ptrace-attach" => cli.ptrace_attach = true,
+                "--patch-vdso" => {
+                    // Implies --ptrace-attach since the patcher
+                    // uses PTRACE_POKEDATA.
+                    cli.patch_vdso = true;
+                    cli.ptrace_attach = true;
+                }
                 other if other.starts_with('-') => {
                     return Err(format!("unknown flag: {other}"));
                 }
@@ -213,6 +236,8 @@ mod linux_main {
         };
         let options = ReplayOptions {
             max_iterations: cli.max_iterations.unwrap_or(2_000_000),
+            ptrace_attach: cli.ptrace_attach,
+            patch_vdso: cli.patch_vdso,
         };
         let trace_dir = cli.trace_dir.as_deref().expect("validated by parse()");
 
