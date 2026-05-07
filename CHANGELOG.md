@@ -7,6 +7,45 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 — aarch64-linux cross-compile + CPUID
+  trap):
+  - bs-replay's `proc_regs` Tier 2 register restore ported to
+    aarch64 (step 105). `RegisterState` now wraps a
+    `Vec<u8>` blob instead of `libc::user_regs_struct`;
+    arch-specific `capture_arch` / `restore_arch` use
+    `nix::ptrace::getregs/setregs` on x86_64 and
+    `libc::ptrace + PTRACE_GETREGSET + NT_PRSTATUS + iovec`
+    on aarch64. Tier 2 payload codec uses
+    `RegisterState::arch_byte_len()` (216 / 272) for the
+    sanity tripwire. Several pre-existing latent issues
+    surfaced under cross-arch compilation and were fixed in
+    the same commit (`ReplayExit`/`ReplayReport` `Copy`
+    derives that didn't account for `String`-bearing
+    variants; x86_64-only re-exports split into a separate
+    cfg block; explicit `libc` Linux dep on the driver;
+    cross-arch instruction-trap helpers gated to x86_64).
+    Result: all five Phase 5 crates + their tests cross-
+    compile cleanly to `aarch64-unknown-linux-gnu`. The
+    existing `test-arm64` CI job (already on
+    `ubuntu-24.04-arm`) now exercises the Phase 5 surface
+    end-to-end.
+  - CPUID-mask helper (step 106).
+    `bs-replay-engine::record::linux::instrs::set_cpuid_disabled_for_self`
+    calls `arch_prctl(ARCH_SET_CPUID, 0)` — subsequent
+    `CPUID` raises `SIGSEGV`, picked up by the recorder's
+    signal-delivery dispatcher and emitted as
+    `Event::InstructionTrap`. Plumbed through
+    `ChildSetupFlags::disable_cpuid` and
+    `RecordOptions::disable_cpuid`; `replay-record` gains
+    `--disable-cpuid`. Off by default — libc/openssl probe
+    CPUID at startup and the current zero-fill synthesis
+    crashes most modern programs (the flag is the substrate
+    for the next refinement: a CPUID-input-aware
+    `synthesise_trap_result` that reads the host's actual
+    CPUID for the requested leaf and just masks
+    `RDRAND`/`RDSEED` bits). x86-64 only; aarch64 builds
+    get a no-op stub so cross-arch callers don't need their
+    own branches.
 - time-travel (Phase 5 — PC-precise replay + dest-register
   fidelity + aarch64 prep):
   - PC-precise signal replay (step 100). Bounded single-step
