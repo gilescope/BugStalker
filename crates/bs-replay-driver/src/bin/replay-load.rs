@@ -220,11 +220,12 @@ mod linux_main {
             Ok(report) => {
                 eprintln!(
                     "replay-load: {} syscalls applied / {} signals delivered / \
-                     {} signals skipped / {} instr-traps skipped / \
-                     {} steps / {} bytes written",
+                     {} signals skipped / {} instr-traps replayed / \
+                     {} instr-traps skipped / {} steps / {} bytes written",
                     report.syscalls_applied,
                     report.signals_delivered,
                     report.signals_skipped,
+                    report.instruction_traps_replayed,
                     report.instruction_traps_skipped,
                     report.iterations,
                     report.bytes_written,

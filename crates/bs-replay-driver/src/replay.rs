@@ -15,13 +15,16 @@ use std::path::Path;
 
 use bs_replay_engine::format::event::Event;
 use bs_replay_engine::format::{TraceReadError, TraceReader};
+use bs_replay_engine::format::event::InstructionTrapKind;
 use bs_replay_engine::record::linux::exit_stop::{
-    classify_wstatus, ptrace_cont, StopKind,
+    classify_wstatus, get_regs, ptrace_cont, set_regs, StopKind, UserRegsX86_64,
 };
+use bs_replay_engine::record::linux::instrs::{classify_at_pc, InstrKind};
 use bs_replay_engine::record::linux::ptrace_driver::{
-    recv_notif, respond_intercept, SeccompNotif,
+    recv_notif, respond_intercept, ProcMemReader, SeccompNotif,
 };
 use bs_replay_engine::record::linux::signals::ptrace_setsiginfo;
+use bs_replay_engine::record::syscall_capture::MemoryReader;
 use bs_replay_engine::replay::linux::replay_child::{
     spawn_replay_child, spawn_replay_child_with, ReplayChild, ReplaySpawnError,
     ReplaySpawnOptions,
@@ -74,14 +77,17 @@ pub struct ReplayReport {
     /// `Event::Syscall` events successfully applied.
     pub syscalls_applied: u64,
     /// `Event::Signal` events delivered to the tracee via
-    /// `kill(2)` (best-effort — not PC-precise).
+    /// `kill(2)` (best-effort) or `PTRACE_SETSIGINFO`
+    /// (content-precise, ptraced replays).
     pub signals_delivered: u64,
     /// `Event::Signal` events that couldn't be delivered
     /// (target dead, EPERM, etc.).
     pub signals_skipped: u64,
-    /// `Event::InstructionTrap` events skipped (replay-side
-    /// RAX rewrite needs cross-process PTRACE_SETREGS; queued
-    /// for follow-up).
+    /// `Event::InstructionTrap` events replayed via
+    /// PTRACE_SETREGS (ptraced mode only).
+    pub instruction_traps_replayed: u64,
+    /// `Event::InstructionTrap` events skipped (non-ptraced
+    /// mode, or no matching trap fired during replay).
     pub instruction_traps_skipped: u64,
     /// Total ioctl turns the supervisor executed.
     pub iterations: u64,
@@ -486,8 +492,42 @@ pub(crate) fn drive_ptraced_iteration(
         LoopEvent::Stop(kind, status) => match kind {
             StopKind::Exited { code } => Ok(DriveOutcome::Exited(code)),
             StopKind::Signalled { sig } => Ok(DriveOutcome::Signalled(sig)),
+            StopKind::SignalDelivery { sig }
+                if sig == libc::SIGSEGV || sig == libc::SIGILL =>
+            {
+                // Could be a non-deterministic instruction
+                // (RDTSC/RDTSCP/RDRAND/RDSEED/CPUID) that
+                // PR_SET_TSC or CPUID-mask is trapping. If
+                // we recognise the PC, install the recorded
+                // result via PTRACE_SETREGS, advance RIP,
+                // swallow the signal.
+                match try_replay_instruction_trap(pid, cursor, report) {
+                    Ok(true) => {
+                        if let Err(_e) = ptrace_cont(pid, /*sig=*/ 0) {
+                            return Ok(DriveOutcome::TraceeGone);
+                        }
+                        Ok(DriveOutcome::Continue)
+                    }
+                    Ok(false) => {
+                        // Not a recognised instruction trap;
+                        // pass the signal through.
+                        if let Err(_e) = ptrace_cont(pid, sig) {
+                            return Ok(DriveOutcome::TraceeGone);
+                        }
+                        Ok(DriveOutcome::Continue)
+                    }
+                    Err(_) => {
+                        // Read failure (tracee gone?); pass
+                        // signal through best-effort.
+                        if let Err(_e) = ptrace_cont(pid, sig) {
+                            return Ok(DriveOutcome::TraceeGone);
+                        }
+                        Ok(DriveOutcome::Continue)
+                    }
+                }
+            }
             StopKind::SignalDelivery { sig } => {
-                // Step-96 placeholder: pass through the signal.
+                // Other signals — pass through unchanged.
                 if let Err(_e) = ptrace_cont(pid, sig) {
                     return Ok(DriveOutcome::TraceeGone);
                 }
@@ -635,5 +675,136 @@ trait ReplayShimErrorExt {
 impl ReplayShimErrorExt for ReplayShimError {
     fn into_io_placeholder(self, _io: std::io::Error) -> ReplayShimError {
         self
+    }
+}
+
+/// Attempt instruction-trap replay. Returns `Ok(true)` if the
+/// stop was a classified non-deterministic instruction at a
+/// PC matched against the next `Event::InstructionTrap` and
+/// the recorded result was installed. `Ok(false)` if the PC
+/// isn't a classified instruction or no matching event in the
+/// trace. `Err` on ptrace I/O failure.
+fn try_replay_instruction_trap(
+    pid: i32,
+    cursor: &mut bs_replay_engine::format::EventCursor<'_>,
+    report: &mut ReplayReport,
+) -> std::io::Result<bool> {
+    // Read the tracee's RIP and the bytes there.
+    let regs = get_regs(pid)?;
+    let pc = regs.rip;
+
+    // Open /proc/<pid>/mem for the bytes-at-PC read.
+    let reader = ProcMemReader::open(pid)?;
+    let bytes = reader.read(pc, 16);
+    let kind = match classify_at_pc(pc, &bytes) {
+        Some(k) => k,
+        None => return Ok(false),
+    };
+
+    // Walk the cursor for the next Event::InstructionTrap.
+    // If the very next interesting event is a non-trap, we
+    // skip it (count as "skipped") rather than consume it
+    // out of order.
+    loop {
+        match cursor.next() {
+            Ok(Some(e)) => match e {
+                Event::InstructionTrap { pc: tpc, kind: tkind, result } => {
+                    if pc != tpc {
+                        // PC mismatch — stash the count and
+                        // pass through.
+                        report.instruction_traps_skipped += 1;
+                        return Ok(false);
+                    }
+                    install_recorded_trap(pid, &regs, kind, tkind, &result)?;
+                    report.instruction_traps_replayed += 1;
+                    return Ok(true);
+                }
+                Event::Syscall { .. } => {
+                    // The next event in the trace is a syscall,
+                    // not an instruction trap. Means the
+                    // recording didn't trap at this PC; pass
+                    // through and let the cursor stay at the
+                    // syscall for the syscall-handling path.
+                    // (We can't put it back, so we lose ordering;
+                    // count as skip.)
+                    report.instruction_traps_skipped += 1;
+                    return Ok(false);
+                }
+                Event::Signal { .. } => {
+                    // Defer signals for the next walk.
+                    report.signals_skipped += 1;
+                    continue;
+                }
+                _ => continue,
+            },
+            Ok(None) => return Ok(false),
+            Err(_) => return Ok(false),
+        }
+    }
+}
+
+/// Write the recorded result vector into the tracee's
+/// registers per the format crate's per-kind contract, then
+/// advance RIP past the instruction. Mirrors the recorder's
+/// `synthesise_trap_result` shape.
+fn install_recorded_trap(
+    pid: i32,
+    regs: &UserRegsX86_64,
+    observed_kind: InstrKind,
+    recorded_kind: InstructionTrapKind,
+    result: &[u64],
+) -> std::io::Result<()> {
+    // Mismatched kind is suspicious but not fatal (instruction
+    // encoding may overlap across CPU generations); honour the
+    // observed kind for register placement.
+    let _ = recorded_kind;
+    let mut new_regs = *regs;
+    match observed_kind {
+        InstrKind::Rdtsc | InstrKind::Rdtscp => {
+            // result[0] is the 64-bit TSC. EDX:EAX = high:low.
+            let tsc = result.first().copied().unwrap_or(0);
+            new_regs.rax = tsc & 0xFFFF_FFFF;
+            new_regs.rdx = tsc >> 32;
+            // RDTSCP also writes IA32_TSC_AUX into ECX —
+            // recorded format doesn't carry it; leave RCX
+            // unchanged.
+        }
+        InstrKind::Rdrand | InstrKind::Rdseed => {
+            // result[0] = value, result[1] = success (0/1).
+            // Real RDRAND writes into the operand register;
+            // we don't know which from the trap alone, so we
+            // write to RAX as a sensible default. The recorder
+            // didn't store the dest register either; this is
+            // a known fidelity gap for non-EAX RDRAND uses.
+            let value = result.first().copied().unwrap_or(0);
+            new_regs.rax = value;
+        }
+        InstrKind::Cpuid => {
+            // result = [eax, ebx, ecx, edx].
+            let eax = result.first().copied().unwrap_or(0);
+            let ebx = result.get(1).copied().unwrap_or(0);
+            let ecx = result.get(2).copied().unwrap_or(0);
+            let edx = result.get(3).copied().unwrap_or(0);
+            new_regs.rax = eax & 0xFFFF_FFFF;
+            new_regs.rbx = ebx & 0xFFFF_FFFF;
+            new_regs.rcx = ecx & 0xFFFF_FFFF;
+            new_regs.rdx = edx & 0xFFFF_FFFF;
+        }
+    }
+    // Advance RIP past the trapped instruction.
+    new_regs.rip = regs.rip.saturating_add(instruction_byte_len(observed_kind));
+    set_regs(pid, &new_regs)?;
+    Ok(())
+}
+
+/// Bytes per encoding for the five trapped instructions.
+/// Mirrors the recorder's `instruction_byte_len`.
+fn instruction_byte_len(kind: InstrKind) -> u64 {
+    match kind {
+        InstrKind::Rdtsc => 2,
+        InstrKind::Rdtscp => 3,
+        InstrKind::Rdrand => 3,
+        InstrKind::Rdseed => 3,
+        InstrKind::Cpuid => 2,
     }
 }
