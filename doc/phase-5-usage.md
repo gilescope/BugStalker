@@ -146,10 +146,15 @@ assert_eq!(replay_report.syscalls_applied, record_report.syscall_events);
 
 | Limitation                                        | Workaround / status                                  |
 | ------------------------------------------------- | ---------------------------------------------------- |
-| `gettimeofday` / `clock_gettime` via vDSO         | call `vdso_patch::apply_vdso_trampolines` manually   |
+| `gettimeofday` / `clock_gettime` via vDSO         | record-side: pass `--patch-vdso` (shipped). Replay-  |
+|                                                   | side patching needs the replay tracee under ptrace   |
+|                                                   | (queued)                                             |
+| `RDTSC` / `RDTSCP` capture                        | record-side: pass `--trap-tsc` (shipped). Replay-    |
+|                                                   | side RAX rewrite still TODO                          |
 | Signals replayed at exact PC                      | `kill(2)`-based delivery is best-effort (shipped);   |
 |                                                   | PC-precise variant via PTRACE_SETSIGINFO is queued   |
-| `RDTSC` / `RDRAND` / `CPUID` re-injection         | recorded but not yet rewritten into RAX on replay    |
+| `RDRAND` / `CPUID` capture                        | recorder catches if the program raises SIGSEGV/      |
+|                                                   | SIGILL on them; CPUID-mask helper not yet wired      |
 | Multi-threaded determinism                        | single-CPU pin available; PMU instr counts TODO      |
 | aarch64 record_session                            | syscall table only — full port pending               |
 | Cross-host replay                                 | manifest CPU-feature check refuses incompatible      |

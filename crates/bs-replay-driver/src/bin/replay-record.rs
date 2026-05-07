@@ -32,6 +32,19 @@ Options:
                              (otherwise a deadbeef placeholder).
     --label <text>           Human-readable label stamped into
                              manifest.kernel_release for diagnostics.
+    --patch-vdso             At startup, patch the tracee's vDSO so
+                             libc's gettimeofday/clock_gettime/time/
+                             getcpu fast paths route through real
+                             syscalls and trip the recorder. Off by
+                             default — opt in if your program uses
+                             time-related calls and you need them
+                             captured.
+    --trap-tsc               Set PR_SET_TSC=PR_TSC_SIGSEGV in the
+                             tracee so RDTSC/RDTSCP raise SIGSEGV
+                             and the recorder emits Event::InstructionTrap
+                             for them. Off by default — some libc
+                             versions probe RDTSC at startup, opt-in
+                             keeps the default robust.
     -h, --help               Show this help.
 
 The TRACE_DIR must not already exist; the recorder refuses to
@@ -66,6 +79,8 @@ mod linux_main {
         pub max_iterations: Option<u64>,
         pub build_id: Option<String>,
         pub label: Option<String>,
+        pub patch_vdso: bool,
+        pub trap_tsc: bool,
     }
 
     pub fn parse() -> Result<Cli, String> {
@@ -102,6 +117,8 @@ mod linux_main {
                         "--label requires a text argument".to_owned()
                     })?);
                 }
+                "--patch-vdso" => cli.patch_vdso = true,
+                "--trap-tsc" => cli.trap_tsc = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown flag: {other}"));
                 }
@@ -198,6 +215,8 @@ mod linux_main {
         };
         let options = RecordOptions {
             max_iterations: cli.max_iterations.unwrap_or(2_000_000),
+            patch_vdso: cli.patch_vdso,
+            trap_tsc: cli.trap_tsc,
         };
         let trace_dir = cli.trace_dir.as_deref().expect("validated by parse()");
 

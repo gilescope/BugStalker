@@ -43,6 +43,10 @@ fn help_long_flag_prints_usage_and_exits_zero() {
         stdout.contains("<TRACE_DIR>"),
         "usage line should reference TRACE_DIR positional",
     );
+    // The opt-in flags must show up in --help so users can
+    // discover them.
+    assert!(stdout.contains("--patch-vdso"), "missing --patch-vdso in help");
+    assert!(stdout.contains("--trap-tsc"), "missing --trap-tsc in help");
 }
 
 #[test]
