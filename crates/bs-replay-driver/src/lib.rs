@@ -34,6 +34,11 @@ pub mod reverse;
 
 pub use capture::capture_host_manifest;
 #[cfg(target_os = "linux")]
+pub use dap::{record as dap_record, DapRecordError};
+pub use dap::{
+    ReplayRecordExitKind, ReplayRecordOptions, ReplayRecordRequest, ReplayRecordResponse,
+};
+#[cfg(target_os = "linux")]
 pub use record::{
     record_program, ExitStatus as RecorderExitStatus, RecordOptions, RecordProgramError,
     RecordReport,

@@ -354,3 +354,105 @@ fn dap_timeline_on_empty_trace_is_zero_with_no_waypoints() {
     assert!(resp.waypoints.is_empty());
     fs::remove_dir_all(&dir).ok();
 }
+
+// -- bs/replayRecord ---------------------------------------------------------
+
+/// Cross-platform: the `record()` handler is gated to Linux but
+/// validation errors surface from a pure-Rust pre-flight that
+/// runs everywhere — we can't exercise it directly off-Linux
+/// without conditional compilation, so the validation suite
+/// itself is also Linux-gated. The shapes themselves still
+/// compile cross-platform via the unconditional re-exports.
+#[cfg(target_os = "linux")]
+mod record_handler {
+    use super::*;
+    use bs_replay_driver::dap::{
+        record, DapRecordError, ReplayRecordExitKind, ReplayRecordOptions,
+        ReplayRecordRequest,
+    };
+
+    fn req(trace_path: &std::path::Path, argv: Vec<String>) -> ReplayRecordRequest {
+        ReplayRecordRequest {
+            trace_path: trace_path.to_string_lossy().into_owned(),
+            argv,
+            envp: vec![],
+            build_id: "0".repeat(40),
+            kernel_label: Some("dap-test".to_owned()),
+            options: ReplayRecordOptions::default(),
+        }
+    }
+
+    #[test]
+    fn empty_argv_errors_before_spawn() {
+        let dir = temp_dir("rec-empty-argv");
+        let r = req(&dir, vec![]);
+        let err = record(&r).unwrap_err();
+        assert!(matches!(err, DapRecordError::EmptyArgv), "got: {err}");
+        // Trace dir must not have been created — the handler
+        // refuses *before* touching the filesystem.
+        assert!(!dir.exists(), "trace_path created on validation failure");
+    }
+
+    #[test]
+    fn argv_with_nul_errors() {
+        let dir = temp_dir("rec-argv-nul");
+        let r = req(&dir, vec!["/bin/true\0bad".to_owned()]);
+        let err = record(&r).unwrap_err();
+        assert!(matches!(err, DapRecordError::ArgvNul), "got: {err}");
+    }
+
+    #[test]
+    fn env_key_with_equals_errors() {
+        let dir = temp_dir("rec-env-eq");
+        let mut r = req(&dir, vec!["/bin/true".to_owned()]);
+        r.envp.push(("BAD=KEY".to_owned(), "v".to_owned()));
+        let err = record(&r).unwrap_err();
+        assert!(
+            matches!(err, DapRecordError::EnvKeyContainsEquals(ref k) if k == "BAD=KEY"),
+            "got: {err}",
+        );
+    }
+
+    /// End-to-end: record `/bin/true` through the DAP handler,
+    /// confirm we get a sensible report and a real on-disk trace.
+    /// Skips on environments where ptrace is restricted (yama,
+    /// containerised CI without CAP_SYS_PTRACE).
+    #[test]
+    fn record_bin_true_round_trip() {
+        let dir = temp_dir("rec-bin-true");
+        let r = req(&dir, vec!["/bin/true".to_owned()]);
+        let resp = match record(&r) {
+            Ok(r) => r,
+            Err(e) => {
+                let s = format!("{e}");
+                if s.contains("EPERM")
+                    || s.contains("EACCES")
+                    || s.contains("yama")
+                    || s.contains("ENOSYS")
+                {
+                    eprintln!("skipping record_bin_true_round_trip — {s}");
+                    return;
+                }
+                panic!("record failed: {e}");
+            }
+        };
+        assert_eq!(resp.trace_path, dir.to_string_lossy());
+        assert!(matches!(resp.exit, ReplayRecordExitKind::Exited { code: 0 }));
+        // /bin/true exits cleanly; we expect at least one
+        // syscall (exit_group) and zero instruction-traps with
+        // default options.
+        assert!(resp.syscall_events >= 1, "no syscalls recorded");
+        assert_eq!(resp.instruction_traps, 0, "default options trap nothing");
+        assert_eq!(
+            resp.events_written,
+            resp.syscall_events + resp.signal_events + resp.instruction_traps,
+        );
+        // Trace dir was created and is non-empty.
+        assert!(dir.is_dir(), "trace dir wasn't created");
+        assert!(
+            fs::read_dir(&dir).unwrap().next().is_some(),
+            "trace dir is empty",
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+}

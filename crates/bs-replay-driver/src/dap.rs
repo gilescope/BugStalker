@@ -19,8 +19,10 @@
 //! | `bs/replayCheckpointList`     | implemented       | engine answers today                |
 //! | `bs/replayJump`               | implemented       | seek_to + checkpoint lookup         |
 //! | `bs/replayTimeline`           | implemented       | sparse timeline from current data   |
-//! | `bs/replayRecord`             | type-only stub    | needs the recorder (sub-phase 3B)   |
-//! | `bs/replayLoad`               | type-only stub    | needs debugger attach machinery     |
+//! | `bs/replayRecord`             | implemented (Linux) | wraps `record_program`            |
+//! | `bs/replayCapture`            | implemented (Linux) | wraps `capture_one_shot`          |
+//! | `bs/replayRestore`            | implemented (Linux) | wraps Tier 2 restore primitives   |
+//! | `bs/replayLoad`               | implemented       | opens trace + reports stats         |
 
 use bs_replay_engine::format::checkpoint::CheckpointHeader;
 
@@ -133,29 +135,220 @@ pub enum TimelineWaypoint {
 }
 
 // ---------------------------------------------------------------------------
-// bs/replayRecord — type-only stub (needs the recorder, sub-phase 3B)
+// bs/replayRecord — synchronous full-program record into a fresh trace dir
 // ---------------------------------------------------------------------------
 
-/// Request: start or stop the recorder.
+/// Request: record a program end-to-end into a fresh trace dir.
 ///
-/// Wire-shape only — the recorder itself (sub-phase 3B) does not
-/// yet exist, so [`TraceReplayer`] does not implement a handler
-/// for this request.
+/// Synchronous: the handler returns when the recorded program
+/// exits (or hits the iteration cap). A future "background +
+/// stop" request can layer over this without breaking the
+/// shape; for now we mirror what the engine actually exposes.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplayRecordRequest {
-    /// `true` → begin recording; `false` → stop & finalise.
-    pub start: bool,
-    /// Output trace directory (when `start == true`).
-    pub trace_path: Option<String>,
+    /// Output trace directory. Refuses to overwrite — caller
+    /// supplies a fresh path.
+    pub trace_path: String,
+    /// argv passed to the recorded program. `argv[0]` is the
+    /// executable. Must be non-empty.
+    pub argv: Vec<String>,
+    /// envp for the recorded program. Each entry is `(key,
+    /// value)`; the handler joins on `=`. Empty means "no
+    /// environment", *not* "inherit" — the DAP server
+    /// chooses what to expose.
+    pub envp: Vec<(String, String)>,
+    /// build-id to stamp into the manifest. Hex string. The
+    /// DAP server typically extracts this from the binary's
+    /// ELF NT_GNU_BUILD_ID; if unknown, supply a placeholder
+    /// (e.g. 32 hex zeroes).
+    pub build_id: String,
+    /// Optional kernel-release / label override stamped into
+    /// the manifest. None → engine-default ("unknown" off-Linux
+    /// or `/proc/sys/kernel/osrelease` on Linux).
+    pub kernel_label: Option<String>,
+    /// Recorder tunables.
+    pub options: ReplayRecordOptions,
 }
 
-/// Response shape mirror.
+/// Wire-shape mirror of [`crate::record::RecordOptions`]. Kept
+/// separate so the DAP shape can grow knobs the engine doesn't
+/// expose yet (and vice versa).
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub struct ReplayRecordOptions {
+    /// Hard cap on loop iterations. None → engine default
+    /// (currently 2_000_000).
+    pub max_iterations: Option<u64>,
+    /// Patch the tracee's vDSO so libc fast paths trip the
+    /// recorder. See [`crate::record::RecordOptions::patch_vdso`].
+    pub patch_vdso: bool,
+    /// Trap RDTSC/RDTSCP via PR_SET_TSC. See
+    /// [`crate::record::RecordOptions::trap_tsc`].
+    pub trap_tsc: bool,
+    /// Trap CPUID via ARCH_SET_CPUID. See
+    /// [`crate::record::RecordOptions::disable_cpuid`].
+    pub disable_cpuid: bool,
+}
+
+/// How the recorded program left the recorder loop. Mirrors
+/// [`crate::record::ExitStatus`] in DAP-friendly variant form.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ReplayRecordExitKind {
+    /// Tracee called exit/exit_group with this code.
+    Exited {
+        /// Process exit code.
+        code: i32,
+    },
+    /// Tracee was killed by this signal.
+    Signalled {
+        /// Signal number.
+        signal: i32,
+    },
+    /// Recorder hit its iteration cap before the tracee exited.
+    /// The trace is well-formed but truncated.
+    IterationCap {
+        /// Iteration count at which the cap fired.
+        iterations: u64,
+    },
+}
+
+/// Response: per-event counts plus how the run ended.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ReplayRecordResponse {
-    /// Whether the recorder is now actively recording.
-    pub recording: bool,
-    /// Number of events written so far. Always 0 in the stub.
+    /// Path the trace was written to (echoed for clients that
+    /// derive it from the request and want one canonical
+    /// answer).
+    pub trace_path: String,
+    /// Total events written across all variants.
     pub events_written: u64,
+    /// `Event::Syscall` events written.
+    pub syscall_events: u64,
+    /// `Event::Signal` events written.
+    pub signal_events: u64,
+    /// `Event::InstructionTrap` events written.
+    pub instruction_traps: u64,
+    /// Loop iterations executed.
+    pub iterations: u64,
+    /// How the recorded program ended.
+    pub exit: ReplayRecordExitKind,
+}
+
+/// Handle `bs/replayRecord`. Linux only — the engine's recorder
+/// is `cfg(target_os = "linux")`. Synchronous: returns when the
+/// recorded program exits or hits the iteration cap.
+#[cfg(target_os = "linux")]
+pub fn record(
+    req: &ReplayRecordRequest,
+) -> Result<ReplayRecordResponse, DapRecordError> {
+    use std::ffi::CString;
+
+    use bs_replay_engine::format::manifest::Manifest;
+    use bs_replay_engine::format::version::FormatVersion;
+    use bs_replay_engine::VERSION as ENGINE_VERSION;
+
+    use crate::record::{self, ExitStatus, RecordOptions};
+
+    if req.argv.is_empty() {
+        return Err(DapRecordError::EmptyArgv);
+    }
+    let argv: Vec<CString> = req
+        .argv
+        .iter()
+        .map(|s| CString::new(s.as_str()).map_err(|_| DapRecordError::ArgvNul))
+        .collect::<Result<_, _>>()?;
+    let envp: Vec<CString> = req
+        .envp
+        .iter()
+        .map(|(k, v)| {
+            if k.contains('=') {
+                return Err(DapRecordError::EnvKeyContainsEquals(k.clone()));
+            }
+            CString::new(format!("{k}={v}")).map_err(|_| DapRecordError::EnvNul)
+        })
+        .collect::<Result<_, _>>()?;
+
+    let manifest = Manifest {
+        format_version: FormatVersion::V1,
+        build_id: req.build_id.clone(),
+        kernel_release: req
+            .kernel_label
+            .clone()
+            .unwrap_or_else(default_kernel_release),
+        cpu_features: crate::host::host_features().unwrap_or_default(),
+        engine_version: ENGINE_VERSION.to_owned(),
+        initial_env: req.envp.clone(),
+        initial_cwd: std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "<unknown>".to_owned()),
+        initial_args: req.argv.clone(),
+        recorded_at: Some(chrono::Utc::now().to_rfc3339()),
+    };
+
+    let options = RecordOptions {
+        max_iterations: req.options.max_iterations.unwrap_or(2_000_000),
+        patch_vdso: req.options.patch_vdso,
+        trap_tsc: req.options.trap_tsc,
+        disable_cpuid: req.options.disable_cpuid,
+    };
+
+    let report =
+        record::record_program(&req.trace_path, &manifest, argv, envp, options)
+            .map_err(DapRecordError::Record)?;
+
+    Ok(ReplayRecordResponse {
+        trace_path: req.trace_path.clone(),
+        events_written: report.syscall_events
+            + report.signal_events
+            + report.instruction_traps,
+        syscall_events: report.syscall_events,
+        signal_events: report.signal_events,
+        instruction_traps: report.instruction_traps,
+        iterations: report.iterations,
+        exit: match report.exit_status {
+            ExitStatus::Exited(code) => ReplayRecordExitKind::Exited { code },
+            ExitStatus::Signalled(signal) => {
+                ReplayRecordExitKind::Signalled { signal }
+            }
+            ExitStatus::IterationCap(iterations) => {
+                ReplayRecordExitKind::IterationCap { iterations }
+            }
+        },
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn default_kernel_release() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Errors arising from [`record`]. Layered: argv/envp validation
+/// happens before any spawning; recorder errors come back wrapped.
+#[cfg(target_os = "linux")]
+#[derive(thiserror::Error, Debug)]
+pub enum DapRecordError {
+    /// `argv` was empty — at minimum `argv[0]` (the executable)
+    /// must be supplied.
+    #[error("argv must contain at least argv[0]")]
+    EmptyArgv,
+    /// One of the argv entries contained a NUL byte; the kernel
+    /// won't accept it via `execve`.
+    #[error("argv contains a NUL byte")]
+    ArgvNul,
+    /// One of the env vars contained a NUL byte.
+    #[error("envp contains a NUL byte")]
+    EnvNul,
+    /// POSIX disallows `=` in env-var keys; surface this rather
+    /// than silently misparse.
+    #[error("env key contains `=`: {0}")]
+    EnvKeyContainsEquals(String),
+    /// The recorder loop itself failed — almost always a setup
+    /// (yama lockdown, missing /proc/<pid>/mem) or disk-full
+    /// error, not a tracee bug.
+    #[error("recorder: {0}")]
+    Record(#[from] crate::record::RecordProgramError),
 }
 
 // ---------------------------------------------------------------------------
