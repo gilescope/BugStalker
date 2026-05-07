@@ -310,6 +310,108 @@ fn doctor_dump_events_with_explicit_n_caps_output() {
 }
 
 #[test]
+fn doctor_diff_identical_traces_returns_zero() {
+    let dir_a = temp_dir("diff-a");
+    let dir_b = temp_dir("diff-b");
+    for d in [&dir_a, &dir_b] {
+        let mut writer = TraceWriter::create(d, &manifest()).unwrap();
+        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer.write_event(Event::PcMarker { pc: 0xDEAD_BEEF }).unwrap();
+        writer.finish().unwrap();
+    }
+    let out = Command::new(doctor_bin())
+        .arg("--diff")
+        .arg(&dir_b)
+        .arg(&dir_a)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("identical"),
+        "expected 'identical' on matching traces; got: {stdout}",
+    );
+    fs::remove_dir_all(&dir_a).ok();
+    fs::remove_dir_all(&dir_b).ok();
+}
+
+#[test]
+fn doctor_diff_divergent_traces_reports_first_event() {
+    let dir_a = temp_dir("diff-div-a");
+    let dir_b = temp_dir("diff-div-b");
+    {
+        let mut writer = TraceWriter::create(&dir_a, &manifest()).unwrap();
+        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+        writer.finish().unwrap();
+    }
+    {
+        let mut writer = TraceWriter::create(&dir_b, &manifest()).unwrap();
+        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer.write_event(Event::Marker { tag: 99, data: 0 }).unwrap();
+        writer.finish().unwrap();
+    }
+    let out = Command::new(doctor_bin())
+        .arg("--diff")
+        .arg(&dir_b)
+        .arg(&dir_a)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("diverge at event 1"),
+        "expected divergence at event 1; got: {stdout}",
+    );
+    assert!(
+        stdout.contains("marker 2:0 != 99:0") || stdout.contains("marker"),
+        "expected marker mismatch reason; got: {stdout}",
+    );
+    fs::remove_dir_all(&dir_a).ok();
+    fs::remove_dir_all(&dir_b).ok();
+}
+
+#[test]
+fn doctor_diff_length_mismatch_reports_truncation() {
+    let dir_a = temp_dir("diff-len-a");
+    let dir_b = temp_dir("diff-len-b");
+    {
+        let mut writer = TraceWriter::create(&dir_a, &manifest()).unwrap();
+        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+        writer.finish().unwrap();
+    }
+    {
+        let mut writer = TraceWriter::create(&dir_b, &manifest()).unwrap();
+        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer.finish().unwrap();
+    }
+    let out = Command::new(doctor_bin())
+        .arg("--diff")
+        .arg(&dir_b)
+        .arg(&dir_a)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ended"),
+        "expected length-mismatch ('ended'); got: {stdout}",
+    );
+    fs::remove_dir_all(&dir_a).ok();
+    fs::remove_dir_all(&dir_b).ok();
+}
+
+#[test]
+fn doctor_diff_without_arg_returns_two() {
+    let out = Command::new(doctor_bin())
+        .arg("--diff")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}
+
+#[test]
 fn doctor_check_host_flag_does_not_panic_on_unsupported_os() {
     // On macOS host_features() returns Unsupported. The doctor
     // should fall back to skipping the host check rather than

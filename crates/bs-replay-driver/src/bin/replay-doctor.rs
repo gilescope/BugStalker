@@ -37,11 +37,16 @@ Options:
     --dump-events [N]        Print the first N events in
                              human-readable form (default 20;
                              pass 0 to dump every event).
+    --diff <OTHER>           Compare <DIR> against <OTHER>
+                             event-by-event; print the first
+                             divergence (event index + what
+                             changed) or 'identical' if they
+                             match through both ends.
     -h, --help               Show this help.
 
 Exit codes:
-    0  trace is replayable / summary printed
-    1  trace has errors / load failed
+    0  trace is replayable / summary printed / traces match
+    1  trace has errors / load failed / traces diverge
     2  argument parse error
 ";
 
@@ -53,6 +58,7 @@ struct Cli {
     load: bool,
     counts: bool,
     dump_events: Option<usize>,
+    diff_against: Option<String>,
 }
 
 fn parse() -> Result<Cli, String> {
@@ -86,6 +92,11 @@ fn parse() -> Result<Cli, String> {
             "--build-id" => {
                 cli.build_id = Some(args.next().ok_or_else(|| {
                     "--build-id requires a hex argument".to_owned()
+                })?);
+            }
+            "--diff" => {
+                cli.diff_against = Some(args.next().ok_or_else(|| {
+                    "--diff requires a path to another trace dir".to_owned()
                 })?);
             }
             other if other.starts_with('-') => {
@@ -152,6 +163,20 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("replay-doctor: --dump-events failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if let Some(other) = cli.diff_against.as_deref() {
+        return match print_diff(dir, other) {
+            Ok(true) => {
+                println!("identical: both traces match through both ends");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("replay-doctor: --diff failed: {e}");
                 ExitCode::FAILURE
             }
         };
@@ -308,6 +333,143 @@ fn sig_name(n: u32) -> &'static str {
         libc::SIGCONT => "SIGCONT",
         libc::SIGSTOP => "SIGSTOP",
         _ => "SIG?",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --diff
+// ---------------------------------------------------------------------------
+
+/// Walk two traces in lock-step, report the first event-index
+/// where they diverge. Returns Ok(true) on identical
+/// sequences, Ok(false) on a found divergence (which has
+/// already been printed), Err on I/O or decode failure.
+fn print_diff(dir_a: &str, dir_b: &str) -> Result<bool, String> {
+    let reader_a = TraceReader::open(dir_a).map_err(|e| format!("open {dir_a}: {e}"))?;
+    let reader_b = TraceReader::open(dir_b).map_err(|e| format!("open {dir_b}: {e}"))?;
+    let mut cur_a = reader_a.cursor();
+    let mut cur_b = reader_b.cursor();
+    let mut idx = 0u64;
+    loop {
+        let a = cur_a.next().map_err(|e| format!("{dir_a}: {e}"))?;
+        let b = cur_b.next().map_err(|e| format!("{dir_b}: {e}"))?;
+        match (a, b) {
+            (None, None) => return Ok(true),
+            (Some(_), None) => {
+                println!(
+                    "diverge at event {idx}: {dir_b} ended; {dir_a} still has events"
+                );
+                return Ok(false);
+            }
+            (None, Some(_)) => {
+                println!(
+                    "diverge at event {idx}: {dir_a} ended; {dir_b} still has events"
+                );
+                return Ok(false);
+            }
+            (Some(ea), Some(eb)) => {
+                if let Some(reason) = events_differ(&ea, &eb) {
+                    println!("diverge at event {idx}:");
+                    println!("  {dir_a}: {}", render_event(&ea));
+                    println!("  {dir_b}: {}", render_event(&eb));
+                    println!("  reason: {reason}");
+                    return Ok(false);
+                }
+                idx += 1;
+            }
+        }
+    }
+}
+
+/// Return a human-readable reason if the two events differ, or
+/// `None` if they're identical for diff purposes. Captured-
+/// output blob bytes are compared for Syscall events;
+/// siginfo-equality for Signal events; full vector for
+/// InstructionTrap.
+fn events_differ(a: &Event, b: &Event) -> Option<String> {
+    match (a, b) {
+        (
+            Event::Syscall { nr: na, args: aa, result: ra, output: oa },
+            Event::Syscall { nr: nb, args: ab, result: rb, output: ob },
+        ) => {
+            if na != nb {
+                return Some(format!("syscall nr: {na} != {nb}"));
+            }
+            for (i, (x, y)) in aa.iter().zip(ab.iter()).enumerate() {
+                if x != y {
+                    return Some(format!("arg[{i}]: {x:#x} != {y:#x}"));
+                }
+            }
+            if ra != rb {
+                return Some(format!("result: {ra} != {rb}"));
+            }
+            if oa != ob {
+                return Some(format!(
+                    "output blob: {} != {} bytes (or differing contents)",
+                    oa.len(), ob.len(),
+                ));
+            }
+            None
+        }
+        (
+            Event::Signal { sig_no: sa, pc: pa, siginfo: ia },
+            Event::Signal { sig_no: sb, pc: pb, siginfo: ib },
+        ) => {
+            if sa != sb {
+                return Some(format!("sig_no: {sa} != {sb}"));
+            }
+            if pa != pb {
+                return Some(format!("pc: {pa:#x} != {pb:#x}"));
+            }
+            if ia != ib {
+                return Some("siginfo bytes differ".to_owned());
+            }
+            None
+        }
+        (
+            Event::InstructionTrap { pc: pa, kind: ka, result: ra },
+            Event::InstructionTrap { pc: pb, kind: kb, result: rb },
+        ) => {
+            if pa != pb {
+                return Some(format!("pc: {pa:#x} != {pb:#x}"));
+            }
+            if ka != kb {
+                return Some(format!("kind: {ka:?} != {kb:?}"));
+            }
+            if ra != rb {
+                return Some(format!("result: {ra:?} != {rb:?}"));
+            }
+            None
+        }
+        (Event::Marker { tag: ta, data: da }, Event::Marker { tag: tb, data: db }) => {
+            if ta != tb || da != db {
+                Some(format!("marker {ta}:{da} != {tb}:{db}"))
+            } else {
+                None
+            }
+        }
+        (Event::PcMarker { pc: pa }, Event::PcMarker { pc: pb }) => {
+            if pa != pb {
+                Some(format!("pc: {pa:#x} != {pb:#x}"))
+            } else {
+                None
+            }
+        }
+        (a, b) => Some(format!(
+            "different variants: {} vs {}",
+            variant_name(a),
+            variant_name(b),
+        )),
+    }
+}
+
+fn variant_name(e: &Event) -> &'static str {
+    match e {
+        Event::Syscall { .. } => "Syscall",
+        Event::Signal { .. } => "Signal",
+        Event::InstructionTrap { .. } => "InstructionTrap",
+        Event::Marker { .. } => "Marker",
+        Event::PcMarker { .. } => "PcMarker",
     }
 }
 
