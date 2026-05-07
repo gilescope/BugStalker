@@ -55,6 +55,7 @@ fn bench_record_bin_true(c: &mut Criterion) {
             initial_cwd: "/tmp".to_owned(),
             initial_args: vec![],
             recorded_at: None,
+            initial_fds: vec![],
         }
     }
 

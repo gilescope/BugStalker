@@ -185,6 +185,7 @@ mod linux_main {
             // Auto-stamped — RFC 3339 / UTC. Same path as
             // bs_replay_driver::capture::capture_host_manifest.
             recorded_at: Some(chrono::Utc::now().to_rfc3339()),
+            initial_fds: vec![],
         }
     }
 

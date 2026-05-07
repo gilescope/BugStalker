@@ -21,6 +21,7 @@ fn sample_manifest() -> Manifest {
         initial_cwd: "/tmp".to_owned(),
         initial_args: vec!["--probe".into()],
         recorded_at: None,
+        initial_fds: vec![],
     }
 }
 

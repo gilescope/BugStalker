@@ -74,6 +74,19 @@ pub struct Manifest {
     /// traces written before this field existed; new writers
     /// should populate it.
     pub recorded_at: Option<String>,
+    /// File descriptors open in the recorded child at exec time,
+    /// sorted ascending. Available from format V2 onward; V1
+    /// traces always present an empty list. Replay uses this to
+    /// mask out the supervisor's accidental fd-table contamination
+    /// — fds the supervisor has open that the recorded child
+    /// didn't get closed before execve; fds the recorded child
+    /// had that the supervisor doesn't get a `/dev/null` placeholder
+    /// (the seccomp listener answers reads/writes from the trace).
+    ///
+    /// Numbers, not targets — Phase 5 doesn't try to reproduce
+    /// pty paths or pipe inodes. Targets are provided by the
+    /// seccomp listener at replay time.
+    pub initial_fds: Vec<u32>,
 }
 
 impl Manifest {
@@ -134,6 +147,12 @@ impl Manifest {
         if let Some(ts) = &self.recorded_at {
             writeln!(out, "recorded_at: {}", escape(ts)).unwrap();
         }
+        // V2-onward field. Emit only when non-empty so V1 traces
+        // round-trip byte-for-byte through to_text/from_text on
+        // older readers (the parser tolerates missing keys).
+        for fd in &self.initial_fds {
+            writeln!(out, "initial_fd: {fd}").unwrap();
+        }
         out
     }
 
@@ -151,6 +170,7 @@ impl Manifest {
         let mut cpu_features: Vec<String> = Vec::new();
         let mut initial_args: Vec<String> = Vec::new();
         let mut initial_env: Vec<(String, String)> = Vec::new();
+        let mut initial_fds: Vec<u32> = Vec::new();
 
         for (idx, raw) in input.lines().enumerate() {
             let line_no = idx + 1;
@@ -195,6 +215,15 @@ impl Manifest {
                     initial_env.push((k.to_owned(), v.to_owned()));
                 }
                 "recorded_at" => recorded_at = Some(value),
+                "initial_fd" => {
+                    let n: u32 = value.parse().map_err(|_| {
+                        ManifestParseError::malformed(
+                            line_no,
+                            "initial_fd must be a u32",
+                        )
+                    })?;
+                    initial_fds.push(n);
+                }
                 other => {
                     return Err(ManifestParseError::malformed(
                         line_no,
@@ -203,6 +232,13 @@ impl Manifest {
                 }
             }
         }
+
+        // V2 contract: writers emit `initial_fd` lines in
+        // ascending order. Don't trust input — sort + dedupe so
+        // downstream invariants (no duplicates, monotonic) hold
+        // even if a hand-crafted manifest violates them.
+        initial_fds.sort_unstable();
+        initial_fds.dedup();
 
         Ok(Self {
             format_version: format_version
@@ -219,6 +255,7 @@ impl Manifest {
                 .ok_or_else(|| ManifestParseError::missing("initial_cwd"))?,
             initial_args,
             recorded_at,
+            initial_fds,
         })
     }
 }
@@ -297,6 +334,7 @@ mod tests {
             initial_cwd: "/home/giles".to_owned(),
             initial_args: vec!["--flag".into(), "--also".into()],
             recorded_at: None,
+            initial_fds: vec![],
         }
     }
 
@@ -322,6 +360,68 @@ mod tests {
                  initial_cwd: /\n";
         let m = Manifest::from_text(s).unwrap();
         assert_eq!(m.recorded_at, None);
+    }
+
+    #[test]
+    fn v1_text_without_initial_fd_lines_parses_to_empty_vec() {
+        // V2 added initial_fd lines; V1 traces predate them and
+        // must still parse — the field defaults to empty so
+        // replay falls back to "inherit everything" (the
+        // pre-step-112 behaviour).
+        let s = "format_version: 1\n\
+                 build_id: ab\n\
+                 kernel_release: r\n\
+                 engine_version: e\n\
+                 initial_cwd: /\n";
+        let m = Manifest::from_text(s).unwrap();
+        assert_eq!(m.format_version, FormatVersion::V1);
+        assert!(m.initial_fds.is_empty());
+    }
+
+    #[test]
+    fn initial_fds_round_trip_through_text() {
+        let mut m = sample();
+        m.format_version = FormatVersion::V2;
+        m.initial_fds = vec![0, 1, 2, 5, 7];
+        let s = m.to_text();
+        let back = Manifest::from_text(&s).unwrap();
+        assert_eq!(back.initial_fds, vec![0u32, 1, 2, 5, 7]);
+        assert_eq!(m, back);
+    }
+
+    #[test]
+    fn initial_fds_are_sorted_and_deduped_on_parse() {
+        // Hand-crafted manifests can include initial_fd lines in
+        // any order with duplicates; the parser normalises so
+        // downstream invariants (ascending, unique) hold.
+        let s = "format_version: 2\n\
+                 build_id: ab\n\
+                 kernel_release: r\n\
+                 engine_version: e\n\
+                 initial_cwd: /\n\
+                 initial_fd: 5\n\
+                 initial_fd: 1\n\
+                 initial_fd: 5\n\
+                 initial_fd: 2\n\
+                 initial_fd: 0\n";
+        let m = Manifest::from_text(s).unwrap();
+        assert_eq!(m.initial_fds, vec![0u32, 1, 2, 5]);
+    }
+
+    #[test]
+    fn initial_fd_with_non_numeric_value_is_a_malformed_error() {
+        let s = "format_version: 2\n\
+                 build_id: ab\n\
+                 kernel_release: r\n\
+                 engine_version: e\n\
+                 initial_cwd: /\n\
+                 initial_fd: not-a-u32\n";
+        let err = Manifest::from_text(s).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("initial_fd") && msg.contains("u32"),
+            "expected typed error mentioning initial_fd + u32; got: {msg}",
+        );
     }
 
     #[test]

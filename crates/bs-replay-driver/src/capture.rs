@@ -56,6 +56,7 @@ pub fn capture_host_manifest(build_id: impl Into<String>) -> Manifest {
         // level implementation detail. UTC chosen so traces are
         // comparable across hosts in different time zones.
         recorded_at: Some(chrono::Utc::now().to_rfc3339()),
+        initial_fds: vec![],
     }
 }
 

@@ -174,11 +174,41 @@ pub fn replay_program(
 ) -> Result<ReplayReport, ReplayProgramError> {
     let reader = TraceReader::open(&trace_dir)?;
     let need_ptrace = options.ptrace_attach || options.patch_vdso;
+
+    // Compute fd-table fixups from the trace's recorded fd set
+    // (V2 traces) vs the supervisor's current fd-table. V1 traces
+    // present an empty `initial_fds` and fall back to
+    // "inherit whatever the supervisor has open" — same behaviour
+    // as before step 112. The list_open_fds call on /proc/self/fd
+    // is best-effort: any I/O failure yields an empty supervisor
+    // set, which `fd_diff_actions` interprets as "open everything
+    // the recorded child had". The actions land in the replay
+    // child between fork and execve.
+    let supervisor_fds = bs_replay_engine::record::linux::proc_fd::list_open_fds(
+        unsafe { libc::getpid() },
+    )
+    .unwrap_or_default();
+    let recorded_fds = &reader.manifest().initial_fds;
+    let file_actions = bs_replay_engine::replay::linux::file_actions::fd_diff_actions(
+        &supervisor_fds,
+        recorded_fds,
+    );
+
     let child = if need_ptrace {
         spawn_replay_child_with(
             argv,
             envp,
-            ReplaySpawnOptions { ptrace_attach: true },
+            ReplaySpawnOptions {
+                ptrace_attach: true,
+                file_actions: file_actions.clone(),
+            },
+        )?
+    } else if !file_actions.is_empty() {
+        // V2 trace without ptrace: still need the file actions.
+        spawn_replay_child_with(
+            argv,
+            envp,
+            ReplaySpawnOptions { ptrace_attach: false, file_actions },
         )?
     } else {
         spawn_replay_child(argv, envp)?

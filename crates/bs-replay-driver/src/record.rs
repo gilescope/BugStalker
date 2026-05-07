@@ -227,23 +227,41 @@ pub fn record_program(
     // wins for the CLI (which builds a fresh Manifest with
     // None) and is a no-op for callers that already pinned a
     // value (e.g. capture_host_manifest already populates it).
-    let manifest_with_ts = if manifest.recorded_at.is_some() {
+    let mut manifest_with_ts = if manifest.recorded_at.is_some() {
         manifest.clone()
     } else {
         let mut m = manifest.clone();
         m.recorded_at = Some(chrono::Utc::now().to_rfc3339());
         m
     };
-    let manifest = &manifest_with_ts;
-    let mut writer =
-        TraceWriter::create(&trace_dir, manifest).map_err(RecordProgramError::Trace)?;
 
+    // Spawn before creating the trace writer: we need the child
+    // PID to capture its fd-table at exec, which gets stamped
+    // into the manifest before TraceWriter freezes it. The child
+    // is paused at its first syscall stop after this returns.
     let flags = ChildSetupFlags {
         trap_tsc: options.trap_tsc,
         disable_cpuid: options.disable_cpuid,
     };
     let mut child = spawn_recorded_child_with(argv, envp, flags)?;
     let pid = child.pid();
+
+    // V2 manifest: list of fds open in the recorded child at
+    // exec time. Replay uses this to mask the supervisor's
+    // accidental fd-table contamination via posix_spawn_file_actions
+    // semantics. Best-effort — yama/ proc_fs failures yield an
+    // empty list, which falls back to V1's "inherit everything"
+    // behaviour.
+    manifest_with_ts.format_version =
+        bs_replay_engine::format::version::FormatVersion::V2;
+    manifest_with_ts.initial_fds =
+        bs_replay_engine::record::linux::proc_fd::list_open_fds(pid)
+            .unwrap_or_default();
+
+    let manifest = &manifest_with_ts;
+    let mut writer =
+        TraceWriter::create(&trace_dir, manifest).map_err(RecordProgramError::Trace)?;
+
     let reader = ProcMemReader::open(pid).map_err(RecordProgramError::ProcMem)?;
 
     if options.patch_vdso {

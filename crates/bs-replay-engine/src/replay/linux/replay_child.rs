@@ -61,7 +61,7 @@ use crate::record::linux::record_child::{recv_fd, send_fd};
 use crate::record::linux::seccomp::install_trap_all_listener;
 
 /// Tunables for [`spawn_replay_child_with`].
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ReplaySpawnOptions {
     /// If true, parent `PTRACE_SEIZE`s the child after the
     /// listener handover and sets PTRACE_O_TRACESYSGOOD |
@@ -75,6 +75,13 @@ pub struct ReplaySpawnOptions {
     /// through the listener fd. Other ptrace stops (signal-
     /// delivery, ptrace-events) work normally.
     pub ptrace_attach: bool,
+    /// `posix_spawn_file_actions(3)`-style fd-table fixups
+    /// applied in the child between fork and execve. Built by
+    /// [`crate::replay::linux::file_actions::fd_diff_actions`]
+    /// from the supervisor's current fd-table and the recorded
+    /// child's `Manifest::initial_fds`. Empty = no fixups
+    /// (legacy behaviour for V1 traces).
+    pub file_actions: Vec<super::file_actions::FileAction>,
 }
 
 /// A NOTIF-trapped child process. The replay supervisor drives
@@ -209,14 +216,14 @@ pub fn spawn_replay_child_with(
     if pid == 0 {
         // === Child ===
         drop(parent_sock);
-        match child_main(child_sock, argv, envp) {
+        match child_main(child_sock, argv, envp, &options.file_actions) {
             Ok(_) => unsafe { libc::_exit(101) },
             Err(code) => unsafe { libc::_exit(code) },
         }
     }
     // === Parent ===
     drop(child_sock);
-    match parent_setup(pid, parent_sock, options) {
+    match parent_setup(pid, parent_sock, &options) {
         Ok(c) => Ok(c),
         Err(e) => {
             unsafe {
@@ -233,6 +240,7 @@ fn child_main(
     sock: OwnedFd,
     argv: Vec<CString>,
     envp: Vec<CString>,
+    file_actions: &[super::file_actions::FileAction],
 ) -> Result<core::convert::Infallible, libc::c_int> {
     // Install the NOTIF filter. install_trap_all_listener also
     // sets PR_SET_NO_NEW_PRIVS so we don't have to.
@@ -252,6 +260,13 @@ fn child_main(
     }
     drop(listener);
     drop(sock);
+
+    // Apply fd-table fixups (close supervisor leakage, open
+    // /dev/null at recorded-only fds) before execve. Empty list
+    // = no-op, matching the V1-trace legacy path.
+    if super::file_actions::apply_in_child(file_actions).is_err() {
+        return Err(73);
+    }
 
     let argv_ptrs: Vec<*const libc::c_char> = argv
         .iter()
@@ -273,7 +288,7 @@ fn child_main(
 fn parent_setup(
     pid: i32,
     sock: OwnedFd,
-    options: ReplaySpawnOptions,
+    options: &ReplaySpawnOptions,
 ) -> Result<ReplayChild, ReplaySpawnError> {
     let listener = recv_fd(&sock).map_err(ReplaySpawnError::RecvFd)?;
     drop(sock);

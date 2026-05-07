@@ -47,6 +47,7 @@ fn manifest() -> Manifest {
         initial_cwd: "/tmp".to_owned(),
         initial_args: vec![],
         recorded_at: None,
+        initial_fds: vec![],
     }
 }
 
@@ -87,13 +88,10 @@ fn tier2_capture_through_tier3_storage_round_trip() {
     let a_bytes_at_addr =
         read_bytes_at(a_pid, addr, buf.len()).expect("read A buf");
     assert!(a_bytes_at_addr.iter().all(|&b| b == 0));
-    let a_regs_bytes = unsafe {
-        std::slice::from_raw_parts(
-            &a.state.regs.regs as *const _ as *const u8,
-            std::mem::size_of::<libc::user_regs_struct>(),
-        )
-        .to_vec()
-    };
+    // Step 105 changed RegisterState to wrap a Vec<u8> blob
+    // (cross-arch); compare the blobs directly rather than
+    // reaching into the old user_regs_struct layout.
+    let a_regs_bytes = a.state.regs.bytes.clone();
 
     // === Tier 3: write trace + stash A's payload as a checkpoint ===
     let dir = temp_trace_dir("e2e-bridge");
@@ -151,13 +149,7 @@ fn tier2_capture_through_tier3_storage_round_trip() {
         "B's bytes at addr should match A's after Tier 2 → 3 → 2 round-trip",
     );
     let b_regs = capture_registers(b_handle.pid).expect("capture B regs");
-    let b_regs_bytes = unsafe {
-        std::slice::from_raw_parts(
-            &b_regs.regs as *const _ as *const u8,
-            std::mem::size_of::<libc::user_regs_struct>(),
-        )
-        .to_vec()
-    };
+    let b_regs_bytes = b_regs.bytes.clone();
     assert_eq!(
         a_regs_bytes, b_regs_bytes,
         "B's regs should match A's after the bridge round-trip",

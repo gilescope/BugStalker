@@ -281,6 +281,7 @@ pub fn record(
             .unwrap_or_else(|_| "<unknown>".to_owned()),
         initial_args: req.argv.clone(),
         recorded_at: Some(chrono::Utc::now().to_rfc3339()),
+        initial_fds: vec![],
     };
 
     let options = RecordOptions {

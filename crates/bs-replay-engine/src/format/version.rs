@@ -19,7 +19,7 @@ pub const TRACE_MAGIC: &[u8; 8] = b"BSREPLAY";
 /// Increment on every incompatible on-disk change. Replay refuses
 /// `trace.format_version > MAX_SUPPORTED_FORMAT_VERSION` with a
 /// clear error rather than silently misinterpreting newer data.
-pub const MAX_SUPPORTED_FORMAT_VERSION: FormatVersion = FormatVersion(1);
+pub const MAX_SUPPORTED_FORMAT_VERSION: FormatVersion = FormatVersion(2);
 
 /// Wire-format version newtype. Monotonic, never reused.
 ///
@@ -33,6 +33,12 @@ pub struct FormatVersion(pub u32);
 impl FormatVersion {
     /// First public version. Anything older is pre-history.
     pub const V1: Self = Self(1);
+
+    /// V2 — adds `Manifest::initial_fds` (sorted list of fd numbers
+    /// open in the recorded child at exec time). Older readers
+    /// missing this field would silently drop fd-table fidelity;
+    /// the version bump makes that detection explicit.
+    pub const V2: Self = Self(2);
 
     /// True iff this build can decode `self`.
     #[inline]
@@ -65,11 +71,17 @@ mod tests {
     }
 
     #[test]
-    fn v1_is_supported_v_max_plus_one_is_not() {
+    fn v1_and_v2_are_supported_v_max_plus_one_is_not() {
         assert!(FormatVersion::V1.is_supported());
+        assert!(FormatVersion::V2.is_supported());
         assert!(MAX_SUPPORTED_FORMAT_VERSION.is_supported());
         let unsupported = FormatVersion(MAX_SUPPORTED_FORMAT_VERSION.0 + 1);
         assert!(!unsupported.is_supported());
+    }
+
+    #[test]
+    fn v2_is_strictly_greater_than_v1() {
+        assert!(FormatVersion::V2 > FormatVersion::V1);
     }
 
     #[test]

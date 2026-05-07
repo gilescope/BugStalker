@@ -10,5 +10,6 @@
 //!
 //! `scheduler` is deferred to a follow-up batch.
 
+pub mod file_actions;
 pub mod replay_child;
 pub mod shim;
