@@ -175,6 +175,20 @@ impl Drop for RecordedChild {
     }
 }
 
+/// In-tracee setup flags applied by the child between
+/// PTRACE_TRACEME and execve. The supervisor passes them
+/// through [`spawn_recorded_child_with`] when it needs RDTSC
+/// trapping or other per-thread state that can't be set from
+/// the tracer side.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChildSetupFlags {
+    /// `prctl(PR_SET_TSC, PR_TSC_SIGSEGV)` — RDTSC/RDTSCP raise
+    /// SIGSEGV instead of running natively. The recorder's
+    /// signal-delivery dispatcher classifies the faulting PC
+    /// and emits `Event::InstructionTrap`.
+    pub trap_tsc: bool,
+}
+
 /// Spawn a child program for PTRACE-based recording. Compared
 /// to step 64's `record_child::spawn`:
 ///
@@ -192,6 +206,16 @@ pub fn spawn_recorded_child(
     argv: Vec<CString>,
     envp: Vec<CString>,
 ) -> Result<RecordedChild, SpawnError> {
+    spawn_recorded_child_with(argv, envp, ChildSetupFlags::default())
+}
+
+/// Like [`spawn_recorded_child`] but with [`ChildSetupFlags`]
+/// applied in the tracee between PTRACE_TRACEME and execve.
+pub fn spawn_recorded_child_with(
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+    flags: ChildSetupFlags,
+) -> Result<RecordedChild, SpawnError> {
     if argv.is_empty() {
         return Err(SpawnError::EmptyArgv);
     }
@@ -204,7 +228,7 @@ pub fn spawn_recorded_child(
     }
     if pid == 0 {
         // Child.
-        match child_main(argv, envp) {
+        match child_main(argv, envp, flags) {
             Ok(_) => unsafe { libc::_exit(101) },
             Err(code) => unsafe { libc::_exit(code) },
         }
@@ -226,6 +250,7 @@ pub fn spawn_recorded_child(
 fn child_main(
     argv: Vec<CString>,
     envp: Vec<CString>,
+    flags: ChildSetupFlags,
 ) -> Result<core::convert::Infallible, libc::c_int> {
     // PTRACE_TRACEME — parent gains ptrace authority.
     let r = unsafe {
@@ -238,6 +263,13 @@ fn child_main(
     };
     if r != 0 {
         return Err(70);
+    }
+    // PR_SET_TSC must be set in the tracee thread. Apply
+    // before execve so it survives into the new image.
+    if flags.trap_tsc {
+        if super::instrs::set_tsc_trap_for_self().is_err() {
+            return Err(75);
+        }
     }
     // execve. PTRACE_TRACEME makes the kernel raise SIGTRAP at
     // the first user-space instruction after execve, which the

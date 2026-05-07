@@ -92,6 +92,12 @@ pub struct ReplayOptions {
     /// `2_000_000`. Same shape as
     /// [`crate::record::RecordOptions`] for symmetry.
     pub max_iterations: u64,
+    // NB: `patch_vdso` belongs here in spirit but the replay
+    // tracee currently isn't under ptrace (the listener fd is
+    // the only control surface). Patching the vDSO needs
+    // PTRACE_POKEDATA's FOLL_FORCE write, which means we'd
+    // have to SEIZE the replay tracee first. That's the next
+    // refactor; until it lands the option would be a no-op.
 }
 
 impl Default for ReplayOptions {

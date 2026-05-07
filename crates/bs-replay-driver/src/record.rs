@@ -84,8 +84,11 @@ use std::ffi::CString;
 
 use bs_replay_engine::record::linux::ptrace_driver::ProcMemReader;
 use bs_replay_engine::record::linux::record_session::{
-    self, record_to_completion, spawn_recorded_child, RecordSessionError, RecordSummary,
-    SpawnError, Terminal,
+    self, record_to_completion, spawn_recorded_child_with, ChildSetupFlags,
+    RecordSessionError, RecordSummary, SpawnError, Terminal,
+};
+use bs_replay_engine::record::linux::vdso_patch::{
+    apply_vdso_trampolines, scan_remote_vdso, ScanRemoteError, VdsoPatchError,
 };
 
 /// How a recorded program ended.
@@ -126,11 +129,31 @@ pub struct RecordOptions {
     /// `u64::MAX`. Default `2_000_000` (covers a 30-minute
     /// session at 1000 syscalls/sec).
     pub max_iterations: u64,
+    /// If true, patch the tracee's vDSO at startup so libc's
+    /// `gettimeofday` / `clock_gettime` / `time` / `getcpu`
+    /// fast paths route through the kernel and trip the
+    /// recorder. Adds one PTRACE_POKEDATA pass per vDSO entry
+    /// after the tracee reaches its first syscall stop.
+    /// Default `false` — opt-in until end-to-end vDSO-patched
+    /// replay is validated on a wider set of glibc versions.
+    pub patch_vdso: bool,
+    /// If true, set `PR_SET_TSC = PR_TSC_SIGSEGV` on the tracee
+    /// so any `RDTSC` / `RDTSCP` raises SIGSEGV instead of
+    /// running natively. The recorder's signal-delivery
+    /// dispatcher (already wired) classifies the faulting PC,
+    /// emits `Event::InstructionTrap`, and advances RIP past
+    /// the instruction. Default `false` for the same reason —
+    /// some libc versions probe RDTSC; opt-in.
+    pub trap_tsc: bool,
 }
 
 impl Default for RecordOptions {
     fn default() -> Self {
-        Self { max_iterations: 2_000_000 }
+        Self {
+            max_iterations: 2_000_000,
+            patch_vdso: false,
+            trap_tsc: false,
+        }
     }
 }
 
@@ -152,6 +175,12 @@ pub enum RecordProgramError {
     /// Recorder loop produced an error mid-session.
     #[error("recorder: {0}")]
     Session(RecordSessionError),
+    /// vDSO scan failed (RecordOptions::patch_vdso = true).
+    #[error("vDSO scan: {0}")]
+    VdsoScan(ScanRemoteError),
+    /// vDSO patch failed (RecordOptions::patch_vdso = true).
+    #[error("vDSO patch: {0}")]
+    VdsoPatch(VdsoPatchError),
 }
 
 /// Record the program at `argv[0]` with the supplied `envp`,
@@ -181,9 +210,20 @@ pub fn record_program(
     let mut writer =
         TraceWriter::create(&trace_dir, manifest).map_err(RecordProgramError::Trace)?;
 
-    let mut child = spawn_recorded_child(argv, envp)?;
+    let flags = ChildSetupFlags {
+        trap_tsc: options.trap_tsc,
+    };
+    let mut child = spawn_recorded_child_with(argv, envp, flags)?;
     let pid = child.pid();
     let reader = ProcMemReader::open(pid).map_err(RecordProgramError::ProcMem)?;
+
+    if options.patch_vdso {
+        let symbols = scan_remote_vdso(pid).map_err(RecordProgramError::VdsoScan)?;
+        if !symbols.is_empty() {
+            apply_vdso_trampolines(pid, &symbols)
+                .map_err(RecordProgramError::VdsoPatch)?;
+        }
+    }
 
     let summary: RecordSummary =
         record_to_completion(&mut child, &reader, &mut writer, options.max_iterations)
