@@ -7,6 +7,51 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 — replay-side ptrace surface):
+  - `spawn_replay_child` opts into `PTRACE_SEIZE` (step 94).
+    `ReplaySpawnOptions { ptrace_attach: bool }`. After SCM_RIGHTS
+    handover, parent SEIZEs the child without a stop. Per
+    `seccomp_unotify(2)`, NOTIF still takes precedence over
+    ptrace-syscall events, so syscalls keep flowing through the
+    listener; signal-delivery + ptrace-events arrive at waitpid.
+    `ReplayChild::is_ptraced` exposed to downstream callers.
+  - Multiplexed replay loop (step 95). `replay_program` adds
+    `ReplayOptions::ptrace_attach`; when true, the per-iteration
+    driver `drive_ptraced_iteration` calls `await_loop_event`
+    which `poll`s the listener (with timeout) plus `waitpid
+    (WNOHANG)` to drain ptrace stops. Returns
+    `LoopEvent::{Notif, Stop, Idle}`. Existing single-thread
+    blocking loop preserved when `ptrace_attach = false`.
+  - Content-precise signal replay (step 96). When the supervisor
+    sees an `Event::Signal` while walking to the next syscall,
+    it now calls `kill(pid, sig)` → `waitpid` for the resulting
+    signal-delivery-stop → `PTRACE_SETSIGINFO` with the
+    recorded `siginfo_t` bytes → `PTRACE_CONT(sig)`. The
+    tracee's signal handler sees the same `siginfo_t` it saw
+    at recording. PC-precision (deliver at recorded RIP via
+    single-step rendezvous) is the queued next refinement.
+    `bs-replay-engine::record::linux::signals::ptrace_setsiginfo`
+    is the new wrapper.
+  - InstructionTrap replay (step 97). When SIGSEGV/SIGILL fires
+    at a classified non-deterministic instruction (`RDTSC`/
+    `RDTSCP`/`RDRAND`/`RDSEED`/`CPUID`), the supervisor
+    matches it to the next `Event::InstructionTrap` and
+    installs the recorded result via `PTRACE_SETREGS`:
+      RDTSC/P → result[0] split into EDX:EAX
+      RDRAND/RDSEED → result[0] → RAX (default; recorder doesn't
+        capture the operand-encoded dest yet)
+      CPUID → [eax, ebx, ecx, edx]
+    RIP is advanced past the instruction. `ReplayReport` gains
+    `instruction_traps_replayed`; `instruction_traps_skipped`
+    now strictly means "not replayed" (PC mismatch, no matching
+    event, or non-ptraced mode).
+  - `ReplayOptions::patch_vdso` (step 98). Now possible because
+    the replay tracee can be ptraced. After spawn,
+    `replay_program` calls `scan_remote_vdso` +
+    `apply_vdso_trampolines` against the replay tracee. Soft-
+    fail (warn + continue) on scan/patch errors. Implies
+    `ptrace_attach`. CLI exposure: `replay-load
+    --ptrace-attach` and `--patch-vdso`.
 - time-travel (Phase 5 round-out — UX polish, latent fix):
   - Auto-stamped `recorded_at` in `record_program` (step 90).
     Programmatic callers no longer need to manually plug in

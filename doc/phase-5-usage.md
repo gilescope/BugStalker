@@ -147,14 +147,20 @@ assert_eq!(replay_report.syscalls_applied, record_report.syscall_events);
 | Limitation                                        | Workaround / status                                  |
 | ------------------------------------------------- | ---------------------------------------------------- |
 | `gettimeofday` / `clock_gettime` via vDSO         | record-side: pass `--patch-vdso` (shipped). Replay-  |
-|                                                   | side patching needs the replay tracee under ptrace   |
-|                                                   | (queued)                                             |
-| `RDTSC` / `RDTSCP` capture                        | record-side: pass `--trap-tsc` (shipped). Replay-    |
-|                                                   | side RAX rewrite still TODO                          |
-| Signals replayed at exact PC                      | `kill(2)`-based delivery is best-effort (shipped);   |
-|                                                   | PC-precise variant via PTRACE_SETSIGINFO is queued   |
+|                                                   | side: pass `--patch-vdso` (shipped, implies          |
+|                                                   | `--ptrace-attach`)                                   |
+| `RDTSC` / `RDTSCP` capture                        | record-side: `--trap-tsc` (shipped). Replay-side:    |
+|                                                   | `--ptrace-attach` enables PTRACE_SETREGS RAX/EDX     |
+|                                                   | rewrite (shipped)                                    |
+| Signals replayed at exact PC                      | non-ptraced: `kill(2)` best-effort (shipped).        |
+|                                                   | Ptraced: `PTRACE_SETSIGINFO` content-precise         |
+|                                                   | (shipped). PC-precise via single-step rendezvous     |
+|                                                   | is still queued                                      |
 | `RDRAND` / `CPUID` capture                        | recorder catches if the program raises SIGSEGV/      |
 |                                                   | SIGILL on them; CPUID-mask helper not yet wired      |
+| RDRAND/RDSEED dest-register decoding              | replay writes to RAX by default; non-EAX uses lose   |
+|                                                   | fidelity until the recorder captures the operand     |
+|                                                   | register                                             |
 | Multi-threaded determinism                        | single-CPU pin available; PMU instr counts TODO      |
 | aarch64 record_session                            | syscall table only — full port pending               |
 | Cross-host replay                                 | manifest CPU-feature check refuses incompatible      |
