@@ -93,14 +93,14 @@ impl From<InstrKind> for InstructionTrapKind {
 /// `CPUID`. The trap is per-thread; the recorder calls this
 /// from the tracee thread it wants to monitor.
 ///
-/// Implication: libc / openssl / etc. will see the trap on
-/// startup CPUID probes and either crash or fall back to
-/// non-CPUID-dependent code paths. A future enhancement
-/// would have the recorder respond to each trap with a
-/// synthetic CPUID return that masks RDRAND/RDSEED feature
-/// bits while preserving the rest. For now it's an opt-in
-/// flag; users with libcs that probe CPUID at startup
-/// shouldn't enable it.
+/// Pair this with [`cpuid_synthesised`] in the recorder's
+/// signal-delivery dispatcher: the dispatcher classifies the
+/// trapping PC, runs `cpuid_synthesised` with the trapped
+/// register inputs, and stamps the four output values into
+/// the recorded `Event::InstructionTrap`. Without that
+/// synthesis libc/openssl startup probes see all-zero
+/// returns and crash; with it, they see the real host CPUID
+/// minus the RDRAND/RDSEED feature bits.
 ///
 /// Linux ≥ 4.12, x86-64 only — `arch_prctl` is an x86-specific
 /// syscall. On non-x86 builds the function is a no-op that
@@ -126,6 +126,54 @@ pub fn set_cpuid_disabled_for_self() -> io::Result<()> {
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_cpuid_disabled_for_self() -> io::Result<()> {
     Ok(())
+}
+
+/// Run native `CPUID` with the supplied (eax, ecx) inputs and
+/// return the four output registers, with two feature-detection
+/// bits masked off:
+///
+/// - **leaf 1, ECX bit 30** — `RDRAND` availability.
+/// - **leaf 7 sub-leaf 0, EBX bit 18** — `RDSEED` availability.
+///
+/// Returns `[eax, ebx, ecx, edx]` in that order. Output is
+/// host-specific — Phase 5 traces are same-host replay only,
+/// and the manifest's `cpu_features` field already gates
+/// cross-host replay at trace open.
+///
+/// **Why mask?** With `ARCH_SET_CPUID` enabled, every CPUID
+/// in the tracee is intercepted and answered from this fn. If
+/// the answer advertised RDRAND/RDSEED, libc/openssl would
+/// emit those instructions natively in code paths that don't
+/// trap (RDRAND/RDSEED execute without a fault on capable
+/// hosts), yielding non-deterministic bytes the replay can't
+/// reproduce. Masking the feature bits forces those callers
+/// down the syscall-based getrandom() / getentropy() paths,
+/// which the seccomp recorder *does* observe.
+///
+/// **Why not just record the host's untouched CPUID?** Replay
+/// would then see RDRAND-using code paths that the recorder
+/// never traversed, and the tracee would compute different
+/// values on replay vs record. The mask is the same lie told
+/// consistently to record and replay.
+///
+/// x86-64 only.
+#[cfg(target_arch = "x86_64")]
+pub fn cpuid_synthesised(input_eax: u32, input_ecx: u32) -> [u32; 4] {
+    // SAFETY: __cpuid_count is always defined on x86_64 and has
+    // no preconditions beyond running on x86_64. The CPUID
+    // instruction has no memory side effects.
+    let r = unsafe { core::arch::x86_64::__cpuid_count(input_eax, input_ecx) };
+    let eax = r.eax;
+    let mut ebx = r.ebx;
+    let mut ecx = r.ecx;
+    let edx = r.edx;
+    if input_eax == 1 {
+        ecx &= !(1u32 << 30); // RDRAND
+    }
+    if input_eax == 7 && input_ecx == 0 {
+        ebx &= !(1u32 << 18); // RDSEED
+    }
+    [eax, ebx, ecx, edx]
 }
 
 /// `prctl(PR_SET_TSC, PR_TSC_SIGSEGV)`. After this call the
@@ -367,6 +415,97 @@ mod tests {
         assert_eq!(classify_at_pc(0x0, &[0x0F, 0x0B]), None);
         // C3 — RET
         assert_eq!(classify_at_pc(0x0, &[0xC3]), None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpuid_synthesised_leaf_0_returns_a_printable_vendor_string() {
+        // CPUID leaf 0: eax = highest leaf supported, then
+        // ebx + edx + ecx encode the 12-byte vendor string.
+        let r = cpuid_synthesised(0, 0);
+        assert!(r[0] >= 1, "leaf 0 eax should be at least 1");
+        let mut bytes = [0u8; 12];
+        bytes[0..4].copy_from_slice(&r[1].to_le_bytes());
+        bytes[4..8].copy_from_slice(&r[3].to_le_bytes()); // edx in middle
+        bytes[8..12].copy_from_slice(&r[2].to_le_bytes());
+        for &c in &bytes {
+            assert!(
+                c.is_ascii_alphanumeric() || c == b' ',
+                "vendor byte not printable ASCII: {c:#x}; full bytes={bytes:x?}",
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpuid_synthesised_masks_rdrand_in_leaf_1() {
+        let r = cpuid_synthesised(1, 0);
+        // Leaf 1, ECX bit 30 is RDRAND. We mask it to 0 so libc
+        // sees it as unavailable and routes to getrandom().
+        assert_eq!(
+            r[2] & (1u32 << 30),
+            0,
+            "leaf 1 ECX bit 30 (RDRAND) was not masked: ecx={:#010x}",
+            r[2],
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpuid_synthesised_masks_rdseed_in_leaf_7_subleaf_0() {
+        let r = cpuid_synthesised(7, 0);
+        // Leaf 7 sub-leaf 0, EBX bit 18 is RDSEED.
+        assert_eq!(
+            r[1] & (1u32 << 18),
+            0,
+            "leaf 7.0 EBX bit 18 (RDSEED) was not masked: ebx={:#010x}",
+            r[1],
+        );
+    }
+
+    /// The mask only applies to (leaf, subleaf) tuples we
+    /// explicitly target. CPUID leaf 7 sub-leaf 1 must not have
+    /// ebx[18] cleared — that bit means something different at
+    /// other sub-leaves.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpuid_synthesised_does_not_touch_unrelated_leaves() {
+        // Run native CPUID at leaf 0 sub-leaf 0 (vendor) twice
+        // and confirm cpuid_synthesised returns the same bytes
+        // — it isn't accidentally masking anything in this leaf.
+        let raw = unsafe { core::arch::x86_64::__cpuid_count(0, 0) };
+        let r = cpuid_synthesised(0, 0);
+        assert_eq!(r[0], raw.eax);
+        assert_eq!(r[1], raw.ebx);
+        assert_eq!(r[2], raw.ecx);
+        assert_eq!(r[3], raw.edx);
+    }
+
+    /// On a host that actually has RDRAND, `cpuid_synthesised`
+    /// must be the only thing that turns it off — proving the
+    /// mask is doing real work and not relying on host-absent
+    /// features.
+    ///
+    /// Skips on hosts without RDRAND (rare but legal — early
+    /// AMD chips).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cpuid_synthesised_actively_strips_rdrand_when_host_has_it() {
+        let raw = unsafe { core::arch::x86_64::__cpuid_count(1, 0) };
+        if raw.ecx & (1u32 << 30) == 0 {
+            eprintln!("skipping: host CPU does not advertise RDRAND");
+            return;
+        }
+        let r = cpuid_synthesised(1, 0);
+        assert_eq!(r[2] & (1u32 << 30), 0, "mask did not strip RDRAND bit");
+        // Other ECX bits should still be present — we mask only
+        // the RDRAND bit, not the whole register.
+        let other_bits_native = raw.ecx & !(1u32 << 30);
+        let other_bits_masked = r[2] & !(1u32 << 30);
+        assert_eq!(
+            other_bits_native, other_bits_masked,
+            "mask clobbered ECX bits other than RDRAND",
+        );
     }
 
     #[test]

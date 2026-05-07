@@ -149,10 +149,16 @@ pub struct RecordOptions {
     pub trap_tsc: bool,
     /// If true, set `arch_prctl(ARCH_SET_CPUID, 0)` on the
     /// tracee so any `CPUID` raises SIGSEGV. Recorder catches
-    /// the trap and emits `Event::InstructionTrap` with
-    /// recorded `eax/ebx/ecx/edx`. WARNING: libc/openssl probe
-    /// CPUID at startup; enabling this without recorder-side
-    /// CPUID synthesis can crash the tracee. Default `false`.
+    /// the trap, calls native `CPUID` with the trapped
+    /// register inputs (via `cpuid_synthesised`), masks the
+    /// RDRAND/RDSEED feature bits, and emits the four output
+    /// values into `Event::InstructionTrap`. libc/openssl
+    /// startup probes see the host's real CPU features minus
+    /// RDRAND/RDSEED — they fall back to syscall-based
+    /// randomness rather than emitting non-deterministic
+    /// instructions. Same-host replay only. Default `false`
+    /// — opt-in until validated on a wider set of glibc
+    /// versions.
     pub disable_cpuid: bool,
 }
 

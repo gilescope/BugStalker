@@ -548,8 +548,11 @@ pub fn ptrace_getsiginfo(pid: i32) -> io::Result<Vec<u8>> {
 ///   step 101 so replay can write to the right register.
 ///   Older traces have 2 words here; replay-side defaults the
 ///   id to 0 (RAX) when absent.
-/// - Cpuid → 4 words (eax, ebx, ecx, edx) — recorded as zeros
-///   today; a real implementation would `cpuid` on the host
+/// - Cpuid → 4 words (eax, ebx, ecx, edx) — caller is expected
+///   to use [`synthesise_cpuid_result_at_regs`] which has access
+///   to the trapped tracee's input registers. The fallback
+///   below returns zeros and exists only so the match is
+///   exhaustive; the production path never hits it.
 #[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
 fn synthesise_trap_result(kind: InstrKind) -> Vec<u64> {
@@ -561,8 +564,29 @@ fn synthesise_trap_result_with_dest(kind: InstrKind, dest_id: u64) -> Vec<u64> {
     match kind {
         InstrKind::Rdtsc | InstrKind::Rdtscp => vec![read_host_tsc()],
         InstrKind::Rdrand | InstrKind::Rdseed => vec![read_host_tsc(), 1, dest_id],
+        // Production callers go through synthesise_cpuid_result_at_regs;
+        // this arm only fires if a future caller forgets to pass regs.
         InstrKind::Cpuid => vec![0, 0, 0, 0],
     }
+}
+
+/// Drive [`crate::record::linux::instrs::cpuid_synthesised`]
+/// from the trapped tracee's `(rax, rcx)` and pack the four
+/// output registers into a CPUID `Event::InstructionTrap`
+/// result vector. Mirrors [`synthesise_trap_result_with_dest`]
+/// but only handles the CPUID case — separated because CPUID
+/// is the only kind that needs the trapped registers as input.
+#[cfg(target_arch = "x86_64")]
+fn synthesise_cpuid_result_at_regs(regs: &UserRegsX86_64) -> Vec<u64> {
+    let eax_in = (regs.rax & 0xFFFF_FFFF) as u32;
+    let ecx_in = (regs.rcx & 0xFFFF_FFFF) as u32;
+    let r = crate::record::linux::instrs::cpuid_synthesised(eax_in, ecx_in);
+    vec![
+        u64::from(r[0]),
+        u64::from(r[1]),
+        u64::from(r[2]),
+        u64::from(r[3]),
+    ]
 }
 
 /// Bytes per encoding for the five trapped instructions. Used
@@ -668,7 +692,14 @@ fn handle_signal_delivery(
         if let Some((instr_kind, dest_id)) =
             crate::record::linux::instrs::classify_at_pc_full(pc, &bytes)
         {
-            let result = synthesise_trap_result_with_dest(instr_kind, dest_id);
+            // CPUID needs the trapped tracee's input registers
+            // (eax, ecx) so the synthesised answer reflects the
+            // leaf/subleaf actually being queried. Other kinds
+            // are leaf-less and use the dest-id-only helper.
+            let result = match instr_kind {
+                InstrKind::Cpuid => synthesise_cpuid_result_at_regs(&regs),
+                _ => synthesise_trap_result_with_dest(instr_kind, dest_id),
+            };
             writer
                 .write_event(event_for_instruction_trap(pc, instr_kind, result))
                 .map_err(RecordSessionError::Write)?;
