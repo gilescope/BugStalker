@@ -45,6 +45,11 @@ Options:
                              for them. Off by default — some libc
                              versions probe RDTSC at startup, opt-in
                              keeps the default robust.
+    --overwrite              If TRACE_DIR already exists, remove it
+                             and start a fresh recording. Default
+                             behaviour refuses (a stale segment from
+                             a prior run could silently corrupt a
+                             replay).
     -h, --help               Show this help.
 
 The TRACE_DIR must not already exist; the recorder refuses to
@@ -81,6 +86,7 @@ mod linux_main {
         pub label: Option<String>,
         pub patch_vdso: bool,
         pub trap_tsc: bool,
+        pub overwrite: bool,
     }
 
     pub fn parse() -> Result<Cli, String> {
@@ -119,6 +125,7 @@ mod linux_main {
                 }
                 "--patch-vdso" => cli.patch_vdso = true,
                 "--trap-tsc" => cli.trap_tsc = true,
+                "--overwrite" => cli.overwrite = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown flag: {other}"));
                 }
@@ -224,6 +231,14 @@ mod linux_main {
             trap_tsc: cli.trap_tsc,
         };
         let trace_dir = cli.trace_dir.as_deref().expect("validated by parse()");
+
+        if cli.overwrite {
+            // Best-effort remove; non-existent dir is fine
+            // because TraceWriter::create handles that case.
+            // Anything else (permission denied, busy mount,
+            // …) surfaces as the recorder's first hard error.
+            let _ = std::fs::remove_dir_all(trace_dir);
+        }
 
         match record_program(trace_dir, &manifest, argv, envp, options) {
             Ok(report) => {

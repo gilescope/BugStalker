@@ -47,6 +47,7 @@ fn help_long_flag_prints_usage_and_exits_zero() {
     // discover them.
     assert!(stdout.contains("--patch-vdso"), "missing --patch-vdso in help");
     assert!(stdout.contains("--trap-tsc"), "missing --trap-tsc in help");
+    assert!(stdout.contains("--overwrite"), "missing --overwrite in help");
 }
 
 #[test]
