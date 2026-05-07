@@ -7,8 +7,10 @@
 //! module is the register half; combining the two into one
 //! payload is the consumer's job.
 //!
-//! Architecture-specific. Linux x86_64 today; aarch64 will land
-//! when Phase 5 sub-phase 3G ports the recorder.
+//! Architecture-specific. Linux x86_64 today; aarch64 builds
+//! get a stub that returns `ENOSYS` from each operation. The
+//! aarch64 path will land alongside Phase 5 sub-phase 3G's
+//! `regs_aarch64` work in `bs-replay-engine`.
 
 use nix::unistd::Pid;
 

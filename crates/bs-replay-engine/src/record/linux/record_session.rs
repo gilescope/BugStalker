@@ -74,12 +74,21 @@ use std::os::fd::RawFd;
 use crate::format::event::Event;
 use crate::format::trace_writer::{TraceWriteError, TraceWriter};
 use crate::record::linux::exit_stop::{
-    classify_wstatus, get_regs, ptrace_cont, ptrace_syscall, set_regs, ExitStopError,
-    StopKind, UserRegsX86_64,
+    classify_wstatus, ptrace_cont, ptrace_syscall, ExitStopError, StopKind,
+    UserRegsX86_64,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::record::linux::exit_stop::{get_regs, set_regs};
+// Instruction trapping is x86-64 only — iced-x86 disassembly +
+// the InstrKind set are x86 ISA. aarch64 has analogues
+// (CNTVCT_EL0 trap, AT/MRS) that aren't ported yet.
+#[cfg(target_arch = "x86_64")]
 use crate::record::linux::instrs::{
     classify_at_pc, event_for_instruction_trap, read_host_tsc, InstrKind,
 };
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_imports)]
+use crate::record::linux::instrs::classify_at_pc as _classify_at_pc_keep;
 use crate::record::linux::signals::{
     event_for_signal, SignalCapture, SignalLengthError, SIGINFO_T_LEN_X86_64,
 };
@@ -91,6 +100,118 @@ use crate::record::linux::exit_stop::result_register_x86_64;
 // ---------------------------------------------------------------------------
 // CallFrame extraction from registers
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Arch dispatch
+// ---------------------------------------------------------------------------
+//
+// step_until_event runs on whichever Linux arch the supervisor
+// + tracee share. Type-alias `Regs` to the host's user-regs
+// struct + thin helpers for the per-stop primitives. Both arches
+// produce the same `CallFrame` shape consumed by syscall_capture.
+
+#[cfg(target_arch = "x86_64")]
+type Regs = UserRegsX86_64;
+#[cfg(target_arch = "aarch64")]
+type Regs = crate::record::linux::regs_aarch64::UserRegsAarch64;
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+type Regs = UserRegsX86_64; // unreachable but keeps the type live
+
+fn read_regs(pid: i32) -> std::io::Result<Regs> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        get_regs(pid)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::record::linux::regs_aarch64::get_regs_aarch64(pid)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = pid;
+        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+}
+
+fn write_regs(pid: i32, regs: &Regs) -> std::io::Result<()> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        set_regs(pid, regs)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::record::linux::regs_aarch64::set_regs_aarch64(pid, regs)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (pid, regs);
+        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+    }
+}
+
+fn frame_from(regs: &Regs) -> CallFrame {
+    #[cfg(target_arch = "x86_64")]
+    {
+        call_frame_from_regs(regs)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::record::linux::regs_aarch64::call_frame_from_regs(regs)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = regs;
+        CallFrame { nr: 0, args: [0; 6] }
+    }
+}
+
+fn result_from(regs: &Regs) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        result_register_x86_64(regs)
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::record::linux::regs_aarch64::result_register(regs)
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = regs;
+        0
+    }
+}
+
+fn pc_of(regs: &Regs) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        regs.rip
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        regs.pc
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = regs;
+        0
+    }
+}
+
+fn set_pc(regs: &mut Regs, pc: u64) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        regs.rip = pc;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        regs.pc = pc;
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (regs, pc);
+    }
+}
 
 /// On x86-64 the syscall number lives in `orig_rax` (the kernel
 /// preserves it across the syscall) and the six argument regs
@@ -329,6 +450,36 @@ fn parent_setup(pid: i32) -> Result<RecordedChild, SpawnError> {
     })
 }
 
+/// Errors arising from [`spawn_recorded_child`] /
+/// [`spawn_recorded_child_with`].
+#[derive(thiserror::Error, Debug)]
+pub enum SpawnError {
+    /// Caller passed an empty `argv`.
+    #[error("argv is empty; need at least the program path")]
+    EmptyArgv,
+    /// `fork(2)` failed.
+    #[error("fork: {0}")]
+    Fork(io::Error),
+    /// `waitpid(2)` for the child's PTRACE_TRACEME stop failed.
+    #[error("waitpid: {0}")]
+    Wait(io::Error),
+    /// Child reached the SIGTRAP barrier in an unexpected
+    /// state (typically a child-side prctl/exec failure;
+    /// WEXITSTATUS gives the exit code).
+    #[error(
+        "child setup failed at PTRACE_TRACEME stop; wstatus={wstatus:#x}. \
+         Common skip codes: 64 (kernel/perms reject seccomp), 70 \
+         (PTRACE_TRACEME denied), 75 (PR_SET_TSC denied)."
+    )]
+    ChildSetupFailed {
+        /// Raw wstatus from waitpid.
+        wstatus: libc::c_int,
+    },
+    /// `PTRACE_SETOPTIONS` failed.
+    #[error("PTRACE_SETOPTIONS: {0}")]
+    SetOptions(io::Error),
+}
+
 // ---------------------------------------------------------------------------
 // Event dispatcher
 // ---------------------------------------------------------------------------
@@ -388,11 +539,13 @@ pub fn ptrace_getsiginfo(pid: i32) -> io::Result<Vec<u8>> {
 ///   id to 0 (RAX) when absent.
 /// - Cpuid → 4 words (eax, ebx, ecx, edx) — recorded as zeros
 ///   today; a real implementation would `cpuid` on the host
+#[cfg(target_arch = "x86_64")]
 #[allow(dead_code)]
 fn synthesise_trap_result(kind: InstrKind) -> Vec<u64> {
     synthesise_trap_result_with_dest(kind, 0)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn synthesise_trap_result_with_dest(kind: InstrKind, dest_id: u64) -> Vec<u64> {
     match kind {
         InstrKind::Rdtsc | InstrKind::Rdtscp => vec![read_host_tsc()],
@@ -403,7 +556,8 @@ fn synthesise_trap_result_with_dest(kind: InstrKind, dest_id: u64) -> Vec<u64> {
 
 /// Bytes per encoding for the five trapped instructions. Used
 /// to advance RIP past a trapped instruction so the replay
-/// shim doesn't re-trap.
+/// shim doesn't re-trap. x86-64 only.
+#[cfg(target_arch = "x86_64")]
 fn instruction_byte_len(kind: InstrKind) -> u64 {
     match kind {
         InstrKind::Rdtsc => 2,   // 0F 31
@@ -463,8 +617,8 @@ fn handle_syscall_stop(
     reader: &dyn MemoryReader,
     writer: &mut TraceWriter,
 ) -> Result<RecordedEventKind, RecordSessionError> {
-    let regs = get_regs(child.pid).map_err(RecordSessionError::GetRegs)?;
-    let frame = call_frame_from_regs(&regs);
+    let regs = read_regs(child.pid).map_err(RecordSessionError::GetRegs)?;
+    let frame = frame_from(&regs);
     if child.in_flight_pre.is_none() {
         // Entry stop — capture and stash.
         let pre = capture_pre_syscall(frame, reader);
@@ -473,7 +627,7 @@ fn handle_syscall_stop(
     } else {
         // Exit stop — capture post + merge + emit.
         let pre = child.in_flight_pre.take().expect("just checked is_some");
-        let result = result_register_x86_64(&regs);
+        let result = result_from(&regs);
         let post = capture_post_syscall(frame, result, reader);
         let merged = merge_pre_post(&pre, &post);
         writer
@@ -489,10 +643,15 @@ fn handle_signal_delivery(
     reader: &dyn MemoryReader,
     writer: &mut TraceWriter,
 ) -> Result<RecordedEventKind, RecordSessionError> {
-    let regs = get_regs(child.pid).map_err(RecordSessionError::GetRegs)?;
-    let pc = regs.rip;
+    let regs = read_regs(child.pid).map_err(RecordSessionError::GetRegs)?;
+    let pc = pc_of(&regs);
     let siginfo = ptrace_getsiginfo(child.pid).map_err(RecordSessionError::Ptrace)?;
 
+    // Instruction-trap classification + replay-side synthesis is
+    // x86-64-only — iced-x86 disassembly + InstructionTrap kind
+    // set are x86 ISA. aarch64's analogue (MRS CNTVCT_EL0 trap)
+    // is queued for a later port.
+    #[cfg(target_arch = "x86_64")]
     if sig == libc::SIGSEGV || sig == libc::SIGILL {
         let bytes = reader.read(pc, 16);
         if let Some((instr_kind, dest_id)) =
@@ -503,12 +662,17 @@ fn handle_signal_delivery(
                 .write_event(event_for_instruction_trap(pc, instr_kind, result))
                 .map_err(RecordSessionError::Write)?;
             let mut new_regs = regs;
-            new_regs.rip = pc.saturating_add(instruction_byte_len(instr_kind));
-            set_regs(child.pid, &new_regs).map_err(RecordSessionError::SetRegs)?;
+            set_pc(&mut new_regs, pc.saturating_add(instruction_byte_len(instr_kind)));
+            write_regs(child.pid, &new_regs).map_err(RecordSessionError::SetRegs)?;
             // Don't deliver the signal — we synthesised around it.
             child.pending_signal = 0;
             return Ok(RecordedEventKind::InstructionTrap);
         }
+    }
+    // Suppress unused-variable warnings on aarch64.
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (sig, reader, pc);
     }
 
     let cap = SignalCapture::new(sig as u32, pc, siginfo)
@@ -632,12 +796,13 @@ pub enum RecordSessionError {
 
 impl From<ExitStopError> for RecordSessionError {
     fn from(e: ExitStopError) -> Self {
+        let display = format!("{e}");
         match e {
             ExitStopError::Wait(io) => Self::Wait(io),
             ExitStopError::GetRegs(io) => Self::GetRegs(io),
             ExitStopError::Write(w) => Self::Write(w),
-            ExitStopError::Recorder(_) | ExitStopError::Recv(_) => {
-                Self::Other(format!("legacy NOTIF-path error: {e}"))
+            ExitStopError::Recorder(_) => {
+                Self::Other(format!("legacy NOTIF-path error: {display}"))
             }
             ExitStopError::UnexpectedStop { kind, wstatus } => {
                 Self::Other(format!("unexpected stop {kind:?} (wstatus={wstatus:#x})"))
@@ -678,19 +843,21 @@ mod tests {
         assert_eq!(f.args, [2, 0xCAFE_BA00, 5, 0, 0, 0]);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn synthesise_trap_result_shapes_match_format_contract() {
         // Per format/event.rs comments:
         //   Rdtsc/Rdtscp  → 1 word
-        //   Rdrand/Rdseed → 2 words (value, success)
+        //   Rdrand/Rdseed → 3 words (value, success, dest_reg_id)
         //   Cpuid         → 4 words
         assert_eq!(synthesise_trap_result(InstrKind::Rdtsc).len(), 1);
         assert_eq!(synthesise_trap_result(InstrKind::Rdtscp).len(), 1);
-        assert_eq!(synthesise_trap_result(InstrKind::Rdrand).len(), 2);
-        assert_eq!(synthesise_trap_result(InstrKind::Rdseed).len(), 2);
+        assert_eq!(synthesise_trap_result(InstrKind::Rdrand).len(), 3);
+        assert_eq!(synthesise_trap_result(InstrKind::Rdseed).len(), 3);
         assert_eq!(synthesise_trap_result(InstrKind::Cpuid).len(), 4);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn instruction_byte_len_covers_every_kind() {
         for k in [

@@ -115,7 +115,11 @@ pub fn result_register_x86_64(regs: &UserRegsX86_64) -> i64 {
     regs.rax as i64
 }
 
-/// `PTRACE_GETREGS` wrapper.
+/// `PTRACE_GETREGS` wrapper. x86-64 only — `PTRACE_GETREGS` is
+/// the legacy x86 ptrace request; aarch64 uses
+/// `PTRACE_GETREGSET + NT_PRSTATUS` (see
+/// `regs_aarch64::get_regs_aarch64`).
+#[cfg(target_arch = "x86_64")]
 pub fn get_regs(pid: i32) -> io::Result<UserRegsX86_64> {
     let mut regs: UserRegsX86_64 = unsafe { mem::zeroed() };
     // SAFETY: PTRACE_GETREGS writes through &mut regs; the
@@ -137,7 +141,8 @@ pub fn get_regs(pid: i32) -> io::Result<UserRegsX86_64> {
 /// `PTRACE_SETREGS` wrapper. The replay shim calls this with a
 /// modified regs struct (typically rax overwritten with the
 /// recorded result) before stepping the tracee past the
-/// syscall-exit-stop.
+/// syscall-exit-stop. x86-64 only (see [`get_regs`] note).
+#[cfg(target_arch = "x86_64")]
 pub fn set_regs(pid: i32, regs: &UserRegsX86_64) -> io::Result<()> {
     let r = unsafe {
         libc::ptrace(
@@ -338,6 +343,12 @@ pub fn merge_pre_post(
 /// `PTRACE_O_TRACESYSGOOD` set (typically by `RecordChild::spawn`).
 ///
 /// Returns the merged capture so the caller can log/inspect.
+///
+/// x86-64 only — uses the legacy `PTRACE_GETREGS` request which
+/// isn't available on aarch64. The current PTRACE-only recorder
+/// (`record_session::step_until_event`) is the cross-arch path
+/// and should be preferred.
+#[cfg(target_arch = "x86_64")]
 pub fn record_syscall_with_exit(
     tracee_pid: i32,
     listener: BorrowedFd<'_>,

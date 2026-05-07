@@ -183,8 +183,9 @@ pub fn scan_vdso_exports(
     // ELF base for the loaded image = mapping start.
     let load_base = range.start;
     // Validate the e_type just to surface a clear error if
-    // someone hands us non-vDSO bytes.
-    if elf.elf_header().e_type.get(elf.endian())
+    // someone hands us non-vDSO bytes. `raw_header()` is the
+    // object 0.32 accessor for the parsed `Elf64_Ehdr`.
+    if elf.raw_header().e_type.get(elf.endian())
         != object::elf::ET_DYN
     {
         return Err(VdsoScanError::NotShared);
@@ -297,9 +298,11 @@ pub fn pokedata(pid: i32, addr: u64, word: u64) -> io::Result<()> {
 pub fn peekdata(pid: i32, addr: u64) -> io::Result<u64> {
     // PTRACE_PEEKDATA returns the word as the syscall result;
     // -1 is ambiguous with a real word value, so we set errno
-    // to 0 first and check both.
+    // to 0 first and check both. Linux uses
+    // `__errno_location()` (Darwin's equivalent is `__error()`,
+    // hence the cfg-gate).
     unsafe {
-        let errno_loc = libc::__error();
+        let errno_loc = errno_location();
         *errno_loc = 0;
         let r = libc::ptrace(
             libc::PTRACE_PEEKDATA,
@@ -313,6 +316,16 @@ pub fn peekdata(pid: i32, addr: u64) -> io::Result<u64> {
         }
         Ok(r as u64)
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__errno_location()
+}
+
+#[cfg(target_vendor = "apple")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__error()
 }
 
 /// Write `bytes` into the tracee at `addr`, in 8-byte chunks.
