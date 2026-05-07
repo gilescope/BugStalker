@@ -38,6 +38,15 @@ fn help_long_flag_prints_usage_and_exits_zero() {
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("replay-load"));
     assert!(stdout.contains("<TRACE_DIR>"));
+    // New inherit flags should be discoverable from --help.
+    assert!(
+        stdout.contains("--inherit-env"),
+        "missing --inherit-env in help: {stdout}",
+    );
+    assert!(
+        stdout.contains("--inherit-args"),
+        "missing --inherit-args in help: {stdout}",
+    );
 }
 
 #[test]

@@ -24,6 +24,16 @@ Usage:
 Options:
     --max-iterations <N>     Hard cap on supervisor loop iterations.
                              Defaults to 2_000_000.
+    --inherit-env            Use the trace's recorded initial_env
+                             instead of the current shell's env.
+                             Substantive for cross-host replay where
+                             the recording host's env differs from
+                             this one.
+    --inherit-args           Use the trace's recorded initial_args
+                             instead of the args passed after `--`.
+                             The PROGRAM positional is still
+                             required (defines argv[0] / which
+                             binary to spawn).
     -h, --help               Show this help.
 
 The TRACE_DIR must already exist and have been produced by a
@@ -54,6 +64,8 @@ mod linux_main {
         pub trace_dir: Option<String>,
         pub argv: Vec<String>,
         pub max_iterations: Option<u64>,
+        pub inherit_env: bool,
+        pub inherit_args: bool,
     }
 
     pub fn parse() -> Result<Cli, String> {
@@ -80,6 +92,8 @@ mod linux_main {
                     })?;
                     cli.max_iterations = Some(n);
                 }
+                "--inherit-env" => cli.inherit_env = true,
+                "--inherit-args" => cli.inherit_args = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown flag: {other}"));
                 }
@@ -138,18 +152,63 @@ mod linux_main {
     }
 
     pub fn run(cli: Cli) -> ExitCode {
-        let argv = match into_cstrings(&cli.argv) {
+        // Read the trace's manifest if either inherit flag is
+        // set so we can substitute env / args from the
+        // recording. Done up-front so an unreadable trace
+        // fails before we fork the tracee.
+        let recorded_manifest = if cli.inherit_env || cli.inherit_args {
+            match bs_replay_driver::engine::format::TraceReader::open(
+                cli.trace_dir.as_deref().expect("validated by parse()"),
+            ) {
+                Ok(r) => Some(r.manifest().clone()),
+                Err(e) => {
+                    eprintln!(
+                        "replay-load: --inherit-env/args requested but \
+                         couldn't open trace: {e}"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            None
+        };
+
+        // argv: program path always from cli.argv[0]; tail
+        // either from cli.argv[1..] or from the recorded
+        // initial_args, depending on --inherit-args.
+        let effective_argv: Vec<String> = if cli.inherit_args {
+            let mut v = vec![cli.argv[0].clone()];
+            if let Some(m) = recorded_manifest.as_ref() {
+                v.extend(m.initial_args.iter().cloned());
+            }
+            v
+        } else {
+            cli.argv.clone()
+        };
+        let argv = match into_cstrings(&effective_argv) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("replay-load: {e}");
                 return ExitCode::from(2);
             }
         };
-        let envp = match current_envp() {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("replay-load: {e}");
-                return ExitCode::from(2);
+
+        // envp: all-or-nothing from the recording vs. current.
+        let envp = if cli.inherit_env {
+            let m = recorded_manifest
+                .as_ref()
+                .expect("set above when inherit_env true");
+            m.initial_env
+                .iter()
+                .filter_map(|(k, v)| CString::new(format!("{k}={v}")).ok())
+                .collect()
+        } else {
+            match current_envp() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("replay-load: {e}");
+                    return ExitCode::from(2);
+                }
             }
         };
         let options = ReplayOptions {
