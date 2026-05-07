@@ -7,6 +7,27 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 round-out — UX polish, latent fix):
+  - Auto-stamped `recorded_at` in `record_program` (step 90).
+    Programmatic callers no longer need to manually plug in
+    `chrono::Utc::now().to_rfc3339()`; if the supplied
+    `Manifest.recorded_at` is `None`, `record_program` stamps
+    it. The replay-record CLI's `build_manifest` is fixed to
+    type-correctly construct `initial_env: Vec<(String,
+    String)>` (was `Vec<String>` of "K=V" — a latent
+    Linux-only build error since the CLI is cfg-gated and only
+    Darwin had been compiling it).
+  - `replay-load --inherit-env` and `--inherit-args` (step 91).
+    Use the trace's recorded `initial_env` /  `initial_args`
+    instead of the user's current shell env / argv-after-`--`.
+    Substantive correctness improvement for cross-host replay
+    where PATH / LANG / library paths differ from the
+    recording host. The trace's manifest is opened up-front
+    (before fork) so unreadable traces fail fast.
+  - `replay-record --overwrite` (step 92). Iterative recording
+    sessions no longer have to `rm -rf trace_dir` manually
+    between runs. Default (refuse-clobber) preserved as the
+    corruption-guard.
 - time-travel (Phase 5 follow-on — opt-in trapping, trace diff):
   - `RecordOptions::patch_vdso` + `trap_tsc` (step 86). Two
     new opt-in flags wire the existing primitives into
