@@ -60,12 +60,31 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use crate::record::linux::record_child::{recv_fd, send_fd};
 use crate::record::linux::seccomp::install_trap_all_listener;
 
+/// Tunables for [`spawn_replay_child_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReplaySpawnOptions {
+    /// If true, parent `PTRACE_SEIZE`s the child after the
+    /// listener handover and sets PTRACE_O_TRACESYSGOOD |
+    /// PTRACE_O_TRACEEXEC. Gives the supervisor authority to
+    /// PTRACE_SETSIGINFO for PC-precise signal replay,
+    /// PTRACE_SETREGS for instruction-trap replay, and
+    /// PTRACE_POKEDATA for cross-process vDSO patching.
+    ///
+    /// Per `seccomp_unotify(2)`, NOTIF takes precedence over
+    /// ptrace-syscall events, so syscall stops stay routed
+    /// through the listener fd. Other ptrace stops (signal-
+    /// delivery, ptrace-events) work normally.
+    pub ptrace_attach: bool,
+}
+
 /// A NOTIF-trapped child process. The replay supervisor drives
-/// it via [`Self::listener`].
+/// it via [`Self::listener`] (and optionally PTRACE primitives
+/// when [`Self::is_ptraced`] is true).
 #[derive(Debug)]
 pub struct ReplayChild {
     pid: i32,
     listener: OwnedFd,
+    ptraced: bool,
     cleaned_up: bool,
 }
 
@@ -73,6 +92,15 @@ impl ReplayChild {
     /// PID of the child.
     pub fn pid(&self) -> i32 {
         self.pid
+    }
+
+    /// True iff the supervisor PTRACE_SEIZED the child at
+    /// spawn. When false, ptrace-side primitives
+    /// (PTRACE_SETREGS, PTRACE_GETSIGINFO, PTRACE_POKEDATA)
+    /// will fail with ESRCH; the multiplexed replay loop
+    /// branches on this.
+    pub fn is_ptraced(&self) -> bool {
+        self.ptraced
     }
 
     /// Borrow the seccomp-NOTIF listener fd. The supervisor
@@ -93,6 +121,20 @@ impl ReplayChild {
     }
 
     fn do_shutdown(&self) -> io::Result<()> {
+        // If we're ptrace'd, detach first so SIGKILL can land
+        // cleanly. Errors here are best-effort — we want the
+        // SIGKILL path to run regardless.
+        if self.ptraced {
+            // SAFETY: PTRACE_DETACH on a tracee we own.
+            unsafe {
+                libc::ptrace(
+                    libc::PTRACE_DETACH,
+                    self.pid,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    std::ptr::null_mut::<libc::c_void>(),
+                );
+            }
+        }
         // Best-effort SIGKILL. ESRCH is fine — child already
         // died.
         let r = unsafe { libc::kill(self.pid, libc::SIGKILL) };
@@ -132,6 +174,16 @@ pub fn spawn_replay_child(
     argv: Vec<CString>,
     envp: Vec<CString>,
 ) -> Result<ReplayChild, ReplaySpawnError> {
+    spawn_replay_child_with(argv, envp, ReplaySpawnOptions::default())
+}
+
+/// Like [`spawn_replay_child`] but with [`ReplaySpawnOptions`]
+/// to opt into ptrace authority.
+pub fn spawn_replay_child_with(
+    argv: Vec<CString>,
+    envp: Vec<CString>,
+    options: ReplaySpawnOptions,
+) -> Result<ReplayChild, ReplaySpawnError> {
     if argv.is_empty() {
         return Err(ReplaySpawnError::EmptyArgv);
     }
@@ -164,7 +216,7 @@ pub fn spawn_replay_child(
     }
     // === Parent ===
     drop(child_sock);
-    match parent_setup(pid, parent_sock) {
+    match parent_setup(pid, parent_sock, options) {
         Ok(c) => Ok(c),
         Err(e) => {
             unsafe {
@@ -218,12 +270,44 @@ fn child_main(
     Err(74)
 }
 
-fn parent_setup(pid: i32, sock: OwnedFd) -> Result<ReplayChild, ReplaySpawnError> {
+fn parent_setup(
+    pid: i32,
+    sock: OwnedFd,
+    options: ReplaySpawnOptions,
+) -> Result<ReplayChild, ReplaySpawnError> {
     let listener = recv_fd(&sock).map_err(ReplaySpawnError::RecvFd)?;
     drop(sock);
+
+    let mut ptraced = false;
+    if options.ptrace_attach {
+        // PTRACE_SEIZE attaches without stopping the tracee
+        // (unlike PTRACE_ATTACH which sends SIGSTOP). The
+        // tracee keeps running natively; signal-delivery
+        // stops + ptrace-events arrive at the supervisor's
+        // waitpid as they occur.
+        // SAFETY: ptrace with SEIZE on a freshly-forked pid
+        // we own; data argument 0 = no options (PTRACE_SETOPTIONS
+        // can't run until the tracee is in a stop, which it
+        // isn't post-SEIZE — we set options lazily on first
+        // stop if needed).
+        let r = unsafe {
+            libc::ptrace(
+                libc::PTRACE_SEIZE,
+                pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
+        if r != 0 {
+            return Err(ReplaySpawnError::Seize(io::Error::last_os_error()));
+        }
+        ptraced = true;
+    }
+
     Ok(ReplayChild {
         pid,
         listener,
+        ptraced,
         cleaned_up: false,
     })
 }
@@ -243,6 +327,9 @@ pub enum ReplaySpawnError {
     /// `recvmsg(SCM_RIGHTS)` failed.
     #[error("recvmsg(SCM_RIGHTS): {0}")]
     RecvFd(io::Error),
+    /// `PTRACE_SEIZE` failed (yama strict mode, target died).
+    #[error("PTRACE_SEIZE: {0}")]
+    Seize(io::Error),
 }
 
 #[cfg(test)]
