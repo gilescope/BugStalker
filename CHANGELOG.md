@@ -7,6 +7,33 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 follow-on — opt-in trapping, trace diff):
+  - `RecordOptions::patch_vdso` + `trap_tsc` (step 86). Two
+    new opt-in flags wire the existing primitives into
+    `record_program`. `patch_vdso` calls
+    `apply_vdso_trampolines` on the tracee's [vdso] mapping
+    after the first ptrace stop; `trap_tsc` sets
+    `PR_SET_TSC = PR_TSC_SIGSEGV` in the tracee between
+    `PTRACE_TRACEME` and `execve` (per-thread, must run in the
+    tracee) via the new
+    `record_session::spawn_recorded_child_with(argv, envp,
+    flags)` + `ChildSetupFlags { trap_tsc }` API. Both flags
+    default `false`; `RecordProgramError` gains `VdsoScan` /
+    `VdsoPatch` variants.
+  - `replay-doctor --diff <OTHER>` (step 87). Walks two
+    traces in lock-step, prints the first event-index where
+    they diverge with per-variant divergence reasons (syscall
+    nr / arg index / result / output blob; signal sig_no / pc
+    / siginfo; instruction-trap pc / kind / result vector;
+    marker tag+data; pcmarker pc; "different variants"). Pairs
+    with `--counts` and `--dump-events` to give diagnose-by-
+    eyeball capability for non-deterministic recordings.
+    Differential-rr-oracle pipe is the eventual consumer; the
+    primitive lands now.
+  - `replay-record --patch-vdso` and `--trap-tsc` (step 88).
+    CLI exposure of the new RecordOptions flags. Help-text
+    paragraphs document the rationale for opt-in (libc RDTSC
+    probes at startup; vDSO-patched replay not yet validated).
 - time-travel (Phase 5 polish round — vDSO patcher, doctor
   diagnostics, signal replay, recorder bench):
   - vDSO remote patcher (step 78). Completes 3D's writer half:
