@@ -207,6 +207,18 @@ pub fn record_program(
     envp: Vec<CString>,
     options: RecordOptions,
 ) -> Result<RecordReport, RecordProgramError> {
+    // Auto-stamp recorded_at if the caller didn't. Always
+    // wins for the CLI (which builds a fresh Manifest with
+    // None) and is a no-op for callers that already pinned a
+    // value (e.g. capture_host_manifest already populates it).
+    let manifest_with_ts = if manifest.recorded_at.is_some() {
+        manifest.clone()
+    } else {
+        let mut m = manifest.clone();
+        m.recorded_at = Some(chrono::Utc::now().to_rfc3339());
+        m
+    };
+    let manifest = &manifest_with_ts;
     let mut writer =
         TraceWriter::create(&trace_dir, manifest).map_err(RecordProgramError::Trace)?;
 

@@ -156,14 +156,19 @@ mod linux_main {
                 .unwrap_or_else(|| "replay-record".to_owned()),
             cpu_features: vec![],
             engine_version: env!("CARGO_PKG_VERSION").to_owned(),
+            // POSIX disallows `=` in env keys; the format crate's
+            // serialiser would refuse those rows. Filter belt-and-
+            // braces.
             initial_env: std::env::vars()
-                .map(|(k, v)| format!("{k}={v}"))
+                .filter(|(k, _)| !k.contains('='))
                 .collect(),
             initial_cwd: std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| "/".to_owned()),
             initial_args: cli.argv.clone(),
-            recorded_at: None,
+            // Auto-stamped — RFC 3339 / UTC. Same path as
+            // bs_replay_driver::capture::capture_host_manifest.
+            recorded_at: Some(chrono::Utc::now().to_rfc3339()),
         }
     }
 
