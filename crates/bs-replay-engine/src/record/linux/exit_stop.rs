@@ -251,6 +251,26 @@ pub fn ptrace_syscall(pid: i32, sig: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// `PTRACE_SINGLESTEP`. Set the TF flag in EFLAGS so the
+/// tracee executes exactly one instruction then traps with
+/// `SIGTRAP`. Used by the replay-side single-step rendezvous
+/// (advance the tracee instruction-by-instruction toward a
+/// recorded PC).
+pub fn ptrace_singlestep(pid: i32, sig: i32) -> io::Result<()> {
+    let r = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SINGLESTEP,
+            pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            sig as *mut libc::c_void,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `PTRACE_CONT`. Continue, but skip past the next syscall-
 /// entry-stop (used after a `PTRACE_O_TRACESYSCALL` exit-stop
 /// when the recorder doesn't need to see the next entry).

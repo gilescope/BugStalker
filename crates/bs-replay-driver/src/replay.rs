@@ -17,7 +17,8 @@ use bs_replay_engine::format::event::Event;
 use bs_replay_engine::format::{TraceReadError, TraceReader};
 use bs_replay_engine::format::event::InstructionTrapKind;
 use bs_replay_engine::record::linux::exit_stop::{
-    classify_wstatus, get_regs, ptrace_cont, set_regs, StopKind, UserRegsX86_64,
+    classify_wstatus, get_regs, ptrace_cont, ptrace_singlestep, set_regs, StopKind,
+    UserRegsX86_64,
 };
 use bs_replay_engine::record::linux::instrs::{classify_at_pc, InstrKind};
 use bs_replay_engine::record::linux::ptrace_driver::{
@@ -78,8 +79,14 @@ pub struct ReplayReport {
     pub syscalls_applied: u64,
     /// `Event::Signal` events delivered to the tracee via
     /// `kill(2)` (best-effort) or `PTRACE_SETSIGINFO`
-    /// (content-precise, ptraced replays).
+    /// (content-precise, ptraced replays). Includes
+    /// `signals_pc_precise` as a strict subset.
     pub signals_delivered: u64,
+    /// `Event::Signal` events delivered at the *recorded* PC
+    /// via single-step rendezvous (subset of
+    /// `signals_delivered`). The remainder were content-precise
+    /// but delivered at the tracee's current PC.
+    pub signals_pc_precise: u64,
     /// `Event::Signal` events that couldn't be delivered
     /// (target dead, EPERM, etc.).
     pub signals_skipped: u64,
@@ -497,10 +504,14 @@ pub(crate) fn drive_ptraced_iteration(
     {
         LoopEvent::Notif(notif) => {
             // Syscall path — same as non-ptraced loop, but
-            // signal events along the way are delivered via
-            // PTRACE_SETSIGINFO (content-precise) instead of
-            // best-effort kill(2).
-            let event = walk_to_next_syscall_with(cursor, report, Some(pid))?;
+            // signal events along the way are delivered with
+            // PC-precise rendezvous when possible
+            // (single-step until RIP matches recorded.pc),
+            // falling back to content-precise SETSIGINFO and
+            // finally best-effort kill on failure.
+            let event = walk_to_next_syscall_full(
+                cursor, report, Some(pid), Some(listener_fd),
+            )?;
             let event = match event {
                 Some(e) => e,
                 None => return Ok(DriveOutcome::TraceExhausted),
@@ -615,19 +626,53 @@ fn walk_to_next_syscall_with(
     report: &mut ReplayReport,
     inject_pid: Option<i32>,
 ) -> Result<Option<Event>, ReplayShimError> {
+    walk_to_next_syscall_full(cursor, report, inject_pid, None)
+}
+
+/// Three-mode signal delivery:
+/// - `inject_pid = None`                          : best-effort
+///   `kill(2)`, no SETSIGINFO, no PC rendezvous.
+/// - `inject_pid = Some(pid)`, `listener_fd = None`: content-
+///   precise (PTRACE_SETSIGINFO), no PC rendezvous.
+/// - both `Some(_)`                               : PC-precise
+///   (single-step rendezvous + PTRACE_SETSIGINFO).
+fn walk_to_next_syscall_full(
+    cursor: &mut bs_replay_engine::format::EventCursor<'_>,
+    report: &mut ReplayReport,
+    inject_pid: Option<i32>,
+    listener_fd: Option<i32>,
+) -> Result<Option<Event>, ReplayShimError> {
     loop {
         match cursor.next() {
             Ok(Some(e)) => match e {
                 Event::Syscall { .. } => return Ok(Some(e)),
-                Event::Signal { sig_no, siginfo, .. } => {
-                    let delivered = match inject_pid {
-                        Some(pid) => deliver_recorded_signal(pid, sig_no, &siginfo).is_ok(),
-                        None => false,
+                Event::Signal { sig_no, pc, siginfo, .. } => {
+                    let outcome = match (inject_pid, listener_fd) {
+                        (Some(pid), Some(lfd)) => deliver_recorded_signal_at_pc(
+                            pid, lfd, sig_no, pc, &siginfo,
+                        ).map(Some),
+                        (Some(pid), None) => {
+                            deliver_recorded_signal(pid, sig_no, &siginfo)
+                                .map(|_| Some(DeliveryFidelity::ContentOnly))
+                        }
+                        (None, _) => Ok(None),
                     };
-                    if delivered {
-                        report.signals_delivered += 1;
-                    } else {
-                        report.signals_skipped += 1;
+                    match outcome {
+                        Ok(Some(DeliveryFidelity::PcPrecise { .. })) => {
+                            report.signals_delivered += 1;
+                            report.signals_pc_precise += 1;
+                        }
+                        Ok(Some(DeliveryFidelity::ContentOnly)) => {
+                            report.signals_delivered += 1;
+                        }
+                        Ok(None) => {
+                            // Best-effort kill — already accounted
+                            // for in the non-ptraced path.
+                            report.signals_skipped += 1;
+                        }
+                        Err(_) => {
+                            report.signals_skipped += 1;
+                        }
                     }
                     continue;
                 }
@@ -649,22 +694,167 @@ fn walk_to_next_syscall_with(
     }
 }
 
+/// Synchronously deliver a recorded signal to a ptraced tracee
+/// at the recorded PC where possible. PC-precise variant:
+/// before delivering, single-step the tracee until RIP matches
+/// the recorded delivery PC. Bounded to avoid runaway stepping;
+/// falls back to deliver-at-current-PC if the rendezvous is
+/// abandoned.
+fn deliver_recorded_signal_at_pc(
+    pid: i32,
+    listener_fd: i32,
+    sig_no: u32,
+    pc: u64,
+    siginfo: &[u8],
+) -> std::io::Result<DeliveryFidelity> {
+    let fidelity = match rendezvous_at_pc(pid, listener_fd, pc, MAX_RENDEZVOUS_STEPS) {
+        Ok(RendezvousOutcome::Reached { steps }) => DeliveryFidelity::PcPrecise { steps },
+        Ok(RendezvousOutcome::AlreadyThere) => {
+            DeliveryFidelity::PcPrecise { steps: 0 }
+        }
+        // PastIt / CapHit / AbortedSyscall / AbortedStop / Timeout
+        // → fall back to deliver-at-current-PC.
+        _ => DeliveryFidelity::ContentOnly,
+    };
+    deliver_recorded_signal(pid, sig_no, siginfo)?;
+    Ok(fidelity)
+}
+
+/// Outcome of a single-step rendezvous attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RendezvousOutcome {
+    /// RIP already matched on entry.
+    AlreadyThere,
+    /// Single-stepped to the target PC.
+    Reached {
+        /// How many single-steps it took.
+        steps: u32,
+    },
+    /// Tracee's RIP is past the target — can't go back.
+    PastIt,
+    /// Listener became readable mid-step — a syscall is queued
+    /// and we'd hang if we tried to single-step over it.
+    AbortedSyscall,
+    /// Got a non-SIGTRAP stop mid-step (e.g. SIGSEGV at an
+    /// instruction trap).
+    AbortedStop,
+    /// Step cap exceeded.
+    CapHit,
+    /// Tracee exited or was killed during the rendezvous.
+    TraceeGone,
+}
+
+/// Fidelity tier of a single signal delivery attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryFidelity {
+    /// `siginfo_t` matches the recording but the tracee
+    /// receives the signal at its current PC, not the
+    /// recorded delivery PC.
+    ContentOnly,
+    /// `siginfo_t` matches AND the tracee was rendezvoused to
+    /// the recorded PC via single-step before delivery.
+    PcPrecise {
+        /// Number of single-steps it took to rendezvous.
+        steps: u32,
+    },
+}
+
+/// Cap on single-step iterations. 64 is enough for sync
+/// signals where the recorded PC is the immediately-next
+/// instruction; async signals (timer SIGALRM, external
+/// SIGTERM) typically can't be PC-rendezvoused at all and
+/// hit AbortedSyscall fast.
+const MAX_RENDEZVOUS_STEPS: u32 = 64;
+
+/// Bounded poll-readable check on the listener fd.
+fn listener_is_readable(fd: i32, timeout_ms: i32) -> std::io::Result<bool> {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pfd.revents & libc::POLLIN != 0)
+}
+
+fn rendezvous_at_pc(
+    pid: i32,
+    listener_fd: i32,
+    target_pc: u64,
+    max_steps: u32,
+) -> std::io::Result<RendezvousOutcome> {
+    // Initial position check.
+    let regs = get_regs(pid)?;
+    if regs.rip == target_pc {
+        return Ok(RendezvousOutcome::AlreadyThere);
+    }
+    if regs.rip > target_pc {
+        return Ok(RendezvousOutcome::PastIt);
+    }
+
+    for steps in 1..=max_steps {
+        // Don't step into a syscall — the tracee would block
+        // in seccomp NOTIF wait and waitpid would hang. Bail
+        // out so the caller services the listener first.
+        if listener_is_readable(listener_fd, 0)? {
+            return Ok(RendezvousOutcome::AbortedSyscall);
+        }
+        ptrace_singlestep(pid, /*sig=*/ 0)?;
+        // Wait for the SIGTRAP that PTRACE_SINGLESTEP raises.
+        // Use a polling waitpid with a per-step deadline so
+        // we don't hang if the tracee blocked unexpectedly.
+        let mut status: libc::c_int = 0;
+        let mut waited_ms = 0i32;
+        let step_timeout_ms = 200;
+        let kind = loop {
+            let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if r > 0 {
+                break classify_wstatus(status);
+            }
+            if r < 0 {
+                return Ok(RendezvousOutcome::TraceeGone);
+            }
+            if waited_ms >= step_timeout_ms {
+                // Defensive — assume the tracee is stuck.
+                return Ok(RendezvousOutcome::AbortedSyscall);
+            }
+            // Sleep 1ms and retry.
+            unsafe {
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 1_000_000,
+                };
+                libc::nanosleep(&ts, std::ptr::null_mut());
+            }
+            waited_ms += 1;
+        };
+        match kind {
+            StopKind::SignalDelivery { sig } if sig == libc::SIGTRAP => {
+                let regs = get_regs(pid)?;
+                if regs.rip == target_pc {
+                    return Ok(RendezvousOutcome::Reached { steps });
+                }
+                if regs.rip > target_pc {
+                    return Ok(RendezvousOutcome::PastIt);
+                }
+                continue;
+            }
+            StopKind::Exited { .. } | StopKind::Signalled { .. } => {
+                return Ok(RendezvousOutcome::TraceeGone);
+            }
+            _ => return Ok(RendezvousOutcome::AbortedStop),
+        }
+    }
+    Ok(RendezvousOutcome::CapHit)
+}
+
 /// Synchronously deliver a recorded signal to a ptraced tracee.
-///
-/// Sequence:
-/// 1. `kill(pid, sig_no)` — kernel queues the signal.
-/// 2. `waitpid(pid)` — supervisor receives the signal-delivery
-///    stop.
-/// 3. `PTRACE_SETSIGINFO(pid, recorded siginfo)` — replace the
-///    in-flight siginfo with the recorded one (same si_code,
-///    si_addr, etc. as the recording).
-/// 4. `PTRACE_CONT(pid, sig_no)` — kernel routes the signal
-///    through the tracee's handler chain.
-///
-/// PC-precision caveat: the tracee receives the signal at its
-/// *current* PC, not the recorded one. Stronger guarantee
-/// would need single-stepping until RIP matches recorded.pc;
-/// queued for follow-up.
+/// (Content-precise — `siginfo_t` matches the recording, but
+/// the tracee receives it at its *current* PC.) Used as the
+/// fallback path when a PC-precise rendezvous can't complete.
 fn deliver_recorded_signal(pid: i32, sig_no: u32, siginfo: &[u8]) -> std::io::Result<()> {
     if sig_no == 0 || sig_no > 64 {
         return Err(std::io::Error::other(format!(
