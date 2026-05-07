@@ -183,6 +183,37 @@ pub fn validate_replay_plan(plan: &SignalReplayPlan<'_>) -> Result<(), SignalRep
     Ok(())
 }
 
+/// `PTRACE_SETSIGINFO` wrapper. Writes the recorded
+/// `siginfo_t` bytes into the kernel's pending-signal slot for
+/// `pid`; the next [`ptrace_cont`](super::exit_stop::ptrace_cont)
+/// with `sig != 0` delivers it to the tracee at the current
+/// PC. Pre-condition: the tracee must be in a signal-delivery
+/// stop (the supervisor reached this code path via a waitpid
+/// returning `WSTOPSIG`-tagged sig).
+pub fn ptrace_setsiginfo(pid: i32, siginfo: &[u8]) -> std::io::Result<()> {
+    if siginfo.len() != SIGINFO_T_LEN_X86_64 {
+        return Err(std::io::Error::other(format!(
+            "ptrace_setsiginfo: expected {SIGINFO_T_LEN_X86_64} bytes, got {}",
+            siginfo.len(),
+        )));
+    }
+    // SAFETY: PTRACE_SETSIGINFO reads exactly sizeof(siginfo_t)
+    // bytes through the data pointer. The slice's first
+    // SIGINFO_T_LEN_X86_64 bytes are valid for read.
+    let r = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETSIGINFO,
+            pid,
+            std::ptr::null_mut::<libc::c_void>(),
+            siginfo.as_ptr() as *mut libc::c_void,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Errors raised by [`validate_replay_plan`].
 #[derive(thiserror::Error, Debug, Clone, Eq, PartialEq)]
 pub enum SignalReplayError {

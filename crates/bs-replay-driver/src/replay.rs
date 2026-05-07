@@ -21,6 +21,7 @@ use bs_replay_engine::record::linux::exit_stop::{
 use bs_replay_engine::record::linux::ptrace_driver::{
     recv_notif, respond_intercept, SeccompNotif,
 };
+use bs_replay_engine::record::linux::signals::ptrace_setsiginfo;
 use bs_replay_engine::replay::linux::replay_child::{
     spawn_replay_child, spawn_replay_child_with, ReplayChild, ReplaySpawnError,
     ReplaySpawnOptions,
@@ -452,8 +453,11 @@ pub(crate) fn drive_ptraced_iteration(
         ).into_io_placeholder(e))? // see helper below
     {
         LoopEvent::Notif(notif) => {
-            // Syscall path — same as non-ptraced loop.
-            let event = walk_to_next_syscall(cursor, report)?;
+            // Syscall path — same as non-ptraced loop, but
+            // signal events along the way are delivered via
+            // PTRACE_SETSIGINFO (content-precise) instead of
+            // best-effort kill(2).
+            let event = walk_to_next_syscall_with(cursor, report, Some(pid))?;
             let event = match event {
                 Some(e) => e,
                 None => return Ok(DriveOutcome::TraceExhausted),
@@ -518,19 +522,36 @@ pub(crate) enum DriveOutcome {
     TraceeGone,
 }
 
-/// Walk `cursor` until the next `Event::Syscall`, counting
-/// signal/instruction-trap events along the way. Returns `None`
-/// when the trace is exhausted.
+/// Walk `cursor` until the next `Event::Syscall`. Signal
+/// events along the way get PC-not-precise-but-content-precise
+/// delivery via PTRACE_SETSIGINFO; instruction-trap events
+/// stay skipped (replay landing in step 97).
 fn walk_to_next_syscall(
     cursor: &mut bs_replay_engine::format::EventCursor<'_>,
     report: &mut ReplayReport,
+) -> Result<Option<Event>, ReplayShimError> {
+    walk_to_next_syscall_with(cursor, report, None)
+}
+
+fn walk_to_next_syscall_with(
+    cursor: &mut bs_replay_engine::format::EventCursor<'_>,
+    report: &mut ReplayReport,
+    inject_pid: Option<i32>,
 ) -> Result<Option<Event>, ReplayShimError> {
     loop {
         match cursor.next() {
             Ok(Some(e)) => match e {
                 Event::Syscall { .. } => return Ok(Some(e)),
-                Event::Signal { .. } => {
-                    report.signals_skipped += 1;
+                Event::Signal { sig_no, siginfo, .. } => {
+                    let delivered = match inject_pid {
+                        Some(pid) => deliver_recorded_signal(pid, sig_no, &siginfo).is_ok(),
+                        None => false,
+                    };
+                    if delivered {
+                        report.signals_delivered += 1;
+                    } else {
+                        report.signals_skipped += 1;
+                    }
                     continue;
                 }
                 Event::InstructionTrap { .. } => {
@@ -549,6 +570,61 @@ fn walk_to_next_syscall(
             }
         }
     }
+}
+
+/// Synchronously deliver a recorded signal to a ptraced tracee.
+///
+/// Sequence:
+/// 1. `kill(pid, sig_no)` — kernel queues the signal.
+/// 2. `waitpid(pid)` — supervisor receives the signal-delivery
+///    stop.
+/// 3. `PTRACE_SETSIGINFO(pid, recorded siginfo)` — replace the
+///    in-flight siginfo with the recorded one (same si_code,
+///    si_addr, etc. as the recording).
+/// 4. `PTRACE_CONT(pid, sig_no)` — kernel routes the signal
+///    through the tracee's handler chain.
+///
+/// PC-precision caveat: the tracee receives the signal at its
+/// *current* PC, not the recorded one. Stronger guarantee
+/// would need single-stepping until RIP matches recorded.pc;
+/// queued for follow-up.
+fn deliver_recorded_signal(pid: i32, sig_no: u32, siginfo: &[u8]) -> std::io::Result<()> {
+    if sig_no == 0 || sig_no > 64 {
+        return Err(std::io::Error::other(format!(
+            "deliver_recorded_signal: sig_no {sig_no} out of range"
+        )));
+    }
+    // Step 1: queue the signal.
+    let r = unsafe { libc::kill(pid, sig_no as i32) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Step 2: wait for the signal-delivery stop. Block here —
+    // we expect the kernel to deliver promptly.
+    let mut status: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let kind = classify_wstatus(status);
+    let actual_sig = match kind {
+        StopKind::SignalDelivery { sig } => sig,
+        StopKind::Exited { .. } | StopKind::Signalled { .. } => {
+            return Err(std::io::Error::other(
+                "tracee exited before signal delivery stop",
+            ));
+        }
+        _ => {
+            return Err(std::io::Error::other(format!(
+                "unexpected stop kind awaiting signal: {kind:?}"
+            )));
+        }
+    };
+    // Step 3: install the recorded siginfo.
+    ptrace_setsiginfo(pid, siginfo)?;
+    // Step 4: resume with the signal pending.
+    ptrace_cont(pid, actual_sig)?;
+    Ok(())
 }
 
 // Helper trait so we can chain io::Error into ReplayShimError
