@@ -436,19 +436,10 @@ mod tests {
         // so this isolates the register half of the loop.
         restore_registers(b.pid, &a_regs).expect("restore A regs into B");
         let b_regs = capture_registers(b.pid).expect("capture B regs");
-        let a_bs = unsafe {
-            std::slice::from_raw_parts(
-                &a_regs.regs as *const _ as *const u8,
-                std::mem::size_of::<libc::user_regs_struct>(),
-            )
-        };
-        let b_bs = unsafe {
-            std::slice::from_raw_parts(
-                &b_regs.regs as *const _ as *const u8,
-                std::mem::size_of::<libc::user_regs_struct>(),
-            )
-        };
-        assert_eq!(a_bs, b_bs, "B's regs should match A's after restore");
+        assert_eq!(
+            a_regs.bytes, b_regs.bytes,
+            "B's regs should match A's after restore",
+        );
 
         mech.kill(a).expect("kill A");
         mech.kill(b).expect("kill B");

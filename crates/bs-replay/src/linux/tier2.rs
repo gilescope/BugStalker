@@ -102,15 +102,9 @@ impl Tier2Capture {
 /// Encode a [`Tier2State`] into a single `Vec<u8>` suitable for
 /// stashing in a Tier 3 `format::Checkpoint.payload`.
 pub fn to_payload(state: &Tier2State) -> Vec<u8> {
-    let reg_bytes = unsafe {
-        std::slice::from_raw_parts(
-            &state.regs.regs as *const _ as *const u8,
-            std::mem::size_of::<libc::user_regs_struct>(),
-        )
-    };
+    let reg_bytes = state.regs.bytes.as_slice();
     let writable_payload = writable_to_payload(&state.writable);
-    let mut out =
-        Vec::with_capacity(8 + reg_bytes.len() + writable_payload.len());
+    let mut out = Vec::with_capacity(8 + reg_bytes.len() + writable_payload.len());
     out.extend_from_slice(&(reg_bytes.len() as u64).to_le_bytes());
     out.extend_from_slice(reg_bytes);
     out.extend_from_slice(&writable_payload);
@@ -127,7 +121,7 @@ pub fn from_payload(bytes: &[u8]) -> Result<Tier2State, Tier2DecodeError> {
     }
     let (head, rest) = bytes.split_at(8);
     let reg_len = u64::from_le_bytes(head.try_into().expect("8")) as usize;
-    let expected = std::mem::size_of::<libc::user_regs_struct>();
+    let expected = RegisterState::arch_byte_len();
     if reg_len != expected {
         return Err(Tier2DecodeError::WrongRegSize {
             claimed: reg_len,
@@ -141,12 +135,12 @@ pub fn from_payload(bytes: &[u8]) -> Result<Tier2State, Tier2DecodeError> {
         });
     }
     let (reg_bytes, writable_bytes) = rest.split_at(reg_len);
-    let regs = unsafe {
-        std::ptr::read_unaligned(reg_bytes.as_ptr() as *const libc::user_regs_struct)
-    };
     let writable =
         writable_from_payload(writable_bytes).map_err(Tier2DecodeError::Writable)?;
-    Ok(Tier2State { writable, regs: RegisterState { regs } })
+    Ok(Tier2State {
+        writable,
+        regs: RegisterState { bytes: reg_bytes.to_vec() },
+    })
 }
 
 /// Errors arising from [`Tier2Capture::capture`] /
@@ -208,25 +202,13 @@ mod tests {
                 }],
             },
             regs: RegisterState {
-                regs: zeroed_regs(),
+                bytes: vec![0u8; RegisterState::arch_byte_len()],
             },
         };
         let p = to_payload(&state);
         let back = from_payload(&p).unwrap();
         assert_eq!(state.writable, back.writable);
-        let a_bs = unsafe {
-            std::slice::from_raw_parts(
-                &state.regs.regs as *const _ as *const u8,
-                std::mem::size_of::<libc::user_regs_struct>(),
-            )
-        };
-        let b_bs = unsafe {
-            std::slice::from_raw_parts(
-                &back.regs.regs as *const _ as *const u8,
-                std::mem::size_of::<libc::user_regs_struct>(),
-            )
-        };
-        assert_eq!(a_bs, b_bs);
+        assert_eq!(state.regs.bytes, back.regs.bytes);
     }
 
     #[test]
@@ -313,30 +295,12 @@ mod tests {
         let a_at_addr = read_bytes_at(a.handle.pid, addr, 128).expect("read A");
         assert_eq!(b_post, a_at_addr);
 
-        // Registers too.
+        // Registers too — bytes-equality on the captured snapshot.
         let b_regs = capture_registers(b_handle.pid).expect("getregs B");
-        let a_bs = unsafe {
-            std::slice::from_raw_parts(
-                &a.state.regs.regs as *const _ as *const u8,
-                std::mem::size_of::<libc::user_regs_struct>(),
-            )
-        };
-        let b_bs = unsafe {
-            std::slice::from_raw_parts(
-                &b_regs.regs as *const _ as *const u8,
-                std::mem::size_of::<libc::user_regs_struct>(),
-            )
-        };
-        assert_eq!(a_bs, b_bs);
+        assert_eq!(a.state.regs.bytes, b_regs.bytes);
 
         // Clean up.
         a.kill(&mut mech).expect("kill A");
         mech.kill(b_handle).expect("kill B");
-    }
-
-    fn zeroed_regs() -> libc::user_regs_struct {
-        // SAFETY: user_regs_struct is POD; zero-init is a valid
-        // value for every field.
-        unsafe { std::mem::zeroed() }
     }
 }

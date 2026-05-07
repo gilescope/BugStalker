@@ -1,151 +1,295 @@
 // SPDX-License-Identifier: MIT
-//! Register-state capture / restore via `ptrace::getregs` and
-//! `ptrace::setregs`.
+//! Register-state capture / restore via ptrace.
 //!
 //! Tier 2 checkpoints need both memory state (handled in
 //! [`super::checkpoint_capture`]) and CPU register state. This
 //! module is the register half; combining the two into one
 //! payload is the consumer's job.
 //!
-//! Architecture-specific. Linux x86_64 today; aarch64 builds
-//! get a stub that returns `ENOSYS` from each operation. The
-//! aarch64 path will land alongside Phase 5 sub-phase 3G's
-//! `regs_aarch64` work in `bs-replay-engine`.
+//! Cross-arch on Linux:
+//!
+//! - **x86-64**: `PTRACE_GETREGS` / `PTRACE_SETREGS` returning
+//!   `libc::user_regs_struct` (216 B).
+//! - **aarch64**: `PTRACE_GETREGSET` / `PTRACE_SETREGSET` with
+//!   `NT_PRSTATUS` and an iovec; the kernel struct is
+//!   `user_pt_regs` (272 B).
+//!
+//! [`RegisterState`] carries the raw bytes; the architecture
+//! is implicit (the manifest's CPU-feature check refuses
+//! cross-arch replay before we'd ever try to write a wrong-
+//! shape blob).
+
+use std::io;
+use std::mem;
 
 use nix::unistd::Pid;
 
-/// Wrapped `libc::user_regs_struct`. Newtype so the public API
-/// doesn't leak the libc type and we can pin a `Clone + Copy +
-/// Debug` shape independent of libc's bindings.
-#[derive(Debug, Clone, Copy)]
+/// Wrapped kernel register snapshot. Bytes are arch-shaped:
+/// `arch_byte_len()` × 8 on x86-64, more on aarch64. The
+/// payload codec doesn't peek inside; replay's
+/// `restore_registers` writes them back via the same ptrace
+/// path that produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisterState {
-    /// Raw kernel-ABI register snapshot.
-    pub regs: libc::user_regs_struct,
+    /// Raw kernel-ABI bytes. Length depends on the host arch.
+    pub bytes: Vec<u8>,
 }
 
-/// PTRACE_GETREGS the target. Caller must have already
-/// ptrace-attached.
+impl RegisterState {
+    /// Number of bytes the local arch's register snapshot
+    /// occupies. Tier 2 payload codec uses this as a sanity
+    /// tripwire.
+    pub const fn arch_byte_len() -> usize {
+        #[cfg(target_arch = "x86_64")]
+        {
+            mem::size_of::<libc::user_regs_struct>()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // struct user_pt_regs: 31×u64 + sp + pc + pstate = 34×8.
+            34 * 8
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            0
+        }
+    }
+}
+
+/// `PTRACE_GETREGS` (x86_64) or `PTRACE_GETREGSET + NT_PRSTATUS`
+/// (aarch64). Caller must have already ptrace-attached.
 pub fn capture_registers(pid: Pid) -> Result<RegisterState, RegError> {
-    let regs = nix::sys::ptrace::getregs(pid)?;
-    Ok(RegisterState { regs })
+    capture_arch(pid)
 }
 
-/// PTRACE_SETREGS the target with `state`. Caller must have
-/// already ptrace-attached.
+/// Inverse of [`capture_registers`]: `PTRACE_SETREGS` (x86_64)
+/// or `PTRACE_SETREGSET` (aarch64).
 pub fn restore_registers(pid: Pid, state: &RegisterState) -> Result<(), RegError> {
-    nix::sys::ptrace::setregs(pid, state.regs)?;
+    if state.bytes.len() != RegisterState::arch_byte_len() {
+        return Err(RegError::WrongLen {
+            got: state.bytes.len(),
+            expected: RegisterState::arch_byte_len(),
+        });
+    }
+    restore_arch(pid, &state.bytes)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn capture_arch(pid: Pid) -> Result<RegisterState, RegError> {
+    let regs = nix::sys::ptrace::getregs(pid)?;
+    let n = mem::size_of::<libc::user_regs_struct>();
+    let mut bytes = Vec::with_capacity(n);
+    // SAFETY: user_regs_struct is POD; reinterpreting its
+    // memory as &[u8] for the duration of the copy is sound.
+    unsafe {
+        let src = std::slice::from_raw_parts(
+            &regs as *const _ as *const u8,
+            n,
+        );
+        bytes.extend_from_slice(src);
+    }
+    Ok(RegisterState { bytes })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn restore_arch(pid: Pid, bytes: &[u8]) -> Result<(), RegError> {
+    // Reconstruct the user_regs_struct from bytes and call
+    // setregs. The struct is POD so a read_unaligned is fine
+    // even if the buffer's start isn't 8-aligned.
+    let regs: libc::user_regs_struct = unsafe {
+        std::ptr::read_unaligned(bytes.as_ptr() as *const _)
+    };
+    nix::sys::ptrace::setregs(pid, regs)?;
     Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+fn capture_arch(pid: Pid) -> Result<RegisterState, RegError> {
+    const NT_PRSTATUS: i32 = 1;
+    let n = RegisterState::arch_byte_len();
+    let mut bytes = vec![0u8; n];
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr() as *mut libc::c_void,
+        iov_len: n,
+    };
+    // SAFETY: PTRACE_GETREGSET fills iov_base with up to
+    // iov_len bytes; the buffer is owned and exactly that size.
+    let r = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETREGSET,
+            pid.as_raw(),
+            NT_PRSTATUS as *mut libc::c_void,
+            &mut iov as *mut _ as *mut libc::c_void,
+        )
+    };
+    if r != 0 {
+        return Err(RegError::Io(io::Error::last_os_error()));
+    }
+    bytes.truncate(iov.iov_len);
+    Ok(RegisterState { bytes })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn restore_arch(pid: Pid, bytes: &[u8]) -> Result<(), RegError> {
+    const NT_PRSTATUS: i32 = 1;
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_ptr() as *mut libc::c_void,
+        iov_len: bytes.len(),
+    };
+    let r = unsafe {
+        libc::ptrace(
+            libc::PTRACE_SETREGSET,
+            pid.as_raw(),
+            NT_PRSTATUS as *mut libc::c_void,
+            &mut iov as *mut _ as *mut libc::c_void,
+        )
+    };
+    if r != 0 {
+        return Err(RegError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn capture_arch(_pid: Pid) -> Result<RegisterState, RegError> {
+    Err(RegError::Io(io::Error::from_raw_os_error(libc::ENOSYS)))
+}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn restore_arch(_pid: Pid, _bytes: &[u8]) -> Result<(), RegError> {
+    Err(RegError::Io(io::Error::from_raw_os_error(libc::ENOSYS)))
 }
 
 /// Errors arising from getregs / setregs.
 #[derive(thiserror::Error, Debug)]
 pub enum RegError {
-    /// nix-level errno failure.
+    /// nix-level errno failure (x86_64 path).
     #[error("nix error: {0}")]
     Nix(#[from] nix::errno::Errno),
+    /// raw I/O error (aarch64 path).
+    #[error("ptrace io: {0}")]
+    Io(io::Error),
+    /// Caller passed a [`RegisterState`] with a `bytes` length
+    /// that doesn't match the host architecture's expected
+    /// snapshot size — typically a cross-arch trace replay.
+    #[error("register-state byte length: got {got}, expected {expected}")]
+    WrongLen {
+        /// What the caller supplied.
+        got: usize,
+        /// What `RegisterState::arch_byte_len()` requires.
+        expected: usize,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux::fork_self::LinuxForkSelfMechanism;
-    use crate::ring::CheckpointMechanism;
-    use std::thread::sleep;
-    use std::time::Duration;
 
     #[test]
-    fn capture_then_restore_is_identity() {
-        let mut mech = LinuxForkSelfMechanism::new();
-        let h = mech.take(0).expect("fork failed");
-        sleep(Duration::from_millis(50));
-        if let Err(e) = mech.seize(&h) {
-            let s = format!("{e:?}");
-            if s.contains("EPERM") {
-                eprintln!("skipping regs test: YAMA blocked seize");
-                mech.kill(h).expect("kill failed");
-                return;
-            }
-            panic!("seize failed: {e:?}");
-        }
-
-        let captured = match capture_registers(h.pid) {
-            Ok(r) => r,
-            Err(e) => {
-                let s = format!("{e:?}");
-                if s.contains("EPERM") {
-                    mech.kill(h).expect("kill failed");
-                    return;
-                }
-                panic!("getregs failed: {e:?}");
-            }
-        };
-        // Restore the same state — should be a no-op.
-        restore_registers(h.pid, &captured).expect("setregs failed");
-        let recaptured = capture_registers(h.pid).expect("getregs2 failed");
-
-        // Compare the raw user_regs_struct field-by-field via a
-        // memcmp on the byte representation. The struct is plain
-        // POD (no padding aliasing per the kernel ABI).
-        let a = bytes_of(&captured.regs);
-        let b = bytes_of(&recaptured.regs);
-        assert_eq!(a, b, "no-op restore changed the register state");
-
-        mech.kill(h).expect("kill failed");
-    }
-
-    #[test]
-    fn targeted_modification_is_observable_after_restore() {
-        // Capture; flip rax to a sentinel via setregs; recapture
-        // and confirm rax matches the sentinel. This proves
-        // restore_registers writes through to the kernel's tracee
-        // copy.
-        let mut mech = LinuxForkSelfMechanism::new();
-        let h = mech.take(0).expect("fork failed");
-        sleep(Duration::from_millis(50));
-        if let Err(e) = mech.seize(&h) {
-            let s = format!("{e:?}");
-            if s.contains("EPERM") {
-                eprintln!("skipping regs-modify test: YAMA blocked seize");
-                mech.kill(h).expect("kill failed");
-                return;
-            }
-            panic!("seize failed: {e:?}");
-        }
-
-        let mut state = match capture_registers(h.pid) {
-            Ok(r) => r,
-            Err(e) => {
-                let s = format!("{e:?}");
-                if s.contains("EPERM") {
-                    mech.kill(h).expect("kill failed");
-                    return;
-                }
-                panic!("getregs failed: {e:?}");
-            }
-        };
-        const SENTINEL: u64 = 0xdead_beef_cafe_babe;
-        state.regs.rax = SENTINEL;
-        restore_registers(h.pid, &state).expect("setregs failed");
-        let recaptured = capture_registers(h.pid).expect("getregs2 failed");
-        assert_eq!(
-            recaptured.regs.rax, SENTINEL,
-            "rax did not survive setregs roundtrip",
+    fn arch_byte_len_is_nontrivial() {
+        let n = RegisterState::arch_byte_len();
+        // x86_64: 216, aarch64: 272.
+        assert!(
+            n == 216 || n == 272,
+            "unexpected arch byte len: {n}",
         );
-
-        mech.kill(h).expect("kill failed");
     }
 
-    /// Reinterpret the user_regs_struct as a byte slice for a
-    /// memcmp-style equality check.
-    fn bytes_of(r: &libc::user_regs_struct) -> &[u8] {
-        // SAFETY: user_regs_struct is POD (no padding-by-language,
-        // no Drop, no interior pointers). Reinterpreting its
-        // memory as &[u8] for read-only inspection is sound.
-        unsafe {
-            std::slice::from_raw_parts(
-                r as *const libc::user_regs_struct as *const u8,
-                std::mem::size_of::<libc::user_regs_struct>(),
-            )
+    #[test]
+    fn restore_rejects_wrong_len() {
+        let bad = RegisterState { bytes: vec![0u8; 7] };
+        let err = restore_registers(Pid::from_raw(1), &bad).unwrap_err();
+        match err {
+            RegError::WrongLen { got: 7, expected } => {
+                assert_eq!(expected, RegisterState::arch_byte_len());
+            }
+            other => panic!("expected WrongLen, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    mod x86_64_only {
+        use super::super::*;
+        use crate::linux::fork_self::LinuxForkSelfMechanism;
+        use crate::ring::CheckpointMechanism;
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        #[test]
+        fn capture_then_restore_is_identity() {
+            let mut mech = LinuxForkSelfMechanism::new();
+            let h = mech.take(0).expect("fork failed");
+            sleep(Duration::from_millis(50));
+            if let Err(e) = mech.seize(&h) {
+                let s = format!("{e:?}");
+                if s.contains("EPERM") {
+                    eprintln!("skipping regs test: YAMA blocked seize");
+                    mech.kill(h).expect("kill failed");
+                    return;
+                }
+                panic!("seize failed: {e:?}");
+            }
+
+            let captured = match capture_registers(h.pid) {
+                Ok(r) => r,
+                Err(e) => {
+                    let s = format!("{e:?}");
+                    if s.contains("EPERM") {
+                        mech.kill(h).expect("kill failed");
+                        return;
+                    }
+                    panic!("getregs failed: {e:?}");
+                }
+            };
+            // No-op round-trip.
+            restore_registers(h.pid, &captured).expect("setregs failed");
+            let recaptured = capture_registers(h.pid).expect("getregs2 failed");
+            assert_eq!(captured, recaptured, "no-op restore mutated state");
+            mech.kill(h).expect("kill failed");
+        }
+
+        #[test]
+        fn targeted_modification_is_observable_after_restore() {
+            // x86_64 only — demonstrates rax-flip via raw bytes.
+            let mut mech = LinuxForkSelfMechanism::new();
+            let h = mech.take(0).expect("fork failed");
+            sleep(Duration::from_millis(50));
+            if let Err(e) = mech.seize(&h) {
+                let s = format!("{e:?}");
+                if s.contains("EPERM") {
+                    eprintln!("skipping regs-modify test: YAMA blocked seize");
+                    mech.kill(h).expect("kill failed");
+                    return;
+                }
+                panic!("seize failed: {e:?}");
+            }
+            let mut state = match capture_registers(h.pid) {
+                Ok(r) => r,
+                Err(e) => {
+                    let s = format!("{e:?}");
+                    if s.contains("EPERM") {
+                        mech.kill(h).expect("kill failed");
+                        return;
+                    }
+                    panic!("getregs failed: {e:?}");
+                }
+            };
+            // RAX offset in user_regs_struct is +80 (10 u64 fields
+            // before it). Reconstruct, flip, restore.
+            const RAX_OFFSET: usize = 80;
+            const SENTINEL: u64 = 0xdead_beef_cafe_babe;
+            state.bytes[RAX_OFFSET..RAX_OFFSET + 8]
+                .copy_from_slice(&SENTINEL.to_le_bytes());
+            restore_registers(h.pid, &state).expect("setregs failed");
+            let recaptured = capture_registers(h.pid).expect("getregs2 failed");
+            let read_back = u64::from_le_bytes(
+                recaptured.bytes[RAX_OFFSET..RAX_OFFSET + 8]
+                    .try_into().unwrap(),
+            );
+            assert_eq!(
+                read_back, SENTINEL,
+                "rax did not survive setregs roundtrip",
+            );
+            mech.kill(h).expect("kill failed");
         }
     }
 }

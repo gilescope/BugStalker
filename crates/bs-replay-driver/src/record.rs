@@ -88,8 +88,10 @@ use bs_replay_engine::record::linux::record_session::{
     RecordSessionError, RecordSummary, SpawnError, Terminal,
 };
 use bs_replay_engine::record::linux::vdso_patch::{
-    apply_vdso_trampolines, scan_remote_vdso, ScanRemoteError, VdsoPatchError,
+    scan_remote_vdso, ScanRemoteError, VdsoPatchError,
 };
+#[cfg(target_arch = "x86_64")]
+use bs_replay_engine::record::linux::vdso_patch::apply_vdso_trampolines;
 
 /// How a recorded program ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,10 +233,17 @@ pub fn record_program(
 
     if options.patch_vdso {
         let symbols = scan_remote_vdso(pid).map_err(RecordProgramError::VdsoScan)?;
+        #[cfg(target_arch = "x86_64")]
         if !symbols.is_empty() {
             apply_vdso_trampolines(pid, &symbols)
                 .map_err(RecordProgramError::VdsoPatch)?;
         }
+        // aarch64 trampoline payload not yet ported (would
+        // need an `svc #0`-style instruction sequence). The
+        // scan still runs to surface the symbols for
+        // diagnostics; patching is silently skipped.
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = symbols;
     }
 
     let summary: RecordSummary =

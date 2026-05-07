@@ -21,7 +21,11 @@
 //! - The trace round-trips through `TraceReader` cleanly.
 //! - Every captured event decodes via `CapturedSyscall::decode_output`.
 
-#![cfg(target_os = "linux")]
+// x86_64-specific (uses the legacy NOTIF + GETREGS recorder
+// path which is x86-only). The cross-arch recorder path lives
+// in `record_session::step_until_event` and has its own
+// in-tree tests.
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::ffi::CString;
 use std::path::PathBuf;

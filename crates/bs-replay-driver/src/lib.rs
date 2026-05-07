@@ -70,12 +70,8 @@ pub mod record_primitives {
     #[doc(inline)]
     pub use bs_replay_engine::record::linux::{
         exit_stop::{
-            classify_wstatus, get_regs, merge_pre_post, ptrace_cont, ptrace_syscall,
-            record_syscall_with_exit, result_register_x86_64, set_regs,
+            classify_wstatus, merge_pre_post, ptrace_cont, ptrace_syscall,
             wait_for_next_stop, ExitStopError, StopKind, UserRegsX86_64,
-        },
-        instrs::{
-            classify_at_pc, event_for_instruction_trap, set_tsc_trap_for_self, InstrKind,
         },
         ptrace_driver::{
             capture_from_notif, event_for_capture, frame_from_notif, recv_notif,
@@ -85,9 +81,9 @@ pub mod record_primitives {
         },
         record_child::{spawn as spawn_record_child, RecordChild},
         record_session::{
-            call_frame_from_regs, ptrace_getsiginfo, record_to_completion,
-            spawn_recorded_child, step_until_event, RecordSessionError, RecordSummary,
-            RecordedChild, RecordedEventKind, SpawnError, Terminal,
+            ptrace_getsiginfo, record_to_completion, spawn_recorded_child,
+            step_until_event, RecordSessionError, RecordSummary, RecordedChild,
+            RecordedEventKind, SpawnError, Terminal,
         },
         seccomp::install_trap_all_listener,
         signals::{
@@ -100,13 +96,30 @@ pub mod record_primitives {
             AffinityMask, SingleCpuPin,
         },
         vdso_patch::{
-            apply_vdso_trampolines, find_vdso_range, find_vdso_range_for_self,
+            find_vdso_range, find_vdso_range_for_self,
             patch_bytes as patch_remote_bytes, peekdata, pokedata,
             read_proc_maps, read_proc_maps_for_self, read_remote_vdso_bytes,
             scan_remote_vdso, scan_vdso_exports, syscall_nr_for_vdso,
             ProcMapping, ScanRemoteError, VdsoPatch, VdsoPatchError, VdsoScanError,
             VdsoSymbol, VDSO_TARGET_SYMBOLS,
         },
+    };
+
+    // x86_64-only re-exports (not available on aarch64 Linux):
+    // get_regs / set_regs (use PTRACE_GETREGS request), legacy
+    // record_syscall_with_exit (NOTIF + GETREGS path), the
+    // iced-x86 instruction classifier, vDSO trampoline applier
+    // (uses x86 trampoline payload), and the x86 result-register
+    // accessor.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[doc(inline)]
+    pub use bs_replay_engine::record::linux::{
+        exit_stop::{get_regs, record_syscall_with_exit, result_register_x86_64, set_regs},
+        instrs::{
+            classify_at_pc, event_for_instruction_trap, set_tsc_trap_for_self, InstrKind,
+        },
+        record_session::call_frame_from_regs,
+        vdso_patch::apply_vdso_trampolines,
     };
 }
 

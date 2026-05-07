@@ -29,9 +29,12 @@ libc = "0.2"
 
 # Linux DAP handlers (capture, restore) need nix::unistd::Pid for
 # constructing target PIDs from i32. nix is a transitive dep via
-# bs-replay; the explicit dep makes the import valid.
+# bs-replay; the explicit dep makes the import valid. The libc
+# dep is explicit too — replay.rs uses libc::ptrace, libc::poll,
+# libc::waitpid + the WIFEXITED/WIFSIGNALED macros directly.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.27.1", features = ["process"] }
+libc = "0.2"
 
 # Small support CLI — see crate-level docs.
 [[bin]]

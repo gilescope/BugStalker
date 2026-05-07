@@ -16,7 +16,11 @@
 //!    decoded state, verify bytes + registers match the
 //!    originally-captured A.
 
-#![cfg(target_os = "linux")]
+// x86_64-specific (uses libc::user_regs_struct fields directly).
+// The aarch64 path validates via RegisterState::bytes equality
+// in the inline tests; this end-to-end test stays x86-only
+// pending a layout-agnostic field-flip helper.
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
 use std::fs;
 use std::path::PathBuf;

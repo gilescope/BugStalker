@@ -17,9 +17,10 @@ use bs_replay_engine::format::event::Event;
 use bs_replay_engine::format::{TraceReadError, TraceReader};
 use bs_replay_engine::format::event::InstructionTrapKind;
 use bs_replay_engine::record::linux::exit_stop::{
-    classify_wstatus, get_regs, ptrace_cont, ptrace_singlestep, set_regs, StopKind,
-    UserRegsX86_64,
+    classify_wstatus, ptrace_cont, ptrace_singlestep, StopKind, UserRegsX86_64,
 };
+#[cfg(target_arch = "x86_64")]
+use bs_replay_engine::record::linux::exit_stop::{get_regs, set_regs};
 use bs_replay_engine::record::linux::instrs::{classify_at_pc, InstrKind};
 use bs_replay_engine::record::linux::ptrace_driver::{
     recv_notif, respond_intercept, ProcMemReader, SeccompNotif,
@@ -35,7 +36,7 @@ use bs_replay_engine::replay::linux::shim::{
 };
 
 /// How a replay session ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplayExit {
     /// Tracee exited normally.
     Exited(i32),
@@ -73,7 +74,7 @@ pub enum ShimRefusedReason {
 }
 
 /// Per-event counts from a [`replay_program`] run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReplayReport {
     /// `Event::Syscall` events successfully applied.
     pub syscalls_applied: u64,
@@ -185,6 +186,7 @@ pub fn replay_program(
     let pid = child.pid();
     let mut writer = ProcMemWriter::new(pid);
 
+    #[cfg(target_arch = "x86_64")]
     if options.patch_vdso && child.is_ptraced() {
         // The vDSO patcher runs from the supervisor side via
         // PTRACE_POKEDATA; tracee must be ptraced. Errors are
@@ -211,6 +213,10 @@ pub fn replay_program(
             }
         }
     }
+    // On aarch64 the patch payload isn't ported yet; the
+    // option is accepted but no-op.
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = options.patch_vdso;
     let listener_fd = std::os::fd::AsRawFd::as_raw_fd(&child.listener());
     let ptraced = child.is_ptraced();
 
@@ -540,6 +546,7 @@ pub(crate) fn drive_ptraced_iteration(
         LoopEvent::Stop(kind, status) => match kind {
             StopKind::Exited { code } => Ok(DriveOutcome::Exited(code)),
             StopKind::Signalled { sig } => Ok(DriveOutcome::Signalled(sig)),
+            #[cfg(target_arch = "x86_64")]
             StopKind::SignalDelivery { sig }
                 if sig == libc::SIGSEGV || sig == libc::SIGILL =>
             {
@@ -700,6 +707,11 @@ fn walk_to_next_syscall_full(
 /// the recorded delivery PC. Bounded to avoid runaway stepping;
 /// falls back to deliver-at-current-PC if the rendezvous is
 /// abandoned.
+///
+/// x86-64 only — the rendezvous reads `RIP` via `PTRACE_GETREGS`
+/// and the aarch64 register-read primitive isn't yet wired
+/// through the driver. On aarch64 the call falls through to
+/// content-precise delivery (no rendezvous).
 fn deliver_recorded_signal_at_pc(
     pid: i32,
     listener_fd: i32,
@@ -707,6 +719,7 @@ fn deliver_recorded_signal_at_pc(
     pc: u64,
     siginfo: &[u8],
 ) -> std::io::Result<DeliveryFidelity> {
+    #[cfg(target_arch = "x86_64")]
     let fidelity = match rendezvous_at_pc(pid, listener_fd, pc, MAX_RENDEZVOUS_STEPS) {
         Ok(RendezvousOutcome::Reached { steps }) => DeliveryFidelity::PcPrecise { steps },
         Ok(RendezvousOutcome::AlreadyThere) => {
@@ -715,6 +728,11 @@ fn deliver_recorded_signal_at_pc(
         // PastIt / CapHit / AbortedSyscall / AbortedStop / Timeout
         // → fall back to deliver-at-current-PC.
         _ => DeliveryFidelity::ContentOnly,
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let fidelity = {
+        let _ = (listener_fd, pc);
+        DeliveryFidelity::ContentOnly
     };
     deliver_recorded_signal(pid, sig_no, siginfo)?;
     Ok(fidelity)
@@ -780,6 +798,7 @@ fn listener_is_readable(fd: i32, timeout_ms: i32) -> std::io::Result<bool> {
     Ok(pfd.revents & libc::POLLIN != 0)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn rendezvous_at_pc(
     pid: i32,
     listener_fd: i32,
@@ -911,6 +930,11 @@ impl ReplayShimErrorExt for ReplayShimError {
 /// the recorded result was installed. `Ok(false)` if the PC
 /// isn't a classified instruction or no matching event in the
 /// trace. `Err` on ptrace I/O failure.
+///
+/// x86-64 only — uses iced-x86 to classify the instruction +
+/// PTRACE_GETREGS/SETREGS to write the recorded result. The
+/// aarch64 analogue (CNTVCT_EL0 / MRS / AT) is queued.
+#[cfg(target_arch = "x86_64")]
 fn try_replay_instruction_trap(
     pid: i32,
     cursor: &mut bs_replay_engine::format::EventCursor<'_>,
@@ -974,6 +998,7 @@ fn try_replay_instruction_trap(
 /// registers per the format crate's per-kind contract, then
 /// advance RIP past the instruction. Mirrors the recorder's
 /// `synthesise_trap_result` shape.
+#[cfg(target_arch = "x86_64")]
 fn install_recorded_trap(
     pid: i32,
     regs: &UserRegsX86_64,
@@ -1024,6 +1049,7 @@ fn install_recorded_trap(
 
 /// Bytes per encoding for the five trapped instructions.
 /// Mirrors the recorder's `instruction_byte_len`.
+#[cfg(target_arch = "x86_64")]
 fn instruction_byte_len(kind: InstrKind) -> u64 {
     match kind {
         InstrKind::Rdtsc => 2,
@@ -1038,6 +1064,7 @@ fn instruction_byte_len(kind: InstrKind) -> u64 {
 /// [`UserRegsX86_64`] field and write `value` into its low 64
 /// bits. Out-of-range ids fall back to RAX (matches the
 /// recorder's `x86_64_register_id` clamp).
+#[cfg(target_arch = "x86_64")]
 fn write_to_register(regs: &mut UserRegsX86_64, dest_id: u64, value: u64) {
     match dest_id {
         0 => regs.rax = value,
