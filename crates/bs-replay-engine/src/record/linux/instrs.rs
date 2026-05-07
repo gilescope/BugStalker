@@ -117,23 +117,70 @@ pub fn set_tsc_trap_for_self() -> io::Result<()> {
 /// Returns `None` if the instruction isn't one of the five
 /// non-deterministic ones the replay engine cares about.
 pub fn classify_at_pc(pc: u64, bytes: &[u8]) -> Option<InstrKind> {
+    classify_at_pc_full(pc, bytes).map(|(k, _)| k)
+}
+
+/// Like [`classify_at_pc`] but also returns the destination
+/// register's stable id for `RDRAND` / `RDSEED`. Other kinds
+/// return `id == 0` (their dest registers are fixed by the
+/// instruction encoding).
+///
+/// The register id is the value from [`x86_64_register_id`]
+/// — a stable mapping from the iced-x86 register name (any
+/// width) to a 0..=15 family slot (`RAX`..=`R15`). Wire
+/// format: encoded as the third `u64` in
+/// [`crate::format::event::Event::InstructionTrap::result`]
+/// for RDRAND/RDSEED. Older traces (two-element result) decode
+/// to id 0 (RAX) — backwards-compatible.
+pub fn classify_at_pc_full(pc: u64, bytes: &[u8]) -> Option<(InstrKind, u64)> {
     use iced_x86::{Code, Decoder, DecoderOptions};
     let mut dec = Decoder::with_ip(64, bytes, pc, DecoderOptions::NONE);
     if !dec.can_decode() {
         return None;
     }
     let instr = dec.decode();
-    match instr.code() {
-        Code::Rdtsc => Some(InstrKind::Rdtsc),
-        Code::Rdtscp => Some(InstrKind::Rdtscp),
-        Code::Rdrand_r16 | Code::Rdrand_r32 | Code::Rdrand_r64 => {
-            Some(InstrKind::Rdrand)
-        }
-        Code::Rdseed_r16 | Code::Rdseed_r32 | Code::Rdseed_r64 => {
-            Some(InstrKind::Rdseed)
-        }
-        Code::Cpuid => Some(InstrKind::Cpuid),
-        _ => None,
+    let kind = match instr.code() {
+        Code::Rdtsc => InstrKind::Rdtsc,
+        Code::Rdtscp => InstrKind::Rdtscp,
+        Code::Rdrand_r16 | Code::Rdrand_r32 | Code::Rdrand_r64 => InstrKind::Rdrand,
+        Code::Rdseed_r16 | Code::Rdseed_r32 | Code::Rdseed_r64 => InstrKind::Rdseed,
+        Code::Cpuid => InstrKind::Cpuid,
+        _ => return None,
+    };
+    let dest_id = match kind {
+        InstrKind::Rdrand | InstrKind::Rdseed => x86_64_register_id(instr.op0_register()),
+        _ => 0,
+    };
+    Some((kind, dest_id))
+}
+
+/// Map an `iced_x86::Register` to a stable 0..=15 family id.
+/// All width-aliases of the same physical register map to the
+/// same id (`RAX`/`EAX`/`AX`/`AL`/`AH` → 0).
+///
+/// Anything outside the 16-register x86-64 GP set returns
+/// `RAX`'s id (0) as a fall-back so wire format never carries
+/// an out-of-range id.
+pub fn x86_64_register_id(r: iced_x86::Register) -> u64 {
+    use iced_x86::Register as R;
+    match r {
+        R::RAX | R::EAX | R::AX | R::AL | R::AH => 0,
+        R::RCX | R::ECX | R::CX | R::CL | R::CH => 1,
+        R::RDX | R::EDX | R::DX | R::DL | R::DH => 2,
+        R::RBX | R::EBX | R::BX | R::BL | R::BH => 3,
+        R::RSP | R::ESP | R::SP | R::SPL => 4,
+        R::RBP | R::EBP | R::BP | R::BPL => 5,
+        R::RSI | R::ESI | R::SI | R::SIL => 6,
+        R::RDI | R::EDI | R::DI | R::DIL => 7,
+        R::R8 | R::R8D | R::R8W | R::R8L => 8,
+        R::R9 | R::R9D | R::R9W | R::R9L => 9,
+        R::R10 | R::R10D | R::R10W | R::R10L => 10,
+        R::R11 | R::R11D | R::R11W | R::R11L => 11,
+        R::R12 | R::R12D | R::R12W | R::R12L => 12,
+        R::R13 | R::R13D | R::R13W | R::R13L => 13,
+        R::R14 | R::R14D | R::R14W | R::R14L => 14,
+        R::R15 | R::R15D | R::R15W | R::R15L => 15,
+        _ => 0,
     }
 }
 
@@ -212,6 +259,50 @@ mod tests {
         // 0F C7 F0 — RDRAND eax
         let bytes = [0x0F, 0xC7, 0xF0];
         assert_eq!(classify_at_pc(0x0, &bytes), Some(InstrKind::Rdrand));
+    }
+
+    #[test]
+    fn classify_at_pc_full_returns_dest_id_for_rdrand() {
+        // 0F C7 F0 — RDRAND eax → dest id 0
+        assert_eq!(
+            classify_at_pc_full(0x0, &[0x0F, 0xC7, 0xF0]),
+            Some((InstrKind::Rdrand, 0)),
+        );
+        // 48 0F C7 F3 — RDRAND rbx → dest id 3
+        assert_eq!(
+            classify_at_pc_full(0x0, &[0x48, 0x0F, 0xC7, 0xF3]),
+            Some((InstrKind::Rdrand, 3)),
+        );
+        // 49 0F C7 F1 — RDRAND r9 → dest id 9
+        assert_eq!(
+            classify_at_pc_full(0x0, &[0x49, 0x0F, 0xC7, 0xF1]),
+            Some((InstrKind::Rdrand, 9)),
+        );
+    }
+
+    #[test]
+    fn classify_at_pc_full_returns_zero_dest_for_rdtsc() {
+        // RDTSC has no operand register; dest id is 0.
+        assert_eq!(
+            classify_at_pc_full(0x0, &[0x0F, 0x31]),
+            Some((InstrKind::Rdtsc, 0)),
+        );
+    }
+
+    #[test]
+    fn x86_64_register_id_aliases_match() {
+        use iced_x86::Register;
+        // Width aliases of the same register family map to the same id.
+        assert_eq!(x86_64_register_id(Register::RAX), 0);
+        assert_eq!(x86_64_register_id(Register::EAX), 0);
+        assert_eq!(x86_64_register_id(Register::AX), 0);
+        assert_eq!(x86_64_register_id(Register::AL), 0);
+        // R8..R15 family.
+        assert_eq!(x86_64_register_id(Register::R8), 8);
+        assert_eq!(x86_64_register_id(Register::R8D), 8);
+        assert_eq!(x86_64_register_id(Register::R15), 15);
+        // SIMD or non-GP regs fall back to 0.
+        assert_eq!(x86_64_register_id(Register::XMM0), 0);
     }
 
     #[test]

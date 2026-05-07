@@ -997,14 +997,12 @@ fn install_recorded_trap(
             // unchanged.
         }
         InstrKind::Rdrand | InstrKind::Rdseed => {
-            // result[0] = value, result[1] = success (0/1).
-            // Real RDRAND writes into the operand register;
-            // we don't know which from the trap alone, so we
-            // write to RAX as a sensible default. The recorder
-            // didn't store the dest register either; this is
-            // a known fidelity gap for non-EAX RDRAND uses.
+            // result format (step 101): [value, success, dest_id].
+            // Older traces have just [value, success] — fall
+            // back to RAX (id=0) when result.len() == 2.
             let value = result.first().copied().unwrap_or(0);
-            new_regs.rax = value;
+            let dest_id = result.get(2).copied().unwrap_or(0);
+            write_to_register(&mut new_regs, dest_id, value);
         }
         InstrKind::Cpuid => {
             // result = [eax, ebx, ecx, edx].
@@ -1033,5 +1031,31 @@ fn instruction_byte_len(kind: InstrKind) -> u64 {
         InstrKind::Rdrand => 3,
         InstrKind::Rdseed => 3,
         InstrKind::Cpuid => 2,
+    }
+}
+
+/// Map a 0..=15 destination-register id to the matching
+/// [`UserRegsX86_64`] field and write `value` into its low 64
+/// bits. Out-of-range ids fall back to RAX (matches the
+/// recorder's `x86_64_register_id` clamp).
+fn write_to_register(regs: &mut UserRegsX86_64, dest_id: u64, value: u64) {
+    match dest_id {
+        0 => regs.rax = value,
+        1 => regs.rcx = value,
+        2 => regs.rdx = value,
+        3 => regs.rbx = value,
+        4 => regs.rsp = value,
+        5 => regs.rbp = value,
+        6 => regs.rsi = value,
+        7 => regs.rdi = value,
+        8 => regs.r8 = value,
+        9 => regs.r9 = value,
+        10 => regs.r10 = value,
+        11 => regs.r11 = value,
+        12 => regs.r12 = value,
+        13 => regs.r13 = value,
+        14 => regs.r14 = value,
+        15 => regs.r15 = value,
+        _ => regs.rax = value,
     }
 }

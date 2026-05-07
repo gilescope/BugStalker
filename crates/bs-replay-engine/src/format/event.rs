@@ -104,8 +104,13 @@ pub enum Event {
     /// recorder/replayer contract:
     ///
     /// - `Rdtsc` / `Rdtscp` — one `u64` (the timestamp counter).
-    /// - `Rdrand` / `Rdseed` — two `u64`s; the value, then `1`
-    ///   on success or `0` on the kernel's CF=0 path.
+    /// - `Rdrand` / `Rdseed` — *three* `u64`s; the value, then
+    ///   `1` on success or `0` on the kernel's CF=0 path, then
+    ///   the destination-register id (0..=15 for RAX..R15;
+    ///   see `bs_replay_engine::record::linux::instrs::x86_64_register_id`).
+    ///   Traces predating step 101 have only the first two
+    ///   `u64`s; replay defaults the id to 0 (RAX) when the
+    ///   third element is absent (backwards compat).
     /// - `Cpuid` — four `u64`s holding `eax`, `ebx`, `ecx`, `edx`.
     InstructionTrap {
         /// PC where the trap fired.

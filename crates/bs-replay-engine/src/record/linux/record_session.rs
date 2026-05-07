@@ -381,14 +381,22 @@ pub fn ptrace_getsiginfo(pid: i32) -> io::Result<Vec<u8>> {
 /// Per the format crate's contract:
 ///
 /// - Rdtsc / Rdtscp → 1 word (host TSC at capture time)
-/// - Rdrand / Rdseed → 2 words (value, success-flag) — we
-///   record (host_tsc, 1) so replay sees a predictable value
+/// - Rdrand / Rdseed → 3 words (value, success-flag,
+///   dest_register_id) — added the dest_register_id field in
+///   step 101 so replay can write to the right register.
+///   Older traces have 2 words here; replay-side defaults the
+///   id to 0 (RAX) when absent.
 /// - Cpuid → 4 words (eax, ebx, ecx, edx) — recorded as zeros
 ///   today; a real implementation would `cpuid` on the host
+#[allow(dead_code)]
 fn synthesise_trap_result(kind: InstrKind) -> Vec<u64> {
+    synthesise_trap_result_with_dest(kind, 0)
+}
+
+fn synthesise_trap_result_with_dest(kind: InstrKind, dest_id: u64) -> Vec<u64> {
     match kind {
         InstrKind::Rdtsc | InstrKind::Rdtscp => vec![read_host_tsc()],
-        InstrKind::Rdrand | InstrKind::Rdseed => vec![read_host_tsc(), 1],
+        InstrKind::Rdrand | InstrKind::Rdseed => vec![read_host_tsc(), 1, dest_id],
         InstrKind::Cpuid => vec![0, 0, 0, 0],
     }
 }
@@ -487,8 +495,10 @@ fn handle_signal_delivery(
 
     if sig == libc::SIGSEGV || sig == libc::SIGILL {
         let bytes = reader.read(pc, 16);
-        if let Some(instr_kind) = classify_at_pc(pc, &bytes) {
-            let result = synthesise_trap_result(instr_kind);
+        if let Some((instr_kind, dest_id)) =
+            crate::record::linux::instrs::classify_at_pc_full(pc, &bytes)
+        {
+            let result = synthesise_trap_result_with_dest(instr_kind, dest_id);
             writer
                 .write_event(event_for_instruction_trap(pc, instr_kind, result))
                 .map_err(RecordSessionError::Write)?;
