@@ -147,6 +147,13 @@ pub struct RecordOptions {
     /// the instruction. Default `false` for the same reason —
     /// some libc versions probe RDTSC; opt-in.
     pub trap_tsc: bool,
+    /// If true, set `arch_prctl(ARCH_SET_CPUID, 0)` on the
+    /// tracee so any `CPUID` raises SIGSEGV. Recorder catches
+    /// the trap and emits `Event::InstructionTrap` with
+    /// recorded `eax/ebx/ecx/edx`. WARNING: libc/openssl probe
+    /// CPUID at startup; enabling this without recorder-side
+    /// CPUID synthesis can crash the tracee. Default `false`.
+    pub disable_cpuid: bool,
 }
 
 impl Default for RecordOptions {
@@ -155,6 +162,7 @@ impl Default for RecordOptions {
             max_iterations: 2_000_000,
             patch_vdso: false,
             trap_tsc: false,
+            disable_cpuid: false,
         }
     }
 }
@@ -226,6 +234,7 @@ pub fn record_program(
 
     let flags = ChildSetupFlags {
         trap_tsc: options.trap_tsc,
+        disable_cpuid: options.disable_cpuid,
     };
     let mut child = spawn_recorded_child_with(argv, envp, flags)?;
     let pid = child.pid();

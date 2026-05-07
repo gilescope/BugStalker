@@ -308,6 +308,12 @@ pub struct ChildSetupFlags {
     /// signal-delivery dispatcher classifies the faulting PC
     /// and emits `Event::InstructionTrap`.
     pub trap_tsc: bool,
+    /// `arch_prctl(ARCH_SET_CPUID, 0)` — CPUID raises SIGSEGV
+    /// instead of running natively. Same dispatch path as
+    /// `trap_tsc`. WARNING: libc / openssl / etc. probe CPUID
+    /// at startup; enabling this without recorder-side CPUID
+    /// synthesis can crash the tracee. Opt-in.
+    pub disable_cpuid: bool,
 }
 
 /// Spawn a child program for PTRACE-based recording. Compared
@@ -390,6 +396,11 @@ fn child_main(
     if flags.trap_tsc {
         if super::instrs::set_tsc_trap_for_self().is_err() {
             return Err(75);
+        }
+    }
+    if flags.disable_cpuid {
+        if super::instrs::set_cpuid_disabled_for_self().is_err() {
+            return Err(76);
         }
     }
     // execve. PTRACE_TRACEME makes the kernel raise SIGTRAP at

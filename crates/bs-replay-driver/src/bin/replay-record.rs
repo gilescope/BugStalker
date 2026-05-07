@@ -50,6 +50,13 @@ Options:
                              behaviour refuses (a stale segment from
                              a prior run could silently corrupt a
                              replay).
+    --disable-cpuid          Set arch_prctl(ARCH_SET_CPUID, 0) in
+                             the tracee so CPUID raises SIGSEGV
+                             and the recorder emits Event::Instruction
+                             Trap for it. WARNING: libc / openssl
+                             probe CPUID at startup; enabling this
+                             without recorder-side CPUID synthesis
+                             can crash the tracee. Off by default.
     -h, --help               Show this help.
 
 The TRACE_DIR must not already exist; the recorder refuses to
@@ -87,6 +94,7 @@ mod linux_main {
         pub patch_vdso: bool,
         pub trap_tsc: bool,
         pub overwrite: bool,
+        pub disable_cpuid: bool,
     }
 
     pub fn parse() -> Result<Cli, String> {
@@ -126,6 +134,7 @@ mod linux_main {
                 "--patch-vdso" => cli.patch_vdso = true,
                 "--trap-tsc" => cli.trap_tsc = true,
                 "--overwrite" => cli.overwrite = true,
+                "--disable-cpuid" => cli.disable_cpuid = true,
                 other if other.starts_with('-') => {
                     return Err(format!("unknown flag: {other}"));
                 }
@@ -229,6 +238,7 @@ mod linux_main {
             max_iterations: cli.max_iterations.unwrap_or(2_000_000),
             patch_vdso: cli.patch_vdso,
             trap_tsc: cli.trap_tsc,
+            disable_cpuid: cli.disable_cpuid,
         };
         let trace_dir = cli.trace_dir.as_deref().expect("validated by parse()");
 

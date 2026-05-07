@@ -88,6 +88,46 @@ impl From<InstrKind> for InstructionTrapKind {
     }
 }
 
+/// `arch_prctl(ARCH_SET_CPUID, 0)`. After this call the
+/// calling thread takes a `SIGSEGV` whenever it executes
+/// `CPUID`. The trap is per-thread; the recorder calls this
+/// from the tracee thread it wants to monitor.
+///
+/// Implication: libc / openssl / etc. will see the trap on
+/// startup CPUID probes and either crash or fall back to
+/// non-CPUID-dependent code paths. A future enhancement
+/// would have the recorder respond to each trap with a
+/// synthetic CPUID return that masks RDRAND/RDSEED feature
+/// bits while preserving the rest. For now it's an opt-in
+/// flag; users with libcs that probe CPUID at startup
+/// shouldn't enable it.
+///
+/// Linux ≥ 4.12, x86-64 only — `arch_prctl` is an x86-specific
+/// syscall. On non-x86 builds the function is a no-op that
+/// returns `Ok(())` so callers don't need their own arch
+/// branches.
+#[cfg(target_arch = "x86_64")]
+pub fn set_cpuid_disabled_for_self() -> io::Result<()> {
+    // libc 0.2 doesn't always export ARCH_SET_CPUID; spell
+    // out the constant.
+    const ARCH_SET_CPUID: libc::c_int = 0x1012;
+    // SAFETY: arch_prctl with ARCH_SET_CPUID + arg=0 is a
+    // self-only state change; no buffer pointers.
+    let r = unsafe { libc::syscall(libc::SYS_arch_prctl, ARCH_SET_CPUID, 0) };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Non-x86 stub — CPUID doesn't exist on aarch64; the flag is
+/// silently no-op. Returns `Ok(())` so cross-arch callers
+/// don't need their own branches.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_cpuid_disabled_for_self() -> io::Result<()> {
+    Ok(())
+}
+
 /// `prctl(PR_SET_TSC, PR_TSC_SIGSEGV)`. After this call the
 /// calling thread takes a `SIGSEGV` whenever it executes
 /// `RDTSC` or `RDTSCP`. The trap is per-thread, not per-

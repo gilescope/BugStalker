@@ -48,6 +48,7 @@ fn help_long_flag_prints_usage_and_exits_zero() {
     assert!(stdout.contains("--patch-vdso"), "missing --patch-vdso in help");
     assert!(stdout.contains("--trap-tsc"), "missing --trap-tsc in help");
     assert!(stdout.contains("--overwrite"), "missing --overwrite in help");
+    assert!(stdout.contains("--disable-cpuid"), "missing --disable-cpuid in help");
 }
 
 #[test]
