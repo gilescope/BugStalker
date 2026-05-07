@@ -15,9 +15,15 @@ use std::path::Path;
 
 use bs_replay_engine::format::event::Event;
 use bs_replay_engine::format::{TraceReadError, TraceReader};
-use bs_replay_engine::record::linux::ptrace_driver::{recv_notif, respond_intercept};
+use bs_replay_engine::record::linux::exit_stop::{
+    classify_wstatus, ptrace_cont, StopKind,
+};
+use bs_replay_engine::record::linux::ptrace_driver::{
+    recv_notif, respond_intercept, SeccompNotif,
+};
 use bs_replay_engine::replay::linux::replay_child::{
-    spawn_replay_child, ReplayChild, ReplaySpawnError,
+    spawn_replay_child, spawn_replay_child_with, ReplayChild, ReplaySpawnError,
+    ReplaySpawnOptions,
 };
 use bs_replay_engine::replay::linux::shim::{
     apply_recorded_event, MemoryWriter, ProcMemWriter, ReplayError as ReplayShimError,
@@ -92,17 +98,23 @@ pub struct ReplayOptions {
     /// `2_000_000`. Same shape as
     /// [`crate::record::RecordOptions`] for symmetry.
     pub max_iterations: u64,
-    // NB: `patch_vdso` belongs here in spirit but the replay
-    // tracee currently isn't under ptrace (the listener fd is
-    // the only control surface). Patching the vDSO needs
-    // PTRACE_POKEDATA's FOLL_FORCE write, which means we'd
-    // have to SEIZE the replay tracee first. That's the next
-    // refactor; until it lands the option would be a no-op.
+    /// If true, PTRACE_SEIZE the replay tracee at spawn so the
+    /// supervisor has authority to PTRACE_SETSIGINFO (PC-
+    /// precise signal replay), PTRACE_SETREGS (instruction-
+    /// trap replay), and PTRACE_POKEDATA (cross-process vDSO
+    /// patching). Replay loop multiplexes the listener fd
+    /// (syscall events) with waitpid (signal/event stops).
+    /// Default `false` — current shipping behaviour preserved
+    /// for callers who don't need the extra ptrace channel.
+    pub ptrace_attach: bool,
 }
 
 impl Default for ReplayOptions {
     fn default() -> Self {
-        Self { max_iterations: 2_000_000 }
+        Self {
+            max_iterations: 2_000_000,
+            ptrace_attach: false,
+        }
     }
 }
 
@@ -137,15 +149,61 @@ pub fn replay_program(
     options: ReplayOptions,
 ) -> Result<ReplayReport, ReplayProgramError> {
     let reader = TraceReader::open(&trace_dir)?;
-    let child = spawn_replay_child(argv, envp)?;
+    let child = if options.ptrace_attach {
+        spawn_replay_child_with(
+            argv,
+            envp,
+            ReplaySpawnOptions { ptrace_attach: true },
+        )?
+    } else {
+        spawn_replay_child(argv, envp)?
+    };
     let pid = child.pid();
     let mut writer = ProcMemWriter::new(pid);
+    let listener_fd = std::os::fd::AsRawFd::as_raw_fd(&child.listener());
+    let ptraced = child.is_ptraced();
 
     let mut cursor = reader.cursor();
     let mut report = ReplayReport::default();
 
     'replay: for _ in 0..options.max_iterations {
         report.iterations += 1;
+
+        if ptraced {
+            match drive_ptraced_iteration(
+                pid, listener_fd, &mut cursor, &mut writer, &mut report,
+            ) {
+                Ok(DriveOutcome::Continue) => continue 'replay,
+                Ok(DriveOutcome::TraceExhausted) => {
+                    report.exit = Some(ReplayExit::TraceExhausted {
+                        applied: report.syscalls_applied,
+                    });
+                    let _ = child.shutdown();
+                    return Ok(report);
+                }
+                Ok(DriveOutcome::Exited(code)) => {
+                    report.exit = Some(ReplayExit::Exited(code));
+                    break 'replay;
+                }
+                Ok(DriveOutcome::Signalled(sig)) => {
+                    report.exit = Some(ReplayExit::Signalled(sig));
+                    break 'replay;
+                }
+                Ok(DriveOutcome::TraceeGone) => {
+                    report.exit = Some(
+                        reap_exit(pid).unwrap_or(ReplayExit::Exited(0)),
+                    );
+                    break 'replay;
+                }
+                Err(shim) => {
+                    report.exit = Some(ReplayExit::ShimRefused(
+                        classify_shim_error(&shim),
+                    ));
+                    let _ = child.shutdown();
+                    return Ok(report);
+                }
+            }
+        }
 
         // Pull the next syscall notification. If recv_notif
         // fails, the tracee likely exited under us.
@@ -315,3 +373,191 @@ fn _writer_lifeline<W: MemoryWriter>() {}
 /// debugger to the running replay).
 #[allow(unused_imports)]
 pub use bs_replay_engine::replay::linux::replay_child::ReplayChild as ReplayChildHandle;
+
+// ---------------------------------------------------------------------------
+// Multiplex (ptraced replay only)
+// ---------------------------------------------------------------------------
+
+/// One iteration of the ptraced replay loop. Either a syscall
+/// notification arrived (event) or a ptrace stop fired
+/// (signal-delivery, exit, …). Polls the listener with a
+/// short timeout so the supervisor isn't starved if the
+/// tracee is busy in user-mode without making syscalls.
+pub enum LoopEvent {
+    /// `recv_notif` returned a notification; service it.
+    Notif(SeccompNotif),
+    /// `waitpid` returned a stop on the tracee.
+    Stop(StopKind, libc::c_int),
+    /// Neither — poll timed out, no waitpid event ready.
+    Idle,
+}
+
+/// Block up to `timeout_ms` waiting for either a listener
+/// notification or a tracee stop. Returns whichever arrives
+/// first; falls through to `Idle` if neither.
+pub fn await_loop_event(
+    listener_fd: i32,
+    pid: i32,
+    timeout_ms: i32,
+) -> std::io::Result<LoopEvent> {
+    // Drain any pending tracee stops first — cheap WNOHANG.
+    let mut status: libc::c_int = 0;
+    let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    if r > 0 {
+        return Ok(LoopEvent::Stop(classify_wstatus(status), status));
+    }
+    // Else poll the listener.
+    let mut pfd = libc::pollfd {
+        fd: listener_fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let n = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if n == 0 {
+        // Timeout — give waitpid one more shot.
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if r > 0 {
+            return Ok(LoopEvent::Stop(classify_wstatus(status), status));
+        }
+        return Ok(LoopEvent::Idle);
+    }
+    if pfd.revents & libc::POLLIN != 0 {
+        let notif = recv_notif(unsafe {
+            std::os::fd::BorrowedFd::borrow_raw(listener_fd)
+        })?;
+        return Ok(LoopEvent::Notif(notif));
+    }
+    // POLLHUP / POLLERR — tracee exited under us.
+    Ok(LoopEvent::Idle)
+}
+
+/// Drive one ptraced replay iteration. Mirrors the non-ptraced
+/// inner loop's flow but services ptrace stops as they arrive
+/// alongside listener events. Pass-through for now: signal
+/// stops just `ptrace_cont(sig)`; PC-precise replay lands in
+/// step 96. ptrace events cont as no-op.
+pub(crate) fn drive_ptraced_iteration(
+    pid: i32,
+    listener_fd: i32,
+    cursor: &mut bs_replay_engine::format::EventCursor<'_>,
+    writer: &mut ProcMemWriter,
+    report: &mut ReplayReport,
+) -> Result<DriveOutcome, ReplayShimError> {
+    match await_loop_event(listener_fd, pid, /*timeout_ms=*/ 200)
+        .map_err(|e| ReplayShimError::Decode(
+            bs_replay_engine::record::syscall_capture::DecodeError::TrailingBytes(0)
+        ).into_io_placeholder(e))? // see helper below
+    {
+        LoopEvent::Notif(notif) => {
+            // Syscall path — same as non-ptraced loop.
+            let event = walk_to_next_syscall(cursor, report)?;
+            let event = match event {
+                Some(e) => e,
+                None => return Ok(DriveOutcome::TraceExhausted),
+            };
+            let resp = apply_recorded_event(&notif, &event, writer)?;
+            // Tally bytes from the captured-output blob.
+            let bytes = match &event {
+                Event::Syscall { output, .. } => {
+                    bs_replay_engine::record::syscall_capture::CapturedSyscall::decode_output(
+                        0, [0; 6], 0, output,
+                    )
+                    .map(|c| c.regions.iter().map(|r| r.bytes.len() as u64).sum())
+                    .unwrap_or(0)
+                }
+                _ => 0,
+            };
+            report.bytes_written += bytes;
+            report.syscalls_applied += 1;
+            // Send response (may fail if tracee just died).
+            let lis = unsafe { std::os::fd::BorrowedFd::borrow_raw(listener_fd) };
+            if let Err(_e) = respond_intercept(lis, resp.notif_id, resp.result, 0) {
+                return Ok(DriveOutcome::TraceeGone);
+            }
+            Ok(DriveOutcome::Continue)
+        }
+        LoopEvent::Stop(kind, status) => match kind {
+            StopKind::Exited { code } => Ok(DriveOutcome::Exited(code)),
+            StopKind::Signalled { sig } => Ok(DriveOutcome::Signalled(sig)),
+            StopKind::SignalDelivery { sig } => {
+                // Step-96 placeholder: pass through the signal.
+                if let Err(_e) = ptrace_cont(pid, sig) {
+                    return Ok(DriveOutcome::TraceeGone);
+                }
+                Ok(DriveOutcome::Continue)
+            }
+            StopKind::PtraceEvent { .. } | StopKind::SyscallStop => {
+                if let Err(_e) = ptrace_cont(pid, 0) {
+                    return Ok(DriveOutcome::TraceeGone);
+                }
+                let _ = status; // silence unused
+                Ok(DriveOutcome::Continue)
+            }
+        },
+        LoopEvent::Idle => Ok(DriveOutcome::Continue),
+    }
+}
+
+/// Outcome of one ptraced iteration.
+#[derive(Debug)]
+pub(crate) enum DriveOutcome {
+    /// Loop more.
+    Continue,
+    /// Trace ran out of Syscall events while a notification
+    /// was pending — caller stamps TraceExhausted.
+    TraceExhausted,
+    /// Tracee exited normally.
+    Exited(i32),
+    /// Tracee was killed.
+    Signalled(i32),
+    /// Tracee disappeared mid-cycle (ESRCH on response or
+    /// ptrace_cont). Caller treats as exit.
+    TraceeGone,
+}
+
+/// Walk `cursor` until the next `Event::Syscall`, counting
+/// signal/instruction-trap events along the way. Returns `None`
+/// when the trace is exhausted.
+fn walk_to_next_syscall(
+    cursor: &mut bs_replay_engine::format::EventCursor<'_>,
+    report: &mut ReplayReport,
+) -> Result<Option<Event>, ReplayShimError> {
+    loop {
+        match cursor.next() {
+            Ok(Some(e)) => match e {
+                Event::Syscall { .. } => return Ok(Some(e)),
+                Event::Signal { .. } => {
+                    report.signals_skipped += 1;
+                    continue;
+                }
+                Event::InstructionTrap { .. } => {
+                    report.instruction_traps_skipped += 1;
+                    continue;
+                }
+                _ => continue,
+            },
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                return Err(ReplayShimError::Decode(
+                    bs_replay_engine::record::syscall_capture::DecodeError::TrailingBytes(
+                        format!("{e}").len(),
+                    ),
+                ))
+            }
+        }
+    }
+}
+
+// Helper trait so we can chain io::Error into ReplayShimError
+// without a new variant.
+trait ReplayShimErrorExt {
+    fn into_io_placeholder(self, _io: std::io::Error) -> ReplayShimError;
+}
+impl ReplayShimErrorExt for ReplayShimError {
+    fn into_io_placeholder(self, _io: std::io::Error) -> ReplayShimError {
+        self
+    }
+}
