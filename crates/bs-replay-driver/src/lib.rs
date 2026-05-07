@@ -113,9 +113,9 @@ pub mod record_primitives {
     // x86_64-only re-exports (not available on aarch64 Linux):
     // get_regs / set_regs (use PTRACE_GETREGS request), legacy
     // record_syscall_with_exit (NOTIF + GETREGS path), the
-    // iced-x86 instruction classifier, vDSO trampoline applier
-    // (uses x86 trampoline payload), and the x86 result-register
-    // accessor.
+    // iced-x86 instruction classifier, and the x86 result-register
+    // accessor. The vDSO trampoline applier moved to the
+    // cross-arch block below now that aarch64 has a payload.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[doc(inline)]
     pub use bs_replay_engine::record::linux::{
@@ -124,8 +124,15 @@ pub mod record_primitives {
             classify_at_pc, event_for_instruction_trap, set_tsc_trap_for_self, InstrKind,
         },
         record_session::call_frame_from_regs,
-        vdso_patch::apply_vdso_trampolines,
     };
+
+    // Cross-arch trampoline applier (Linux/x86_64 + Linux/aarch64).
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+    ))]
+    #[doc(inline)]
+    pub use bs_replay_engine::record::linux::vdso_patch::apply_vdso_trampolines;
 }
 
 /// Convenience re-exports of the 3C replay-shim primitives.

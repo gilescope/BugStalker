@@ -37,12 +37,28 @@ use std::io;
 /// are the ones libc's fast paths call into; missing one means
 /// libc went through the normal syscall path and seccomp
 /// already saw it.
+///
+/// Both architecture's namings live here. x86_64 exports
+/// `__vdso_*`; aarch64 exports `__kernel_*`. Listing both is
+/// harmless — each scan only finds the names its kernel
+/// exposes — and it keeps the symbol scanner free of arch
+/// branches. `__kernel_rt_sigreturn` is *deliberately omitted*
+/// on aarch64: it's the signal-trampoline the kernel jumps to
+/// during signal delivery, and patching it would break signal
+/// handling in every traced program.
 pub const VDSO_TARGET_SYMBOLS: &[&str] = &[
+    // x86_64
     "__vdso_gettimeofday",
     "__vdso_clock_gettime",
     "__vdso_clock_getres",
     "__vdso_time",
     "__vdso_getcpu",
+    // aarch64 — generic syscall numbering; `time(2)` is not
+    // exposed via the vDSO on aarch64 (libc reduces it to
+    // clock_gettime).
+    "__kernel_clock_gettime",
+    "__kernel_clock_getres",
+    "__kernel_gettimeofday",
 ];
 
 /// One mapping line from `/proc/<pid>/maps`. Layout:
@@ -249,17 +265,80 @@ pub fn patch_payload_x86_64(syscall_nr: u32) -> [u8; 8] {
     [0xB8, nr[0], nr[1], nr[2], nr[3], 0x0F, 0x05, 0xC3]
 }
 
+/// Build the trampoline opcode sequence the recorder writes
+/// over each vDSO entry on aarch64. Twelve bytes (three
+/// 32-bit instructions, little-endian):
+///
+/// ```text
+///   D2 80 00 08 | (nr << 5)   ; MOVZ X8, #imm16  (4 bytes)
+///   D4 00 00 01                ; SVC  #0          (4 bytes)
+///   D6 5F 03 C0                ; RET   (X30)     (4 bytes)
+/// ```
+///
+/// `MOVZ X8, #imm16` zero-extends the 16-bit immediate into
+/// X8 — the AArch64 syscall-number register. The Linux generic
+/// syscall numbering (which aarch64 uses) caps every vDSO-replaced
+/// syscall well under 65 535 (highest is `gettimeofday = 169`),
+/// so a single MOVZ is enough; we debug-assert the constraint.
+///
+/// Same replay rule as x86-64: the seccomp listener answers
+/// every syscall on replay, so the patched bytes can stay in
+/// place permanently.
+#[cfg(target_arch = "aarch64")]
+pub fn patch_payload_aarch64(syscall_nr: u32) -> [u8; 12] {
+    debug_assert!(
+        syscall_nr < 0x10000,
+        "syscall_nr {syscall_nr} exceeds the 16-bit MOVZ immediate; \
+         add a MOVK follow-up if the kernel ever exposes a >65535 \
+         vDSO syscall",
+    );
+    // MOVZ X8, #imm16, LSL #0 — encoding: 1 10 100101 hw imm16 Rd
+    // sf=1, opc=10, fixed=100101, hw=00, Rd=01000 (X8)
+    // → 0xD280_0008 | (imm16 << 5)
+    let movz = 0xD280_0008u32 | ((syscall_nr & 0xFFFF) << 5);
+    // SVC #0 — encoding: 11010100 000 imm16 00001
+    let svc = 0xD400_0001u32;
+    // RET — alias for `RET X30`. Encoding: 1101011_0_0_10_11111_000000_Rn_00000
+    // Rn = 11110 (X30) → 0xD65F_03C0
+    let ret = 0xD65F_03C0u32;
+    let mut out = [0u8; 12];
+    out[0..4].copy_from_slice(&movz.to_le_bytes());
+    out[4..8].copy_from_slice(&svc.to_le_bytes());
+    out[8..12].copy_from_slice(&ret.to_le_bytes());
+    out
+}
+
 /// Map a vDSO export name to the syscall number that replaces
-/// it. Returns `None` for names outside [`VDSO_TARGET_SYMBOLS`].
+/// it. Returns `None` for names outside [`VDSO_TARGET_SYMBOLS`]
+/// or for names from another architecture (the syscall numbers
+/// differ between x86-64 and aarch64).
+///
+/// Numbers come from `arch/x86/entry/syscalls/syscall_64.tbl`
+/// (x86-64) and `<asm-generic/unistd.h>` (aarch64).
 pub fn syscall_nr_for_vdso(name: &str) -> Option<u32> {
-    Some(match name {
-        "__vdso_gettimeofday" => 96,    // gettimeofday
-        "__vdso_clock_gettime" => 228,  // clock_gettime
-        "__vdso_clock_getres" => 229,   // clock_getres
-        "__vdso_time" => 201,           // time
-        "__vdso_getcpu" => 309,         // getcpu
-        _ => return None,
-    })
+    #[cfg(target_arch = "x86_64")]
+    {
+        match name {
+            "__vdso_gettimeofday" => return Some(96),
+            "__vdso_clock_gettime" => return Some(228),
+            "__vdso_clock_getres" => return Some(229),
+            "__vdso_time" => return Some(201),
+            "__vdso_getcpu" => return Some(309),
+            _ => {}
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        match name {
+            // Linux generic syscall numbering.
+            "__kernel_clock_gettime" => return Some(113),
+            "__kernel_clock_getres" => return Some(114),
+            "__kernel_gettimeofday" => return Some(169),
+            _ => {}
+        }
+    }
+    let _ = name;
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -415,7 +494,14 @@ pub struct VdsoPatch {
 /// must be in a stop. The recorder calls this at startup so
 /// every subsequent libc fast path (gettimeofday etc.) lands
 /// in the kernel and trips the recorder loop.
-#[cfg(target_arch = "x86_64")]
+///
+/// Cross-arch: the function is defined for both x86-64 and
+/// aarch64 (the only two Linux arches Phase 5 supports today);
+/// the per-arch payload comes from
+/// [`patch_payload_x86_64`] or [`patch_payload_aarch64`]
+/// respectively. Adding a third Linux arch is a single match
+/// arm here plus a new `patch_payload_*` function.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn apply_vdso_trampolines(
     tracee_pid: i32,
     symbols: &[VdsoSymbol],
@@ -426,7 +512,10 @@ pub fn apply_vdso_trampolines(
             Some(nr) => nr,
             None => continue,
         };
-        let payload = patch_payload_x86_64(nr);
+        #[cfg(target_arch = "x86_64")]
+        let payload: Vec<u8> = patch_payload_x86_64(nr).to_vec();
+        #[cfg(target_arch = "aarch64")]
+        let payload: Vec<u8> = patch_payload_aarch64(nr).to_vec();
         patch_bytes(tracee_pid, s.address, &payload).map_err(|e| {
             VdsoPatchError::PatchFailed {
                 name: s.name.clone(),
@@ -567,6 +656,71 @@ mod tests {
         assert_eq!(&p[1..5], &228u32.to_le_bytes());
         assert_eq!(&p[5..7], &[0x0F, 0x05]); // syscall
         assert_eq!(p[7], 0xC3); // ret
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn patch_payload_aarch64_clock_gettime_emits_expected_words() {
+        // aarch64 generic syscall 113 = clock_gettime
+        let p = patch_payload_aarch64(113);
+        let movz = u32::from_le_bytes(p[0..4].try_into().unwrap());
+        let svc = u32::from_le_bytes(p[4..8].try_into().unwrap());
+        let ret = u32::from_le_bytes(p[8..12].try_into().unwrap());
+        // MOVZ X8, #113  → 0xD2800008 | (113 << 5) = 0xD2800E68
+        assert_eq!(movz, 0xD280_0008 | (113u32 << 5));
+        assert_eq!(svc, 0xD400_0001);
+        assert_eq!(ret, 0xD65F_03C0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn patch_payload_aarch64_zero_imm_is_pure_movz() {
+        // syscall 0 (io_setup) is bizarre to patch over but
+        // verifies the bit-laying isn't accidentally OR-ing
+        // junk into the immediate field.
+        let p = patch_payload_aarch64(0);
+        let movz = u32::from_le_bytes(p[0..4].try_into().unwrap());
+        // Only Rd = X8 (bits 0..5 = 01000) and the MOVZ opcode
+        // bits (31..21 = 110100101) should be set.
+        assert_eq!(movz, 0xD280_0008);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn patch_payload_aarch64_packs_imm_in_bits_5_to_20() {
+        // Sweep a few nontrivial syscall numbers and confirm
+        // the imm16 field (bits 5..20) decodes back. Catches
+        // off-by-one shift errors.
+        for nr in [1u32, 113, 169, 0x1234, 0xFFFF] {
+            let p = patch_payload_aarch64(nr);
+            let movz = u32::from_le_bytes(p[0..4].try_into().unwrap());
+            let recovered = (movz >> 5) & 0xFFFF;
+            assert_eq!(recovered, nr & 0xFFFF, "imm16 bit-packing for {nr:#x}");
+        }
+    }
+
+    /// `syscall_nr_for_vdso` knows the arch's vDSO names. Off-arch
+    /// names always return None so the merged VDSO_TARGET_SYMBOLS
+    /// list is safe to share.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn syscall_nr_for_vdso_x86_64_routes_known_names() {
+        assert_eq!(syscall_nr_for_vdso("__vdso_clock_gettime"), Some(228));
+        assert_eq!(syscall_nr_for_vdso("__vdso_gettimeofday"), Some(96));
+        // aarch64 names → None on x86_64.
+        assert_eq!(syscall_nr_for_vdso("__kernel_clock_gettime"), None);
+        assert_eq!(syscall_nr_for_vdso("__kernel_gettimeofday"), None);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn syscall_nr_for_vdso_aarch64_routes_known_names() {
+        assert_eq!(syscall_nr_for_vdso("__kernel_clock_gettime"), Some(113));
+        assert_eq!(syscall_nr_for_vdso("__kernel_clock_getres"), Some(114));
+        assert_eq!(syscall_nr_for_vdso("__kernel_gettimeofday"), Some(169));
+        // x86_64 names → None on aarch64.
+        assert_eq!(syscall_nr_for_vdso("__vdso_clock_gettime"), None);
+        assert_eq!(syscall_nr_for_vdso("__vdso_time"), None);
     }
 
     /// End-to-end integration: fork a child that PTRACE_TRACEME's

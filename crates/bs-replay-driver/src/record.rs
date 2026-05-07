@@ -90,7 +90,7 @@ use bs_replay_engine::record::linux::record_session::{
 use bs_replay_engine::record::linux::vdso_patch::{
     scan_remote_vdso, ScanRemoteError, VdsoPatchError,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use bs_replay_engine::record::linux::vdso_patch::apply_vdso_trampolines;
 
 /// How a recorded program ended.
@@ -242,16 +242,15 @@ pub fn record_program(
 
     if options.patch_vdso {
         let symbols = scan_remote_vdso(pid).map_err(RecordProgramError::VdsoScan)?;
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if !symbols.is_empty() {
             apply_vdso_trampolines(pid, &symbols)
                 .map_err(RecordProgramError::VdsoPatch)?;
         }
-        // aarch64 trampoline payload not yet ported (would
-        // need an `svc #0`-style instruction sequence). The
-        // scan still runs to surface the symbols for
-        // diagnostics; patching is silently skipped.
-        #[cfg(not(target_arch = "x86_64"))]
+        // Other Linux arches: scan still runs to surface the
+        // symbols for diagnostics; patching is skipped until
+        // a per-arch trampoline payload lands here.
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let _ = symbols;
     }
 
