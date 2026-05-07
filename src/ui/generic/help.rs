@@ -31,6 +31,11 @@ async await-trace, async at                 -- print current task's awaitee chai
 trigger info|any|<>|b <number>|w <number>   -- define a list of commands that will be executed when a certain event is triggered
 call <function name> <arguments>            -- call a function from debuggee program
 oracle <oracle> <>|<subcommand>             -- execute a specific oracle
+replay load|unload|status                   -- manage Phase 5 reverse-step session against a recorded trace
+rs, rstep                                   -- step the loaded trace's playhead back one event
+rsf, rstep-fwd                              -- step the loaded trace's playhead forward one event
+rc, rcontinue                               -- run playhead back to the previous replay breakpoint
+rbreak, rbreak-clear <event_index>          -- add or remove a replay breakpoint at an event index
 h, help <>|<command>                        -- show help
 tui                                         -- change ui mode to tui
 q, quit                                     -- exit the BugStalker

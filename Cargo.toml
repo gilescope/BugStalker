@@ -82,6 +82,10 @@ fallible-iterator = "0.3.0"
 itertools = "0.12.1"
 rust-mangle-tree = { path = "crates/rust-mangle-tree" }
 bs-viz-spec = { path = "crates/bs-viz-spec" }
+# Phase 5 Tier 1 navigation primitives — TraceReplayer +
+# ReverseDebugger. Cross-platform; the Linux-only record/replay
+# bits aren't reached from the REPL handler.
+bs-replay-driver = { path = "crates/bs-replay-driver" }
 thiserror = "1.0.69"
 bytes = "1.11.0"
 log = "0.4.29"

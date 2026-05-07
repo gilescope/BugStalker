@@ -273,6 +273,7 @@ dependencies = [
  "bs-replay",
  "bs-replay-engine",
  "chrono",
+ "criterion",
  "libc",
  "nix 0.27.1",
  "thiserror 1.0.69",
@@ -283,9 +284,14 @@ dependencies = [
 name = "bs-replay-engine"
 version = "0.0.1"
 dependencies = [
+ "bs-syscall-spec",
+ "iced-x86",
+ "libc",
  "lz4_flex",
+ "object",
  "proptest",
  "rkyv",
+ "rustix 0.38.34",
  "thiserror 1.0.69",
  "tracing",
 ]
@@ -313,6 +319,9 @@ dependencies = [
 [[package]]
 name = "bs-syscall-spec"
 version = "0.0.1"
+dependencies = [
+ "bs-syscall-macro",
+]
 
 [[package]]
 name = "bs-test-harness"
@@ -359,6 +368,7 @@ dependencies = [
  "base64 0.22.1",
  "bit_field",
  "blake3",
+ "bs-replay-driver",
  "bs-test-harness",
  "bs-viz-spec",
  "bytes",
@@ -1287,6 +1297,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]

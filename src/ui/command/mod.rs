@@ -16,6 +16,7 @@ pub mod memory;
 pub mod parser;
 pub mod print;
 pub mod register;
+pub mod replay;
 pub mod run;
 pub mod sharedlib;
 pub mod source_code;
@@ -68,6 +69,10 @@ pub enum Command {
     Async(r#async::Command),
     Trigger(trigger::Command),
     Call(call::Command),
+    /// Phase 5 Tier 1 reverse-step navigation against a loaded
+    /// trace. Sidecar to live debugging — does not rewind the
+    /// running tracee.
+    Replay(replay::Command),
     Help {
         command: Option<String>,
         reason: Option<String>,

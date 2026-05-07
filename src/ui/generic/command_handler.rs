@@ -68,6 +68,9 @@ pub struct CommandHandler<'a, Y: YesQuestion, C: Completer, U: ProgramTaker> {
     pub printer: &'a ExternalPrinter,
     pub file_view: &'a FileView,
     pub helper: &'a Helper,
+    /// Phase 5 Tier 1 reverse-step session — sidecar to the live
+    /// debuggee. `None` until the user types `replay load <path>`.
+    pub replay_session: &'a mut crate::ui::command::replay::Session,
 }
 
 impl<Y: YesQuestion, C: Completer, U: ProgramTaker> CommandHandler<'_, Y, C, U> {
@@ -523,8 +526,70 @@ impl<Y: YesQuestion, C: Completer, U: ProgramTaker> CommandHandler<'_, Y, C, U> 
                     .println(ErrorView::from("Oracle not found or not ready")),
                 Some(oracle) => oracle.print(self.printer, subcmd.as_deref()),
             },
+            Command::Replay(replay_cmd) => {
+                use crate::ui::command::replay::Handler as ReplayHandler;
+                let mut handler = ReplayHandler::new(self.replay_session);
+                match handler.handle(replay_cmd) {
+                    Ok(outcome) => self.print_replay_outcome(outcome),
+                    Err(e) => self.printer.println(ErrorView::from(format!("{e}"))),
+                }
+            }
         }
 
         Ok(())
+    }
+
+    /// Format a [`crate::ui::command::replay::Outcome`] as one or
+    /// more lines on the printer. Plain text — Tier 1 surface
+    /// doesn't yet have a dedicated view module; the format is
+    /// shaped to match what the Phase 5 plan's "rstep" example
+    /// shows (`now at <pc>; n events left`).
+    fn print_replay_outcome(&self, outcome: crate::ui::command::replay::Outcome) {
+        use crate::ui::command::replay::Outcome;
+        match outcome {
+            Outcome::Loaded { trace_path, total_events, build_id } => {
+                self.printer.println(format!(
+                    "loaded trace {trace_path}: {total_events} events; build-id {build_id}",
+                ));
+            }
+            Outcome::Unloaded { had_session: true } => {
+                self.printer.println("trace unloaded");
+            }
+            Outcome::Unloaded { had_session: false } => {
+                self.printer.println("no trace was loaded");
+            }
+            Outcome::Status {
+                position,
+                total_events,
+                breakpoint_count,
+                build_id,
+                recorded_at,
+            } => {
+                self.printer.println(format!(
+                    "playhead {position} / {total_events}; {breakpoint_count} breakpoint(s); build-id {build_id}",
+                ));
+                if let Some(ts) = recorded_at {
+                    self.printer.println(format!("recorded at {ts}"));
+                }
+            }
+            Outcome::Stepped { position, backward } => {
+                let dir = if backward { "stepped back" } else { "stepped forward" };
+                self.printer.println(format!("{dir}; now at event {position}"));
+            }
+            Outcome::Continued { position } => {
+                self.printer.println(format!("rcontinue: stopped at event {position}"));
+            }
+            Outcome::BreakpointAdded { event_index } => {
+                self.printer.println(format!("replay breakpoint at event {event_index}"));
+            }
+            Outcome::BreakpointRemoved { event_index, was_present: true } => {
+                self.printer.println(format!("removed replay breakpoint at event {event_index}"));
+            }
+            Outcome::BreakpointRemoved { event_index, was_present: false } => {
+                self.printer.println(format!(
+                    "no replay breakpoint at event {event_index} to remove",
+                ));
+            }
+        }
     }
 }

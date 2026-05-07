@@ -97,6 +97,22 @@ pub const TRIGGER_COMMAND_WP_TRIGGER_SUBCOMMAND: &str = "w";
 pub const TRIGGER_COMMAND_INFO_SUBCOMMAND: &str = "info";
 pub const CALL_COMMAND: &str = "call";
 
+// Phase 5 Tier 1 reverse-step REPL surface. `replay` is the
+// session-management namespace; the `r*` aliases are the
+// session-active navigation commands.
+pub const REPLAY_COMMAND: &str = "replay";
+pub const REPLAY_LOAD_SUBCOMMAND: &str = "load";
+pub const REPLAY_UNLOAD_SUBCOMMAND: &str = "unload";
+pub const REPLAY_STATUS_SUBCOMMAND: &str = "status";
+pub const RSTEP_COMMAND: &str = "rstep";
+pub const RSTEP_COMMAND_SHORT: &str = "rs";
+pub const RSTEP_FORWARD_COMMAND: &str = "rstep-fwd";
+pub const RSTEP_FORWARD_COMMAND_SHORT: &str = "rsf";
+pub const RCONTINUE_COMMAND: &str = "rcontinue";
+pub const RCONTINUE_COMMAND_SHORT: &str = "rc";
+pub const RBREAK_COMMAND: &str = "rbreak";
+pub const RBREAK_CLEAR_COMMAND: &str = "rbreak-clear";
+
 pub const HELP_COMMAND: &str = "help";
 pub const HELP_COMMAND_SHORT: &str = "h";
 
@@ -649,6 +665,80 @@ impl Command {
             .padded()
             .boxed();
 
+        // Phase 5 Tier 1 reverse-step REPL surface. Six commands
+        // total — bundled into one `choice((..))` arm so the outer
+        // dispatch table doesn't have to grow by six entries
+        // (chumsky's choice tuple has a fixed arity).
+        let replay_path = any()
+            .filter(|c: &char| !c.is_whitespace())
+            .repeated()
+            .at_least(1)
+            .to_slice()
+            .map(|s: &str| s.to_string());
+
+        let replay_load = op_w_arg(REPLAY_COMMAND)
+            .ignore_then(sub_op_w_arg(REPLAY_LOAD_SUBCOMMAND))
+            .ignore_then(replay_path)
+            .map(|trace_path| {
+                Command::Replay(super::replay::Command::Load { trace_path })
+            })
+            .padded()
+            .boxed();
+        let replay_unload = op_w_arg(REPLAY_COMMAND)
+            .ignore_then(sub_op(REPLAY_UNLOAD_SUBCOMMAND))
+            .to(Command::Replay(super::replay::Command::Unload))
+            .padded()
+            .boxed();
+        let replay_status = op_w_arg(REPLAY_COMMAND)
+            .ignore_then(sub_op(REPLAY_STATUS_SUBCOMMAND))
+            .to(Command::Replay(super::replay::Command::Status))
+            .padded()
+            .boxed();
+        let rstep = op2(RSTEP_COMMAND, RSTEP_COMMAND_SHORT)
+            .to(Command::Replay(super::replay::Command::RStep))
+            .padded()
+            .boxed();
+        let rstep_fwd = op2(RSTEP_FORWARD_COMMAND, RSTEP_FORWARD_COMMAND_SHORT)
+            .to(Command::Replay(super::replay::Command::RStepForward))
+            .padded()
+            .boxed();
+        let rcontinue = op2(RCONTINUE_COMMAND, RCONTINUE_COMMAND_SHORT)
+            .to(Command::Replay(super::replay::Command::RContinue))
+            .padded()
+            .boxed();
+        let rbreak = op_w_arg(RBREAK_COMMAND)
+            .ignore_then(text::int(10).from_str().unwrapped())
+            .map(|event_index: u64| {
+                Command::Replay(super::replay::Command::RAddBreakpoint {
+                    event_index,
+                })
+            })
+            .padded()
+            .boxed();
+        let rbreak_clear = op_w_arg(RBREAK_CLEAR_COMMAND)
+            .ignore_then(text::int(10).from_str().unwrapped())
+            .map(|event_index: u64| {
+                Command::Replay(super::replay::Command::RRemoveBreakpoint {
+                    event_index,
+                })
+            })
+            .padded()
+            .boxed();
+        let replay_commands = choice((
+            // Order matters when one command's prefix is another's:
+            // `rstep-fwd` before `rstep` so the longer literal binds
+            // first; same for `rbreak-clear` before `rbreak`.
+            rstep_fwd,
+            rstep,
+            rcontinue,
+            rbreak_clear,
+            rbreak,
+            replay_load,
+            replay_unload,
+            replay_status,
+        ))
+        .boxed();
+
         choice((
             command(VAR_COMMAND, print_variables),
             command(ARG_COMMAND, print_arguments),
@@ -675,6 +765,7 @@ impl Command {
             command(CALL_COMMAND, call),
             command(APPLY_PATCH_COMMAND, apply_patch),
             command(WATCH_PATCH_COMMAND, watch_patch),
+            replay_commands,
         ))
     }
 
@@ -1271,6 +1362,51 @@ fn test_parser() {
         TestCase {
             inputs: vec!["oracle tokio all ", " oracle  tokio   all"],
             expected: Expect::Ok(Command::Oracle("tokio".into(), Some("all".into()))),
+        },
+        // Phase 5 Tier 1 reverse-step REPL surface (step 113).
+        TestCase {
+            inputs: vec!["replay load /tmp/trace", "  replay   load   /tmp/trace  "],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::Load {
+                trace_path: "/tmp/trace".to_owned(),
+            })),
+        },
+        TestCase {
+            inputs: vec!["replay unload", "replay  unload  "],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::Unload)),
+        },
+        TestCase {
+            inputs: vec!["replay status"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::Status)),
+        },
+        TestCase {
+            inputs: vec!["rstep", "rs"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RStep)),
+        },
+        TestCase {
+            inputs: vec!["rstep-fwd", "rsf"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RStepForward)),
+        },
+        TestCase {
+            inputs: vec!["rcontinue", "rc"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RContinue)),
+        },
+        TestCase {
+            inputs: vec!["rbreak 42"],
+            expected: Expect::Ok(Command::Replay(
+                super::replay::Command::RAddBreakpoint { event_index: 42 },
+            )),
+        },
+        TestCase {
+            inputs: vec!["rbreak-clear 42"],
+            expected: Expect::Ok(Command::Replay(
+                super::replay::Command::RRemoveBreakpoint { event_index: 42 },
+            )),
+        },
+        // `rstep-fwd` must bind before `rstep` even though `rstep`
+        // is its prefix — the parser orders them longest-first.
+        TestCase {
+            inputs: vec!["replay"],
+            expected: Expect::Err,
         },
     ];
 
