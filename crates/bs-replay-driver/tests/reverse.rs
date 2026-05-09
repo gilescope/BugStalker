@@ -6,10 +6,10 @@
 use std::fs;
 use std::path::PathBuf;
 
+use bs_replay_driver::engine::format::TraceWriter;
 use bs_replay_driver::engine::format::event::Event;
 use bs_replay_driver::engine::format::manifest::Manifest;
 use bs_replay_driver::engine::format::version::FormatVersion;
-use bs_replay_driver::engine::format::TraceWriter;
 use bs_replay_driver::{ReverseDebugger, TraceReplayer};
 
 fn manifest() -> Manifest {
@@ -40,7 +40,9 @@ fn temp_dir(label: &str) -> PathBuf {
 fn make_trace(dir: &PathBuf, count: u32) {
     let mut writer = TraceWriter::create(dir, &manifest()).unwrap();
     for i in 0..count {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.finish().unwrap();
 }
@@ -62,9 +64,13 @@ fn current_pc_tracks_pcmarker_through_rstep() {
     let dir = temp_dir("current-pc");
     let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
     writer.write_event(Event::PcMarker { pc: 0xaa }).unwrap();
-    writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 1, data: 0 })
+        .unwrap();
     writer.write_event(Event::PcMarker { pc: 0xbb }).unwrap();
-    writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 2, data: 0 })
+        .unwrap();
     writer.finish().unwrap();
     let replayer = TraceReplayer::open(&dir).unwrap();
     let mut rdb = ReverseDebugger::new(replayer);
@@ -94,8 +100,12 @@ fn current_pc_tracks_pcmarker_through_rstep() {
 fn current_pc_is_none_when_no_pcmarker_emitted() {
     let dir = temp_dir("no-pcmarker");
     let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
-    writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
-    writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 1, data: 0 })
+        .unwrap();
+    writer
+        .write_event(Event::Marker { tag: 2, data: 0 })
+        .unwrap();
     writer.finish().unwrap();
     let replayer = TraceReplayer::open(&dir).unwrap();
     let mut rdb = ReverseDebugger::new(replayer);
@@ -129,7 +139,11 @@ fn step_then_rstep_returns_to_same_event() {
     assert_eq!(rdb.position(), 1);
 
     let backward = rdb.rstep().unwrap().unwrap();
-    assert_eq!(marker_tag(&backward), 0, "rstep yields the same event we stepped past");
+    assert_eq!(
+        marker_tag(&backward),
+        0,
+        "rstep yields the same event we stepped past"
+    );
     assert_eq!(rdb.position(), 0);
 
     fs::remove_dir_all(&dir).ok();

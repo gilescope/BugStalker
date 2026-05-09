@@ -20,9 +20,9 @@ mod symbol;
 // still hits a wall (probably an async-fn name-mangling or
 // vtable-PAC quirk). Keep `mod tokio` Linux-only until a dedicated
 // tokio-on-darwin batch.
+mod fuzz;
 #[cfg(target_os = "linux")]
 mod tokio;
-mod fuzz;
 mod unwind;
 mod variables;
 mod viz;
@@ -100,8 +100,8 @@ fn ensure_entitled_self_or_reexec() {
             .output();
         match out {
             Ok(out) => {
-                let blob = String::from_utf8_lossy(&out.stdout)
-                    + String::from_utf8_lossy(&out.stderr);
+                let blob =
+                    String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
                 blob.contains("com.apple.security.cs.debugger")
             }
             Err(_) => false,
@@ -257,10 +257,7 @@ fn ensure_dsym_fresh(prog: &str) {
     };
     let _ = dsym_inner; // keep the variable for future symlink-aware checks
     let needs_refresh = match std::fs::metadata(&dsym_path) {
-        Ok(m) => m
-            .modified()
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-            < bin_mtime,
+        Ok(m) => m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH) < bin_mtime,
         Err(_) => true,
     };
     if needs_refresh {

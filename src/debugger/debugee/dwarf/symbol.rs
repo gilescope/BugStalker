@@ -10,9 +10,7 @@ fn strip_rust_hash(name: &str) -> &str {
     if name.len() >= 20 && name.ends_with('E') {
         let suffix_start = name.len() - 20;
         let suffix = &name[suffix_start..];
-        if suffix.starts_with("17h")
-            && suffix[3..19].bytes().all(|b| b.is_ascii_hexdigit())
-        {
+        if suffix.starts_with("17h") && suffix[3..19].bytes().all(|b| b.is_ascii_hexdigit()) {
             return &name[..suffix_start];
         }
     }
@@ -115,7 +113,10 @@ impl SymbolTab {
                 // and walks to `impl_self_type()`.
                 by_address.insert(symbol.address(), raw.to_string());
             }
-            SymbolTab { by_name, by_address }
+            SymbolTab {
+                by_name,
+                by_address,
+            }
         })
     }
 

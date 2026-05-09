@@ -745,8 +745,7 @@ impl super::DebugSession {
             let _ = dbg.set_thread_into_focus_by_pid(pid);
         }
 
-        dbg.set_pc(addr as u64)
-            .context("goto: set pc")?;
+        dbg.set_pc(addr as u64).context("goto: set pc")?;
         let _ = dbg.set_frame_into_focus(0);
 
         self.send_success(req)?;

@@ -200,9 +200,8 @@ impl Child<Installed> {
         use crate::debugger::darwin_mach;
         use sysinfo::{RefreshKind, System};
 
-        let sys = System::new_with_specifics(
-            RefreshKind::everything().without_cpu().without_memory(),
-        );
+        let sys =
+            System::new_with_specifics(RefreshKind::everything().without_cpu().without_memory());
         let external = System::process(&sys, sysinfo::Pid::from_u32(pid.as_raw() as u32))
             .ok_or(Error::AttachedProcessNotFound(pid))?;
         let program = external
@@ -427,8 +426,8 @@ impl<S: State> Child<S> {
             .cwd
             .as_deref()
             .map(|cwd| -> Result<std::path::PathBuf, Error> {
-                let prev = std::env::current_dir()
-                    .map_err(|_| Error::Attach(nix::errno::Errno::EIO))?;
+                let prev =
+                    std::env::current_dir().map_err(|_| Error::Attach(nix::errno::Errno::EIO))?;
                 std::env::set_current_dir(cwd)
                     .map_err(|_| Error::Attach(nix::errno::Errno::EIO))?;
                 Ok(prev)

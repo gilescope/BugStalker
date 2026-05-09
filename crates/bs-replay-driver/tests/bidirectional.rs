@@ -28,9 +28,8 @@ use std::path::PathBuf;
 use bs_replay_driver::engine::format::manifest::Manifest;
 use bs_replay_driver::engine::format::version::FormatVersion;
 use bs_replay_driver::{
-    record_program, replay_program, RecordOptions, RecordProgramError,
-    RecorderExitStatus, ReplayExit, ReplayOptions, ReplayProgramError,
-    ShimRefusedReason,
+    RecordOptions, RecordProgramError, RecorderExitStatus, ReplayExit, ReplayOptions,
+    ReplayProgramError, ShimRefusedReason, record_program, replay_program,
 };
 
 fn manifest() -> Manifest {
@@ -49,10 +48,7 @@ fn manifest() -> Manifest {
 }
 
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "bs-replay-bidi-{label}-{}",
-        std::process::id(),
-    ));
+    let dir = std::env::temp_dir().join(format!("bs-replay-bidi-{label}-{}", std::process::id(),));
     let _ = fs::remove_dir_all(&dir);
     dir
 }
@@ -125,7 +121,8 @@ fn record_then_replay_bin_true_runs_to_completion() {
     );
 
     eprintln!(
-        "record OK: {} syscalls / {} signals / {} instr-traps / {} steps",
+        "record OK: {} pc-markers / {} syscalls / {} signals / {} instr-traps / {} steps",
+        record_report.pc_marker_events,
         record_report.syscall_events,
         record_report.signal_events,
         record_report.instruction_traps,
@@ -133,12 +130,7 @@ fn record_then_replay_bin_true_runs_to_completion() {
     );
 
     // ---- replay -----------------------------------------------
-    let replay_report = match replay_program(
-        &trace_dir,
-        argv,
-        envp,
-        ReplayOptions::default(),
-    ) {
+    let replay_report = match replay_program(&trace_dir, argv, envp, ReplayOptions::default()) {
         Ok(r) => r,
         Err(e) if is_skip_replay(&e) => {
             eprintln!("skipping replay leg: {e:?}");
@@ -165,7 +157,10 @@ fn record_then_replay_bin_true_runs_to_completion() {
     // The replay session must produce *some* exit reason, and
     // the iterations should be > 0 (we entered the supervisor
     // loop at least once).
-    assert!(replay_report.exit.is_some(), "replay didn't stamp an exit reason");
+    assert!(
+        replay_report.exit.is_some(),
+        "replay didn't stamp an exit reason"
+    );
     assert!(replay_report.iterations > 0);
 
     // Acceptable end states for a smoke test:
@@ -178,13 +173,9 @@ fn record_then_replay_bin_true_runs_to_completion() {
     //                                     stale step-7b trace;
     //                                     would be a regression
     match replay_report.exit.unwrap() {
-        ReplayExit::Exited(_)
-        | ReplayExit::Signalled(_)
-        | ReplayExit::TraceExhausted { .. } => {}
+        ReplayExit::Exited(_) | ReplayExit::Signalled(_) | ReplayExit::TraceExhausted { .. } => {}
         ReplayExit::ShimRefused(ShimRefusedReason::Mismatch(m)) => {
-            eprintln!(
-                "(expected on a non-deterministic host) shim mismatch: {m}",
-            );
+            eprintln!("(expected on a non-deterministic host) shim mismatch: {m}",);
         }
         ReplayExit::ShimRefused(ShimRefusedReason::ResultNotCaptured) => {
             panic!(
@@ -196,8 +187,10 @@ fn record_then_replay_bin_true_runs_to_completion() {
             eprintln!("(unexpected but tolerated) shim refused: {other:?}");
         }
         ReplayExit::IterationCap(n) => {
-            panic!("replay hit iteration cap at {n}; either the trace is \
-                    huge or the supervisor loop is stuck");
+            panic!(
+                "replay hit iteration cap at {n}; either the trace is \
+                    huge or the supervisor loop is stuck"
+            );
         }
     }
 

@@ -178,9 +178,9 @@ impl Manifest {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (key, value) = line.split_once(':').ok_or_else(|| {
-                ManifestParseError::malformed(line_no, "expected `key: value`")
-            })?;
+            let (key, value) = line
+                .split_once(':')
+                .ok_or_else(|| ManifestParseError::malformed(line_no, "expected `key: value`"))?;
             let key = key.trim();
             // Strip exactly the one separator space the writer emits.
             // `trim()` would discard intentional leading whitespace
@@ -192,10 +192,7 @@ impl Manifest {
             match key {
                 "format_version" => {
                     let n: u32 = value.parse().map_err(|_| {
-                        ManifestParseError::malformed(
-                            line_no,
-                            "format_version must be a u32",
-                        )
+                        ManifestParseError::malformed(line_no, "format_version must be a u32")
                     })?;
                     format_version = Some(FormatVersion(n));
                 }
@@ -207,20 +204,14 @@ impl Manifest {
                 "initial_arg" => initial_args.push(value),
                 "env" => {
                     let (k, v) = value.split_once('=').ok_or_else(|| {
-                        ManifestParseError::malformed(
-                            line_no,
-                            "env value must be `KEY=VALUE`",
-                        )
+                        ManifestParseError::malformed(line_no, "env value must be `KEY=VALUE`")
                     })?;
                     initial_env.push((k.to_owned(), v.to_owned()));
                 }
                 "recorded_at" => recorded_at = Some(value),
                 "initial_fd" => {
                     let n: u32 = value.parse().map_err(|_| {
-                        ManifestParseError::malformed(
-                            line_no,
-                            "initial_fd must be a u32",
-                        )
+                        ManifestParseError::malformed(line_no, "initial_fd must be a u32")
                     })?;
                     initial_fds.push(n);
                 }
@@ -243,16 +234,14 @@ impl Manifest {
         Ok(Self {
             format_version: format_version
                 .ok_or_else(|| ManifestParseError::missing("format_version"))?,
-            build_id: build_id
-                .ok_or_else(|| ManifestParseError::missing("build_id"))?,
+            build_id: build_id.ok_or_else(|| ManifestParseError::missing("build_id"))?,
             kernel_release: kernel_release
                 .ok_or_else(|| ManifestParseError::missing("kernel_release"))?,
             cpu_features,
             engine_version: engine_version
                 .ok_or_else(|| ManifestParseError::missing("engine_version"))?,
             initial_env,
-            initial_cwd: initial_cwd
-                .ok_or_else(|| ManifestParseError::missing("initial_cwd"))?,
+            initial_cwd: initial_cwd.ok_or_else(|| ManifestParseError::missing("initial_cwd"))?,
             initial_args,
             recorded_at,
             initial_fds,
@@ -306,7 +295,10 @@ impl ManifestParseError {
         Self::Missing(key)
     }
     fn malformed(line: usize, detail: impl Into<String>) -> Self {
-        Self::Malformed { line, detail: detail.into() }
+        Self::Malformed {
+            line,
+            detail: detail.into(),
+        }
     }
 }
 
@@ -428,7 +420,10 @@ mod tests {
     fn recorded_at_emitted_only_when_some() {
         let m = sample(); // recorded_at = None
         let s = m.to_text();
-        assert!(!s.contains("recorded_at"), "should not emit empty recorded_at line");
+        assert!(
+            !s.contains("recorded_at"),
+            "should not emit empty recorded_at line"
+        );
     }
 
     #[test]

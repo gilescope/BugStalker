@@ -44,10 +44,7 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::{
-    bracketed, parenthesized, parse_macro_input, Ident, LitInt, Result as SynResult,
-    Token,
-};
+use syn::{Ident, LitInt, Result as SynResult, Token, bracketed, parenthesized, parse_macro_input};
 
 /// `syscall! { … }` — see crate docs for the grammar.
 #[proc_macro]
@@ -109,7 +106,9 @@ impl Parse for Table {
     fn parse(input: ParseStream) -> SynResult<Self> {
         let entries: Punctuated<Entry, Token![;]> =
             input.parse_terminated(Entry::parse, Token![;])?;
-        Ok(Table { entries: entries.into_iter().collect() })
+        Ok(Table {
+            entries: entries.into_iter().collect(),
+        })
     }
 }
 
@@ -129,7 +128,12 @@ impl Parse for Entry {
         let ret_ident: Ident = input.parse()?;
         let ret = parse_ret(&ret_ident)?;
 
-        Ok(Entry { name, nr, params: params.into_iter().collect(), ret })
+        Ok(Entry {
+            name,
+            nr,
+            params: params.into_iter().collect(),
+            ret,
+        })
     }
 }
 

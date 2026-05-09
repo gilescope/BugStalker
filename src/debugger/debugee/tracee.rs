@@ -157,9 +157,9 @@ impl Tracee {
     pub fn location(&self, debugee: &Debugee) -> Result<Location, Error> {
         use crate::debugger::address::GlobalAddress;
         let pc = self.pc()?;
-        let global_pc = pc.into_global(debugee).unwrap_or_else(|_| {
-            GlobalAddress::from(pc.as_u64())
-        });
+        let global_pc = pc
+            .into_global(debugee)
+            .unwrap_or_else(|_| GlobalAddress::from(pc.as_u64()));
         Ok(Location {
             pid: self.pid,
             pc,
@@ -349,18 +349,12 @@ impl TraceeCtl {
 
     /// Get TLS base address for a module by its module ID.
     /// For the main executable, modid is always 1.
-    pub fn tls_base(
-        &self,
-        tid: Pid,
-        modid: u32,
-    ) -> Result<RelocatedAddress, Error> {
+    pub fn tls_base(&self, tid: Pid, modid: u32) -> Result<RelocatedAddress, Error> {
         let td_proc = self.thread_db_proc.as_ref().ok_or(NoThreadDB)?;
 
         let thread: thread_db::Thread =
             td_proc.borrow_process().get_thread(tid).map_err(ThreadDB)?;
 
-        Ok(RelocatedAddress::from(
-            thread.tls_base(modid)? as usize,
-        ))
+        Ok(RelocatedAddress::from(thread.tls_base(modid)? as usize))
     }
 }

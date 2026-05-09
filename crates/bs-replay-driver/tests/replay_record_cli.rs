@@ -37,7 +37,10 @@ fn run(args: &[&str]) -> (i32, String, String) {
 fn help_long_flag_prints_usage_and_exits_zero() {
     let (code, stdout, _) = run(&["--help"]);
     assert_eq!(code, 0, "--help should exit 0");
-    assert!(stdout.contains("Usage:"), "stdout missing `Usage:`: {stdout}");
+    assert!(
+        stdout.contains("Usage:"),
+        "stdout missing `Usage:`: {stdout}"
+    );
     assert!(stdout.contains("replay-record"));
     assert!(
         stdout.contains("<TRACE_DIR>"),
@@ -45,10 +48,19 @@ fn help_long_flag_prints_usage_and_exits_zero() {
     );
     // The opt-in flags must show up in --help so users can
     // discover them.
-    assert!(stdout.contains("--patch-vdso"), "missing --patch-vdso in help");
+    assert!(
+        stdout.contains("--patch-vdso"),
+        "missing --patch-vdso in help"
+    );
     assert!(stdout.contains("--trap-tsc"), "missing --trap-tsc in help");
-    assert!(stdout.contains("--overwrite"), "missing --overwrite in help");
-    assert!(stdout.contains("--disable-cpuid"), "missing --disable-cpuid in help");
+    assert!(
+        stdout.contains("--overwrite"),
+        "missing --overwrite in help"
+    );
+    assert!(
+        stdout.contains("--disable-cpuid"),
+        "missing --disable-cpuid in help"
+    );
 }
 
 #[test]
@@ -64,11 +76,13 @@ fn missing_args_returns_exit_code_two() {
     let (code, _, stderr) = run(&[]);
     assert_eq!(code, 2, "no args should exit 2 (argv parse error)");
     assert!(
-        stderr.contains("missing TRACE_DIR")
-            || stderr.contains("missing program"),
+        stderr.contains("missing TRACE_DIR") || stderr.contains("missing program"),
         "stderr missing diagnostic: {stderr}",
     );
-    assert!(stderr.contains("Usage:"), "expected USAGE printed on parse error");
+    assert!(
+        stderr.contains("Usage:"),
+        "expected USAGE printed on parse error"
+    );
 }
 
 #[cfg(target_os = "linux")]

@@ -344,10 +344,9 @@ impl Debugger {
                 // (`Iterator::next`, `BTreeMap::insert`, …) jumps
                 // straight past the loop. Only skip when strictly
                 // inside the body.
-                let in_inline_interior = inline_ranges
-                    .iter()
-                    .any(|r| u64::from(place.address) > r.begin
-                          && u64::from(place.address) < r.end);
+                let in_inline_interior = inline_ranges.iter().any(|r| {
+                    u64::from(place.address) > r.begin && u64::from(place.address) < r.end
+                });
 
                 if !in_inline_interior && place.is_stmt {
                     let load_addr = place

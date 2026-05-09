@@ -109,12 +109,7 @@ impl DebugControlRegister {
     }
 
     #[inline(always)]
-    pub fn configure_bp(
-        &mut self,
-        dr: DebugRegisterNumber,
-        cond: BreakCondition,
-        size: BreakSize,
-    ) {
+    pub fn configure_bp(&mut self, dr: DebugRegisterNumber, cond: BreakCondition, size: BreakSize) {
         let dr = dr as usize;
         let idx = 16 + (dr * 4);
         self.0.set_bits(idx..=idx + 1, cond as usize);

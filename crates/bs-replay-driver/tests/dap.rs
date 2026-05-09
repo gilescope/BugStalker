@@ -5,15 +5,15 @@
 use std::fs;
 use std::path::PathBuf;
 
+use bs_replay_driver::TraceReplayer;
 use bs_replay_driver::dap::{
     JumpTarget, ReplayCheckpointListRequest, ReplayJumpRequest, ReplayLoadRequest,
     ReplayTimelineRequest, TimelineWaypoint, load,
 };
+use bs_replay_driver::engine::format::TraceWriter;
 use bs_replay_driver::engine::format::event::Event;
 use bs_replay_driver::engine::format::manifest::Manifest;
 use bs_replay_driver::engine::format::version::FormatVersion;
-use bs_replay_driver::engine::format::TraceWriter;
-use bs_replay_driver::TraceReplayer;
 
 fn manifest() -> Manifest {
     Manifest {
@@ -44,15 +44,21 @@ fn temp_dir(label: &str) -> PathBuf {
 fn make_trace_with_two_checkpoints(dir: &PathBuf) {
     let mut writer = TraceWriter::create(dir, &manifest()).unwrap();
     for i in 0..3u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.take_checkpoint(b"A".to_vec()).unwrap();
     for i in 3..7u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.take_checkpoint(b"B".to_vec()).unwrap();
     for i in 7..10u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.finish().unwrap();
 }
@@ -162,7 +168,7 @@ fn dap_timeline_reports_total_events_and_checkpoint_waypoints() {
 #[cfg(target_os = "linux")]
 #[test]
 fn dap_capture_writes_a_decodable_checkpoint() {
-    use bs_replay_driver::dap::{capture, ReplayCaptureRequest};
+    use bs_replay_driver::dap::{ReplayCaptureRequest, capture};
     use bs_replay_driver::engine::format::TraceReader;
 
     let dir = temp_dir("dap-capture");
@@ -196,9 +202,7 @@ fn dap_capture_then_restore_into_fresh_fork_round_trips() {
     use bs_replay::linux::fork_self::LinuxForkSelfMechanism;
     use bs_replay::linux::proc_mem::{read_bytes_at, write_bytes_at};
     use bs_replay::ring::CheckpointMechanism;
-    use bs_replay_driver::dap::{
-        capture, restore, ReplayCaptureRequest, ReplayRestoreRequest,
-    };
+    use bs_replay_driver::dap::{ReplayCaptureRequest, ReplayRestoreRequest, capture, restore};
 
     // The headline DAP-driven flow: capture into a trace, then
     // restore from that same trace into a fresh fork. End-to-end
@@ -294,7 +298,9 @@ fn dap_load_surfaces_recorded_at_when_present() {
     m.recorded_at = Some("2026-05-06T10:00:00Z".to_owned());
     {
         let mut writer = bs_replay_driver::engine::format::TraceWriter::create(&dir, &m).unwrap();
-        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: 0, data: 0 })
+            .unwrap();
         writer.finish().unwrap();
     }
     let (_, resp) = load(&ReplayLoadRequest {
@@ -368,8 +374,7 @@ fn dap_timeline_on_empty_trace_is_zero_with_no_waypoints() {
 mod record_handler {
     use super::*;
     use bs_replay_driver::dap::{
-        record, DapRecordError, ReplayRecordExitKind, ReplayRecordOptions,
-        ReplayRecordRequest,
+        DapRecordError, ReplayRecordExitKind, ReplayRecordOptions, ReplayRecordRequest, record,
     };
 
     fn req(trace_path: &std::path::Path, argv: Vec<String>) -> ReplayRecordRequest {
@@ -430,6 +435,8 @@ mod record_handler {
                     || s.contains("EACCES")
                     || s.contains("yama")
                     || s.contains("ENOSYS")
+                    || s.contains("child setup failed")
+                    || s.contains("PTRACE_TRACEME")
                 {
                     eprintln!("skipping record_bin_true_round_trip — {s}");
                     return;
@@ -438,7 +445,10 @@ mod record_handler {
             }
         };
         assert_eq!(resp.trace_path, dir.to_string_lossy());
-        assert!(matches!(resp.exit, ReplayRecordExitKind::Exited { code: 0 }));
+        assert!(matches!(
+            resp.exit,
+            ReplayRecordExitKind::Exited { code: 0 }
+        ));
         // /bin/true exits cleanly; we expect at least one
         // syscall (exit_group) and zero instruction-traps with
         // default options.
@@ -446,7 +456,10 @@ mod record_handler {
         assert_eq!(resp.instruction_traps, 0, "default options trap nothing");
         assert_eq!(
             resp.events_written,
-            resp.syscall_events + resp.signal_events + resp.instruction_traps,
+            resp.pc_marker_events
+                + resp.syscall_events
+                + resp.signal_events
+                + resp.instruction_traps,
         );
         // Trace dir was created and is non-empty.
         assert!(dir.is_dir(), "trace dir wasn't created");

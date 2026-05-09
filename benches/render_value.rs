@@ -29,8 +29,7 @@ const VARS_LINE: u64 = 749;
 fn vars_path() -> PathBuf {
     // CARGO_MANIFEST_DIR points at the workspace root for benches
     // declared in the root Cargo.toml.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/target/debug/vars")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/target/debug/vars")
 }
 
 fn bench_render_phase1(c: &mut Criterion) {

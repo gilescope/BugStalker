@@ -34,7 +34,11 @@ pub struct EventCursor<'a> {
 
 impl<'a> EventCursor<'a> {
     pub(crate) fn new(reader: &'a TraceReader, start: u64) -> Self {
-        Self { reader, next_event_index: start, current: None }
+        Self {
+            reader,
+            next_event_index: start,
+            current: None,
+        }
     }
 
     /// The event index that [`Self::next`] would return next.

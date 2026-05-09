@@ -52,6 +52,7 @@ fn fixed_manifest() -> Manifest {
 fn arb_event() -> impl Strategy<Value = Event> {
     prop_oneof![
         (any::<u32>(), any::<u64>()).prop_map(|(tag, data)| Event::Marker { tag, data }),
+        any::<u64>().prop_map(|pc| Event::PcMarker { pc }),
         (
             any::<u32>(),
             any::<[u64; 6]>(),
@@ -59,7 +60,12 @@ fn arb_event() -> impl Strategy<Value = Event> {
             // Cap output length so a single case isn't multi-MB.
             prop::collection::vec(any::<u8>(), 0..256),
         )
-            .prop_map(|(nr, args, result, output)| Event::Syscall { nr, args, result, output }),
+            .prop_map(|(nr, args, result, output)| Event::Syscall {
+                nr,
+                args,
+                result,
+                output
+            }),
     ]
 }
 

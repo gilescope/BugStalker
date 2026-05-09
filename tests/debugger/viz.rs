@@ -48,20 +48,17 @@ fn debug_view_specs_loaded_from_demo_binary() {
         .expect("Person spec should be in the registry");
     assert_eq!(person.type_name, "viz_demo::Person");
     assert!(debugger.view_spec_for("viz_demo::Person").is_some());
-    assert_eq!(
-        person.summary.as_deref(),
-        Some("Person({name}, age {age})"),
-    );
+    assert_eq!(person.summary.as_deref(), Some("Person({name}, age {age})"),);
     assert_eq!(person.fields.len(), 5);
 
     // Field attributes: skip, rename, format = "hex".
-    let by_name: std::collections::HashMap<&str, &bs_viz_spec::FieldSpec> = person
-        .fields
-        .iter()
-        .map(|f| (f.name.as_str(), f))
-        .collect();
+    let by_name: std::collections::HashMap<&str, &bs_viz_spec::FieldSpec> =
+        person.fields.iter().map(|f| (f.name.as_str(), f)).collect();
 
-    assert!(by_name["_private_token"].hidden, "_private_token should be hidden");
+    assert!(
+        by_name["_private_token"].hidden,
+        "_private_token should be hidden"
+    );
     assert_eq!(by_name["category"].rename.as_deref(), Some("kind"));
     assert_eq!(by_name["flags"].format, Format::Hex);
     assert!(!by_name["name"].hidden);
@@ -323,8 +320,7 @@ fn debug_view_summary_applied_at_render_time() {
         .iter()
         .find(|qr| qr.identity().name.as_deref() == Some("sentinel"));
     if let Some(sentinel_local) = sentinel_local {
-        let sentinel_with_spec =
-            render_value_with_viz(sentinel_local.value(), Some(viz));
+        let sentinel_with_spec = render_value_with_viz(sentinel_local.value(), Some(viz));
         assert!(
             sentinel_with_spec.contains("Sentinel"),
             "unit-struct summary not applied: {sentinel_with_spec}",
@@ -489,9 +485,13 @@ fn debug_view_loader_recovers_dsym_for_split_debuginfo() {
     // SAFETY: single-threaded test (`#[serial]`), and we restore
     // the env var at the end so other tests aren't affected.
     // `set_var` / `remove_var` are unsafe in edition 2024.
-    unsafe { std::env::set_var("BS_TEST_NO_AUTODSYM", "1"); }
+    unsafe {
+        std::env::set_var("BS_TEST_NO_AUTODSYM", "1");
+    }
     let process = prepare_debugee_process(VIZ_DEMO_APP, &[]);
-    unsafe { std::env::remove_var("BS_TEST_NO_AUTODSYM"); }
+    unsafe {
+        std::env::remove_var("BS_TEST_NO_AUTODSYM");
+    }
 
     let info = TestInfo::default();
     let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));

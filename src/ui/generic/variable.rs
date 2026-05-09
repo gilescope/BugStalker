@@ -109,10 +109,8 @@ fn render_value_inner(
                         let outer = value.r#type().name_fmt();
                         r.find(&outer)
                     }) {
-                        let active_variant_name = re
-                            .value
-                            .as_ref()
-                            .and_then(|m| m.field_name.as_deref());
+                        let active_variant_name =
+                            re.value.as_ref().and_then(|m| m.field_name.as_deref());
                         let variant_spec = active_variant_name
                             .and_then(|n| spec.variants.iter().find(|v| v.name == n));
                         let tmpl = variant_spec
@@ -186,9 +184,7 @@ fn render_value_inner(
                             format_scalar(&member.value, f)
                                 .or_else(|| format_bytes(&member.value, f))
                         })
-                        .unwrap_or_else(|| {
-                            render_value_inner(&member.value, depth + 1, true, viz)
-                        });
+                        .unwrap_or_else(|| render_value_inner(&member.value, depth + 1, true, viz));
                     render = format!("{render}\n");
                     render = format!(
                         "{render}{tabs}{}: {}",
@@ -351,7 +347,9 @@ pub fn format_bytes_for_dap(value: &Value, fmt: Format) -> Option<String> {
 /// Returns `None` for anything that isn't a recognisable byte
 /// shape so the caller falls through to default rendering.
 fn format_bytes(value: &Value, fmt: Format) -> Option<String> {
-    use crate::debugger::variable::render::{ByteRenderMode, render_byte_slice_members, render_bytes};
+    use crate::debugger::variable::render::{
+        ByteRenderMode, render_byte_slice_members, render_bytes,
+    };
     use crate::debugger::variable::value::{SpecializedValue, SupportedScalar};
     let mode = match fmt {
         Format::Utf8 => ByteRenderMode::ForceUtf8,
@@ -359,7 +357,9 @@ fn format_bytes(value: &Value, fmt: Format) -> Option<String> {
         _ => return None,
     };
     match value {
-        Value::Specialized { value: Some(spec), .. } => match spec {
+        Value::Specialized {
+            value: Some(spec), ..
+        } => match spec {
             SpecializedValue::Vector(v) | SpecializedValue::VecDeque(v) => {
                 render_byte_slice_members(&v.structure.members, mode)
             }

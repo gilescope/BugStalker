@@ -76,18 +76,18 @@ impl SignalCapture {
     /// `siginfo` length is exactly [`SIGINFO_T_LEN_X86_64`] —
     /// short or long blobs would confuse `PTRACE_SETSIGINFO`
     /// at replay.
-    pub fn new(
-        sig_no: u32,
-        pc: u64,
-        siginfo: Vec<u8>,
-    ) -> Result<Self, SignalLengthError> {
+    pub fn new(sig_no: u32, pc: u64, siginfo: Vec<u8>) -> Result<Self, SignalLengthError> {
         if siginfo.len() != SIGINFO_T_LEN_X86_64 {
             return Err(SignalLengthError {
                 got: siginfo.len(),
                 expected: SIGINFO_T_LEN_X86_64,
             });
         }
-        Ok(Self { sig_no, pc, siginfo })
+        Ok(Self {
+            sig_no,
+            pc,
+            siginfo,
+        })
     }
 }
 
@@ -125,8 +125,7 @@ pub fn signal_from_event(event: &Event) -> Result<SignalCapture, SignalDecodeErr
             sig_no,
             pc,
             siginfo,
-        } => SignalCapture::new(*sig_no, *pc, siginfo.clone())
-            .map_err(SignalDecodeError::Length),
+        } => SignalCapture::new(*sig_no, *pc, siginfo.clone()).map_err(SignalDecodeError::Length),
         other => Err(SignalDecodeError::WrongVariant {
             got: format!("{other:?}"),
         }),
@@ -241,12 +240,8 @@ mod tests {
 
     #[test]
     fn capture_round_trip_through_event() {
-        let cap = SignalCapture::new(
-            libc::SIGTERM as u32,
-            0xCAFE_F00D,
-            fake_siginfo(0xAA),
-        )
-        .expect("new");
+        let cap =
+            SignalCapture::new(libc::SIGTERM as u32, 0xCAFE_F00D, fake_siginfo(0xAA)).expect("new");
         let ev = event_for_signal(&cap);
         let back = signal_from_event(&ev).expect("decode");
         assert_eq!(cap, back);
@@ -283,7 +278,11 @@ mod tests {
     #[test]
     fn replay_plan_rejects_sig_no_zero() {
         let bytes = fake_siginfo(0);
-        let plan = SignalReplayPlan { pid: 1, sig_no: 0, siginfo: &bytes };
+        let plan = SignalReplayPlan {
+            pid: 1,
+            sig_no: 0,
+            siginfo: &bytes,
+        };
         assert_eq!(
             validate_replay_plan(&plan),
             Err(SignalReplayError::ZeroSigNo),
@@ -293,7 +292,11 @@ mod tests {
     #[test]
     fn replay_plan_rejects_sig_no_too_big() {
         let bytes = fake_siginfo(0);
-        let plan = SignalReplayPlan { pid: 1, sig_no: 100, siginfo: &bytes };
+        let plan = SignalReplayPlan {
+            pid: 1,
+            sig_no: 100,
+            siginfo: &bytes,
+        };
         assert_eq!(
             validate_replay_plan(&plan),
             Err(SignalReplayError::SigNoOutOfRange { got: 100 }),
@@ -309,7 +312,10 @@ mod tests {
             siginfo: &bytes,
         };
         match validate_replay_plan(&plan) {
-            Err(SignalReplayError::Length(SignalLengthError { got: 32, expected: 128 })) => {}
+            Err(SignalReplayError::Length(SignalLengthError {
+                got: 32,
+                expected: 128,
+            })) => {}
             other => panic!("expected length error, got {other:?}"),
         }
     }

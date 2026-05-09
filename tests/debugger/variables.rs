@@ -248,7 +248,12 @@ fn assert_nonnull_pointer(val: &Value, exp_outer_type: &str, exp_inner_type: &st
 
 /// Phase 1 S3 helper: assert an `Atomic*` rendered as a bare scalar
 /// with the wrapper type-identity preserved.
-fn assert_atomic_scalar(val: &Value, exp_outer_type: &str, exp_inner_type: &str, exp_val: SupportedScalar) {
+fn assert_atomic_scalar(
+    val: &Value,
+    exp_outer_type: &str,
+    exp_inner_type: &str,
+    exp_val: SupportedScalar,
+) {
     let Value::Specialized {
         value: Some(SpecializedValue::Atomic(inner)),
         ..
@@ -337,16 +342,10 @@ fn assert_weak(val: &Value, exp_type: &str, exp_strong: u64, exp_weak: u64) {
         ..
     } = val
     else {
-        panic!(
-            "not a Weak spec value: type={:?}",
-            val.r#type().name_fmt()
-        );
+        panic!("not a Weak spec value: type={:?}", val.r#type().name_fmt());
     };
     assert_eq!(val.r#type().name_fmt(), exp_type);
-    assert_eq!(
-        *strong, exp_strong,
-        "strong count mismatch for {exp_type}"
-    );
+    assert_eq!(*strong, exp_strong, "strong count mismatch for {exp_type}");
     assert_eq!(*weak, exp_weak, "weak count mismatch for {exp_type}");
 }
 
@@ -783,9 +782,7 @@ fn test_read_pointers() {
         ValueLayout::Wrapped(inner) => {
             assert_scalar(inner, "i32", Some(SupportedScalar::I32(2)));
         }
-        other => panic!(
-            "expected Wrapped(inner) for Box<T> smart-deref, got {other:?}"
-        ),
+        other => panic!("expected Wrapped(inner) for Box<T> smart-deref, got {other:?}"),
     }
     // Raw `*const i32` should still be Referential.
     let ptr_a_layout = ptr_a.value().value_layout().expect("ptr_a layout missing");
@@ -2251,7 +2248,12 @@ fn test_read_atomic() {
     // Phase 1 S3: AtomicI32 is now rendered as the bare scalar payload
     // (peeling the outer Atomic wrapper and the UnsafeCell wrapper).
     // The wrapper type identity is preserved on `Value::r#type()`.
-    assert_atomic_scalar(int32_atomic.value(), "AtomicI32", "i32", SupportedScalar::I32(1));
+    assert_atomic_scalar(
+        int32_atomic.value(),
+        "AtomicI32",
+        "i32",
+        SupportedScalar::I32(1),
+    );
 
     // AtomicPtr<i32> peels to the inner *mut i32 pointer.
     assert_atomic_pointer(int32_atomic_ptr.value(), "AtomicPtr<i32>", "*mut i32");
@@ -2326,7 +2328,10 @@ fn assert_mutex_inner(val: &Value, with_inner: impl FnOnce(&Value)) {
         ..
     } = val
     else {
-        panic!("not a Mutex/RwLock spec value: {:?}", val.r#type().name_fmt());
+        panic!(
+            "not a Mutex/RwLock spec value: {:?}",
+            val.r#type().name_fmt()
+        );
     };
     with_inner(inner.as_ref());
 }
@@ -2338,7 +2343,10 @@ fn assert_mutex_poisoned(val: &Value, exp_poisoned: bool) {
         ..
     } = val
     else {
-        panic!("not a Mutex/RwLock spec value: {:?}", val.r#type().name_fmt());
+        panic!(
+            "not a Mutex/RwLock spec value: {:?}",
+            val.r#type().name_fmt()
+        );
     };
     assert_eq!(*poisoned, exp_poisoned);
 }
@@ -2352,7 +2360,10 @@ fn assert_mutex_locked(val: &Value, exp_locked: bool) {
         ..
     } = val
     else {
-        panic!("not a Mutex/RwLock spec value: {:?}", val.r#type().name_fmt());
+        panic!(
+            "not a Mutex/RwLock spec value: {:?}",
+            val.r#type().name_fmt()
+        );
     };
     assert_eq!(*locked, exp_locked);
 }
@@ -2408,7 +2419,10 @@ fn assert_maybe_uninit_inner(val: &Value, with_inner: impl FnOnce(&Value)) {
         ..
     } = val
     else {
-        panic!("not a MaybeUninit spec value: {:?}", val.r#type().name_fmt());
+        panic!(
+            "not a MaybeUninit spec value: {:?}",
+            val.r#type().name_fmt()
+        );
     };
     with_inner(inner.as_ref());
 }
@@ -2720,15 +2734,25 @@ fn test_read_pin() {
         .expect("pinned_ref not in locals");
 
     // Pin<Box<i32>> peels to a Box (still a pointer-shaped Value).
-    assert_pin(pinned_box.value(), "Pin<alloc::boxed::Box<i32, alloc::alloc::Global>>", |inner| {
-        assert!(matches!(inner, Value::Pointer(_)),
-            "pinned_box pinnee should be a pointer; got {:?}", inner.r#type().name_fmt());
-    });
+    assert_pin(
+        pinned_box.value(),
+        "Pin<alloc::boxed::Box<i32, alloc::alloc::Global>>",
+        |inner| {
+            assert!(
+                matches!(inner, Value::Pointer(_)),
+                "pinned_box pinnee should be a pointer; got {:?}",
+                inner.r#type().name_fmt()
+            );
+        },
+    );
 
     // Pin<&mut i32> peels to a &mut i32 reference (also pointer-shaped).
     assert_pin(pinned_ref.value(), "Pin<&mut i32>", |inner| {
-        assert!(matches!(inner, Value::Pointer(_)),
-            "pinned_ref pinnee should be a pointer; got {:?}", inner.r#type().name_fmt());
+        assert!(
+            matches!(inner, Value::Pointer(_)),
+            "pinned_ref pinnee should be a pointer; got {:?}",
+            inner.r#type().name_fmt()
+        );
     });
 
     debugger.continue_debugee().unwrap();
@@ -2757,7 +2781,14 @@ fn test_read_nonnull() {
     let nn = vars
         .iter()
         .find(|v| v.identity().to_string().contains("nn"))
-        .unwrap_or_else(|| panic!("`nn` not in {:?}", vars.iter().map(|v| v.identity().to_string()).collect::<Vec<_>>()));
+        .unwrap_or_else(|| {
+            panic!(
+                "`nn` not in {:?}",
+                vars.iter()
+                    .map(|v| v.identity().to_string())
+                    .collect::<Vec<_>>()
+            )
+        });
 
     assert_nonnull_pointer(nn.value(), "NonNull<i32>", "*const i32");
 
@@ -2804,7 +2835,10 @@ fn test_rc_cycle_detection() {
     let deep_str = render_value(deep.value());
 
     eprintln!("[cycle] cycle_root rendered as:\n{cycle_str}\n");
-    eprintln!("[cycle] deep (truncated to 200 chars): {}", &deep_str[..deep_str.len().min(200)]);
+    eprintln!(
+        "[cycle] deep (truncated to 200 chars): {}",
+        &deep_str[..deep_str.len().min(200)]
+    );
 
     assert!(
         cycle_str.contains("cycle to"),
@@ -2858,7 +2892,10 @@ fn test_niche_option_recovery() {
                         .unwrap_or_else(|| String::from("<anonymous>"))
                 })
                 .unwrap_or_else(|| String::from("<no variant>")),
-            other => panic!("{name}: not a RustEnum, got {:?}", other.r#type().name_fmt()),
+            other => panic!(
+                "{name}: not a RustEnum, got {:?}",
+                other.r#type().name_fmt()
+            ),
         }
     };
 

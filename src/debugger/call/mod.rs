@@ -13,6 +13,11 @@ use super::{
     debugee::dwarf::r#type::ComplexType,
     register::{Register, RegisterMap},
 };
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux")
+))]
+use crate::debugger::utils;
 use crate::{
     debugger::{
         FunctionInfo,
@@ -25,11 +30,6 @@ use crate::{
     debugger::{context::gcx, read_memory_by_pid},
     disable_when_not_stared,
 };
-#[cfg(any(
-    target_arch = "x86_64",
-    all(target_arch = "aarch64", target_os = "linux")
-))]
-use crate::debugger::utils;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use log::debug;
 #[cfg(any(
@@ -883,7 +883,11 @@ impl Debugger {
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    pub(super) fn call_fn_raw(&self, fn_addr: RelocatedAddress, args: CallArgs) -> Result<(), Error> {
+    pub(super) fn call_fn_raw(
+        &self,
+        fn_addr: RelocatedAddress,
+        args: CallArgs,
+    ) -> Result<(), Error> {
         let call_context = CallContext::new(self)?;
 
         call_context.with_ccx(|ccx| {

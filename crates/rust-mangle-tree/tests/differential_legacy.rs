@@ -7,7 +7,7 @@
 //! Phase 2 batch B scope. Batch C+ will add a corresponding v0
 //! differential.
 
-use rust_mangle_tree::{Symbol, parse};
+use rust_mangle_tree::{parse, Symbol};
 
 /// Each row: a real `_ZN…E` symbol that an actual rustc-built binary
 /// emits for the indicated source path. Hand-picked for variety
@@ -51,7 +51,9 @@ fn matches_rustc_demangle_byte_for_byte() {
             Err(e) => panic!("{sym}: parse failed: {e}"),
         };
         if theirs != ours {
-            mismatches.push(format!("input={sym}\n  ours    = {ours:?}\n  theirs  = {theirs:?}"));
+            mismatches.push(format!(
+                "input={sym}\n  ours    = {ours:?}\n  theirs  = {theirs:?}"
+            ));
         }
     }
     assert!(
@@ -68,7 +70,13 @@ fn no_panic_on_garbage() {
     // They either parse with surprising-but-valid output, or return
     // `Err`. Either is acceptable — panic isn't.
     for input in [
-        "_ZN", "_ZN0E", "_ZNXE", "_ZN999999999E", "_ZN3", "_ZNzzzE", "_ZN3foo",
+        "_ZN",
+        "_ZN0E",
+        "_ZNXE",
+        "_ZN999999999E",
+        "_ZN3",
+        "_ZNzzzE",
+        "_ZN3foo",
     ] {
         let _ = parse(input); // must not panic
     }

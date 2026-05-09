@@ -49,21 +49,21 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // `pub struct Wrap<T> { ... }`. This is correct as long as
     // the field set + summary template are generic-uniform; the
     // common case for crate authors.
-    let (fields, enum_variants): (Option<&syn::Fields>, Option<&syn::DataEnum>) =
-        match &input.data {
-            Data::Struct(s) => (Some(&s.fields), None),
-            // Phase 4 step 8: enums also carry per-variant
-            // attributes — `#[bs_viz(summary = "...", tag = "...")]`
-            // on individual variants, plus per-field overrides
-            // scoped to the variant.
-            Data::Enum(e) => (None, Some(e)),
-            Data::Union(_) => {
-                return Err(syn::Error::new(
-                    input.span(),
-                    "#[derive(DebugView)] does not support unions",
-                ));
-            }
-        };
+    let (fields, enum_variants): (Option<&syn::Fields>, Option<&syn::DataEnum>) = match &input.data
+    {
+        Data::Struct(s) => (Some(&s.fields), None),
+        // Phase 4 step 8: enums also carry per-variant
+        // attributes — `#[bs_viz(summary = "...", tag = "...")]`
+        // on individual variants, plus per-field overrides
+        // scoped to the variant.
+        Data::Enum(e) => (None, Some(e)),
+        Data::Union(_) => {
+            return Err(syn::Error::new(
+                input.span(),
+                "#[derive(DebugView)] does not support unions",
+            ));
+        }
+    };
 
     let type_attrs = parse_type_attrs(&input.attrs)?;
     let summary = type_attrs.summary;

@@ -280,11 +280,7 @@ pub fn x86_64_register_id(r: iced_x86::Register) -> u64 {
 /// - `Rdrand` / `Rdseed` — two `u64`s; the value, then `1` on
 ///   CF=1 success or `0` on CF=0 failure.
 /// - `Cpuid` — four `u64`s holding `eax`, `ebx`, `ecx`, `edx`.
-pub fn event_for_instruction_trap(
-    pc: u64,
-    kind: InstrKind,
-    result: Vec<u64>,
-) -> Event {
+pub fn event_for_instruction_trap(pc: u64, kind: InstrKind, result: Vec<u64>) -> Event {
     debug_assert!(
         match kind {
             InstrKind::Rdtsc | InstrKind::Rdtscp => result.len() == 1,
@@ -555,11 +551,7 @@ mod tests {
 
     #[test]
     fn cpuid_event_carries_four_words() {
-        let ev = event_for_instruction_trap(
-            0x4000_0000,
-            InstrKind::Cpuid,
-            vec![1, 2, 3, 4],
-        );
+        let ev = event_for_instruction_trap(0x4000_0000, InstrKind::Cpuid, vec![1, 2, 3, 4]);
         match ev {
             Event::InstructionTrap { result, .. } => assert_eq!(result.len(), 4),
             other => panic!("got {other:?}"),
@@ -618,7 +610,8 @@ mod tests {
                 if libc::WIFSIGNALED(status) {
                     let sig = libc::WTERMSIG(status);
                     assert_eq!(
-                        sig, libc::SIGSEGV,
+                        sig,
+                        libc::SIGSEGV,
                         "expected SIGSEGV from RDTSC trap, got signal {sig}"
                     );
                 } else if libc::WIFEXITED(status) {

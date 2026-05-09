@@ -54,7 +54,10 @@ pub struct CheckpointSummary {
 
 impl From<&CheckpointHeader> for CheckpointSummary {
     fn from(h: &CheckpointHeader) -> Self {
-        Self { index: h.index, event_index: h.event_index }
+        Self {
+            index: h.index,
+            event_index: h.event_index,
+        }
     }
 }
 
@@ -222,6 +225,8 @@ pub struct ReplayRecordResponse {
     pub events_written: u64,
     /// `Event::Syscall` events written.
     pub syscall_events: u64,
+    /// `Event::PcMarker` events written.
+    pub pc_marker_events: u64,
     /// `Event::Signal` events written.
     pub signal_events: u64,
     /// `Event::InstructionTrap` events written.
@@ -236,14 +241,12 @@ pub struct ReplayRecordResponse {
 /// is `cfg(target_os = "linux")`. Synchronous: returns when the
 /// recorded program exits or hits the iteration cap.
 #[cfg(target_os = "linux")]
-pub fn record(
-    req: &ReplayRecordRequest,
-) -> Result<ReplayRecordResponse, DapRecordError> {
+pub fn record(req: &ReplayRecordRequest) -> Result<ReplayRecordResponse, DapRecordError> {
     use std::ffi::CString;
 
+    use bs_replay_engine::VERSION as ENGINE_VERSION;
     use bs_replay_engine::format::manifest::Manifest;
     use bs_replay_engine::format::version::FormatVersion;
-    use bs_replay_engine::VERSION as ENGINE_VERSION;
 
     use crate::record::{self, ExitStatus, RecordOptions};
 
@@ -291,24 +294,23 @@ pub fn record(
         disable_cpuid: req.options.disable_cpuid,
     };
 
-    let report =
-        record::record_program(&req.trace_path, &manifest, argv, envp, options)
-            .map_err(DapRecordError::Record)?;
+    let report = record::record_program(&req.trace_path, &manifest, argv, envp, options)
+        .map_err(DapRecordError::Record)?;
 
     Ok(ReplayRecordResponse {
         trace_path: req.trace_path.clone(),
-        events_written: report.syscall_events
+        events_written: report.pc_marker_events
+            + report.syscall_events
             + report.signal_events
             + report.instruction_traps,
         syscall_events: report.syscall_events,
+        pc_marker_events: report.pc_marker_events,
         signal_events: report.signal_events,
         instruction_traps: report.instruction_traps,
         iterations: report.iterations,
         exit: match report.exit_status {
             ExitStatus::Exited(code) => ReplayRecordExitKind::Exited { code },
-            ExitStatus::Signalled(signal) => {
-                ReplayRecordExitKind::Signalled { signal }
-            }
+            ExitStatus::Signalled(signal) => ReplayRecordExitKind::Signalled { signal },
             ExitStatus::IterationCap(iterations) => {
                 ReplayRecordExitKind::IterationCap { iterations }
             }
@@ -422,24 +424,20 @@ pub struct ReplayRestoreResponse {
 
 /// Handle `bs/replayRestore`. Linux only.
 #[cfg(target_os = "linux")]
-pub fn restore(
-    req: &ReplayRestoreRequest,
-) -> Result<ReplayRestoreResponse, RestoreError> {
+pub fn restore(req: &ReplayRestoreRequest) -> Result<ReplayRestoreResponse, RestoreError> {
     use bs_replay::linux::checkpoint_capture::restore_writable_state;
     use bs_replay::linux::proc_regs::restore_registers;
     use bs_replay::linux::tier2;
     use bs_replay_engine::format::TraceReader;
 
-    let reader = TraceReader::open(&req.trace_path)
-        .map_err(RestoreError::TraceOpen)?;
+    let reader = TraceReader::open(&req.trace_path).map_err(RestoreError::TraceOpen)?;
     let cp = reader
         .open_checkpoint(req.checkpoint_index)
         .map_err(RestoreError::CheckpointOpen)?;
-    let state = tier2::from_payload(&cp.payload)
-        .map_err(RestoreError::Decode)?;
+    let state = tier2::from_payload(&cp.payload).map_err(RestoreError::Decode)?;
     let target = nix::unistd::Pid::from_raw(req.target_pid);
-    let report = restore_writable_state(target, &state.writable)
-        .map_err(RestoreError::RestoreMem)?;
+    let report =
+        restore_writable_state(target, &state.writable).map_err(RestoreError::RestoreMem)?;
     restore_registers(target, &state.regs).map_err(RestoreError::RestoreReg)?;
     Ok(ReplayRestoreResponse {
         regions_written: report.written as u64,
@@ -507,9 +505,7 @@ pub struct ReplayLoadResponse {
 /// the caller stashes for subsequent [`bs/replayJump`](dap_jump)
 /// and friends. Free function rather than a method because the
 /// request *constructs* the replayer rather than acting on one.
-pub fn load(
-    req: &ReplayLoadRequest,
-) -> Result<(TraceReplayer, ReplayLoadResponse), ReplayError> {
+pub fn load(req: &ReplayLoadRequest) -> Result<(TraceReplayer, ReplayLoadResponse), ReplayError> {
     let replayer = TraceReplayer::open(&req.trace_path)?;
     let segments = replayer
         .reader()
@@ -554,10 +550,7 @@ impl TraceReplayer {
     /// Handle `bs/replayJump`. Does not yield events; updates the
     /// playhead and reports which checkpoint should be the
     /// restore-from anchor.
-    pub fn dap_jump(
-        &mut self,
-        req: &ReplayJumpRequest,
-    ) -> Result<ReplayJumpResponse, ReplayError> {
+    pub fn dap_jump(&mut self, req: &ReplayJumpRequest) -> Result<ReplayJumpResponse, ReplayError> {
         let target_event = match req.target {
             JumpTarget::EventIndex { event_index } => event_index,
             JumpTarget::Checkpoint { index } => {
@@ -565,17 +558,14 @@ impl TraceReplayer {
                     .reader()
                     .checkpoint_headers()
                     .map_err(ReplayError::Engine)?;
-                let h = headers
-                    .iter()
-                    .find(|h| h.index == index)
-                    .ok_or_else(|| {
-                        ReplayError::Engine(
-                            bs_replay_engine::format::TraceReadError::CheckpointHeaderMismatch {
-                                file_index: index,
-                                header_index: 0,
-                            },
-                        )
-                    })?;
+                let h = headers.iter().find(|h| h.index == index).ok_or_else(|| {
+                    ReplayError::Engine(
+                        bs_replay_engine::format::TraceReadError::CheckpointHeaderMismatch {
+                            file_index: index,
+                            header_index: 0,
+                        },
+                    )
+                })?;
                 h.event_index
             }
         };
@@ -583,7 +573,10 @@ impl TraceReplayer {
         let restore_from_checkpoint = self
             .find_checkpoint_at_or_before(target_event)?
             .map(|h| h.index);
-        Ok(ReplayJumpResponse { event_index: target_event, restore_from_checkpoint })
+        Ok(ReplayJumpResponse {
+            event_index: target_event,
+            restore_from_checkpoint,
+        })
     }
 
     /// Handle `bs/replayTimeline`.
@@ -609,6 +602,9 @@ impl TraceReplayer {
                 event_index: h.event_index,
             })
             .collect();
-        Ok(ReplayTimelineResponse { total_events, waypoints })
+        Ok(ReplayTimelineResponse {
+            total_events,
+            waypoints,
+        })
     }
 }

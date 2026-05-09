@@ -388,8 +388,7 @@ pub mod debug_impl {
     use crate::debugger::Error;
     use crate::debugger::Error::Ptrace;
     use crate::debugger::register::debug::{
-        BreakCondition, BreakSize, DebugControlRegister, DebugRegisterNumber,
-        DebugStatusRegister,
+        BreakCondition, BreakSize, DebugControlRegister, DebugRegisterNumber, DebugStatusRegister,
     };
     use nix::sys;
     use nix::sys::ptrace::AddressType;

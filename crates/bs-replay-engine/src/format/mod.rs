@@ -32,5 +32,7 @@ pub use manifest::{Manifest, ManifestParseError};
 pub use segment::{Segment, SegmentHeader};
 pub use trace_reader::{SegmentRange, SegmentReader, TraceReadError, TraceReader};
 pub use trace_writer::{DEFAULT_SEGMENT_SIZE_BYTES, TraceWriteError, TraceWriter};
-pub use validator::{validate, validate_with, Diag, DiagKind, Severity, ValidationOptions, ValidationReport};
+pub use validator::{
+    Diag, DiagKind, Severity, ValidationOptions, ValidationReport, validate, validate_with,
+};
 pub use version::{FormatVersion, MAX_SUPPORTED_FORMAT_VERSION, TRACE_MAGIC};

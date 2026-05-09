@@ -116,9 +116,7 @@ impl<M: CheckpointMechanism> CheckpointRing<M> {
                 .entries
                 .pop_front()
                 .expect("len == capacity ≥ 1 implies non-empty");
-            self.mechanism
-                .kill(oldest)
-                .map_err(RingError::Mechanism)?;
+            self.mechanism.kill(oldest).map_err(RingError::Mechanism)?;
         }
         let handle = self.mechanism.take(key).map_err(RingError::Mechanism)?;
         self.entries.push_back((key, handle));
@@ -234,7 +232,9 @@ pub struct MockError {
 impl MockError {
     /// Construct from a label.
     pub fn new(label: impl Into<String>) -> Self {
-        Self { label: label.into() }
+        Self {
+            label: label.into(),
+        }
     }
 }
 

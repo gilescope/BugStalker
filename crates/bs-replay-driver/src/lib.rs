@@ -34,21 +34,20 @@ pub mod reverse;
 
 pub use capture::capture_host_manifest;
 #[cfg(target_os = "linux")]
-pub use dap::{record as dap_record, DapRecordError};
+pub use dap::{DapRecordError, record as dap_record};
 pub use dap::{
     ReplayRecordExitKind, ReplayRecordOptions, ReplayRecordRequest, ReplayRecordResponse,
 };
+pub use host::{HostDetectError, host_features};
 #[cfg(target_os = "linux")]
 pub use record::{
-    record_program, ExitStatus as RecorderExitStatus, RecordOptions, RecordProgramError,
-    RecordReport,
+    ExitStatus as RecorderExitStatus, RecordOptions, RecordProgramError, RecordReport,
+    record_program,
 };
 #[cfg(target_os = "linux")]
 pub use replay::{
-    replay_program, ReplayExit, ReplayOptions, ReplayProgramError, ReplayReport,
-    ShimRefusedReason,
+    ReplayExit, ReplayOptions, ReplayProgramError, ReplayReport, ShimRefusedReason, replay_program,
 };
-pub use host::{host_features, HostDetectError};
 pub use replayer::{
     BuildIdMismatch, HostMismatchError, ReplayError, ReplayabilityError, TraceReplayer,
 };
@@ -65,48 +64,46 @@ pub use bs_replay_engine as engine;
 pub mod record_primitives {
     #[doc(inline)]
     pub use bs_replay_engine::record::syscall_capture::{
-        capture_post_syscall, capture_pre_syscall, classify, looks_like_user_pointer,
-        BUFFER_CAP, CallFrame, CapturedKind, CapturedRegion, CapturedSyscall, CaptureTier,
-        DecodeError as CapturedSyscallDecodeError, MemoryReader, Tier, CATCH_ALL_WINDOW,
-        CSTR_CAP,
+        BUFFER_CAP, CATCH_ALL_WINDOW, CSTR_CAP, CallFrame, CaptureTier, CapturedKind,
+        CapturedRegion, CapturedSyscall, DecodeError as CapturedSyscallDecodeError, MemoryReader,
+        Tier, capture_post_syscall, capture_pre_syscall, classify, looks_like_user_pointer,
     };
 
     #[cfg(target_os = "linux")]
     #[doc(inline)]
     pub use bs_replay_engine::record::linux::{
         exit_stop::{
-            classify_wstatus, merge_pre_post, ptrace_cont, ptrace_syscall,
-            wait_for_next_stop, ExitStopError, StopKind, UserRegsX86_64,
+            ExitStopError, StopKind, UserRegsX86_64, classify_wstatus, merge_pre_post, ptrace_cont,
+            ptrace_syscall, wait_for_next_stop,
         },
         ptrace_driver::{
-            capture_from_notif, event_for_capture, frame_from_notif, recv_notif,
-            record_one_syscall, respond_continue, respond_intercept, ProcMemReader,
-            RecorderError, SeccompData, SeccompNotif, SeccompNotifResp,
-            RESULT_NOT_CAPTURED_YET, SECCOMP_USER_NOTIF_FLAG_CONTINUE,
+            ProcMemReader, RESULT_NOT_CAPTURED_YET, RecorderError,
+            SECCOMP_USER_NOTIF_FLAG_CONTINUE, SeccompData, SeccompNotif, SeccompNotifResp,
+            capture_from_notif, event_for_capture, frame_from_notif, record_one_syscall,
+            recv_notif, respond_continue, respond_intercept,
         },
-        record_child::{spawn as spawn_record_child, RecordChild},
+        record_child::{RecordChild, spawn as spawn_record_child},
         record_session::{
-            ptrace_getsiginfo, record_to_completion, spawn_recorded_child,
-            step_until_event, RecordSessionError, RecordSummary, RecordedChild,
-            RecordedEventKind, SpawnError, Terminal,
+            RecordSessionError, RecordSummary, RecordedChild, RecordedEventKind, SpawnError,
+            Terminal, ptrace_getsiginfo, record_to_completion, spawn_recorded_child,
+            step_until_event,
         },
         seccomp::install_trap_all_listener,
         signals::{
-            event_for_signal, signal_from_event, validate_replay_plan, SignalCapture,
-            SignalDecodeError, SignalLengthError, SignalReplayError, SignalReplayPlan,
-            SIGINFO_T_LEN_X86_64,
+            SIGINFO_T_LEN_X86_64, SignalCapture, SignalDecodeError, SignalLengthError,
+            SignalReplayError, SignalReplayPlan, event_for_signal, signal_from_event,
+            validate_replay_plan,
         },
         thread_sched::{
-            current_affinity_for_self, pin_to_single_cpu_for_self, AffinityError,
-            AffinityMask, SingleCpuPin,
+            AffinityError, AffinityMask, SingleCpuPin, current_affinity_for_self,
+            pin_to_single_cpu_for_self,
         },
         vdso_patch::{
-            find_vdso_range, find_vdso_range_for_self,
-            patch_bytes as patch_remote_bytes, peekdata, pokedata,
-            read_proc_maps, read_proc_maps_for_self, read_remote_vdso_bytes,
-            scan_remote_vdso, scan_vdso_exports, syscall_nr_for_vdso,
-            ProcMapping, ScanRemoteError, VdsoPatch, VdsoPatchError, VdsoScanError,
-            VdsoSymbol, VDSO_TARGET_SYMBOLS,
+            ProcMapping, ScanRemoteError, VDSO_TARGET_SYMBOLS, VdsoPatch, VdsoPatchError,
+            VdsoScanError, VdsoSymbol, find_vdso_range, find_vdso_range_for_self,
+            patch_bytes as patch_remote_bytes, peekdata, pokedata, read_proc_maps,
+            read_proc_maps_for_self, read_remote_vdso_bytes, scan_remote_vdso, scan_vdso_exports,
+            syscall_nr_for_vdso,
         },
     };
 
@@ -120,9 +117,7 @@ pub mod record_primitives {
     #[doc(inline)]
     pub use bs_replay_engine::record::linux::{
         exit_stop::{get_regs, record_syscall_with_exit, result_register_x86_64, set_regs},
-        instrs::{
-            classify_at_pc, event_for_instruction_trap, set_tsc_trap_for_self, InstrKind,
-        },
+        instrs::{InstrKind, classify_at_pc, event_for_instruction_trap, set_tsc_trap_for_self},
         record_session::call_frame_from_regs,
     };
 
@@ -140,7 +135,7 @@ pub mod record_primitives {
 pub mod replay_primitives {
     #[doc(inline)]
     pub use bs_replay_engine::replay::linux::shim::{
-        apply_recorded_event, replay_one_syscall, MemoryWriter, ProcMemWriter,
-        ReplayError as ReplayShimError, ReplayLoopError, ReplayResponse, SyscallMismatch,
+        MemoryWriter, ProcMemWriter, ReplayError as ReplayShimError, ReplayLoopError,
+        ReplayResponse, SyscallMismatch, apply_recorded_event, replay_one_syscall,
     };
 }

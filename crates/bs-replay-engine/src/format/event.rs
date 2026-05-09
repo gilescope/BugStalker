@@ -136,10 +136,9 @@ pub enum Event {
     /// path strings that would bloat with every basic-block
     /// crossing.
     ///
-    /// Recorder cadence: real PcMarker emission lands when 3B
-    /// (syscall record) lands — between successive syscalls is a
-    /// natural place to sample the PC. Once Phase 6's PT trace
-    /// is available, decode produces a fine-grained PC sequence
+    /// Recorder cadence: the syscall recorder emits one marker at
+    /// each syscall boundary. Once Phase 6's PT trace is available
+    /// on real hardware, decode can add a finer-grained PC sequence
     /// that compresses naturally.
     PcMarker {
         /// Program counter at this point in the recorded stream.
@@ -182,13 +181,9 @@ impl Event {
             // 4-byte nr + 6×8-byte args + 8-byte result + the
             // archived Vec layout (16-byte rkyv RelPtr + len) +
             // the payload bytes themselves.
-            Self::Syscall { output, .. } => {
-                VARIANT_OVERHEAD + 4 + 6 * 8 + 8 + 16 + output.len()
-            }
+            Self::Syscall { output, .. } => VARIANT_OVERHEAD + 4 + 6 * 8 + 8 + 16 + output.len(),
             // 4-byte sig_no + 8-byte pc + Vec<u8> overhead + payload.
-            Self::Signal { siginfo, .. } => {
-                VARIANT_OVERHEAD + 4 + 8 + 16 + siginfo.len()
-            }
+            Self::Signal { siginfo, .. } => VARIANT_OVERHEAD + 4 + 8 + 16 + siginfo.len(),
             // 8-byte pc + 1-byte kind discriminant + Vec<u64> overhead
             // + 8 × words.
             Self::InstructionTrap { result, .. } => {

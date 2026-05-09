@@ -55,15 +55,12 @@ use std::io;
 use std::mem;
 use std::os::fd::BorrowedFd;
 
-use crate::format::event::Event;
 use crate::format::trace_writer::{TraceWriteError, TraceWriter};
 use crate::record::linux::ptrace_driver::{
-    capture_from_notif, event_for_capture, frame_from_notif, recv_notif, respond_continue,
-    RecorderError, SeccompNotif,
+    RecorderError, SeccompNotif, capture_from_notif, event_for_capture, frame_from_notif,
+    recv_notif, respond_continue,
 };
-use crate::record::syscall_capture::{
-    capture_post_syscall, CapturedSyscall, MemoryReader,
-};
+use crate::record::syscall_capture::{CapturedSyscall, MemoryReader, capture_post_syscall};
 
 // ---------------------------------------------------------------------------
 // User-mode register layout
@@ -196,10 +193,14 @@ pub enum StopKind {
 /// command; replay too.
 pub fn classify_wstatus(status: libc::c_int) -> StopKind {
     if libc::WIFEXITED(status) {
-        return StopKind::Exited { code: libc::WEXITSTATUS(status) };
+        return StopKind::Exited {
+            code: libc::WEXITSTATUS(status),
+        };
     }
     if libc::WIFSIGNALED(status) {
-        return StopKind::Signalled { sig: libc::WTERMSIG(status) };
+        return StopKind::Signalled {
+            sig: libc::WTERMSIG(status),
+        };
     }
     if libc::WIFSTOPPED(status) {
         let sig = libc::WSTOPSIG(status);
@@ -303,10 +304,7 @@ pub fn ptrace_cont(pid: i32, sig: i32) -> io::Result<()> {
 /// InCStr regions; the post half supplies the result + OutBuf
 /// + catch-all post-state regions. Plan §3B contract: one
 /// `Event::Syscall` per syscall, carrying both halves.
-pub fn merge_pre_post(
-    pre: &CapturedSyscall,
-    post: &CapturedSyscall,
-) -> CapturedSyscall {
+pub fn merge_pre_post(pre: &CapturedSyscall, post: &CapturedSyscall) -> CapturedSyscall {
     // Sanity — pre and post must agree on nr + args; if they
     // diverge the supervisor is processing the wrong stop.
     debug_assert_eq!(pre.nr, post.nr, "pre/post nr divergence");
@@ -355,13 +353,11 @@ pub fn record_syscall_with_exit(
     reader: &dyn MemoryReader,
     writer: &mut TraceWriter,
 ) -> Result<CapturedSyscall, ExitStopError> {
-    let notif = recv_notif(listener).map_err(|e| {
-        ExitStopError::Recorder(RecorderError::Recv(e))
-    })?;
+    let notif =
+        recv_notif(listener).map_err(|e| ExitStopError::Recorder(RecorderError::Recv(e)))?;
     let pre = capture_from_notif_raw(&notif, reader);
-    respond_continue(listener, notif.id).map_err(|e| {
-        ExitStopError::Recorder(RecorderError::Respond(e))
-    })?;
+    respond_continue(listener, notif.id)
+        .map_err(|e| ExitStopError::Recorder(RecorderError::Respond(e)))?;
     let (kind, status) = wait_for_next_stop(tracee_pid).map_err(ExitStopError::Wait)?;
     if kind != StopKind::SyscallStop {
         return Err(ExitStopError::UnexpectedStop {
@@ -384,10 +380,7 @@ pub fn record_syscall_with_exit(
 /// public [`capture_from_notif`] sets `result =
 /// RESULT_NOT_CAPTURED_YET`; here we want the bare pre half
 /// because [`merge_pre_post`] re-stamps the real result.
-fn capture_from_notif_raw(
-    notif: &SeccompNotif,
-    reader: &dyn MemoryReader,
-) -> CapturedSyscall {
+fn capture_from_notif_raw(notif: &SeccompNotif, reader: &dyn MemoryReader) -> CapturedSyscall {
     // Re-use the public path but immediately overwrite the
     // sentinel. We don't add a new public function because the
     // sentinel is exactly the contract we want for the
@@ -428,9 +421,7 @@ pub enum ExitStopError {
 mod tests {
     use super::*;
     use crate::record::linux::ptrace_driver::SeccompData;
-    use crate::record::syscall_capture::{
-        CallFrame, CaptureTier, CapturedKind, CapturedRegion,
-    };
+    use crate::record::syscall_capture::{CallFrame, CaptureTier, CapturedKind, CapturedRegion};
 
     #[test]
     fn user_regs_layout_is_27_u64_fields() {
@@ -491,10 +482,7 @@ mod tests {
         //   (event << 16) | ((SIGTRAP | event-marker) << 8) | 0x7f
         let event = 4i32;
         let wstatus = (event << 16) | (libc::SIGTRAP << 8) | 0x7f;
-        assert_eq!(
-            classify_wstatus(wstatus),
-            StopKind::PtraceEvent { event },
-        );
+        assert_eq!(classify_wstatus(wstatus), StopKind::PtraceEvent { event },);
     }
 
     #[test]

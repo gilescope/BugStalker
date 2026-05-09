@@ -27,8 +27,8 @@
 
 use nix::unistd::Pid;
 
-use super::proc_maps::{read_proc_maps, MemoryRegion, ProcMapsError};
-use super::proc_mem::{read_region, write_bytes_at, ProcMemError};
+use super::proc_maps::{MemoryRegion, ProcMapsError, read_proc_maps};
+use super::proc_mem::{ProcMemError, read_region, write_bytes_at};
 
 /// One captured writable region: its start address + raw bytes.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -98,7 +98,10 @@ pub fn capture_writable_state(pid: Pid) -> Result<WritableState, CaptureError> {
             continue;
         }
         match read_region(pid, r) {
-            Ok(bytes) => regions.push(CapturedRegion { start: r.start, bytes }),
+            Ok(bytes) => regions.push(CapturedRegion {
+                start: r.start,
+                bytes,
+            }),
             Err(_) => {
                 // Skip — kernel-special VMA or transient
                 // race; replay-time restore will not need this
@@ -226,7 +229,10 @@ pub fn from_payload(bytes: &[u8]) -> Result<WritableState, DecodeError> {
 
 fn read_u64(cur: &mut &[u8]) -> Result<u64, DecodeError> {
     if cur.len() < 8 {
-        return Err(DecodeError::Truncated { needed: 8, have: cur.len() });
+        return Err(DecodeError::Truncated {
+            needed: 8,
+            have: cur.len(),
+        });
     }
     let (head, tail) = cur.split_at(8);
     let v = u64::from_le_bytes(head.try_into().expect("split_at gives 8"));
@@ -246,9 +252,18 @@ mod tests {
     fn payload_roundtrip_preserves_every_byte() {
         let state = WritableState {
             regions: vec![
-                CapturedRegion { start: 0x1000, bytes: vec![0xab; 16] },
-                CapturedRegion { start: 0x2000, bytes: vec![0xcd, 0xef] },
-                CapturedRegion { start: 0x3000, bytes: Vec::new() },
+                CapturedRegion {
+                    start: 0x1000,
+                    bytes: vec![0xab; 16],
+                },
+                CapturedRegion {
+                    start: 0x2000,
+                    bytes: vec![0xcd, 0xef],
+                },
+                CapturedRegion {
+                    start: 0x3000,
+                    bytes: Vec::new(),
+                },
             ],
         };
         let p = to_payload(&state);
@@ -335,8 +350,8 @@ mod tests {
         assert_eq!(report.skipped, 0);
 
         // Read back from the child to confirm the bytes landed.
-        let read_back = super::super::proc_mem::read_bytes_at(h.pid, addr, pattern.len())
-            .expect("read failed");
+        let read_back =
+            super::super::proc_mem::read_bytes_at(h.pid, addr, pattern.len()).expect("read failed");
         assert_eq!(read_back, pattern, "restore did not land the bytes");
 
         // Parent's heap is unchanged thanks to COW.
@@ -353,9 +368,7 @@ mod tests {
         // A's. This is the integration test for the whole Tier 2
         // capture/restore loop assembled in steps 35–43.
         use crate::linux::proc_mem::{read_bytes_at, write_bytes_at};
-        use crate::linux::proc_regs::{
-            capture_registers, restore_registers,
-        };
+        use crate::linux::proc_regs::{capture_registers, restore_registers};
 
         // Heap-allocate a buffer the parent owns. Both forks see
         // it at the same VA (address-space layout shared at fork
@@ -392,8 +405,7 @@ mod tests {
             }
         };
         let a_regs = capture_registers(a.pid).expect("capture A regs");
-        let a_bytes_at_addr = read_bytes_at(a.pid, addr, buf.len())
-            .expect("read A buf");
+        let a_bytes_at_addr = read_bytes_at(a.pid, addr, buf.len()).expect("read A buf");
         // Sanity: A's buffer should be all-zero (initial state).
         assert!(a_bytes_at_addr.iter().all(|&b| b == 0));
 
@@ -411,20 +423,16 @@ mod tests {
         // distinct from A's all-zero content. After this, B's
         // copy of that page diverges from A's via COW.
         let sentinel = vec![0xab; buf.len()];
-        write_bytes_at(b.pid, addr, &sentinel)
-            .expect("write sentinel to B");
-        let b_pre = read_bytes_at(b.pid, addr, buf.len())
-            .expect("read B pre-restore");
+        write_bytes_at(b.pid, addr, &sentinel).expect("write sentinel to B");
+        let b_pre = read_bytes_at(b.pid, addr, buf.len()).expect("read B pre-restore");
         assert_eq!(b_pre, sentinel, "perturbation should have landed");
 
         // Restore A's full writable state into B.
-        let report = restore_writable_state(b.pid, &a_state)
-            .expect("restore failed");
+        let report = restore_writable_state(b.pid, &a_state).expect("restore failed");
         assert!(report.written > 0, "restore must have written something");
 
         // Memory check: B's bytes at addr should now match A's.
-        let b_post = read_bytes_at(b.pid, addr, buf.len())
-            .expect("read B post-restore");
+        let b_post = read_bytes_at(b.pid, addr, buf.len()).expect("read B post-restore");
         assert_eq!(
             b_post, a_bytes_at_addr,
             "B's bytes at addr should match A's after restore",

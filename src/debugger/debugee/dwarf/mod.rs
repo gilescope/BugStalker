@@ -259,10 +259,7 @@ impl DebugInformation {
         let pc_u = u64::from(pc);
         let mut candidates: Vec<&BsUnit> = Vec::new();
         for unit in self.get_units()?.iter() {
-            let in_range = match unit
-                .ranges()
-                .binary_search_by_key(&pc_u, |r| r.begin)
-            {
+            let in_range = match unit.ranges().binary_search_by_key(&pc_u, |r| r.begin) {
                 Ok(_) => true,
                 Err(pos) => unit.ranges()[..pos]
                     .iter()
@@ -611,7 +608,9 @@ impl DebugInformation {
     }
 
     pub fn tls_symbol_offset_stripped(&self, mangled_name: &str) -> Option<u64> {
-        self.tls_symbol_tab.as_ref()?.get_offset_stripped(mangled_name)
+        self.tls_symbol_tab
+            .as_ref()?
+            .get_offset_stripped(mangled_name)
     }
 
     pub fn find_variables(

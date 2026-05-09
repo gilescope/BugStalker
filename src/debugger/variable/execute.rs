@@ -223,14 +223,12 @@ impl<'dbg> DqeExecutor<'dbg> {
         // (e.g. tokio's `CONTEXT`) lives in the main executable
         // regardless. Only a `local_only = true` selector or
         // `Selector::Any` actually need the current function.
-        let pc_debug_info_and_func = debugee
-            .debug_info(ecx.location().pc)
-            .and_then(|di| {
-                let func = di
-                    .find_function_by_pc(ecx.location().global_pc)?
-                    .ok_or(FunctionNotFound(ecx.location().global_pc))?;
-                Ok((di, func))
-            });
+        let pc_debug_info_and_func = debugee.debug_info(ecx.location().pc).and_then(|di| {
+            let func = di
+                .find_function_by_pc(ecx.location().global_pc)?
+                .ok_or(FunctionNotFound(ecx.location().global_pc))?;
+            Ok((di, func))
+        });
 
         let vars = match selector {
             Selector::Name {

@@ -287,6 +287,30 @@ keybinding `H` (alongside Phase 6's `p`/`P`).
 ~1 week. The decoder + aggregator are reused; new piece is the
 column merge in the renderer.
 
+## Phase 11 handoff — precise trace providers
+
+Phase 10 must not depend on Intel PT specifically. Heap timelines
+depend on ordered, source-attributed execution events, and those can
+come from Phase 6 Intel PT today or from Phase 11's vendor-neutral
+precise-trace provider model later.
+
+The important contract is the provider's precision:
+
+- Intel PT and any future verified AMD packet trace can advertise
+  instruction-exact events.
+- AMD LBR Stack / AMD Processor Trace fallback advertises
+  branch-exact events: enough for branch-bound heap correlation and
+  checkpoint rendezvous, not enough to promise every in-block
+  instruction.
+- Apple Processor Trace and ARM CoreSight ETM join through the same
+  decoded-event interface when their platform backends land.
+
+Phase 10's `heap at`, `rstep-alloc`, `rstep-free`, and `heap rstep-uaf`
+commands should surface that precision in their responses. If the
+selected trace provider is branch-exact, the command can still move to
+the closest safe branch/checkpoint anchor, but the UI must say that it
+landed at branch precision rather than exact instruction precision.
+
 ## Crate layout
 
 ```text

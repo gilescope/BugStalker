@@ -78,9 +78,7 @@ mod linux_main {
 
     use bs_replay_driver::engine::format::manifest::Manifest;
     use bs_replay_driver::engine::format::version::FormatVersion;
-    use bs_replay_driver::{
-        record_program, RecordOptions, RecordProgramError, RecorderExitStatus,
-    };
+    use bs_replay_driver::{RecordOptions, RecordProgramError, RecorderExitStatus, record_program};
 
     use super::USAGE;
 
@@ -113,23 +111,25 @@ mod linux_main {
                 }
                 "--" => seen_separator = true,
                 "--max-iterations" => {
-                    let v = args.next().ok_or_else(|| {
-                        "--max-iterations requires a u64 argument".to_owned()
-                    })?;
-                    let n: u64 = v.parse().map_err(|e| {
-                        format!("--max-iterations `{v}`: not a u64 ({e})")
-                    })?;
+                    let v = args
+                        .next()
+                        .ok_or_else(|| "--max-iterations requires a u64 argument".to_owned())?;
+                    let n: u64 = v
+                        .parse()
+                        .map_err(|e| format!("--max-iterations `{v}`: not a u64 ({e})"))?;
                     cli.max_iterations = Some(n);
                 }
                 "--build-id" => {
-                    cli.build_id = Some(args.next().ok_or_else(|| {
-                        "--build-id requires a hex argument".to_owned()
-                    })?);
+                    cli.build_id = Some(
+                        args.next()
+                            .ok_or_else(|| "--build-id requires a hex argument".to_owned())?,
+                    );
                 }
                 "--label" => {
-                    cli.label = Some(args.next().ok_or_else(|| {
-                        "--label requires a text argument".to_owned()
-                    })?);
+                    cli.label = Some(
+                        args.next()
+                            .ok_or_else(|| "--label requires a text argument".to_owned())?,
+                    );
                 }
                 "--patch-vdso" => cli.patch_vdso = true,
                 "--trap-tsc" => cli.trap_tsc = true,
@@ -153,11 +153,9 @@ mod linux_main {
             return Err("missing TRACE_DIR argument".to_owned());
         }
         if cli.argv.is_empty() {
-            return Err(
-                "missing program to record — pass it after `--` (e.g. \
+            return Err("missing program to record — pass it after `--` (e.g. \
                  `replay-record /tmp/trace.bs -- /bin/cat /etc/hostname`)"
-                    .to_owned(),
-            );
+                .to_owned());
         }
         Ok(cli)
     }
@@ -175,9 +173,7 @@ mod linux_main {
             // POSIX disallows `=` in env keys; the format crate's
             // serialiser would refuse those rows. Filter belt-and-
             // braces.
-            initial_env: std::env::vars()
-                .filter(|(k, _)| !k.contains('='))
-                .collect(),
+            initial_env: std::env::vars().filter(|(k, _)| !k.contains('=')).collect(),
             initial_cwd: std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| "/".to_owned()),
@@ -191,19 +187,15 @@ mod linux_main {
 
     fn into_cstrings(args: &[String]) -> Result<Vec<CString>, String> {
         args.iter()
-            .map(|s| {
-                CString::new(s.as_str())
-                    .map_err(|e| format!("argv contains a NUL byte: {e}"))
-            })
+            .map(|s| CString::new(s.as_str()).map_err(|e| format!("argv contains a NUL byte: {e}")))
             .collect()
     }
 
     fn current_envp() -> Result<Vec<CString>, String> {
         std::env::vars()
             .map(|(k, v)| {
-                CString::new(format!("{k}={v}")).map_err(|e| {
-                    format!("env var `{k}` contains a NUL byte: {e}")
-                })
+                CString::new(format!("{k}={v}"))
+                    .map_err(|e| format!("env var `{k}` contains a NUL byte: {e}"))
             })
             .collect()
     }
@@ -254,7 +246,8 @@ mod linux_main {
         match record_program(trace_dir, &manifest, argv, envp, options) {
             Ok(report) => {
                 eprintln!(
-                    "replay-record: {} syscalls / {} signals / {} instr-traps / {} steps",
+                    "replay-record: {} pc-markers / {} syscalls / {} signals / {} instr-traps / {} steps",
+                    report.pc_marker_events,
                     report.syscall_events,
                     report.signal_events,
                     report.instruction_traps,
@@ -263,21 +256,15 @@ mod linux_main {
                 match report.exit_status {
                     RecorderExitStatus::Exited(0) => ExitCode::SUCCESS,
                     RecorderExitStatus::Exited(code) => {
-                        eprintln!(
-                            "replay-record: tracee exited with code {code}"
-                        );
+                        eprintln!("replay-record: tracee exited with code {code}");
                         ExitCode::from(code as u8)
                     }
                     RecorderExitStatus::Signalled(sig) => {
-                        eprintln!(
-                            "replay-record: tracee was killed by signal {sig}"
-                        );
+                        eprintln!("replay-record: tracee was killed by signal {sig}");
                         ExitCode::FAILURE
                     }
                     RecorderExitStatus::IterationCap(n) => {
-                        eprintln!(
-                            "replay-record: hit iteration cap at {n} steps; trace truncated"
-                        );
+                        eprintln!("replay-record: hit iteration cap at {n} steps; trace truncated");
                         ExitCode::FAILURE
                     }
                 }

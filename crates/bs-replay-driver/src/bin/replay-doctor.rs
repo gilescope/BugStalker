@@ -11,10 +11,10 @@
 
 use std::process::ExitCode;
 
-use bs_replay_driver::dap::{load, ReplayLoadRequest};
+use bs_replay_driver::dap::{ReplayLoadRequest, load};
 use bs_replay_driver::host::host_features;
 use bs_replay_engine::format::event::Event;
-use bs_replay_engine::format::{validate_with, TraceReader, ValidationOptions};
+use bs_replay_engine::format::{TraceReader, ValidationOptions, validate_with};
 
 const USAGE: &str = "\
 replay-doctor — validate or summarise a Phase 5 trace directory.
@@ -90,14 +90,16 @@ fn parse() -> Result<Cli, String> {
                 cli.dump_events = Some(n);
             }
             "--build-id" => {
-                cli.build_id = Some(args.next().ok_or_else(|| {
-                    "--build-id requires a hex argument".to_owned()
-                })?);
+                cli.build_id = Some(
+                    args.next()
+                        .ok_or_else(|| "--build-id requires a hex argument".to_owned())?,
+                );
             }
             "--diff" => {
-                cli.diff_against = Some(args.next().ok_or_else(|| {
-                    "--diff requires a path to another trace dir".to_owned()
-                })?);
+                cli.diff_against = Some(
+                    args.next()
+                        .ok_or_else(|| "--diff requires a path to another trace dir".to_owned())?,
+                );
             }
             other if other.starts_with('-') => {
                 return Err(format!("unknown flag: {other}"));
@@ -129,7 +131,9 @@ fn main() -> ExitCode {
     let dir = cli.dir.as_deref().expect("validated by parse()");
 
     if cli.load {
-        match load(&ReplayLoadRequest { trace_path: dir.to_owned() }) {
+        match load(&ReplayLoadRequest {
+            trace_path: dir.to_owned(),
+        }) {
             Ok((_replayer, resp)) => {
                 println!(
                     "{} events / {} segments / {} checkpoints",
@@ -283,16 +287,32 @@ fn print_dump(dir: &str, n: usize) -> Result<(), String> {
 
 fn render_event(ev: &Event) -> String {
     match ev {
-        Event::Syscall { nr, args, result, output } => {
+        Event::Syscall {
+            nr,
+            args,
+            result,
+            output,
+        } => {
             let name = bs_syscall_spec_name(*nr);
             format!(
                 "Syscall  nr={nr:<3} {name:<20} args=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] result={result} output={}B",
-                args[0], args[1], args[2], args[3], args[4], args[5], output.len(),
+                args[0],
+                args[1],
+                args[2],
+                args[3],
+                args[4],
+                args[5],
+                output.len(),
             )
         }
-        Event::Signal { sig_no, pc, siginfo } => format!(
+        Event::Signal {
+            sig_no,
+            pc,
+            siginfo,
+        } => format!(
             "Signal   sig={sig_no:<3} ({}) pc={pc:#x} siginfo={}B",
-            sig_name(*sig_no), siginfo.len(),
+            sig_name(*sig_no),
+            siginfo.len(),
         ),
         Event::InstructionTrap { pc, kind, result } => format!(
             "Trap     {} pc={pc:#x} result={result:?}",
@@ -304,7 +324,7 @@ fn render_event(ev: &Event) -> String {
 }
 
 fn bs_syscall_spec_name(nr: u32) -> String {
-    use bs_replay_driver::engine::record::syscall_capture::{classify, Tier};
+    use bs_replay_driver::engine::record::syscall_capture::{Tier, classify};
     match classify(nr) {
         Tier::Curated(spec) => spec.name.to_owned(),
         Tier::LongTail(g) => g.name.to_owned(),
@@ -356,15 +376,11 @@ fn print_diff(dir_a: &str, dir_b: &str) -> Result<bool, String> {
         match (a, b) {
             (None, None) => return Ok(true),
             (Some(_), None) => {
-                println!(
-                    "diverge at event {idx}: {dir_b} ended; {dir_a} still has events"
-                );
+                println!("diverge at event {idx}: {dir_b} ended; {dir_a} still has events");
                 return Ok(false);
             }
             (None, Some(_)) => {
-                println!(
-                    "diverge at event {idx}: {dir_a} ended; {dir_b} still has events"
-                );
+                println!("diverge at event {idx}: {dir_a} ended; {dir_b} still has events");
                 return Ok(false);
             }
             (Some(ea), Some(eb)) => {
@@ -389,8 +405,18 @@ fn print_diff(dir_a: &str, dir_b: &str) -> Result<bool, String> {
 fn events_differ(a: &Event, b: &Event) -> Option<String> {
     match (a, b) {
         (
-            Event::Syscall { nr: na, args: aa, result: ra, output: oa },
-            Event::Syscall { nr: nb, args: ab, result: rb, output: ob },
+            Event::Syscall {
+                nr: na,
+                args: aa,
+                result: ra,
+                output: oa,
+            },
+            Event::Syscall {
+                nr: nb,
+                args: ab,
+                result: rb,
+                output: ob,
+            },
         ) => {
             if na != nb {
                 return Some(format!("syscall nr: {na} != {nb}"));
@@ -406,14 +432,23 @@ fn events_differ(a: &Event, b: &Event) -> Option<String> {
             if oa != ob {
                 return Some(format!(
                     "output blob: {} != {} bytes (or differing contents)",
-                    oa.len(), ob.len(),
+                    oa.len(),
+                    ob.len(),
                 ));
             }
             None
         }
         (
-            Event::Signal { sig_no: sa, pc: pa, siginfo: ia },
-            Event::Signal { sig_no: sb, pc: pb, siginfo: ib },
+            Event::Signal {
+                sig_no: sa,
+                pc: pa,
+                siginfo: ia,
+            },
+            Event::Signal {
+                sig_no: sb,
+                pc: pb,
+                siginfo: ib,
+            },
         ) => {
             if sa != sb {
                 return Some(format!("sig_no: {sa} != {sb}"));
@@ -427,8 +462,16 @@ fn events_differ(a: &Event, b: &Event) -> Option<String> {
             None
         }
         (
-            Event::InstructionTrap { pc: pa, kind: ka, result: ra },
-            Event::InstructionTrap { pc: pb, kind: kb, result: rb },
+            Event::InstructionTrap {
+                pc: pa,
+                kind: ka,
+                result: ra,
+            },
+            Event::InstructionTrap {
+                pc: pb,
+                kind: kb,
+                result: rb,
+            },
         ) => {
             if pa != pb {
                 return Some(format!("pc: {pa:#x} != {pb:#x}"));

@@ -72,9 +72,13 @@ impl<'a> Die<'a> {
         Self::attr_to_string(dcx.dwarf, dcx.unit, die, DW_AT_name).ok()?
     });
 
-    impl_no_virt!(linkage_name, Option<String>, |dcx: &DerefContext, die: GimliDie| {
-        Self::attr_to_string(dcx.dwarf, dcx.unit, die, DW_AT_linkage_name).ok()?
-    });
+    impl_no_virt!(
+        linkage_name,
+        Option<String>,
+        |dcx: &DerefContext, die: GimliDie| {
+            Self::attr_to_string(dcx.dwarf, dcx.unit, die, DW_AT_linkage_name).ok()?
+        }
+    );
 
     impl_no_virt!(ranges, Box<[Range]>, |dcx: &DerefContext, die: GimliDie| {
         dcx.dwarf

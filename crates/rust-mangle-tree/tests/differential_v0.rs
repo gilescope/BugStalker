@@ -12,7 +12,7 @@
 //! still simplified in batch C — primarily lifetime rendering and
 //! complex generic-arg formatting.
 
-use rust_mangle_tree::{Symbol, parse};
+use rust_mangle_tree::{parse, Symbol};
 
 const CORPUS: &[(&str, &str)] = &[
     // Crate root.
@@ -55,12 +55,12 @@ fn no_panic_on_v0_garbage() {
         "_R",
         "_RX",
         "_RB",
-        "_RB_",                // back-ref to offset 0 — no path there yet
-        "_RCs_",               // crate disambiguator without name
-        "_RNvB1_",             // back-ref into the middle of nothing
-        "_RIB_E",              // generic with self back-ref
-        "_RAB_B_",             // array with back-ref length
-        "_RC99999999999999999",// truncated long ident
+        "_RB_",                 // back-ref to offset 0 — no path there yet
+        "_RCs_",                // crate disambiguator without name
+        "_RNvB1_",              // back-ref into the middle of nothing
+        "_RIB_E",               // generic with self back-ref
+        "_RAB_B_",              // array with back-ref length
+        "_RC99999999999999999", // truncated long ident
     ] {
         let _ = parse(input); // must not panic
     }

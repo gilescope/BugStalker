@@ -63,9 +63,9 @@ use crate::oracle::Oracle;
 use crate::{print_warns, weak_error};
 use indexmap::IndexMap;
 use log::debug;
-use nix::libc::uintptr_t;
 #[cfg(target_os = "linux")]
 use nix::libc::c_void;
+use nix::libc::uintptr_t;
 #[cfg(target_os = "linux")]
 use nix::sys;
 use nix::sys::signal;
@@ -572,9 +572,7 @@ impl Debugger {
                 // Darwin: no ptrace relationship to detach. Drop
                 // the Mach suspend count so the inferior can run
                 // free from us.
-                if let Ok(task) =
-                    darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid())
-                {
+                if let Ok(task) = darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid()) {
                     let _ = darwin_mach::task_resume(task);
                 }
             }
@@ -800,9 +798,7 @@ impl Debugger {
     #[cfg(not(target_os = "linux"))]
     fn darwin_release_inferior_for_kill(&self) {
         use crate::debugger::darwin_mach::ExceptionPort;
-        use mach2::exception_types::{
-            EXC_MASK_BAD_ACCESS, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE,
-        };
+        use mach2::exception_types::{EXC_MASK_BAD_ACCESS, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE};
         use mach2::kern_return::KERN_FAILURE;
         use mach2::port::MACH_PORT_NULL;
         use mach2::thread_status::THREAD_STATE_NONE;
@@ -885,8 +881,7 @@ impl Debugger {
             #[cfg(not(target_os = "linux"))]
             {
                 use nix::sys::wait::WaitPidFlag;
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(1000);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
                 while std::time::Instant::now() < deadline {
                     match waitpid(proc_pid, Some(WaitPidFlag::WNOHANG)) {
                         Ok(WaitStatus::StillAlive) => {
@@ -1134,6 +1129,18 @@ impl Debugger {
     pub fn thread_state(&self) -> Result<Vec<ThreadSnapshot>, Error> {
         disable_when_not_stared!(self);
         self.debugee.thread_state(self.ecx())
+    }
+
+    /// Return IDs of currently attached debugee threads without unwinding them.
+    pub fn thread_tids(&self) -> Result<Vec<Pid>, Error> {
+        disable_when_not_stared!(self);
+        Ok(self
+            .debugee
+            .tracee_ctl()
+            .snapshot()
+            .into_iter()
+            .map(|tracee| tracee.pid)
+            .collect())
     }
 
     /// Sets the thread into focus.
@@ -1537,8 +1544,7 @@ impl Drop for Debugger {
                 // …) we still need to give up rather than hang the
                 // whole test runner.
                 use nix::sys::wait::WaitPidFlag;
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(2000);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
                 let mut wait_result = WaitStatus::StillAlive;
                 while std::time::Instant::now() < deadline {
                     let wp = waitpid(kill_pid, Some(WaitPidFlag::WNOHANG));

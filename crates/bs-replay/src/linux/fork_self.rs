@@ -32,8 +32,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{fork, ForkResult, Pid};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::{ForkResult, Pid, fork};
 
 use crate::ring::CheckpointMechanism;
 
@@ -119,10 +119,7 @@ impl LinuxForkSelfMechanism {
     /// - "Synchronise on completion" — used by tests and by
     ///   future driver code that wants to confirm a checkpoint's
     ///   workload is done before moving on.
-    pub fn wait_for_exit(
-        &mut self,
-        handle: ForkHandle,
-    ) -> Result<WaitStatus, ForkMechanismError> {
+    pub fn wait_for_exit(&mut self, handle: ForkHandle) -> Result<WaitStatus, ForkMechanismError> {
         loop {
             match waitpid(handle.pid, None) {
                 Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
@@ -161,7 +158,10 @@ impl CheckpointMechanism for LinuxForkSelfMechanism {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                Ok(ForkHandle { pid: child, captured_unix_seconds })
+                Ok(ForkHandle {
+                    pid: child,
+                    captured_unix_seconds,
+                })
             }
         }
     }
@@ -305,9 +305,7 @@ mod tests {
             Err(e) => {
                 let s = format!("{e:?}");
                 if s.contains("EPERM") {
-                    eprintln!(
-                        "skipping seize test: kernel YAMA scope blocks self-trace ({e:?})",
-                    );
+                    eprintln!("skipping seize test: kernel YAMA scope blocks self-trace ({e:?})",);
                     mech.kill(h).expect("kill failed");
                     return;
                 }
@@ -335,9 +333,7 @@ mod tests {
         // foundation for breakpoint-setting (write the trap
         // instruction at the target PC) and post-stop state
         // inspection.
-        const MAGIC: [u8; 8] = [
-            0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
-        ];
+        const MAGIC: [u8; 8] = [0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe];
 
         let mut mech = LinuxForkSelfMechanism::new();
         let h = mech.take(0).expect("fork failed");
@@ -347,9 +343,7 @@ mod tests {
             Err(e) => {
                 let s = format!("{e:?}");
                 if s.contains("EPERM") {
-                    eprintln!(
-                        "skipping ptrace_read test: YAMA blocks self-trace ({e:?})",
-                    );
+                    eprintln!("skipping ptrace_read test: YAMA blocks self-trace ({e:?})",);
                     mech.kill(h).expect("kill failed");
                     return;
                 }
@@ -361,16 +355,18 @@ mod tests {
         // 8 bytes. Cast to *mut c_void since the nix API takes
         // an address as a void pointer.
         let addr = MAGIC.as_ptr() as *mut std::ffi::c_void;
-        let word: i64 =
-            nix::sys::ptrace::read(h.pid, addr).expect("ptrace::read failed");
+        let word: i64 = nix::sys::ptrace::read(h.pid, addr).expect("ptrace::read failed");
         // Compare to the parent's view by reinterpreting the
         // word's bytes — same architecture endianness on both
         // sides since parent + child are the same kernel binary.
         let bytes = word.to_ne_bytes();
         assert_eq!(
-            bytes, MAGIC,
+            bytes,
+            MAGIC,
             "ptrace::read returned {:02x?} for MAGIC at {:p}; expected {:02x?}",
-            bytes, MAGIC.as_ptr(), MAGIC,
+            bytes,
+            MAGIC.as_ptr(),
+            MAGIC,
         );
 
         mech.kill(h).expect("kill failed");
@@ -390,9 +386,7 @@ mod tests {
             Err(e) => {
                 let s = format!("{e:?}");
                 if s.contains("EPERM") {
-                    eprintln!(
-                        "skipping seize+cont test: YAMA blocks self-trace ({e:?})",
-                    );
+                    eprintln!("skipping seize+cont test: YAMA blocks self-trace ({e:?})",);
                     mech.kill(h).expect("kill failed");
                     return;
                 }

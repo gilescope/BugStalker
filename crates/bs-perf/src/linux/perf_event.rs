@@ -21,16 +21,13 @@
 //!   attr.disabled       = 1             ; enable explicitly via ioctl
 //! ```
 //!
-//! `precise_ip = 2` requests PEBS on Intel; the kernel falls back
-//! to a lower precision automatically if PEBS isn't available. We
-//! could request `precise_ip = 0` and accept skid, but the plan's
-//! gutter-attribution accuracy story relies on low skid.
+//! `precise_ip = 2` requests PEBS on Intel. Some kernels/PMUs reject
+//! that request with `EINVAL`/`EOPNOTSUPP` instead of degrading it, so
+//! the opener retries with `precise_ip = 0` and accepts skid rather
+//! than disabling the whole cycles tier.
 //!
 //! ## What's NOT in this step
 //!
-//! - mmap ring buffer for sample drain. The fd is opened in
-//!   `disabled` state and held; the next step adds `mmap_ring`
-//!   + a drain thread.
 //! - DWARF crossover: PC → (file, line). Wired in step 116.
 //! - Aggregator + UI. Wired in step 117–118.
 
@@ -38,11 +35,12 @@
 // here.
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use perf_event_open_sys::bindings::perf_event_attr;
 use perf_event_open_sys::{bindings, ioctls, perf_event_open};
 
+use super::ring::PerfRingBuffer;
 use crate::PerfError;
 
 /// Default sampling frequency in Hz. The plan's recommendation;
@@ -62,6 +60,9 @@ pub struct PerfMonitor {
     /// Sample frequency stamped into the attribute, in Hz. Same
     /// rationale: kernel doesn't expose it for readback.
     sample_freq_hz: u64,
+    /// `precise_ip` value accepted by the kernel. `2` is the
+    /// preferred low-skid mode; `0` is the portable fallback.
+    precise_ip: u64,
 }
 
 impl PerfMonitor {
@@ -75,11 +76,25 @@ impl PerfMonitor {
         self.sample_freq_hz
     }
 
+    /// `precise_ip` level accepted by the kernel for this monitor.
+    pub fn precise_ip(&self) -> u64 {
+        self.precise_ip
+    }
+
     /// Borrow the raw perf event fd. Used by the future ring
     /// buffer module to mmap it, and by tests that want to
     /// confirm the fd is open.
     pub fn raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+
+    /// Map this event's perf data ring. `data_pages` is the
+    /// number of data pages after the kernel metadata page; it
+    /// must be non-zero and a power of two. The returned ring
+    /// owns a duplicate fd, so it remains valid even if this
+    /// monitor is dropped first.
+    pub fn mmap_ring(&self, data_pages: usize) -> Result<PerfRingBuffer, PerfError> {
+        PerfRingBuffer::map(self.fd.as_raw_fd(), data_pages)
     }
 
     /// `ioctl(PERF_EVENT_IOC_ENABLE)`. The event was opened in
@@ -167,13 +182,29 @@ pub fn open_cycles_for_pid_with_freq(
     sample_freq_hz: u64,
 ) -> Result<PerfMonitor, PerfError> {
     let mut attr = build_cycles_attr(sample_freq_hz);
+    match open_cycles_with_attr(pid, sample_freq_hz, &mut attr) {
+        Ok(monitor) => Ok(monitor),
+        Err(e) if should_retry_without_precise_ip(&e, attr.precise_ip()) => {
+            attr.set_precise_ip(0);
+            open_cycles_with_attr(pid, sample_freq_hz, &mut attr).map_err(PerfError::Open)
+        }
+        Err(e) => Err(PerfError::Open(e)),
+    }
+}
+
+fn open_cycles_with_attr(
+    pid: i32,
+    sample_freq_hz: u64,
+    attr: &mut perf_event_attr,
+) -> Result<PerfMonitor, io::Error> {
+    let precise_ip = attr.precise_ip();
     // CPU = -1: any CPU (the kernel routes per-task events to
     // wherever the task runs). group_fd = -1: this event is its
     // own group leader. flags = 0: no FD_CLOEXEC, FD_NO_GROUP,
     // PID_CGROUP, etc.
     let raw = unsafe {
         perf_event_open(
-            &mut attr as *mut perf_event_attr,
+            attr as *mut perf_event_attr,
             pid,
             /* cpu */ -1,
             /* group_fd */ -1,
@@ -181,12 +212,21 @@ pub fn open_cycles_for_pid_with_freq(
         )
     };
     if raw < 0 {
-        return Err(PerfError::Open(io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: positive return value from perf_event_open is a
     // valid file descriptor we now own.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    Ok(PerfMonitor { fd, pid, sample_freq_hz })
+    Ok(PerfMonitor {
+        fd,
+        pid,
+        sample_freq_hz,
+        precise_ip,
+    })
+}
+
+fn should_retry_without_precise_ip(error: &io::Error, precise_ip: u64) -> bool {
+    precise_ip != 0 && matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP))
 }
 
 /// Build the `perf_event_attr` for cycles + IP sampling. Public
@@ -224,8 +264,6 @@ pub fn build_cycles_attr(sample_freq_hz: u64) -> perf_event_attr {
     attr.set_disabled(1);
     attr
 }
-
-use std::os::fd::FromRawFd;
 
 #[cfg(test)]
 mod tests {
@@ -289,6 +327,7 @@ mod tests {
         };
         assert_eq!(m.pid(), pid);
         assert_eq!(m.sample_freq_hz(), DEFAULT_SAMPLE_FREQ_HZ);
+        assert!(matches!(m.precise_ip(), 0 | 2));
         assert!(m.raw_fd() >= 0);
         let mut m = m;
         m.enable().expect("enable");

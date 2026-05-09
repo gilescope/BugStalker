@@ -67,9 +67,7 @@ mod linux_main {
     use std::ffi::CString;
     use std::process::ExitCode;
 
-    use bs_replay_driver::{
-        replay_program, ReplayExit, ReplayOptions, ReplayProgramError,
-    };
+    use bs_replay_driver::{ReplayExit, ReplayOptions, ReplayProgramError, replay_program};
 
     use super::USAGE;
 
@@ -100,12 +98,12 @@ mod linux_main {
                 }
                 "--" => seen_separator = true,
                 "--max-iterations" => {
-                    let v = args.next().ok_or_else(|| {
-                        "--max-iterations requires a u64 argument".to_owned()
-                    })?;
-                    let n: u64 = v.parse().map_err(|e| {
-                        format!("--max-iterations `{v}`: not a u64 ({e})")
-                    })?;
+                    let v = args
+                        .next()
+                        .ok_or_else(|| "--max-iterations requires a u64 argument".to_owned())?;
+                    let n: u64 = v
+                        .parse()
+                        .map_err(|e| format!("--max-iterations `{v}`: not a u64 ({e})"))?;
                     cli.max_iterations = Some(n);
                 }
                 "--inherit-env" => cli.inherit_env = true,
@@ -135,30 +133,24 @@ mod linux_main {
             return Err("missing TRACE_DIR argument".to_owned());
         }
         if cli.argv.is_empty() {
-            return Err(
-                "missing program to replay — pass it after `--` (e.g. \
+            return Err("missing program to replay — pass it after `--` (e.g. \
                  `replay-load /tmp/trace.bs -- /bin/cat /etc/hostname`)"
-                    .to_owned(),
-            );
+                .to_owned());
         }
         Ok(cli)
     }
 
     fn into_cstrings(args: &[String]) -> Result<Vec<CString>, String> {
         args.iter()
-            .map(|s| {
-                CString::new(s.as_str())
-                    .map_err(|e| format!("argv contains a NUL byte: {e}"))
-            })
+            .map(|s| CString::new(s.as_str()).map_err(|e| format!("argv contains a NUL byte: {e}")))
             .collect()
     }
 
     fn current_envp() -> Result<Vec<CString>, String> {
         std::env::vars()
             .map(|(k, v)| {
-                CString::new(format!("{k}={v}")).map_err(|e| {
-                    format!("env var `{k}` contains a NUL byte: {e}")
-                })
+                CString::new(format!("{k}={v}"))
+                    .map_err(|e| format!("env var `{k}` contains a NUL byte: {e}"))
             })
             .collect()
     }
@@ -280,9 +272,7 @@ mod linux_main {
                         ExitCode::FAILURE
                     }
                     Some(ReplayExit::IterationCap(n)) => {
-                        eprintln!(
-                            "replay-load: iteration cap reached at {n} steps"
-                        );
+                        eprintln!("replay-load: iteration cap reached at {n} steps");
                         ExitCode::FAILURE
                     }
                     None => {

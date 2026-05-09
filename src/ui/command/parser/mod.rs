@@ -3,9 +3,8 @@ pub mod expression;
 
 use super::r#break::BreakpointIdentity;
 use super::{
-    Command, CommandError, apply_patch, r#async, call, frame, memory, print, register,
-    source_code, thread,
-    trigger, watch,
+    Command, CommandError, apply_patch, r#async, call, frame, memory, print, register, source_code,
+    thread, trigger, watch,
 };
 use super::{CommandResult, r#break};
 use crate::debugger::register::debug::BreakCondition;
@@ -679,9 +678,7 @@ impl Command {
         let replay_load = op_w_arg(REPLAY_COMMAND)
             .ignore_then(sub_op_w_arg(REPLAY_LOAD_SUBCOMMAND))
             .ignore_then(replay_path)
-            .map(|trace_path| {
-                Command::Replay(super::replay::Command::Load { trace_path })
-            })
+            .map(|trace_path| Command::Replay(super::replay::Command::Load { trace_path }))
             .padded()
             .boxed();
         let replay_unload = op_w_arg(REPLAY_COMMAND)
@@ -709,18 +706,14 @@ impl Command {
         let rbreak = op_w_arg(RBREAK_COMMAND)
             .ignore_then(text::int(10).from_str().unwrapped())
             .map(|event_index: u64| {
-                Command::Replay(super::replay::Command::RAddBreakpoint {
-                    event_index,
-                })
+                Command::Replay(super::replay::Command::RAddBreakpoint { event_index })
             })
             .padded()
             .boxed();
         let rbreak_clear = op_w_arg(RBREAK_CLEAR_COMMAND)
             .ignore_then(text::int(10).from_str().unwrapped())
             .map(|event_index: u64| {
-                Command::Replay(super::replay::Command::RRemoveBreakpoint {
-                    event_index,
-                })
+                Command::Replay(super::replay::Command::RRemoveBreakpoint { event_index })
             })
             .padded()
             .boxed();
@@ -1392,15 +1385,15 @@ fn test_parser() {
         },
         TestCase {
             inputs: vec!["rbreak 42"],
-            expected: Expect::Ok(Command::Replay(
-                super::replay::Command::RAddBreakpoint { event_index: 42 },
-            )),
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RAddBreakpoint {
+                event_index: 42,
+            })),
         },
         TestCase {
             inputs: vec!["rbreak-clear 42"],
-            expected: Expect::Ok(Command::Replay(
-                super::replay::Command::RRemoveBreakpoint { event_index: 42 },
-            )),
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RRemoveBreakpoint {
+                event_index: 42,
+            })),
         },
         // `rstep-fwd` must bind before `rstep` even though `rstep`
         // is its prefix — the parser orders them longest-first.

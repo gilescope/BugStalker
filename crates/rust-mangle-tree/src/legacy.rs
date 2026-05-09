@@ -173,9 +173,7 @@ pub(crate) fn parse(s: &str) -> Result<LegacyPath<'_>, ParseError> {
 /// `17h<16 hex digits>` is the rustc per-mono hash signature.
 fn is_legacy_hash(seg: &str) -> bool {
     let bytes = seg.as_bytes();
-    bytes.len() == 17
-        && bytes[0] == b'h'
-        && bytes[1..].iter().all(|b| b.is_ascii_hexdigit())
+    bytes.len() == 17 && bytes[0] == b'h' && bytes[1..].iter().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Decode the `$XX$` escapes rustc legacy-mangles non-identifier
@@ -283,7 +281,7 @@ fn decode_unicode_escape(code: &str) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Symbol, parse};
+    use crate::{parse, Symbol};
 
     fn roundtrip(input: &str, expected: &str) {
         let parsed = parse(input).unwrap_or_else(|e| panic!("parse({input}): {e}"));

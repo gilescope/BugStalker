@@ -564,7 +564,9 @@ impl<'a> Parser<'a> {
                 return Ok(if empty {
                     0
                 } else {
-                    value.checked_add(1).ok_or(self.err(ParseErrorKind::InvalidBase62))?
+                    value
+                        .checked_add(1)
+                        .ok_or(self.err(ParseErrorKind::InvalidBase62))?
                 });
             }
             empty = false;
@@ -642,7 +644,11 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(b'_') {
             self.pos += 1;
         }
-        if self.pos.checked_add(len).map_or(true, |end| end > self.input.len()) {
+        if self
+            .pos
+            .checked_add(len)
+            .map_or(true, |end| end > self.input.len())
+        {
             return Err(self.err(ParseErrorKind::TruncatedIdent));
         }
         let bytes = &self.input[self.pos..self.pos + len];
@@ -676,7 +682,10 @@ impl<'a> Parser<'a> {
             b'C' => {
                 let disambiguator = self.parse_disambiguator()?;
                 let name = self.parse_undisambiguated_ident()?;
-                Path::CrateRoot { disambiguator, name }
+                Path::CrateRoot {
+                    disambiguator,
+                    name,
+                }
             }
             b'M' => {
                 let disambiguator = self.parse_disambiguator()?;
@@ -815,7 +824,8 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             self.leave();
             let ty = Type::Primitive(prim);
-            self.backrefs.push((start, Parsed::Type(Rc::new(ty.clone()))));
+            self.backrefs
+                .push((start, Parsed::Type(Rc::new(ty.clone()))));
             return Ok(ty);
         }
         let ty = match b {
@@ -1000,8 +1010,8 @@ impl<'a> Parser<'a> {
             _ => {
                 // Primitive prefix indicates the type, then the
                 // value bytes follow up to `_`.
-                let prim = primitive_for_tag(b)
-                    .ok_or_else(|| self.err(ParseErrorKind::InvalidConst))?;
+                let prim =
+                    primitive_for_tag(b).ok_or_else(|| self.err(ParseErrorKind::InvalidConst))?;
                 self.pos += 1;
                 if prim == Primitive::Bool {
                     let body = self.read_until_underscore()?;
@@ -1168,7 +1178,16 @@ fn digit_value(b: u8) -> Option<u32> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn adapt(delta: u32, num_points: u32, first_time: bool, damp: u32, base: u32, tmin: u32, tmax: u32, skew: u32) -> u32 {
+fn adapt(
+    delta: u32,
+    num_points: u32,
+    first_time: bool,
+    damp: u32,
+    base: u32,
+    tmin: u32,
+    tmax: u32,
+    skew: u32,
+) -> u32 {
     let mut delta = if first_time { delta / damp } else { delta / 2 };
     delta += delta / num_points;
     let mut k: u32 = 0;

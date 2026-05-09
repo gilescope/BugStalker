@@ -183,10 +183,7 @@ impl StructValue {
     /// `pointer`/`vtable` member shape rustc emits. Cheap inspection
     /// — no extra storage, no plumbing through every constructor.
     pub fn is_trait_object(&self) -> bool {
-        let name_match = self
-            .type_ident
-            .name()
-            .is_some_and(|n| n.contains("dyn "));
+        let name_match = self.type_ident.name().is_some_and(|n| n.contains("dyn "));
         if name_match {
             return true;
         }

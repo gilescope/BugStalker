@@ -107,8 +107,7 @@ fn build_chain_from_repr_bounded(
             }
             Some(Value::Struct(next_future)) => {
                 let fmt_name = next_future.type_ident.name_fmt();
-                let is_dyn_box = !matches!(fmt_name, "Sleep")
-                    && !fmt_name.contains("JoinHandle");
+                let is_dyn_box = !matches!(fmt_name, "Sleep") && !fmt_name.contains("JoinHandle");
                 let leaf = if fmt_name == "Sleep" {
                     weak_error!(TokioSleepFuture::try_from(next_future.clone()))
                         .map(Future::TokioSleep)
@@ -136,8 +135,7 @@ fn build_chain_from_repr_bounded(
                         crate::debugger::r#async::future::locate_dyn_future(&probe, 4)
                         && let Some(re) = recover_concrete_future(dbg, &loc)
                     {
-                        let inner =
-                            build_chain_from_repr_bounded(re, depth - 1, debugger);
+                        let inner = build_chain_from_repr_bounded(re, depth - 1, debugger);
                         result.extend(inner);
                     }
                 }
@@ -155,9 +153,7 @@ fn build_chain_from_repr_bounded(
                 if nested_seeds.len() >= 2 {
                     let branches = nested_seeds
                         .into_iter()
-                        .map(|seed| {
-                            build_chain_from_repr_bounded(seed, depth - 1, debugger)
-                        })
+                        .map(|seed| build_chain_from_repr_bounded(seed, depth - 1, debugger))
                         .collect();
                     result.push(Future::Multi(branches));
                 }

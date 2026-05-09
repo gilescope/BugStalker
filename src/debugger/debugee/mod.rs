@@ -269,7 +269,10 @@ impl Debugee {
     /// `__TEXT.vmaddr` would need a more thorough calculation that
     /// reads the load commands at runtime.
     pub fn file_offset_to_runtime(&self, file_offset: u64) -> Option<usize> {
-        let path = self.path.canonicalize().unwrap_or_else(|_| self.path.clone());
+        let path = self
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| self.path.clone());
         let mapping = self.dwarf_registry.find_mapping_offset_by_path(&path)?;
         #[cfg(target_os = "linux")]
         {

@@ -101,10 +101,9 @@ pub fn parse_line(line: &str) -> Result<MemoryRegion, String> {
     let (start_s, end_s) = range
         .split_once('-')
         .ok_or_else(|| format!("address range `{range}` missing `-`"))?;
-    let start = u64::from_str_radix(start_s, 16)
-        .map_err(|e| format!("bad start `{start_s}`: {e}"))?;
-    let end = u64::from_str_radix(end_s, 16)
-        .map_err(|e| format!("bad end `{end_s}`: {e}"))?;
+    let start =
+        u64::from_str_radix(start_s, 16).map_err(|e| format!("bad start `{start_s}`: {e}"))?;
+    let end = u64::from_str_radix(end_s, 16).map_err(|e| format!("bad end `{end_s}`: {e}"))?;
 
     let pb = perms_s.as_bytes();
     if pb.len() != 4 {
@@ -117,13 +116,21 @@ pub fn parse_line(line: &str) -> Result<MemoryRegion, String> {
         private: pb[3] == b'p',
     };
 
-    let offset = u64::from_str_radix(offset_s, 16)
-        .map_err(|e| format!("bad offset `{offset_s}`: {e}"))?;
+    let offset =
+        u64::from_str_radix(offset_s, 16).map_err(|e| format!("bad offset `{offset_s}`: {e}"))?;
     let inode: u64 = inode_s
         .parse()
         .map_err(|e| format!("bad inode `{inode_s}`: {e}"))?;
 
-    Ok(MemoryRegion { start, end, perms, offset, dev, inode, pathname })
+    Ok(MemoryRegion {
+        start,
+        end,
+        perms,
+        offset,
+        dev,
+        inode,
+        pathname,
+    })
 }
 
 /// Read and parse `/proc/<pid>/maps` for the given pid.
@@ -162,8 +169,7 @@ mod tests {
 
     #[test]
     fn parse_file_backed_line() {
-        let line =
-            "55ed8b3a4000-55ed8b3a8000 r-xp 00000000 fd:00 1234567   /usr/bin/cat";
+        let line = "55ed8b3a4000-55ed8b3a8000 r-xp 00000000 fd:00 1234567   /usr/bin/cat";
         let r = parse_line(line).unwrap();
         assert_eq!(r.start, 0x55ed8b3a4000);
         assert_eq!(r.end, 0x55ed8b3a8000);
@@ -190,9 +196,18 @@ mod tests {
     #[test]
     fn parse_kernel_pseudo_names() {
         for (line, name) in [
-            ("7ffe9f5b3000-7ffe9f5d4000 rw-p 00000000 00:00 0   [stack]", "[stack]"),
-            ("7ffe9f5fa000-7ffe9f5fc000 r-xp 00000000 00:00 0   [vdso]", "[vdso]"),
-            ("563000000000-563000050000 rw-p 00000000 00:00 0   [heap]", "[heap]"),
+            (
+                "7ffe9f5b3000-7ffe9f5d4000 rw-p 00000000 00:00 0   [stack]",
+                "[stack]",
+            ),
+            (
+                "7ffe9f5fa000-7ffe9f5fc000 r-xp 00000000 00:00 0   [vdso]",
+                "[vdso]",
+            ),
+            (
+                "563000000000-563000050000 rw-p 00000000 00:00 0   [heap]",
+                "[heap]",
+            ),
         ] {
             let r = parse_line(line).unwrap();
             assert_eq!(r.pathname.as_deref(), Some(name));
@@ -201,8 +216,7 @@ mod tests {
 
     #[test]
     fn parse_pathname_with_spaces() {
-        let line =
-            "55ed8b3a4000-55ed8b3a8000 r--p 00000000 fd:00 0   /tmp/file with spaces";
+        let line = "55ed8b3a4000-55ed8b3a8000 r--p 00000000 fd:00 0   /tmp/file with spaces";
         let r = parse_line(line).unwrap();
         assert_eq!(r.pathname.as_deref(), Some("/tmp/file with spaces"));
     }
@@ -243,8 +257,7 @@ mod tests {
         let mut mech = LinuxForkSelfMechanism::new();
         let h = mech.take(0).expect("fork failed");
         sleep(Duration::from_millis(50));
-        let parent_maps = read_proc_maps(nix::unistd::getpid())
-            .expect("parent maps failed");
+        let parent_maps = read_proc_maps(nix::unistd::getpid()).expect("parent maps failed");
         let child_maps = read_proc_maps(h.pid).expect("child maps failed");
         // Child should have *at least* something, and its first
         // few file-backed regions should match the parent's.
@@ -256,13 +269,19 @@ mod tests {
         let common_starts: Vec<u64> = parent_maps
             .iter()
             .filter_map(|r| {
-                r.pathname.as_ref().filter(|_| r.perms.execute).map(|_| r.start)
+                r.pathname
+                    .as_ref()
+                    .filter(|_| r.perms.execute)
+                    .map(|_| r.start)
             })
             .collect();
         let child_executables: Vec<u64> = child_maps
             .iter()
             .filter_map(|r| {
-                r.pathname.as_ref().filter(|_| r.perms.execute).map(|_| r.start)
+                r.pathname
+                    .as_ref()
+                    .filter(|_| r.perms.execute)
+                    .map(|_| r.start)
             })
             .collect();
         // Every executable region the child has, the parent has too.

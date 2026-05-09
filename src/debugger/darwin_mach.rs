@@ -19,26 +19,26 @@
 
 use crate::debugger::Error;
 use crate::debugger::Error::Ptrace;
-use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
-use mach2::mach_types::{task_t, thread_act_array_t, thread_act_t, vm_task_entry_t};
-use mach2::message::mach_msg_type_number_t;
-use mach2::port::mach_port_t;
-use mach2::structs::arm_thread_state64_t;
-use mach2::task::task_threads;
-use mach2::thread_act::{thread_get_state, thread_set_state};
-use mach2::thread_status::ARM_THREAD_STATE64;
 use mach2::exception_types::{
     EXC_MASK_BAD_ACCESS, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE, EXCEPTION_DEFAULT,
     MACH_EXCEPTION_CODES, exception_mask_t,
 };
+use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
 use mach2::mach_port::{mach_port_allocate, mach_port_insert_right};
+use mach2::mach_types::{task_t, thread_act_array_t, thread_act_t, vm_task_entry_t};
+use mach2::message::mach_msg_type_number_t;
 use mach2::message::{
-    MACH_MSG_TYPE_MAKE_SEND, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_RCV_MSG, MACH_RCV_TIMED_OUT,
-    MACH_RCV_TIMEOUT, MACH_SEND_MSG, MACH_SEND_TIMEOUT, MACH_MSGH_BITS, mach_msg,
+    MACH_MSG_TYPE_MAKE_SEND, MACH_MSG_TYPE_MOVE_SEND_ONCE, MACH_MSGH_BITS, MACH_RCV_MSG,
+    MACH_RCV_TIMED_OUT, MACH_RCV_TIMEOUT, MACH_SEND_MSG, MACH_SEND_TIMEOUT, mach_msg,
     mach_msg_header_t,
 };
+use mach2::port::mach_port_t;
 use mach2::port::{MACH_PORT_NULL, MACH_PORT_RIGHT_RECEIVE, mach_port_name_t};
+use mach2::structs::arm_thread_state64_t;
 use mach2::task::task_set_exception_ports;
+use mach2::task::task_threads;
+use mach2::thread_act::{thread_get_state, thread_set_state};
+use mach2::thread_status::ARM_THREAD_STATE64;
 use mach2::thread_status::THREAD_STATE_NONE;
 use mach2::traps::{mach_task_self, task_for_pid as raw_task_for_pid};
 use mach2::vm::{mach_vm_protect, mach_vm_read_overwrite, mach_vm_region, mach_vm_write};
@@ -70,10 +70,16 @@ impl MachError {
             // <mach/kern_return.h>
             0 => "KERN_SUCCESS",
             1 => "KERN_INVALID_ADDRESS — read/write of unmapped vm",
-            2 => "KERN_PROTECTION_FAILURE — page perms reject the op (e.g. write to r-x without VM_PROT_COPY)",
+            2 => {
+                "KERN_PROTECTION_FAILURE — page perms reject the op (e.g. write to r-x without VM_PROT_COPY)"
+            }
             3 => "KERN_NO_SPACE",
-            4 => "KERN_INVALID_ARGUMENT — bad task/thread port, wrong state flavour, or out-of-range count",
-            5 => "KERN_FAILURE — generic Mach catch-all; the meaning depends on the calling op (task_for_pid: missing cs.debugger entitlement; thread_set_state on arm64: thread not suspended, hardened-runtime restriction, or stale port; task_resume: already running)",
+            4 => {
+                "KERN_INVALID_ARGUMENT — bad task/thread port, wrong state flavour, or out-of-range count"
+            }
+            5 => {
+                "KERN_FAILURE — generic Mach catch-all; the meaning depends on the calling op (task_for_pid: missing cs.debugger entitlement; thread_set_state on arm64: thread not suspended, hardened-runtime restriction, or stale port; task_resume: already running)"
+            }
             6 => "KERN_RESOURCE_SHORTAGE",
             7 => "KERN_NOT_RECEIVER",
             8 => "KERN_NO_ACCESS",
@@ -89,10 +95,14 @@ impl MachError {
             49 => "KERN_OPERATION_TIMED_OUT",
             // <mach/message.h> — only the ones we actually trigger.
             0x10000001 => "MACH_SEND_INVALID_DATA",
-            0x10000002 => "MACH_SEND_INVALID_DEST — destination port name is not a valid send right",
+            0x10000002 => {
+                "MACH_SEND_INVALID_DEST — destination port name is not a valid send right"
+            }
             0x10000003 => "MACH_SEND_TIMED_OUT",
             0x10000004 => "MACH_SEND_INTERRUPTED",
-            0x10000007 => "MACH_SEND_INVALID_HEADER — malformed mach_msg_header_t (bits, size, or port refs)",
+            0x10000007 => {
+                "MACH_SEND_INVALID_HEADER — malformed mach_msg_header_t (bits, size, or port refs)"
+            }
             0x10004003 => "MACH_RCV_TIMED_OUT",
             0x10004002 => "MACH_RCV_INVALID_NAME",
             _ => "unknown kern_return_t",
@@ -223,10 +233,15 @@ pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
             pid.as_raw(), MachError(kr));
     }
     check(kr)?;
-    debug_assert!(task != 0, "task_for_pid returned KERN_SUCCESS but null port");
+    debug_assert!(
+        task != 0,
+        "task_for_pid returned KERN_SUCCESS but null port"
+    );
     TASK_FOR_PID_EVER_SUCCEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut guard = TASK_FOR_PID_CACHE.lock().unwrap();
-    guard.get_or_insert_with(HashMap::new).insert(pid.as_raw(), task);
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(pid.as_raw(), task);
     Ok(task)
 }
 
@@ -245,7 +260,8 @@ pub fn task_for_pid_or_proc(pid: Pid) -> Result<task_t, MachError> {
     if let Ok(t) = task_for_pid(pid) {
         return Ok(t);
     }
-    let proc = synthetic_pid_proc(pid).ok_or(MachError(mach2::kern_return::KERN_INVALID_ARGUMENT))?;
+    let proc =
+        synthetic_pid_proc(pid).ok_or(MachError(mach2::kern_return::KERN_INVALID_ARGUMENT))?;
     task_for_pid(proc)
 }
 
@@ -452,15 +468,9 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
 /// On x86_64 this is a no-op at the kernel level (caches are
 /// hardware-coherent) so the call is safe to compile for any
 /// macOS arch.
-fn invalidate_inferior_icache(
-    task: task_t,
-    addr: usize,
-    len: usize,
-) -> Result<(), MachError> {
+fn invalidate_inferior_icache(task: task_t, addr: usize, len: usize) -> Result<(), MachError> {
     use mach2::vm::mach_vm_machine_attribute;
-    use mach2::vm_attributes::{
-        MATTR_CACHE, MATTR_VAL_ICACHE_FLUSH, vm_machine_attribute_val_t,
-    };
+    use mach2::vm_attributes::{MATTR_CACHE, MATTR_VAL_ICACHE_FLUSH, vm_machine_attribute_val_t};
     let mut value: vm_machine_attribute_val_t = MATTR_VAL_ICACHE_FLUSH;
     let kr = unsafe {
         mach_vm_machine_attribute(
@@ -913,10 +923,7 @@ pub fn swap_in_temp_exception_port(
 /// via `task_set_exception_ports`. Errors on individual entries
 /// are logged and skipped — partial restore is better than no
 /// restore.
-pub fn restore_exception_ports(
-    task: task_t,
-    chain: &ExceptionPortChain,
-) -> Result<(), MachError> {
+pub fn restore_exception_ports(task: task_t, chain: &ExceptionPortChain) -> Result<(), MachError> {
     for i in 0..(chain.count as usize) {
         // SAFETY: entries within `count` are valid as written
         // by the kernel during the swap.
@@ -1072,7 +1079,8 @@ pub fn first_thread_of(task: task_t) -> Result<thread_act_t, MachError> {
 
 pub fn set_thread_port(pid: Pid, port: thread_act_t) {
     let mut g = THREAD_PORT_BY_PID.lock().unwrap();
-    g.get_or_insert_with(HashMap::new).insert(pid.as_raw(), port);
+    g.get_or_insert_with(HashMap::new)
+        .insert(pid.as_raw(), port);
 }
 
 /// Record that `synthetic_pid` (a per-thread Pid manufactured by
@@ -1273,9 +1281,8 @@ impl ExceptionPort {
         let mut port: mach_port_name_t = MACH_PORT_NULL;
         // SAFETY: mach_task_self() is always valid; mach_port_allocate
         // writes to `port` iff KERN_SUCCESS.
-        let kr = unsafe {
-            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mut port)
-        };
+        let kr =
+            unsafe { mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mut port) };
         check(kr)?;
         // Add a send right onto the same name so we can hand it to
         // task_set_exception_ports without dropping our own receive.
@@ -1297,18 +1304,11 @@ impl ExceptionPort {
         // EXC_MASK_BAD_ACCESS — segfaults, so the debugger can stop
         //                       at the fault rather than letting the
         //                       process die silently
-        let mask: exception_mask_t =
-            EXC_MASK_BREAKPOINT | EXC_MASK_SOFTWARE | EXC_MASK_BAD_ACCESS;
+        let mask: exception_mask_t = EXC_MASK_BREAKPOINT | EXC_MASK_SOFTWARE | EXC_MASK_BAD_ACCESS;
         let behavior: u32 = (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as u32;
         // SAFETY: task and port are valid mach_port_t values.
         let kr = unsafe {
-            task_set_exception_ports(
-                task,
-                mask,
-                self.port,
-                behavior as i32,
-                THREAD_STATE_NONE,
-            )
+            task_set_exception_ports(task, mask, self.port, behavior as i32, THREAD_STATE_NONE)
         };
         check(kr)?;
         Ok(())
@@ -1497,8 +1497,7 @@ impl Drop for ExceptionPort {
             // both the receive and send rights we hold under that
             // name in our task's IPC space.
             unsafe {
-                let _ =
-                    mach2::mach_port::mach_port_destroy(mach_task_self(), self.port);
+                let _ = mach2::mach_port::mach_port_destroy(mach_task_self(), self.port);
             }
         }
     }
@@ -1616,10 +1615,7 @@ pub enum DyldNotifyMsg {
     },
     /// A non-image-list event (e.g. dyld-before-initializers,
     /// main-called, atlas-changed, shared-cache-mapped).
-    Event {
-        remote_port: u32,
-        msg_id: i32,
-    },
+    Event { remote_port: u32, msg_id: i32 },
 }
 
 unsafe extern "C" {
@@ -1658,9 +1654,8 @@ impl DyldNotifyPort {
     /// `task_dyld_process_info_notify_register`.
     pub fn allocate() -> Result<Self, MachError> {
         let mut port: mach_port_name_t = MACH_PORT_NULL;
-        let kr = unsafe {
-            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mut port)
-        };
+        let kr =
+            unsafe { mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &mut port) };
         check(kr)?;
         let kr = unsafe {
             mach_port_insert_right(mach_task_self(), port, port, MACH_MSG_TYPE_MAKE_SEND)
@@ -1762,10 +1757,11 @@ impl DyldNotifyPort {
             if off + ENTRY_SIZE > msg_size {
                 break;
             }
-            let load_addr =
-                u64::from_ne_bytes(buf[off + ENTRY_LOAD_OFF..off + ENTRY_LOAD_OFF + 8]
+            let load_addr = u64::from_ne_bytes(
+                buf[off + ENTRY_LOAD_OFF..off + ENTRY_LOAD_OFF + 8]
                     .try_into()
-                    .unwrap());
+                    .unwrap(),
+            );
             let path_off = u32::from_ne_bytes(
                 buf[off + ENTRY_PATH_OFF_OFF..off + ENTRY_PATH_OFF_OFF + 4]
                     .try_into()
@@ -1901,9 +1897,8 @@ fn image_list_from_proc_maps(task: task_t) -> Result<Vec<ImageInfo>, MachError> 
     // we cross-check via `sysinfo`.
     let main_exec = {
         use sysinfo::{RefreshKind, System};
-        let sys = System::new_with_specifics(
-            RefreshKind::everything().without_cpu().without_memory(),
-        );
+        let sys =
+            System::new_with_specifics(RefreshKind::everything().without_cpu().without_memory());
         sysinfo::System::process(&sys, sysinfo::Pid::from_u32(pid.as_raw() as u32))
             .and_then(|p| p.exe().map(|p| p.to_string_lossy().to_string()))
     };

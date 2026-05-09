@@ -182,10 +182,7 @@ pub struct TypeViewSpec {
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("truncated input: needed {needed} more bytes for {what}")]
-    Truncated {
-        needed: usize,
-        what: &'static str,
-    },
+    Truncated { needed: usize, what: &'static str },
     #[error("bad magic: expected {:?}, got {got:?}", MAGIC)]
     BadMagic { got: [u8; 4] },
     #[error("unsupported version {got}; this build understands {VERSION}")]
@@ -339,10 +336,7 @@ pub const fn assemble_with_module_path<const N: usize>(
 /// Const-fn variant for the `name = "..."` override case where
 /// the user supplied the full type name verbatim — no
 /// `module_path!()` composition needed.
-pub const fn assemble_verbatim<const N: usize>(
-    type_name: &str,
-    suffix: &[u8],
-) -> [u8; N] {
+pub const fn assemble_verbatim<const N: usize>(type_name: &str, suffix: &[u8]) -> [u8; N] {
     let mut out = [0u8; N];
     out[0] = MAGIC[0];
     out[1] = MAGIC[1];
@@ -550,8 +544,8 @@ impl<'a> Reader<'a> {
             let rename = self.read_opt_str("field.rename")?;
             let hidden = self.read_u8("field.hidden")? != 0;
             let fmt_tag = self.read_u8("field.format")?;
-            let format = Format::from_tag(fmt_tag)
-                .ok_or(DecodeError::UnknownFormatTag { tag: fmt_tag })?;
+            let format =
+                Format::from_tag(fmt_tag).ok_or(DecodeError::UnknownFormatTag { tag: fmt_tag })?;
             out.push(FieldSpec {
                 name,
                 rename,
@@ -679,7 +673,10 @@ mod tests {
     fn rejects_bad_magic() {
         let mut bytes = encode(&sample());
         bytes[0] = 0xFF;
-        assert!(matches!(decode_one(&bytes), Err(DecodeError::BadMagic { .. })));
+        assert!(matches!(
+            decode_one(&bytes),
+            Err(DecodeError::BadMagic { .. })
+        ));
     }
 
     #[test]
@@ -734,8 +731,7 @@ mod tests {
             "size formula must match `encode` (suffix len was {})",
             suffix.len(),
         );
-        let assembled: [u8; TOTAL] =
-            assemble_with_module_path::<TOTAL>(module, local, &suffix);
+        let assembled: [u8; TOTAL] = assemble_with_module_path::<TOTAL>(module, local, &suffix);
         assert_eq!(&assembled[..], &encoded[..]);
     }
 

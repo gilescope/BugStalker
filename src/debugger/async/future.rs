@@ -225,10 +225,7 @@ fn extract_concrete_from_annotation(name: &str) -> Option<String> {
 
 fn data_pointer_addr(s: &StructValue) -> Option<usize> {
     s.members.iter().find_map(|m| {
-        if matches!(
-            m.field_name.as_deref(),
-            Some("pointer") | Some("data_ptr")
-        )
+        if matches!(m.field_name.as_deref(), Some("pointer") | Some("data_ptr"))
             && let Value::Pointer(p) = &m.value
         {
             return p.value.map(|raw| raw as usize);

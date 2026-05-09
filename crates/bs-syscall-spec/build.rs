@@ -30,8 +30,7 @@ fn main() {
     println!("cargo:rerun-if-changed={AARCH64_TABLE}");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR not set by cargo");
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by cargo");
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set by cargo");
     let out = PathBuf::from(out_dir);
 
@@ -49,12 +48,7 @@ fn main() {
     );
 }
 
-fn emit_table(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-    const_name: &str,
-    arch_label: &str,
-) {
+fn emit_table(src: &std::path::Path, dst: &std::path::Path, const_name: &str, arch_label: &str) {
     let raw = fs::read_to_string(src).unwrap_or_else(|e| {
         panic!(
             "couldn't read {arch_label} syscall table at {}: {e}\n\
@@ -64,9 +58,8 @@ fn emit_table(
     });
     let entries = parse_table(&raw, src).unwrap_or_else(|e| panic!("{e}"));
     let body = render(&entries, const_name, arch_label, src);
-    fs::write(dst, body).unwrap_or_else(|e| {
-        panic!("couldn't write generated table to {}: {e}", dst.display())
-    });
+    fs::write(dst, body)
+        .unwrap_or_else(|e| panic!("couldn't write generated table to {}: {e}", dst.display()));
 }
 
 #[derive(Debug)]
@@ -89,7 +82,10 @@ fn parse_table(raw: &str, path: &std::path::Path) -> Result<Vec<Entry>, String> 
         }
         let mut cols = trimmed.split_whitespace();
         let nr_str = cols.next().ok_or_else(|| {
-            format!("{}:{line_no}: empty row after stripping comment", path.display())
+            format!(
+                "{}:{line_no}: empty row after stripping comment",
+                path.display()
+            )
         })?;
         let name = cols.next().ok_or_else(|| {
             format!(
@@ -132,7 +128,11 @@ fn parse_table(raw: &str, path: &std::path::Path) -> Result<Vec<Entry>, String> 
             }
         }
         last_nr = Some(nr);
-        entries.push(Entry { nr, name: name.to_owned(), src_line: line_no });
+        entries.push(Entry {
+            nr,
+            name: name.to_owned(),
+            src_line: line_no,
+        });
     }
     if entries.is_empty() {
         return Err(format!("{}: no entries parsed", path.display()));
@@ -146,12 +146,7 @@ fn is_valid_ident(s: &str) -> bool {
         && !s.starts_with(|c: char| c.is_ascii_digit())
 }
 
-fn render(
-    entries: &[Entry],
-    const_name: &str,
-    arch_label: &str,
-    src: &std::path::Path,
-) -> String {
+fn render(entries: &[Entry], const_name: &str, arch_label: &str, src: &std::path::Path) -> String {
     use std::fmt::Write;
     let mut s = String::new();
     let _ = writeln!(
@@ -160,16 +155,16 @@ fn render(
          // Do not edit by hand; edit the source table instead.",
         src.display(),
     );
-    let _ = writeln!(s, "/// Long-tail {arch_label} syscalls — name + number only.");
+    let _ = writeln!(
+        s,
+        "/// Long-tail {arch_label} syscalls — name + number only."
+    );
     let _ = writeln!(
         s,
         "/// The recorder uses this for syscalls outside the curated\n\
          /// table. Sorted by `nr`."
     );
-    let _ = writeln!(
-        s,
-        "pub const {const_name}: &[GenericSyscall] = &[",
-    );
+    let _ = writeln!(s, "pub const {const_name}: &[GenericSyscall] = &[",);
     for e in entries {
         let _ = writeln!(
             s,

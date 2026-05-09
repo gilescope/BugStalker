@@ -42,11 +42,15 @@ fn take_checkpoint_records_event_offset_and_increments_index() {
     let mut writer = TraceWriter::create(&dir, &sample_manifest()).unwrap();
 
     for i in 0..3u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.take_checkpoint(b"snapshot-A".to_vec()).unwrap();
     for i in 3..7u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.take_checkpoint(b"snapshot-B".to_vec()).unwrap();
     writer.finish().unwrap();
@@ -76,7 +80,9 @@ fn take_checkpoint_forces_segment_rotation() {
     let dir = temp_dir("forces-rotate");
     let mut writer = TraceWriter::create(&dir, &sample_manifest()).unwrap();
     for i in 0..2u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     let segment_idx_before = writer.next_segment_index();
     writer.take_checkpoint(Vec::new()).unwrap();
@@ -107,7 +113,9 @@ fn checkpoint_payload_is_opaque_bytes() {
 fn validator_reports_total_checkpoints() {
     let dir = temp_dir("validator-total");
     let mut writer = TraceWriter::create(&dir, &sample_manifest()).unwrap();
-    writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 0, data: 0 })
+        .unwrap();
     writer.take_checkpoint(b"a".to_vec()).unwrap();
     writer.take_checkpoint(b"b".to_vec()).unwrap();
     writer.take_checkpoint(b"c".to_vec()).unwrap();
@@ -158,7 +166,9 @@ fn checkpoint_filename_does_not_register_as_segment() {
 
     let dir = temp_dir("no-cross-talk");
     let mut writer = TraceWriter::create(&dir, &sample_manifest()).unwrap();
-    writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 0, data: 0 })
+        .unwrap();
     writer.take_checkpoint(b"x".to_vec()).unwrap();
     writer.finish().unwrap();
 

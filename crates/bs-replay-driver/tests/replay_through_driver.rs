@@ -8,11 +8,11 @@
 use std::fs;
 use std::path::PathBuf;
 
+use bs_replay_driver::TraceReplayer;
+use bs_replay_driver::engine::format::TraceWriter;
 use bs_replay_driver::engine::format::event::Event;
 use bs_replay_driver::engine::format::manifest::Manifest;
 use bs_replay_driver::engine::format::version::FormatVersion;
-use bs_replay_driver::engine::format::TraceWriter;
-use bs_replay_driver::TraceReplayer;
 
 fn manifest() -> Manifest {
     Manifest {
@@ -30,10 +30,8 @@ fn manifest() -> Manifest {
 }
 
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "bs-replay-driver-{label}-{}",
-        std::process::id(),
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("bs-replay-driver-{label}-{}", std::process::id(),));
     let _ = fs::remove_dir_all(&dir);
     dir
 }
@@ -51,7 +49,9 @@ fn driver_walks_full_trace_in_record_order() {
     {
         let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
         for i in 0..15u32 {
-            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+            writer
+                .write_event(Event::Marker { tag: i, data: 0 })
+                .unwrap();
             if i == 4 || i == 9 {
                 writer.rotate().unwrap();
             }
@@ -75,7 +75,9 @@ fn driver_seek_to_jumps_without_yielding() {
     {
         let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
         for i in 0..10u32 {
-            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+            writer
+                .write_event(Event::Marker { tag: i, data: 0 })
+                .unwrap();
         }
         writer.finish().unwrap();
     }
@@ -96,11 +98,15 @@ fn driver_finds_checkpoint_at_or_before_target() {
     {
         let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
         for i in 0..3u32 {
-            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+            writer
+                .write_event(Event::Marker { tag: i, data: 0 })
+                .unwrap();
         }
         writer.take_checkpoint(b"snap-A".to_vec()).unwrap();
         for i in 3..8u32 {
-            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+            writer
+                .write_event(Event::Marker { tag: i, data: 0 })
+                .unwrap();
         }
         writer.take_checkpoint(b"snap-B".to_vec()).unwrap();
         writer.finish().unwrap();
@@ -120,8 +126,12 @@ fn driver_position_advances_per_next_event_only() {
     let dir = temp_dir("position");
     {
         let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
-        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
-        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: 0, data: 0 })
+            .unwrap();
+        writer
+            .write_event(Event::Marker { tag: 1, data: 0 })
+            .unwrap();
         writer.finish().unwrap();
     }
     let mut replayer = TraceReplayer::open(&dir).unwrap();
@@ -141,9 +151,13 @@ fn driver_exposes_underlying_reader_for_advanced_queries() {
     let dir = temp_dir("reader-borrow");
     {
         let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
-        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: 0, data: 0 })
+            .unwrap();
         writer.rotate().unwrap();
-        writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: 1, data: 0 })
+            .unwrap();
         writer.finish().unwrap();
     }
     let replayer = TraceReplayer::open(&dir).unwrap();
@@ -223,9 +237,7 @@ fn driver_check_build_id_surfaces_both_sides() {
         writer.finish().unwrap();
     }
     let replayer = TraceReplayer::open(&dir).unwrap();
-    let err = replayer
-        .check_build_id("00000000")
-        .unwrap_err();
+    let err = replayer.check_build_id("00000000").unwrap_err();
     assert_eq!(err.recorded, m.build_id);
     assert_eq!(err.actual, "00000000");
     let s = format!("{err}");

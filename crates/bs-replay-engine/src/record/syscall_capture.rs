@@ -176,18 +176,15 @@ pub enum Tier<'a> {
 /// hasn't executed yet) — but the signature keeps it consistent
 /// with [`capture_post_syscall`] so the caller can use one shape
 /// for both passes.
-pub fn capture_pre_syscall(
-    frame: CallFrame,
-    reader: &dyn MemoryReader,
-) -> CapturedSyscall {
+pub fn capture_pre_syscall(frame: CallFrame, reader: &dyn MemoryReader) -> CapturedSyscall {
     let mut regions = Vec::new();
     let tier = match classify(frame.nr) {
         Tier::Curated(spec) => {
             for (idx, p) in spec.params.iter().enumerate() {
                 if let ParamKind::InBuf { len_param } = p.kind {
-                    if let Some(len) =
-                        resolve_buf_len(spec, &frame, /*ret=*/ 0, len_param, /*pre=*/ true)
-                    {
+                    if let Some(len) = resolve_buf_len(
+                        spec, &frame, /*ret=*/ 0, len_param, /*pre=*/ true,
+                    ) {
                         push_buf_region(
                             &mut regions,
                             idx,
@@ -199,12 +196,7 @@ pub fn capture_pre_syscall(
                     }
                 }
                 if matches!(p.kind, ParamKind::InCStr) {
-                    push_cstr_region(
-                        &mut regions,
-                        idx,
-                        frame.args[idx],
-                        reader,
-                    );
+                    push_cstr_region(&mut regions, idx, frame.args[idx], reader);
                 }
             }
             CaptureTier::Curated
@@ -291,7 +283,11 @@ fn resolve_buf_len(
             // No return value to use yet; skip this region pre-syscall.
             return None;
         }
-        return if result < 0 { Some(0) } else { Some(result as usize) };
+        return if result < 0 {
+            Some(0)
+        } else {
+            Some(result as usize)
+        };
     }
     let idx = spec.params.iter().position(|p| p.name == len_param)?;
     let raw = frame.args[idx];
@@ -539,7 +535,10 @@ impl<'a> ByteReader<'a> {
         Self { bytes, pos: 0 }
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
-        let end = self.pos.checked_add(n).ok_or(DecodeError::Truncated { offset: self.pos })?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(DecodeError::Truncated { offset: self.pos })?;
         if end > self.bytes.len() {
             return Err(DecodeError::Truncated { offset: self.pos });
         }
@@ -754,8 +753,8 @@ mod tests {
         let pre = capture_pre_syscall(frame, &mem);
 
         let out = pre.encode_output();
-        let back = CapturedSyscall::decode_output(pre.nr, pre.args, pre.result, &out)
-            .expect("decode");
+        let back =
+            CapturedSyscall::decode_output(pre.nr, pre.args, pre.result, &out).expect("decode");
         assert_eq!(pre, back);
     }
 

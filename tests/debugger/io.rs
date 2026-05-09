@@ -29,7 +29,9 @@ fn test_read_register_write() {
 
     debugger.start_debugee().unwrap();
 
-    debugger.set_register_value(PC_NAME, 0x55555555BD20).unwrap();
+    debugger
+        .set_register_value(PC_NAME, 0x55555555BD20)
+        .unwrap();
 
     let val = debugger.get_register_value(PC_NAME);
     assert_eq!(val.unwrap(), 0x55555555BD20);

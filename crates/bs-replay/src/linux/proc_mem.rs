@@ -23,31 +23,28 @@ use nix::unistd::Pid;
 use super::proc_maps::MemoryRegion;
 
 /// Read `len` bytes from `pid`'s virtual address `address`.
-pub fn read_bytes_at(
-    pid: Pid,
-    address: u64,
-    len: usize,
-) -> Result<Vec<u8>, ProcMemError> {
+pub fn read_bytes_at(pid: Pid, address: u64, len: usize) -> Result<Vec<u8>, ProcMemError> {
     let path = format!("/proc/{}/mem", pid.as_raw());
     let f = OpenOptions::new()
         .read(true)
         .open(&path)
-        .map_err(|e| ProcMemError::Open { pid: pid.as_raw(), source: e })?;
+        .map_err(|e| ProcMemError::Open {
+            pid: pid.as_raw(),
+            source: e,
+        })?;
     let mut buf = vec![0u8; len];
-    f.read_exact_at(&mut buf, address).map_err(|e| ProcMemError::Read {
-        pid: pid.as_raw(),
-        address,
-        len,
-        source: e,
-    })?;
+    f.read_exact_at(&mut buf, address)
+        .map_err(|e| ProcMemError::Read {
+            pid: pid.as_raw(),
+            address,
+            len,
+            source: e,
+        })?;
     Ok(buf)
 }
 
 /// Read every byte of the given memory region.
-pub fn read_region(
-    pid: Pid,
-    region: &MemoryRegion,
-) -> Result<Vec<u8>, ProcMemError> {
+pub fn read_region(pid: Pid, region: &MemoryRegion) -> Result<Vec<u8>, ProcMemError> {
     let len = region.end.saturating_sub(region.start) as usize;
     read_bytes_at(pid, region.start, len)
 }
@@ -55,16 +52,15 @@ pub fn read_region(
 /// Write `bytes` into `pid`'s virtual address space at `address`.
 /// Symmetric to [`read_bytes_at`]. The caller must already have
 /// ptrace-attached the target so the kernel allows the write.
-pub fn write_bytes_at(
-    pid: Pid,
-    address: u64,
-    bytes: &[u8],
-) -> Result<(), ProcMemError> {
+pub fn write_bytes_at(pid: Pid, address: u64, bytes: &[u8]) -> Result<(), ProcMemError> {
     let path = format!("/proc/{}/mem", pid.as_raw());
     let f = OpenOptions::new()
         .write(true)
         .open(&path)
-        .map_err(|e| ProcMemError::Open { pid: pid.as_raw(), source: e })?;
+        .map_err(|e| ProcMemError::Open {
+            pid: pid.as_raw(),
+            source: e,
+        })?;
     f.write_all_at(bytes, address)
         .map_err(|e| ProcMemError::Read {
             pid: pid.as_raw(),
@@ -115,8 +111,8 @@ mod tests {
     /// Lives in the parent's `.rodata`; after fork the child's
     /// frozen address space has the same bytes at the same VA.
     static MAGIC: [u8; 16] = [
-        0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
-        0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+        0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde,
+        0xf0,
     ];
 
     fn skip_if_yama(e: &ProcMemError) -> bool {
@@ -187,7 +183,9 @@ mod tests {
         if region.end - region.start > 16 * 1024 * 1024 {
             eprintln!(
                 "skipping read_region test: region {:#x}..{:#x} is too large ({} bytes)",
-                region.start, region.end, region.end - region.start,
+                region.start,
+                region.end,
+                region.end - region.start,
             );
             mech.kill(h).expect("kill failed");
             return;
@@ -248,15 +246,13 @@ mod tests {
             Err(e) => panic!("write_bytes_at failed: {e:?}"),
         };
         let read_back = read_bytes_at(h.pid, addr, pattern.len()).expect("read failed");
-        assert_eq!(
-            read_back, pattern,
-            "write then read mismatch at 0x{addr:x}",
-        );
+        assert_eq!(read_back, pattern, "write then read mismatch at 0x{addr:x}",);
 
         // Parent's view is unchanged — COW means the child's
         // write didn't propagate back.
         assert_eq!(
-            buf, vec![0u8; 64],
+            buf,
+            vec![0u8; 64],
             "parent's heap buffer was modified — fork should have COW'd",
         );
 

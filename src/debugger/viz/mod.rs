@@ -250,8 +250,7 @@ impl VizRegistry {
         for (key, spec) in &self.by_name {
             let forward = stripped.len() > key.len() + 2
                 && stripped.ends_with(key)
-                && stripped.as_bytes()
-                    [stripped.len() - key.len() - 2..stripped.len() - key.len()]
+                && stripped.as_bytes()[stripped.len() - key.len() - 2..stripped.len() - key.len()]
                     == *b"::";
             let reverse = key.len() > stripped.len() + 2
                 && key.ends_with(stripped)
@@ -355,7 +354,10 @@ mod tests {
     fn exact_match() {
         let r = populate();
         assert!(r.find("Person").is_some());
-        assert_eq!(r.find("Person").unwrap().summary.as_deref(), Some("Person({name})"));
+        assert_eq!(
+            r.find("Person").unwrap().summary.as_deref(),
+            Some("Person({name})")
+        );
     }
 
     #[test]
@@ -412,10 +414,7 @@ mod tests {
 
     #[test]
     fn strip_generic_args_nested() {
-        assert_eq!(
-            strip_generic_args("HashMap<K, Vec<i32>>"),
-            "HashMap"
-        );
+        assert_eq!(strip_generic_args("HashMap<K, Vec<i32>>"), "HashMap");
         assert_eq!(
             strip_generic_args("a::b::Wrap<Vec<HashMap<K, V>>>"),
             "a::b::Wrap",

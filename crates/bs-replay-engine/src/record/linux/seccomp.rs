@@ -169,7 +169,10 @@ fn install_with_filter(filter: &[SockFilter]) -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     // Plan §Invariants: "Seccomp filter is loaded before fork."
-    debug_assert!(!filter.is_empty(), "empty filter would tell the kernel to allow nothing");
+    debug_assert!(
+        !filter.is_empty(),
+        "empty filter would tell the kernel to allow nothing"
+    );
     let prog = SockFprog {
         len: filter.len() as u16,
         filter: filter.as_ptr(),
@@ -310,9 +313,7 @@ mod tests {
                      kernel/perms don't support seccomp NEW_LISTENER (exit {exit})"
                 );
             }
-            other => panic!(
-                "child returned unexpected status {other} (status word {status:#x})"
-            ),
+            other => panic!("child returned unexpected status {other} (status word {status:#x})"),
         }
     }
 }

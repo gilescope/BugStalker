@@ -43,12 +43,10 @@ use std::os::fd::BorrowedFd;
 
 use crate::format::event::Event;
 use crate::record::linux::ptrace_driver::{
-    frame_from_notif, recv_notif, respond_intercept, RecorderError, SeccompNotif,
-    RESULT_NOT_CAPTURED_YET,
+    RESULT_NOT_CAPTURED_YET, RecorderError, SeccompNotif, frame_from_notif, recv_notif,
+    respond_intercept,
 };
-use crate::record::syscall_capture::{
-    self, CapturedSyscall, MemoryReader,
-};
+use crate::record::syscall_capture::{self, CapturedSyscall, MemoryReader};
 
 /// Inverse of [`MemoryReader`] — write recorded bytes back into
 /// the tracee's address space at replay time. Linux impl wraps
@@ -222,7 +220,11 @@ impl core::fmt::Display for SyscallMismatch {
                  — the tracee called a different syscall than recorded; \
                  trace is corrupt or the binary was rebuilt",
             ),
-            Self::Arg { idx, observed, recorded } => write!(
+            Self::Arg {
+                idx,
+                observed,
+                recorded,
+            } => write!(
                 f,
                 "arg[{idx}] observed={observed:#x}, recorded={recorded:#x} \
                  — argument register diverged; the most likely causes are \
@@ -245,14 +247,11 @@ pub fn replay_one_syscall(
     recorded: &Event,
     writer: &mut dyn MemoryWriter,
 ) -> Result<ReplayResponse, ReplayLoopError> {
-    let notif = recv_notif(listener).map_err(|e| {
-        ReplayLoopError::Recorder(RecorderError::Recv(e))
-    })?;
-    let resp = apply_recorded_event(&notif, recorded, writer)
-        .map_err(ReplayLoopError::Replay)?;
-    respond_intercept(listener, resp.notif_id, resp.result, /*err=*/ 0).map_err(|e| {
-        ReplayLoopError::Recorder(RecorderError::Respond(e))
-    })?;
+    let notif =
+        recv_notif(listener).map_err(|e| ReplayLoopError::Recorder(RecorderError::Recv(e)))?;
+    let resp = apply_recorded_event(&notif, recorded, writer).map_err(ReplayLoopError::Replay)?;
+    respond_intercept(listener, resp.notif_id, resp.result, /*err=*/ 0)
+        .map_err(|e| ReplayLoopError::Recorder(RecorderError::Respond(e)))?;
     Ok(resp)
 }
 
@@ -298,16 +297,8 @@ impl MemoryWriter for ProcMemWriter {
         // it) and writes to `remote` in the tracee. The kernel
         // returns the number of bytes successfully copied; -1
         // on outright failure.
-        let r = unsafe {
-            libc::process_vm_writev(
-                self.pid as libc::pid_t,
-                &local,
-                1,
-                &remote,
-                1,
-                0,
-            )
-        };
+        let r =
+            unsafe { libc::process_vm_writev(self.pid as libc::pid_t, &local, 1, &remote, 1, 0) };
         if r < 0 {
             // Best-effort fall-back to /proc/<pid>/mem.
             return write_via_proc_mem(self.pid, addr, bytes).unwrap_or(0);
@@ -333,8 +324,7 @@ mod tests {
     use super::*;
     use crate::record::linux::ptrace_driver::SeccompData;
     use crate::record::syscall_capture::{
-        capture_pre_syscall, CallFrame, CaptureTier, CapturedKind, CapturedRegion,
-        CapturedSyscall,
+        CallFrame, CaptureTier, CapturedKind, CapturedRegion, CapturedSyscall, capture_pre_syscall,
     };
 
     /// Mock writer — accumulates per-address last-write so a
@@ -413,10 +403,12 @@ mod tests {
         let event = syscall_event(&recorded);
         // tracee called write (nr=1), trace expects read (nr=0)
         let n = notif(1, [3, 0x1000, 5, 0, 0, 0]);
-        let err = apply_recorded_event(&n, &event, &mut MockWriter::default())
-            .unwrap_err();
+        let err = apply_recorded_event(&n, &event, &mut MockWriter::default()).unwrap_err();
         match err {
-            ReplayError::Mismatch(SyscallMismatch::Nr { observed: 1, recorded: 0 }) => {}
+            ReplayError::Mismatch(SyscallMismatch::Nr {
+                observed: 1,
+                recorded: 0,
+            }) => {}
             other => panic!("expected Nr mismatch, got {other:?}"),
         }
     }
@@ -433,8 +425,7 @@ mod tests {
         let event = syscall_event(&recorded);
         // Same nr, but arg[1] (buf pointer) moved.
         let n = notif(1, [1, 0xBEEF, 5, 0, 0, 0]);
-        let err = apply_recorded_event(&n, &event, &mut MockWriter::default())
-            .unwrap_err();
+        let err = apply_recorded_event(&n, &event, &mut MockWriter::default()).unwrap_err();
         match err {
             ReplayError::Mismatch(SyscallMismatch::Arg {
                 idx: 1,
@@ -461,8 +452,7 @@ mod tests {
             .encode_output(),
         };
         let n = notif(1, [1, 0x1000, 5, 0, 0, 0]);
-        let err = apply_recorded_event(&n, &event, &mut MockWriter::default())
-            .unwrap_err();
+        let err = apply_recorded_event(&n, &event, &mut MockWriter::default()).unwrap_err();
         match err {
             ReplayError::ResultNotCaptured { nr: 1, notif_id: 7 } => {}
             other => panic!("expected ResultNotCaptured, got {other:?}"),
@@ -509,8 +499,7 @@ mod tests {
     fn unexpected_event_variant_is_rejected() {
         let event = Event::Marker { tag: 1, data: 2 };
         let n = notif(0, [0; 6]);
-        let err = apply_recorded_event(&n, &event, &mut MockWriter::default())
-            .unwrap_err();
+        let err = apply_recorded_event(&n, &event, &mut MockWriter::default()).unwrap_err();
         match err {
             ReplayError::UnexpectedEvent { got } => {
                 assert!(got.contains("Marker"), "want Marker in error, got `{got}`");

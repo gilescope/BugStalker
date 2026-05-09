@@ -60,7 +60,10 @@ fn print_future(backtrace: &AsyncBacktrace, num: u32, future: &Future, printer: 
             let outer = custom_fut.name.to_string();
             let line = match &custom_fut.concrete {
                 Some(concrete) if concrete != &outer => {
-                    format!("#{num} future {} [→ {concrete}]", FutureTypeView::from(outer))
+                    format!(
+                        "#{num} future {} [→ {concrete}]",
+                        FutureTypeView::from(outer)
+                    )
                 }
                 _ => format!("#{num} future {}", FutureTypeView::from(outer)),
             };
@@ -249,7 +252,10 @@ pub fn print_await_trace(backtrace: &AsyncBacktrace, printer: &ExternalPrinter) 
                 let fn_view = FutureFunctionView::from(&af.async_fn).to_string();
                 let line = match (&af.state, &af.await_location) {
                     (AsyncFnFutureState::Suspend(n), Some((file, line))) => {
-                        format!("  #{i} {fn_view} at {}:{line} (await point {n})", file.display())
+                        format!(
+                            "  #{i} {fn_view} at {}:{line} (await point {n})",
+                            file.display()
+                        )
                     }
                     (AsyncFnFutureState::Suspend(n), None) => {
                         format!("  #{i} {fn_view} (await point {n}, no source coords)")
@@ -275,10 +281,7 @@ pub fn print_await_trace(backtrace: &AsyncBacktrace, printer: &ExternalPrinter) 
                         "  #{i} {} [→ {concrete}] (custom future)",
                         FutureTypeView::from(outer)
                     ),
-                    _ => format!(
-                        "  #{i} {} (custom future)",
-                        FutureTypeView::from(outer)
-                    ),
+                    _ => format!("  #{i} {} (custom future)", FutureTypeView::from(outer)),
                 };
                 printer.println(line);
             }
@@ -321,8 +324,7 @@ pub fn print_await_trace(backtrace: &AsyncBacktrace, printer: &ExternalPrinter) 
                         // spaces so the visual hierarchy reads.
                         match fut {
                             Future::AsyncFn(af) => {
-                                let fn_view =
-                                    FutureFunctionView::from(&af.async_fn).to_string();
+                                let fn_view = FutureFunctionView::from(&af.async_fn).to_string();
                                 let line = match (&af.state, &af.await_location) {
                                     (AsyncFnFutureState::Suspend(n), Some((file, line))) => {
                                         format!(

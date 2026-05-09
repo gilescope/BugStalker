@@ -314,8 +314,7 @@ impl<Y: YesQuestion, C: Completer, U: ProgramTaker> CommandHandler<'_, Y, C, U> 
                 self.printer.println("");
             }
             Command::ApplyPatch(patch_cmd) => {
-                let report = command::apply_patch::Handler::new(self.debugger)
-                    .handle(patch_cmd)?;
+                let report = command::apply_patch::Handler::new(self.debugger).handle(patch_cmd)?;
                 self.printer.println(format!(
                     "applied {} entries ({} bytes)",
                     report.entries_applied, report.bytes_written
@@ -547,7 +546,11 @@ impl<Y: YesQuestion, C: Completer, U: ProgramTaker> CommandHandler<'_, Y, C, U> 
     fn print_replay_outcome(&self, outcome: crate::ui::command::replay::Outcome) {
         use crate::ui::command::replay::Outcome;
         match outcome {
-            Outcome::Loaded { trace_path, total_events, build_id } => {
+            Outcome::Loaded {
+                trace_path,
+                total_events,
+                build_id,
+            } => {
                 self.printer.println(format!(
                     "loaded trace {trace_path}: {total_events} events; build-id {build_id}",
                 ));
@@ -573,19 +576,33 @@ impl<Y: YesQuestion, C: Completer, U: ProgramTaker> CommandHandler<'_, Y, C, U> 
                 }
             }
             Outcome::Stepped { position, backward } => {
-                let dir = if backward { "stepped back" } else { "stepped forward" };
-                self.printer.println(format!("{dir}; now at event {position}"));
+                let dir = if backward {
+                    "stepped back"
+                } else {
+                    "stepped forward"
+                };
+                self.printer
+                    .println(format!("{dir}; now at event {position}"));
             }
             Outcome::Continued { position } => {
-                self.printer.println(format!("rcontinue: stopped at event {position}"));
+                self.printer
+                    .println(format!("rcontinue: stopped at event {position}"));
             }
             Outcome::BreakpointAdded { event_index } => {
-                self.printer.println(format!("replay breakpoint at event {event_index}"));
+                self.printer
+                    .println(format!("replay breakpoint at event {event_index}"));
             }
-            Outcome::BreakpointRemoved { event_index, was_present: true } => {
-                self.printer.println(format!("removed replay breakpoint at event {event_index}"));
+            Outcome::BreakpointRemoved {
+                event_index,
+                was_present: true,
+            } => {
+                self.printer
+                    .println(format!("removed replay breakpoint at event {event_index}"));
             }
-            Outcome::BreakpointRemoved { event_index, was_present: false } => {
+            Outcome::BreakpointRemoved {
+                event_index,
+                was_present: false,
+            } => {
                 self.printer.println(format!(
                     "no replay breakpoint at event {event_index} to remove",
                 ));

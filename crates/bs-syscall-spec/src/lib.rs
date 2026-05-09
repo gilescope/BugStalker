@@ -331,7 +331,8 @@ mod tests {
             assert!(
                 seen.insert(s.nr),
                 "duplicate __NR_{} number {} (also used by another spec)",
-                s.name, s.nr,
+                s.name,
+                s.nr,
             );
         }
     }
@@ -340,11 +341,7 @@ mod tests {
     fn no_duplicate_syscall_names() {
         let mut seen = std::collections::HashSet::new();
         for s in KNOWN_X86_64 {
-            assert!(
-                seen.insert(s.name),
-                "duplicate spec for `{}`",
-                s.name,
-            );
+            assert!(seen.insert(s.name), "duplicate spec for `{}`", s.name,);
         }
     }
 
@@ -353,8 +350,9 @@ mod tests {
         for s in KNOWN_X86_64 {
             for p in s.params {
                 let len_ref = match p.kind {
-                    ParamKind::InBuf { len_param }
-                    | ParamKind::OutBuf { len_param } => Some(len_param),
+                    ParamKind::InBuf { len_param } | ParamKind::OutBuf { len_param } => {
+                        Some(len_param)
+                    }
                     _ => None,
                 };
                 if let Some(name) = len_ref {
@@ -364,7 +362,9 @@ mod tests {
                     assert!(
                         s.params.iter().any(|q| q.name == name),
                         "spec `{}` parameter `{}` references unknown len_param `{}`",
-                        s.name, p.name, name,
+                        s.name,
+                        p.name,
+                        name,
                     );
                 }
             }
@@ -466,7 +466,10 @@ mod tests {
             assert!(
                 w[0].nr < w[1].nr,
                 "long-tail not sorted: {} (nr {}) before {} (nr {})",
-                w[0].name, w[0].nr, w[1].name, w[1].nr,
+                w[0].name,
+                w[0].nr,
+                w[1].name,
+                w[1].nr,
             );
         }
     }
@@ -511,7 +514,10 @@ mod tests {
             assert!(
                 w[0].nr < w[1].nr,
                 "aarch64 long-tail not sorted: {} (nr {}) before {} (nr {})",
-                w[0].name, w[0].nr, w[1].name, w[1].nr,
+                w[0].name,
+                w[0].nr,
+                w[1].name,
+                w[1].nr,
             );
         }
     }
@@ -631,7 +637,8 @@ mod tests {
             let s = lookup_x86_64_by_name(name)
                 .unwrap_or_else(|| panic!("`{name}` should be in the curated table"));
             assert_eq!(
-                s.ret, ReturnKind::Never,
+                s.ret,
+                ReturnKind::Never,
                 "`{name}` must be ReturnKind::Never (does not return)",
             );
         }

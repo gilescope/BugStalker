@@ -276,7 +276,11 @@ pub fn parse_wild_patch_document(text: &str) -> Result<WildPatch, String> {
         if line.starts_with('#') {
             if let Some(rest) = line.strip_prefix("# wild-patch v") {
                 header.version = Some(rest.trim().parse().map_err(|e| {
-                    format!("line {}: bad wild-patch version `{}`: {e}", lineno + 1, rest.trim())
+                    format!(
+                        "line {}: bad wild-patch version `{}`: {e}",
+                        lineno + 1,
+                        rest.trim()
+                    )
                 })?);
             } else if let Some(rest) = line.strip_prefix("# old-size:") {
                 header.old_size = Some(parse_header_usize(rest, lineno + 1, "old-size")?);

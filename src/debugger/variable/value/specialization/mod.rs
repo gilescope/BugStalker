@@ -81,13 +81,15 @@ fn read_named_usize(val: &Value, field: &'static str) -> Option<u64> {
         }
         None
     })?;
-    member_val.bfs_iterator().find_map(|(_, child)| match child {
-        Value::Scalar(s) => match s.value {
-            Some(SupportedScalar::Usize(n)) => Some(n as u64),
+    member_val
+        .bfs_iterator()
+        .find_map(|(_, child)| match child {
+            Value::Scalar(s) => match s.value {
+                Some(SupportedScalar::Usize(n)) => Some(n as u64),
+                _ => None,
+            },
             _ => None,
-        },
-        _ => None,
-    })
+        })
 }
 
 /// Phase 3 Feature C — eagerly deref an `Rc<T>` / `Arc<T>` pointer
@@ -381,10 +383,7 @@ pub enum SpecializedValue {
 #[derive(Clone, PartialEq)]
 pub enum RangeValue {
     /// `start..end`
-    Half {
-        start: Box<Value>,
-        end: Box<Value>,
-    },
+    Half { start: Box<Value>, end: Box<Value> },
     /// `start..=end`
     Inclusive {
         start: Box<Value>,
@@ -392,17 +391,11 @@ pub enum RangeValue {
         exhausted: bool,
     },
     /// `start..`
-    From {
-        start: Box<Value>,
-    },
+    From { start: Box<Value> },
     /// `..end`
-    To {
-        end: Box<Value>,
-    },
+    To { end: Box<Value> },
     /// `..=end`
-    ToInclusive {
-        end: Box<Value>,
-    },
+    ToInclusive { end: Box<Value> },
     /// `..` — no fields.
     Full,
 }
@@ -1331,7 +1324,9 @@ impl<'a> VariableParserExtension<'a> {
             // — the renderer reads `original.type_ident` for the
             // `Specialized::Rc/Arc` arm.
             let original = structure.type_ident.name().unwrap_or("Rc").to_string();
-            structure.type_ident.set_name(format!("{original} {marker}"));
+            structure
+                .type_ident
+                .set_name(format!("{original} {marker}"));
         }
         Some(SpecializedValue::Rc(ptr))
     }
@@ -1363,7 +1358,9 @@ impl<'a> VariableParserExtension<'a> {
         let bail = eager_deref_with_cycle_check(pcx, &mut ptr);
         if let Some(marker) = bail {
             let original = structure.type_ident.name().unwrap_or("Arc").to_string();
-            structure.type_ident.set_name(format!("{original} {marker}"));
+            structure
+                .type_ident
+                .set_name(format!("{original} {marker}"));
         }
         Some(SpecializedValue::Arc(ptr))
     }
@@ -1467,10 +1464,14 @@ impl<'a> VariableParserExtension<'a> {
         {
             // RwLockReadGuard's `data` is a NonNull<T>; the BFS
             // recovers the inner *const T pointer.
-            if let Some(ptr) = data.value.bfs_iterator().find_map(|(_, child)| match child {
-                Value::Pointer(p) if p.value.is_some() => Some(p.clone()),
-                _ => None,
-            }) && let Some(inner) = ptr.deref(pcx)
+            if let Some(ptr) = data
+                .value
+                .bfs_iterator()
+                .find_map(|(_, child)| match child {
+                    Value::Pointer(p) if p.value.is_some() => Some(p.clone()),
+                    _ => None,
+                })
+                && let Some(inner) = ptr.deref(pcx)
             {
                 return Ok(inner);
             }
@@ -1601,10 +1602,7 @@ impl<'a> VariableParserExtension<'a> {
     /// arm has no payload, so we always pick the `value` arm — peel
     /// `ManuallyDrop`'s inner `value` field to get the underlying
     /// `T`. The renderer adds a `[possibly uninit]` trailer.
-    pub fn parse_maybe_uninit(
-        &self,
-        structure: &StructValue,
-    ) -> Option<SpecializedValue> {
+    pub fn parse_maybe_uninit(&self, structure: &StructValue) -> Option<SpecializedValue> {
         weak_error!(
             self.parse_maybe_uninit_inner(Value::Struct(structure.clone()))
                 .context("MaybeUninit<T> interpretation")
@@ -1691,11 +1689,8 @@ impl<'a> VariableParserExtension<'a> {
         let ptr = found_ptr.ok_or(IncompleteInterp("OsString data pointer"))?;
         const MAX_READ: i64 = 64 * 1024;
         let len = guard_len(len).min(MAX_READ);
-        let bytes = debugger::read_memory_by_pid(
-            pcx.evcx.ecx.pid_on_focus(),
-            ptr as usize,
-            len as usize,
-        )?;
+        let bytes =
+            debugger::read_memory_by_pid(pcx.evcx.ecx.pid_on_focus(), ptr as usize, len as usize)?;
         let display = match std::str::from_utf8(&bytes) {
             Ok(s) => format!("{:?}", s),
             Err(_) => {
@@ -1710,7 +1705,10 @@ impl<'a> VariableParserExtension<'a> {
                 out
             }
         };
-        Ok(StringVariable { value: display, elided: None })
+        Ok(StringVariable {
+            value: display,
+            elided: None,
+        })
     }
 
     /// Phase 1 S12 — `alloc::ffi::c_str::CString`. Layout is
@@ -1767,11 +1765,8 @@ impl<'a> VariableParserExtension<'a> {
         // length field. The plan calls this out explicitly.
         const MAX_READ: i64 = 64 * 1024;
         let len = guard_len(len).min(MAX_READ);
-        let mut bytes = debugger::read_memory_by_pid(
-            pcx.evcx.ecx.pid_on_focus(),
-            ptr as usize,
-            len as usize,
-        )?;
+        let mut bytes =
+            debugger::read_memory_by_pid(pcx.evcx.ecx.pid_on_focus(), ptr as usize, len as usize)?;
         // CString invariants guarantee a trailing NUL. Strip it before
         // attempting utf-8 decode.
         if bytes.last() == Some(&0) {
@@ -1792,7 +1787,10 @@ impl<'a> VariableParserExtension<'a> {
                 out
             }
         };
-        Ok(StringVariable { value: display, elided: None })
+        Ok(StringVariable {
+            value: display,
+            elided: None,
+        })
     }
 
     /// Phase 1 S4 — `core::time::Duration` peeling. Layout is
@@ -1809,10 +1807,7 @@ impl<'a> VariableParserExtension<'a> {
         .map(SpecializedValue::Duration)
     }
 
-    fn parse_duration_inner(
-        &self,
-        structure: &StructValue,
-    ) -> Result<(u64, u32), ParsingError> {
+    fn parse_duration_inner(&self, structure: &StructValue) -> Result<(u64, u32), ParsingError> {
         // `secs` is a top-level u64 field on the Duration struct.
         let secs = structure
             .members
@@ -1884,10 +1879,7 @@ impl<'a> VariableParserExtension<'a> {
         // Match prefix so we accept e.g. `Range<i32>` and bare `Range`.
         Ok(if struct_name.starts_with("RangeInclusive") {
             let exhausted = match find("exhausted") {
-                Some(Value::Scalar(s)) => matches!(
-                    s.value,
-                    Some(SupportedScalar::Bool(true))
-                ),
+                Some(Value::Scalar(s)) => matches!(s.value, Some(SupportedScalar::Bool(true))),
                 _ => false,
             };
             RangeValue::Inclusive {
@@ -1900,13 +1892,9 @@ impl<'a> VariableParserExtension<'a> {
                 start: take("start")?,
             }
         } else if struct_name.starts_with("RangeToInclusive") {
-            RangeValue::ToInclusive {
-                end: take("end")?,
-            }
+            RangeValue::ToInclusive { end: take("end")? }
         } else if struct_name.starts_with("RangeTo") {
-            RangeValue::To {
-                end: take("end")?,
-            }
+            RangeValue::To { end: take("end")? }
         } else if struct_name.starts_with("RangeFull") {
             RangeValue::Full
         } else {

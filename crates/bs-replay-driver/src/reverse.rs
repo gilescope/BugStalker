@@ -46,7 +46,10 @@ impl ReverseDebugger {
     /// Wrap an existing replayer. Starts with no breakpoints; the
     /// playhead is wherever the replayer left it.
     pub fn new(replayer: TraceReplayer) -> Self {
-        Self { replayer, breakpoints: Vec::new() }
+        Self {
+            replayer,
+            breakpoints: Vec::new(),
+        }
     }
 
     /// Borrow the underlying replayer (to inspect manifest, run

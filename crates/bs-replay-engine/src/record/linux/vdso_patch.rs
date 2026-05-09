@@ -174,9 +174,7 @@ pub fn read_self_vdso_bytes(range: &ProcMapping) -> Vec<u8> {
     // life of the process; reading bytes from it is sound. We
     // copy out so the caller can pass them to `object`'s ELF
     // parser without lifetime worries.
-    unsafe {
-        std::slice::from_raw_parts(range.start as *const u8, len).to_vec()
-    }
+    unsafe { std::slice::from_raw_parts(range.start as *const u8, len).to_vec() }
 }
 
 /// Walk the vDSO ELF and return every symbol whose name appears
@@ -201,9 +199,7 @@ pub fn scan_vdso_exports(
     // Validate the e_type just to surface a clear error if
     // someone hands us non-vDSO bytes. `raw_header()` is the
     // object 0.32 accessor for the parsed `Elf64_Ehdr`.
-    if elf.raw_header().e_type.get(elf.endian())
-        != object::elf::ET_DYN
-    {
+    if elf.raw_header().e_type.get(elf.endian()) != object::elf::ET_DYN {
         return Err(VdsoScanError::NotShared);
     }
 
@@ -516,12 +512,10 @@ pub fn apply_vdso_trampolines(
         let payload: Vec<u8> = patch_payload_x86_64(nr).to_vec();
         #[cfg(target_arch = "aarch64")]
         let payload: Vec<u8> = patch_payload_aarch64(nr).to_vec();
-        patch_bytes(tracee_pid, s.address, &payload).map_err(|e| {
-            VdsoPatchError::PatchFailed {
-                name: s.name.clone(),
-                addr: s.address,
-                source: e,
-            }
+        patch_bytes(tracee_pid, s.address, &payload).map_err(|e| VdsoPatchError::PatchFailed {
+            name: s.name.clone(),
+            addr: s.address,
+            source: e,
         })?;
         applied.push(VdsoPatch {
             name: s.name.clone(),
@@ -606,9 +600,7 @@ mod tests {
                 assert!(m.len() >= 4096, "vDSO mapping is suspiciously small");
                 assert!(m.perms.contains('x'));
             }
-            None => eprintln!(
-                "skipping vDSO range assertion: kernel lacks [vdso] mapping",
-            ),
+            None => eprintln!("skipping vDSO range assertion: kernel lacks [vdso] mapping",),
         }
     }
 
@@ -641,7 +633,10 @@ mod tests {
             assert!(
                 s.address >= m.start && s.address < m.end,
                 "vDSO symbol `{}` at {:#x} outside mapping {:#x}..{:#x}",
-                s.name, s.address, m.start, m.end,
+                s.name,
+                s.address,
+                m.start,
+                m.end,
             );
         }
     }
@@ -774,11 +769,7 @@ mod tests {
             let addr = buf.as_mut_ptr() as u64;
             let bytes = addr.to_le_bytes();
             unsafe {
-                libc::write(
-                    pipe_to_parent[1],
-                    bytes.as_ptr() as *const _,
-                    bytes.len(),
-                );
+                libc::write(pipe_to_parent[1], bytes.as_ptr() as *const _, bytes.len());
             }
             // SIGSTOP — parent will SETOPTIONS and patch.
             unsafe { libc::raise(libc::SIGSTOP) };
@@ -806,13 +797,7 @@ mod tests {
         }
         // Read the child's heap address.
         let mut buf = [0u8; 8];
-        let n = unsafe {
-            libc::read(
-                pipe_to_parent[0],
-                buf.as_mut_ptr() as *mut _,
-                buf.len(),
-            )
-        };
+        let n = unsafe { libc::read(pipe_to_parent[0], buf.as_mut_ptr() as *mut _, buf.len()) };
         if n != 8 {
             eprintln!("skipping: short read from child");
             return;

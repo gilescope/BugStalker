@@ -306,8 +306,8 @@ fn parent_setup(pid: i32, sock: OwnedFd) -> Result<RecordChild, SpawnError> {
     }
 
     // 3. SETOPTIONS for syscall stops + their discriminator.
-    let opts: libc::c_long = (libc::PTRACE_O_TRACESYSGOOD
-        | libc::PTRACE_O_TRACEEXEC) as libc::c_long;
+    let opts: libc::c_long =
+        (libc::PTRACE_O_TRACESYSGOOD | libc::PTRACE_O_TRACEEXEC) as libc::c_long;
     let r = unsafe {
         libc::ptrace(
             libc::PTRACE_SETOPTIONS,
@@ -379,8 +379,7 @@ pub(crate) fn send_fd(sock: &OwnedFd, fd: RawFd) -> io::Result<()> {
     unsafe {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len =
-            libc::CMSG_LEN(mem::size_of::<RawFd>() as u32) as _;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(mem::size_of::<RawFd>() as u32) as _;
         let data = libc::CMSG_DATA(cmsg);
         std::ptr::copy_nonoverlapping(&fd as *const _, data as *mut RawFd, 1);
     }

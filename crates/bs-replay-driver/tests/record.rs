@@ -8,10 +8,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use bs_replay::linux::tier2;
+use bs_replay_driver::engine::format::TraceReader;
 use bs_replay_driver::engine::format::manifest::Manifest;
 use bs_replay_driver::engine::format::version::FormatVersion;
-use bs_replay_driver::engine::format::TraceReader;
-use bs_replay_driver::record::{capture_one_shot, CaptureReport, RecordError};
+use bs_replay_driver::record::{CaptureReport, RecordError, capture_one_shot};
 
 fn manifest() -> Manifest {
     Manifest {
@@ -29,10 +29,8 @@ fn manifest() -> Manifest {
 }
 
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "bs-replay-record-{label}-{}",
-        std::process::id(),
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("bs-replay-record-{label}-{}", std::process::id(),));
     let _ = fs::remove_dir_all(&dir);
     dir
 }
@@ -100,9 +98,7 @@ fn capture_one_shot_refuses_to_overwrite_existing_dir() {
 use std::ffi::CString;
 
 use bs_replay_driver::engine::format::event::Event;
-use bs_replay_driver::{
-    record_program, RecordOptions, RecordProgramError, RecorderExitStatus,
-};
+use bs_replay_driver::{RecordOptions, RecordProgramError, RecorderExitStatus, record_program};
 
 fn is_skip_record(err: &RecordProgramError) -> bool {
     let s = format!("{err}");
@@ -132,8 +128,7 @@ fn record_program_drives_bin_true_to_exit() {
     let argv = vec![CString::new("/bin/true").unwrap()];
     let envp = vec![CString::new("PATH=/usr/bin:/bin").unwrap()];
 
-    let report = match record_program(&dir, &manifest(), argv, envp, RecordOptions::default())
-    {
+    let report = match record_program(&dir, &manifest(), argv, envp, RecordOptions::default()) {
         Ok(r) => r,
         Err(e) if is_skip_record(&e) => {
             eprintln!("skipping: {e:?}");
@@ -150,7 +145,8 @@ fn record_program_drives_bin_true_to_exit() {
     assert!(
         matches!(report.exit_status, RecorderExitStatus::Exited(0))
             || matches!(report.exit_status, RecorderExitStatus::IterationCap(_)),
-        "unexpected exit status {:?}", report.exit_status,
+        "unexpected exit status {:?}",
+        report.exit_status,
     );
     // At least one syscall should have been recorded; signals
     // and instruction traps stay 0 until step 71 wires them.
@@ -160,18 +156,25 @@ fn record_program_drives_bin_true_to_exit() {
     );
 
     // Round-trip through TraceReader.
-    let reader = bs_replay_driver::engine::format::TraceReader::open(&dir)
-        .expect("reopen trace");
+    let reader = bs_replay_driver::engine::format::TraceReader::open(&dir).expect("reopen trace");
     let mut cursor = reader.cursor();
     let mut walked: u64 = 0;
+    let mut pc_markers: u64 = 0;
+    let mut syscalls: u64 = 0;
     while let Some(ev) = cursor.next().expect("cursor walk") {
         walked += 1;
-        // record_program in step 70 only emits Event::Syscall.
-        assert!(matches!(ev, Event::Syscall { .. }));
+        match ev {
+            Event::PcMarker { .. } => pc_markers += 1,
+            Event::Syscall { .. } => syscalls += 1,
+            other => panic!("unexpected event in recorded trace: {other:?}"),
+        }
     }
+    assert_eq!(pc_markers, report.pc_marker_events);
+    assert_eq!(syscalls, report.syscall_events);
     assert_eq!(
-        walked, report.syscall_events,
-        "trace reader's event count diverged from report.syscall_events",
+        walked,
+        report.pc_marker_events + report.syscall_events,
+        "trace reader's event count diverged from report event counts",
     );
 
     fs::remove_dir_all(&dir).ok();
@@ -183,8 +186,7 @@ fn record_program_refuses_to_overwrite_existing_dir() {
     fs::create_dir(&dir).unwrap();
     let argv = vec![CString::new("/bin/true").unwrap()];
     let envp = vec![CString::new("PATH=/bin").unwrap()];
-    let err = record_program(&dir, &manifest(), argv, envp, RecordOptions::default())
-        .unwrap_err();
+    let err = record_program(&dir, &manifest(), argv, envp, RecordOptions::default()).unwrap_err();
     match err {
         RecordProgramError::Trace(_) => {}
         other => panic!("expected Trace error, got {other:?}"),

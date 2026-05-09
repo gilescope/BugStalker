@@ -31,19 +31,15 @@ use std::ffi::CString;
 use std::fs;
 use std::path::PathBuf;
 
+use bs_replay_driver::engine::format::TraceReader;
 use bs_replay_driver::engine::format::event::Event;
 use bs_replay_driver::engine::format::manifest::Manifest;
 use bs_replay_driver::engine::format::version::FormatVersion;
-use bs_replay_driver::engine::format::TraceReader;
 use bs_replay_driver::record_primitives::{
     CapturedKind, CapturedSyscall, SeccompData, SeccompNotif,
 };
-use bs_replay_driver::replay_primitives::{
-    apply_recorded_event, MemoryWriter, ReplayShimError,
-};
-use bs_replay_driver::{
-    record_program, RecordOptions, RecordProgramError, RecorderExitStatus,
-};
+use bs_replay_driver::replay_primitives::{MemoryWriter, ReplayShimError, apply_recorded_event};
+use bs_replay_driver::{RecordOptions, RecordProgramError, RecorderExitStatus, record_program};
 
 fn manifest() -> Manifest {
     Manifest {
@@ -71,10 +67,7 @@ fn temp_dir(label: &str) -> PathBuf {
 
 fn is_skip(err: &RecordProgramError) -> bool {
     let s = format!("{err}");
-    s.contains("EPERM")
-        || s.contains("EACCES")
-        || s.contains("ENOSYS")
-        || s.contains("yama")
+    s.contains("EPERM") || s.contains("EACCES") || s.contains("ENOSYS") || s.contains("yama")
 }
 
 #[derive(Default, Debug)]
@@ -120,8 +113,7 @@ fn record_bin_true_then_replay_each_event_succeeds() {
     let dir = temp_dir("bin-true");
     let argv = vec![CString::new("/bin/true").unwrap()];
     let envp = vec![CString::new("PATH=/usr/bin:/bin").unwrap()];
-    let report = match record_program(&dir, &manifest(), argv, envp, RecordOptions::default())
-    {
+    let report = match record_program(&dir, &manifest(), argv, envp, RecordOptions::default()) {
         Ok(r) => r,
         Err(e) if is_skip(&e) => {
             eprintln!("skipping: {e:?}");
@@ -172,7 +164,12 @@ fn record_bin_true_then_replay_each_event_succeeds() {
     let mut total_bytes_written = 0u64;
     while let Some(ev) = cursor.next().expect("walk") {
         match &ev {
-            Event::Syscall { nr, args, result, output } => {
+            Event::Syscall {
+                nr,
+                args,
+                result,
+                output,
+            } => {
                 // Decode the captured-output blob first — proves
                 // the wire encoding round-trips.
                 let cap = CapturedSyscall::decode_output(*nr, *args, *result, output)
@@ -180,8 +177,8 @@ fn record_bin_true_then_replay_each_event_succeeds() {
                 // Now apply it through the replay shim.
                 let notif = synthetic_notif_for(&ev);
                 let mut writer = MockWriter::default();
-                let resp = apply_recorded_event(&notif, &ev, &mut writer)
-                    .unwrap_or_else(|e| match e {
+                let resp =
+                    apply_recorded_event(&notif, &ev, &mut writer).unwrap_or_else(|e| match e {
                         ReplayShimError::ResultNotCaptured { .. } => {
                             panic!(
                                 "trace still carries RESULT_NOT_CAPTURED_YET — \
@@ -216,15 +213,18 @@ fn record_bin_true_then_replay_each_event_succeeds() {
                      expected_writes={expected_writes} for nr {nr}",
                 );
                 writer_regions += actual_writes as u64;
-                total_bytes_written += writer.writes.iter()
-                    .map(|(_, b)| b.len() as u64).sum::<u64>();
+                total_bytes_written += writer
+                    .writes
+                    .iter()
+                    .map(|(_, b)| b.len() as u64)
+                    .sum::<u64>();
                 applied += 1;
             }
             Event::Signal { .. } | Event::InstructionTrap { .. } => {
                 // Replay handlers for these land in step 73's CLI
                 // wiring; not yet exercised here.
             }
-            other => panic!("unexpected event in recorded trace: {other:?}"),
+            Event::PcMarker { .. } | Event::Marker { .. } => {}
         }
     }
 
@@ -247,9 +247,7 @@ fn record_bin_true_then_replay_each_event_succeeds() {
 /// without the recorder dependency.
 #[test]
 fn synthetic_event_round_trips_through_shim() {
-    use bs_replay_driver::record_primitives::{
-        CapturedRegion, CaptureTier,
-    };
+    use bs_replay_driver::record_primitives::{CaptureTier, CapturedRegion};
 
     let cap = CapturedSyscall {
         nr: 1, // write

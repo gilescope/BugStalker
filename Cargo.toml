@@ -86,6 +86,10 @@ bs-viz-spec = { path = "crates/bs-viz-spec" }
 # ReverseDebugger. Cross-platform; the Linux-only record/replay
 # bits aren't reached from the REPL handler.
 bs-replay-driver = { path = "crates/bs-replay-driver" }
+# Phase 6 perf overlay. Optional at the root so default builds keep
+# zero perf collector/linkage overhead; `bs-perf` itself stays pure
+# Rust until its `intel-pt` feature is enabled.
+bs-perf = { path = "crates/bs-perf", optional = true }
 thiserror = "1.0.69"
 bytes = "1.11.0"
 log = "0.4.29"
@@ -155,6 +159,8 @@ bs-test-harness = { path = "crates/bs-test-harness" }
 default = []
 nightly = []
 int_test = ["nightly"]
+perf = ["dep:bs-perf"]
+intel-pt = ["perf", "bs-perf/intel-pt"]
 
 # Bench scaffolding. Each bench seeds a Criterion baseline so
 # `ci-bench.yml` can flag >10 % regressions vs the trailing 7-day

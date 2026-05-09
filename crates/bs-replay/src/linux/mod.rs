@@ -13,14 +13,14 @@ pub mod proc_regs;
 pub mod tier2;
 
 pub use checkpoint_capture::{
-    capture_writable_state, from_payload, restore_writable_state, to_payload, CaptureError,
-    CapturedRegion, DecodeError, RestoreReport, WritableState,
+    CaptureError, CapturedRegion, DecodeError, RestoreReport, WritableState,
+    capture_writable_state, from_payload, restore_writable_state, to_payload,
 };
 pub use fork_self::{ForkHandle, ForkMechanismError, LinuxForkSelfMechanism};
-pub use proc_maps::{read_proc_maps, MemoryRegion, Permissions, ProcMapsError};
-pub use proc_mem::{read_bytes_at, read_region, write_bytes_at, ProcMemError};
-pub use proc_regs::{capture_registers, restore_registers, RegError, RegisterState};
+pub use proc_maps::{MemoryRegion, Permissions, ProcMapsError, read_proc_maps};
+pub use proc_mem::{ProcMemError, read_bytes_at, read_region, write_bytes_at};
+pub use proc_regs::{RegError, RegisterState, capture_registers, restore_registers};
 pub use tier2::{
-    from_payload as tier2_from_payload, to_payload as tier2_to_payload, Tier2Capture,
-    Tier2DecodeError, Tier2Error, Tier2State,
+    Tier2Capture, Tier2DecodeError, Tier2Error, Tier2State, from_payload as tier2_from_payload,
+    to_payload as tier2_to_payload,
 };

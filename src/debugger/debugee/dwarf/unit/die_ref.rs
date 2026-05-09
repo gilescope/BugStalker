@@ -317,7 +317,9 @@ impl<'dbg, H: Typed> FatDieRef<'dbg, H> {
         // Try exact match first; for const-init TLS the init closure's hash differs
         // from the ELF symbol, so fall back to hash-stripped matching.
         let linkage_name = die.linkage_name()?;
-        let tls_offset = self.debug_info.tls_symbol_offset(&linkage_name)
+        let tls_offset = self
+            .debug_info
+            .tls_symbol_offset(&linkage_name)
             .or_else(|| {
                 if linkage_name.contains("thread_local_const_init") {
                     self.debug_info.tls_symbol_offset_stripped(&linkage_name)
@@ -327,7 +329,9 @@ impl<'dbg, H: Typed> FatDieRef<'dbg, H> {
             })?;
         let lm_addr = debugee.rendezvous().link_map_main();
         let pid = ecx.pid_on_focus();
-        let tls_addr_result = debugee.tracee_ctl().tls_addr(pid, lm_addr, tls_offset as usize);
+        let tls_addr_result = debugee
+            .tracee_ctl()
+            .tls_addr(pid, lm_addr, tls_offset as usize);
 
         let tls_addr = if let Ok(addr) = tls_addr_result {
             addr
@@ -365,8 +369,7 @@ impl<'dbg, H: Typed> FatDieRef<'dbg, H> {
             }
         };
 
-        let evaluator =
-            ref_resolve_unit_call!(self, evaluator, debugee, self.debug_info.dwarf());
+        let evaluator = ref_resolve_unit_call!(self, evaluator, debugee, self.debug_info.dwarf());
         let type_size = r#type.type_size_in_bytes(
             &EvaluationContext {
                 evaluator: &evaluator,

@@ -66,17 +66,12 @@ pub enum FileAction {
 /// Standard fds (0/1/2) are never emitted as a `Close` action
 /// even if the recorded child didn't have them open — see the
 /// module-level note.
-pub fn fd_diff_actions(
-    supervisor_fds: &[u32],
-    recorded_fds: &[u32],
-) -> Vec<FileAction> {
+pub fn fd_diff_actions(supervisor_fds: &[u32], recorded_fds: &[u32]) -> Vec<FileAction> {
     let mut closes = Vec::new();
     let mut opens = Vec::new();
 
-    let recorded_set: std::collections::BTreeSet<u32> =
-        recorded_fds.iter().copied().collect();
-    let supervisor_set: std::collections::BTreeSet<u32> =
-        supervisor_fds.iter().copied().collect();
+    let recorded_set: std::collections::BTreeSet<u32> = recorded_fds.iter().copied().collect();
+    let supervisor_set: std::collections::BTreeSet<u32> = supervisor_fds.iter().copied().collect();
 
     for &fd in supervisor_set.difference(&recorded_set) {
         if fd >= 3 {
@@ -84,7 +79,10 @@ pub fn fd_diff_actions(
         }
     }
     for &fd in recorded_set.difference(&supervisor_set) {
-        opens.push(FileAction::OpenDevNullAt { fd, read_only: fd == 0 });
+        opens.push(FileAction::OpenDevNullAt {
+            fd,
+            read_only: fd == 0,
+        });
     }
 
     closes.append(&mut opens);
@@ -116,19 +114,26 @@ pub fn apply_in_child(actions: &[FileAction]) -> io::Result<()> {
                 }
             }
             FileAction::OpenDevNullAt { fd, read_only } => {
-                let flags = if read_only { libc::O_RDONLY } else { libc::O_WRONLY };
+                let flags = if read_only {
+                    libc::O_RDONLY
+                } else {
+                    libc::O_WRONLY
+                };
                 // SAFETY: open(/dev/null, flags) — async-signal-
                 // safe. NUL-terminated string literal.
-                let opened = unsafe {
-                    libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, flags)
-                };
+                let opened =
+                    unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, flags) };
                 if opened < 0 {
                     return Err(io::Error::last_os_error());
                 }
                 if opened as u32 != fd {
                     // SAFETY: dup2 — async-signal-safe.
                     let r = unsafe { libc::dup2(opened, fd as i32) };
-                    let saved = if r < 0 { Some(io::Error::last_os_error()) } else { None };
+                    let saved = if r < 0 {
+                        Some(io::Error::last_os_error())
+                    } else {
+                        None
+                    };
                     let _ = unsafe { libc::close(opened) };
                     if let Some(e) = saved {
                         return Err(e);
@@ -163,7 +168,10 @@ mod tests {
         let actions = fd_diff_actions(&[0, 1, 2], &[0, 1, 2, 7]);
         assert_eq!(
             actions,
-            vec![FileAction::OpenDevNullAt { fd: 7, read_only: false }],
+            vec![FileAction::OpenDevNullAt {
+                fd: 7,
+                read_only: false
+            }],
         );
     }
 
@@ -182,7 +190,10 @@ mod tests {
         let actions = fd_diff_actions(&[1, 2], &[0, 1, 2]);
         assert_eq!(
             actions,
-            vec![FileAction::OpenDevNullAt { fd: 0, read_only: true }],
+            vec![FileAction::OpenDevNullAt {
+                fd: 0,
+                read_only: true
+            }],
         );
     }
 
@@ -194,8 +205,14 @@ mod tests {
             vec![
                 FileAction::Close(7),
                 FileAction::Close(9),
-                FileAction::OpenDevNullAt { fd: 4, read_only: false },
-                FileAction::OpenDevNullAt { fd: 6, read_only: false },
+                FileAction::OpenDevNullAt {
+                    fd: 4,
+                    read_only: false
+                },
+                FileAction::OpenDevNullAt {
+                    fd: 6,
+                    read_only: false
+                },
             ],
         );
     }
@@ -227,9 +244,7 @@ mod tests {
         .expect("open /dev/null at target fd");
 
         // The fd should now be open and writable.
-        let r = unsafe {
-            libc::write(target as i32, b"hello".as_ptr() as *const _, 5)
-        };
+        let r = unsafe { libc::write(target as i32, b"hello".as_ptr() as *const _, 5) };
         assert_eq!(r, 5, "write to /dev/null at fd {target} returned {r}");
 
         // Cleanup.

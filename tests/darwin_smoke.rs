@@ -329,7 +329,9 @@ fn thread_set_arm_state64_roundtrip() {
 /// register read.
 #[test]
 fn thread_get_arm_state64_suspended_worker() {
-    use bugstalker::debugger::darwin_mach::{thread_get_arm_state64, thread_resume, thread_suspend};
+    use bugstalker::debugger::darwin_mach::{
+        thread_get_arm_state64, thread_resume, thread_suspend,
+    };
     use std::sync::mpsc;
 
     let (tx, rx) = mpsc::channel::<u32>();
@@ -451,7 +453,9 @@ fn swap_and_restore_exception_ports_self() {
     use bugstalker::debugger::darwin_mach::{
         ExceptionPort, restore_exception_ports, swap_in_temp_exception_port,
     };
-    use mach2::exception_types::{EXCEPTION_DEFAULT, EXC_MASK_BAD_INSTRUCTION, MACH_EXCEPTION_CODES};
+    use mach2::exception_types::{
+        EXC_MASK_BAD_INSTRUCTION, EXCEPTION_DEFAULT, MACH_EXCEPTION_CODES,
+    };
 
     let task = unsafe { mach2::traps::mach_task_self() };
     let port = ExceptionPort::allocate().expect("allocate");
@@ -501,7 +505,10 @@ fn mach_error_describe_known_codes() {
     }
 
     // And a code we deliberately don't cover should fall through.
-    assert_eq!(MachError(0xDEAD_BEEFu32 as i32).describe(), "unknown kern_return_t");
+    assert_eq!(
+        MachError(0xDEAD_BEEFu32 as i32).describe(),
+        "unknown kern_return_t"
+    );
 }
 
 /// `thread_get_arm_exception_state64` against a suspended worker.
@@ -553,7 +560,10 @@ fn dyld_notification_addr_self() {
     let task = unsafe { mach2::traps::mach_task_self() };
     let addr = dyld_notification_addr(task).expect("dyld_notification_addr on self");
 
-    assert!(addr != 0, "dyld notification addr must be set on a live process");
+    assert!(
+        addr != 0,
+        "dyld notification addr must be set on a live process"
+    );
     // aarch64 darwin user space tops out below 0x0000_FFFF_FFFF_FFFF;
     // dyld lives high but not in the kernel range.
     assert!(

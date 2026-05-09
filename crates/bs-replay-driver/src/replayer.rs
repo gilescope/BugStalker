@@ -36,7 +36,10 @@ impl TraceReplayer {
     /// work is deferred to `next_event`.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, ReplayError> {
         let reader = TraceReader::open(dir).map_err(ReplayError::Engine)?;
-        Ok(Self { reader, next_event_index: 0 })
+        Ok(Self {
+            reader,
+            next_event_index: 0,
+        })
     }
 
     /// The trace's manifest. Cheap.
@@ -120,10 +123,7 @@ impl TraceReplayer {
     /// Comparison is byte-exact — the caller is responsible for
     /// canonicalising hex case (lower vs upper) at record and
     /// replay sides.
-    pub fn check_build_id(
-        &self,
-        host_build_id: &str,
-    ) -> Result<(), BuildIdMismatch> {
+    pub fn check_build_id(&self, host_build_id: &str) -> Result<(), BuildIdMismatch> {
         if self.manifest().build_id == host_build_id {
             Ok(())
         } else {
@@ -145,7 +145,8 @@ impl TraceReplayer {
         expected_build_id: Option<&str>,
     ) -> Result<(), ReplayabilityError> {
         if let Some(bid) = expected_build_id {
-            self.check_build_id(bid).map_err(ReplayabilityError::BuildId)?;
+            self.check_build_id(bid)
+                .map_err(ReplayabilityError::BuildId)?;
         }
         self.check_host_compatibility(host_features)
             .map_err(ReplayabilityError::HostFeatures)?;

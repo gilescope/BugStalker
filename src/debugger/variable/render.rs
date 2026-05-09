@@ -57,7 +57,10 @@ mod byte_preview_tests {
 
     #[test]
     fn empty() {
-        assert_eq!(try_byte_string_preview(&vec_of_bytes(&[])).as_deref(), Some("b\"\""));
+        assert_eq!(
+            try_byte_string_preview(&vec_of_bytes(&[])).as_deref(),
+            Some("b\"\"")
+        );
     }
 
     #[test]
@@ -75,7 +78,10 @@ mod byte_preview_tests {
             preview.contains("ff fe 68 69"),
             "expected hex bytes, got {preview:?}"
         );
-        assert!(preview.contains("|..hi|"), "expected ASCII column, got {preview:?}");
+        assert!(
+            preview.contains("|..hi|"),
+            "expected ASCII column, got {preview:?}"
+        );
     }
 
     #[test]
@@ -126,10 +132,7 @@ mod time_tests {
 
     #[test]
     fn system_time_with_nanos() {
-        assert_eq!(
-            format_system_time(0, 1),
-            "1970-01-01T00:00:00.000000001Z"
-        );
+        assert_eq!(format_system_time(0, 1), "1970-01-01T00:00:00.000000001Z");
     }
 
     #[test]
@@ -298,7 +301,11 @@ pub fn render_bytes(bytes: &[u8], mode: ByteRenderMode, truncated: bool) -> Stri
             out.push(' ');
             out.push('|');
             for b in chunk {
-                out.push(if (0x20..=0x7e).contains(b) { *b as char } else { '.' });
+                out.push(if (0x20..=0x7e).contains(b) {
+                    *b as char
+                } else {
+                    '.'
+                });
             }
             out.push('|');
         }
@@ -729,14 +736,10 @@ impl RenderValue for Value {
                 // Phase 1 S12: CString — the inner StringVariable
                 // already carries the rendered text (utf-8-quoted or
                 // hex-preview), produced at parse time.
-                SpecializedValue::CString(s) => {
-                    ValueLayout::PreRendered(Cow::Borrowed(&s.value))
-                }
+                SpecializedValue::CString(s) => ValueLayout::PreRendered(Cow::Borrowed(&s.value)),
                 // Phase 1 S13/S14: OsString / PathBuf — same
                 // pre-rendered shape as CString.
-                SpecializedValue::OsString(s) => {
-                    ValueLayout::PreRendered(Cow::Borrowed(&s.value))
-                }
+                SpecializedValue::OsString(s) => ValueLayout::PreRendered(Cow::Borrowed(&s.value)),
                 // Phase 1 S10: MaybeUninit — render the inner value's
                 // layout. The `[possibly uninit]` marker is on the
                 // type-identity side so DAP clients can append it
@@ -781,7 +784,9 @@ impl RenderValue for Value {
                 // has been dropped but the allocation is still alive
                 // because at least one Weak handle remains).
                 SpecializedValue::Weak { ptr, strong, weak } => {
-                    let addr = ptr.value.map_or("?".to_string(), |p| format!("0x{:x}", p as usize));
+                    let addr = ptr
+                        .value
+                        .map_or("?".to_string(), |p| format!("0x{:x}", p as usize));
                     let dropped_tag = if *strong == 0 { " [dropped]" } else { "" };
                     ValueLayout::PreRendered(Cow::Owned(format!(
                         "{addr} (strong={strong}, weak={weak}){dropped_tag}"

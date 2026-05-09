@@ -156,12 +156,8 @@ impl<'a> Handler<'a> {
             Command::RStep => self.do_rstep(),
             Command::RStepForward => self.do_step_forward(),
             Command::RContinue => self.do_rcontinue(),
-            Command::RAddBreakpoint { event_index } => {
-                self.do_add_breakpoint(event_index)
-            }
-            Command::RRemoveBreakpoint { event_index } => {
-                self.do_remove_breakpoint(event_index)
-            }
+            Command::RAddBreakpoint { event_index } => self.do_add_breakpoint(event_index),
+            Command::RRemoveBreakpoint { event_index } => self.do_remove_breakpoint(event_index),
         }
     }
 
@@ -176,7 +172,11 @@ impl<'a> Handler<'a> {
             .sum();
         let build_id = replayer.manifest().build_id.clone();
         *self.session = Some(ReverseDebugger::new(replayer));
-        Ok(Outcome::Loaded { trace_path, total_events, build_id })
+        Ok(Outcome::Loaded {
+            trace_path,
+            total_events,
+            build_id,
+        })
     }
 
     fn do_unload(&mut self) -> Outcome {
@@ -208,13 +208,19 @@ impl<'a> Handler<'a> {
     fn do_rstep(&mut self) -> Result<Outcome, Error> {
         let rdb = self.session.as_mut().ok_or(Error::NoSession)?;
         rdb.rstep()?;
-        Ok(Outcome::Stepped { position: rdb.position(), backward: true })
+        Ok(Outcome::Stepped {
+            position: rdb.position(),
+            backward: true,
+        })
     }
 
     fn do_step_forward(&mut self) -> Result<Outcome, Error> {
         let rdb = self.session.as_mut().ok_or(Error::NoSession)?;
         rdb.step()?;
-        Ok(Outcome::Stepped { position: rdb.position(), backward: false })
+        Ok(Outcome::Stepped {
+            position: rdb.position(),
+            backward: false,
+        })
     }
 
     fn do_rcontinue(&mut self) -> Result<Outcome, Error> {
@@ -229,23 +235,23 @@ impl<'a> Handler<'a> {
         Ok(Outcome::BreakpointAdded { event_index })
     }
 
-    fn do_remove_breakpoint(
-        &mut self,
-        event_index: u64,
-    ) -> Result<Outcome, Error> {
+    fn do_remove_breakpoint(&mut self, event_index: u64) -> Result<Outcome, Error> {
         let rdb = self.session.as_mut().ok_or(Error::NoSession)?;
         let was_present = rdb.remove_breakpoint(event_index);
-        Ok(Outcome::BreakpointRemoved { event_index, was_present })
+        Ok(Outcome::BreakpointRemoved {
+            event_index,
+            was_present,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bs_replay_driver::engine::format::TraceWriter;
     use bs_replay_driver::engine::format::event::Event;
     use bs_replay_driver::engine::format::manifest::Manifest;
     use bs_replay_driver::engine::format::version::FormatVersion;
-    use bs_replay_driver::engine::format::TraceWriter;
     use std::fs;
     use std::path::PathBuf;
 
@@ -265,14 +271,14 @@ mod tests {
     }
 
     fn fixture_trace(label: &str, count: u32) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "bs-ui-replay-{label}-{}",
-            std::process::id(),
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("bs-ui-replay-{label}-{}", std::process::id(),));
         let _ = fs::remove_dir_all(&dir);
         let mut writer = TraceWriter::create(&dir, &fixture_manifest()).unwrap();
         for i in 0..count {
-            writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+            writer
+                .write_event(Event::Marker { tag: i, data: 0 })
+                .unwrap();
         }
         writer.finish().unwrap();
         dir
@@ -292,7 +298,9 @@ mod tests {
         let mut session: Session = None;
         let mut h = Handler::new(&mut session);
         let r = h
-            .handle(Command::Load { trace_path: dir.to_string_lossy().into_owned() })
+            .handle(Command::Load {
+                trace_path: dir.to_string_lossy().into_owned(),
+            })
             .unwrap();
         match r {
             Outcome::Loaded { total_events, .. } => assert_eq!(total_events, 3),
@@ -307,8 +315,10 @@ mod tests {
         let dir = fixture_trace("unload", 1);
         let mut session: Session = None;
         let mut h = Handler::new(&mut session);
-        h.handle(Command::Load { trace_path: dir.to_string_lossy().into_owned() })
-            .unwrap();
+        h.handle(Command::Load {
+            trace_path: dir.to_string_lossy().into_owned(),
+        })
+        .unwrap();
         assert!(matches!(
             h.handle(Command::Unload).unwrap(),
             Outcome::Unloaded { had_session: true },
@@ -331,8 +341,10 @@ mod tests {
         let dir = fixture_trace("step", 5);
         let mut session: Session = None;
         let mut h = Handler::new(&mut session);
-        h.handle(Command::Load { trace_path: dir.to_string_lossy().into_owned() })
-            .unwrap();
+        h.handle(Command::Load {
+            trace_path: dir.to_string_lossy().into_owned(),
+        })
+        .unwrap();
         // Walk forward twice: 0 → 1 → 2.
         h.handle(Command::RStepForward).unwrap();
         let r = h.handle(Command::RStepForward).unwrap();
@@ -360,22 +372,36 @@ mod tests {
         let dir = fixture_trace("rbp", 5);
         let mut session: Session = None;
         let mut h = Handler::new(&mut session);
-        h.handle(Command::Load { trace_path: dir.to_string_lossy().into_owned() })
-            .unwrap();
-        match h.handle(Command::RAddBreakpoint { event_index: 3 }).unwrap() {
+        h.handle(Command::Load {
+            trace_path: dir.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        match h
+            .handle(Command::RAddBreakpoint { event_index: 3 })
+            .unwrap()
+        {
             Outcome::BreakpointAdded { event_index } => assert_eq!(event_index, 3),
             other => panic!("expected BreakpointAdded, got {other:?}"),
         }
         // Removing an existing one reports was_present = true.
-        match h.handle(Command::RRemoveBreakpoint { event_index: 3 }).unwrap() {
-            Outcome::BreakpointRemoved { was_present, event_index } => {
+        match h
+            .handle(Command::RRemoveBreakpoint { event_index: 3 })
+            .unwrap()
+        {
+            Outcome::BreakpointRemoved {
+                was_present,
+                event_index,
+            } => {
                 assert_eq!(event_index, 3);
                 assert!(was_present);
             }
             other => panic!("expected BreakpointRemoved, got {other:?}"),
         }
         // Removing a non-existent one reports was_present = false.
-        match h.handle(Command::RRemoveBreakpoint { event_index: 99 }).unwrap() {
+        match h
+            .handle(Command::RRemoveBreakpoint { event_index: 99 })
+            .unwrap()
+        {
             Outcome::BreakpointRemoved { was_present, .. } => assert!(!was_present),
             other => panic!("expected BreakpointRemoved, got {other:?}"),
         }
@@ -387,8 +413,10 @@ mod tests {
         let dir = fixture_trace("status", 7);
         let mut session: Session = None;
         let mut h = Handler::new(&mut session);
-        h.handle(Command::Load { trace_path: dir.to_string_lossy().into_owned() })
-            .unwrap();
+        h.handle(Command::Load {
+            trace_path: dir.to_string_lossy().into_owned(),
+        })
+        .unwrap();
         h.handle(Command::RStepForward).unwrap();
         h.handle(Command::RStepForward).unwrap();
         match h.handle(Command::Status).unwrap() {

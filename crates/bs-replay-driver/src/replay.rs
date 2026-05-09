@@ -14,25 +14,24 @@ use std::ffi::CString;
 use std::path::Path;
 
 use bs_replay_engine::format::event::Event;
-use bs_replay_engine::format::{TraceReadError, TraceReader};
 use bs_replay_engine::format::event::InstructionTrapKind;
+use bs_replay_engine::format::{TraceReadError, TraceReader};
 use bs_replay_engine::record::linux::exit_stop::{
-    classify_wstatus, ptrace_cont, ptrace_singlestep, StopKind, UserRegsX86_64,
+    StopKind, UserRegsX86_64, classify_wstatus, ptrace_cont, ptrace_singlestep,
 };
 #[cfg(target_arch = "x86_64")]
 use bs_replay_engine::record::linux::exit_stop::{get_regs, set_regs};
-use bs_replay_engine::record::linux::instrs::{classify_at_pc, InstrKind};
+use bs_replay_engine::record::linux::instrs::{InstrKind, classify_at_pc};
 use bs_replay_engine::record::linux::ptrace_driver::{
-    recv_notif, respond_intercept, ProcMemReader, SeccompNotif,
+    ProcMemReader, SeccompNotif, recv_notif, respond_intercept,
 };
 use bs_replay_engine::record::linux::signals::ptrace_setsiginfo;
 use bs_replay_engine::record::syscall_capture::MemoryReader;
 use bs_replay_engine::replay::linux::replay_child::{
-    spawn_replay_child, spawn_replay_child_with, ReplayChild, ReplaySpawnError,
-    ReplaySpawnOptions,
+    ReplayChild, ReplaySpawnError, ReplaySpawnOptions, spawn_replay_child, spawn_replay_child_with,
 };
 use bs_replay_engine::replay::linux::shim::{
-    apply_recorded_event, MemoryWriter, ProcMemWriter, ReplayError as ReplayShimError,
+    MemoryWriter, ProcMemWriter, ReplayError as ReplayShimError, apply_recorded_event,
 };
 
 /// How a replay session ended.
@@ -184,10 +183,9 @@ pub fn replay_program(
     // set, which `fd_diff_actions` interprets as "open everything
     // the recorded child had". The actions land in the replay
     // child between fork and execve.
-    let supervisor_fds = bs_replay_engine::record::linux::proc_fd::list_open_fds(
-        unsafe { libc::getpid() },
-    )
-    .unwrap_or_default();
+    let supervisor_fds =
+        bs_replay_engine::record::linux::proc_fd::list_open_fds(unsafe { libc::getpid() })
+            .unwrap_or_default();
     let recorded_fds = &reader.manifest().initial_fds;
     let file_actions = bs_replay_engine::replay::linux::file_actions::fd_diff_actions(
         &supervisor_fds,
@@ -208,7 +206,10 @@ pub fn replay_program(
         spawn_replay_child_with(
             argv,
             envp,
-            ReplaySpawnOptions { ptrace_attach: false, file_actions },
+            ReplaySpawnOptions {
+                ptrace_attach: false,
+                file_actions,
+            },
         )?
     } else {
         spawn_replay_child(argv, envp)?
@@ -225,21 +226,15 @@ pub fn replay_program(
         // route through the recorder, not that replay breaks.
         match bs_replay_engine::record::linux::vdso_patch::scan_remote_vdso(pid) {
             Ok(symbols) if !symbols.is_empty() => {
-                if let Err(e) =
-                    bs_replay_engine::record::linux::vdso_patch::apply_vdso_trampolines(
-                        pid, &symbols,
-                    )
-                {
-                    tracing::warn!(
-                        "replay_program: vDSO patch failed (non-fatal): {e}"
-                    );
+                if let Err(e) = bs_replay_engine::record::linux::vdso_patch::apply_vdso_trampolines(
+                    pid, &symbols,
+                ) {
+                    tracing::warn!("replay_program: vDSO patch failed (non-fatal): {e}");
                 }
             }
             Ok(_) => {} // no symbols — host kernel without vDSO
             Err(e) => {
-                tracing::warn!(
-                    "replay_program: vDSO scan failed (non-fatal): {e}"
-                );
+                tracing::warn!("replay_program: vDSO scan failed (non-fatal): {e}");
             }
         }
     }
@@ -257,9 +252,7 @@ pub fn replay_program(
         report.iterations += 1;
 
         if ptraced {
-            match drive_ptraced_iteration(
-                pid, listener_fd, &mut cursor, &mut writer, &mut report,
-            ) {
+            match drive_ptraced_iteration(pid, listener_fd, &mut cursor, &mut writer, &mut report) {
                 Ok(DriveOutcome::Continue) => continue 'replay,
                 Ok(DriveOutcome::TraceExhausted) => {
                     report.exit = Some(ReplayExit::TraceExhausted {
@@ -277,15 +270,11 @@ pub fn replay_program(
                     break 'replay;
                 }
                 Ok(DriveOutcome::TraceeGone) => {
-                    report.exit = Some(
-                        reap_exit(pid).unwrap_or(ReplayExit::Exited(0)),
-                    );
+                    report.exit = Some(reap_exit(pid).unwrap_or(ReplayExit::Exited(0)));
                     break 'replay;
                 }
                 Err(shim) => {
-                    report.exit = Some(ReplayExit::ShimRefused(
-                        classify_shim_error(&shim),
-                    ));
+                    report.exit = Some(ReplayExit::ShimRefused(classify_shim_error(&shim)));
                     let _ = child.shutdown();
                     return Ok(report);
                 }
@@ -332,9 +321,9 @@ pub fn replay_program(
                 },
                 Ok(None) => break None,
                 Err(e) => {
-                    report.exit = Some(ReplayExit::ShimRefused(
-                        ShimRefusedReason::Decode(format!("{e}")),
-                    ));
+                    report.exit = Some(ReplayExit::ShimRefused(ShimRefusedReason::Decode(
+                        format!("{e}"),
+                    )));
                     let _ = child.shutdown();
                     return Ok(report);
                 }
@@ -379,9 +368,7 @@ pub fn replay_program(
                     resp.result,
                     /*err=*/ 0,
                 ) {
-                    tracing::debug!(
-                        "replay_program: respond_intercept failed ({e}); reaping"
-                    );
+                    tracing::debug!("replay_program: respond_intercept failed ({e}); reaping");
                     report.exit = Some(reap_exit(pid).unwrap_or(ReplayExit::Exited(0)));
                     break 'replay;
                 }
@@ -482,11 +469,7 @@ pub enum LoopEvent {
 /// Block up to `timeout_ms` waiting for either a listener
 /// notification or a tracee stop. Returns whichever arrives
 /// first; falls through to `Idle` if neither.
-pub fn await_loop_event(
-    listener_fd: i32,
-    pid: i32,
-    timeout_ms: i32,
-) -> std::io::Result<LoopEvent> {
+pub fn await_loop_event(listener_fd: i32, pid: i32, timeout_ms: i32) -> std::io::Result<LoopEvent> {
     // Drain any pending tracee stops first — cheap WNOHANG.
     let mut status: libc::c_int = 0;
     let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -512,9 +495,7 @@ pub fn await_loop_event(
         return Ok(LoopEvent::Idle);
     }
     if pfd.revents & libc::POLLIN != 0 {
-        let notif = recv_notif(unsafe {
-            std::os::fd::BorrowedFd::borrow_raw(listener_fd)
-        })?;
+        let notif = recv_notif(unsafe { std::os::fd::BorrowedFd::borrow_raw(listener_fd) })?;
         return Ok(LoopEvent::Notif(notif));
     }
     // POLLHUP / POLLERR — tracee exited under us.
@@ -683,15 +664,18 @@ fn walk_to_next_syscall_full(
         match cursor.next() {
             Ok(Some(e)) => match e {
                 Event::Syscall { .. } => return Ok(Some(e)),
-                Event::Signal { sig_no, pc, siginfo, .. } => {
+                Event::Signal {
+                    sig_no,
+                    pc,
+                    siginfo,
+                    ..
+                } => {
                     let outcome = match (inject_pid, listener_fd) {
-                        (Some(pid), Some(lfd)) => deliver_recorded_signal_at_pc(
-                            pid, lfd, sig_no, pc, &siginfo,
-                        ).map(Some),
-                        (Some(pid), None) => {
-                            deliver_recorded_signal(pid, sig_no, &siginfo)
-                                .map(|_| Some(DeliveryFidelity::ContentOnly))
+                        (Some(pid), Some(lfd)) => {
+                            deliver_recorded_signal_at_pc(pid, lfd, sig_no, pc, &siginfo).map(Some)
                         }
+                        (Some(pid), None) => deliver_recorded_signal(pid, sig_no, &siginfo)
+                            .map(|_| Some(DeliveryFidelity::ContentOnly)),
                         (None, _) => Ok(None),
                     };
                     match outcome {
@@ -725,7 +709,7 @@ fn walk_to_next_syscall_full(
                     bs_replay_engine::record::syscall_capture::DecodeError::TrailingBytes(
                         format!("{e}").len(),
                     ),
-                ))
+                ));
             }
         }
     }
@@ -752,9 +736,7 @@ fn deliver_recorded_signal_at_pc(
     #[cfg(target_arch = "x86_64")]
     let fidelity = match rendezvous_at_pc(pid, listener_fd, pc, MAX_RENDEZVOUS_STEPS) {
         Ok(RendezvousOutcome::Reached { steps }) => DeliveryFidelity::PcPrecise { steps },
-        Ok(RendezvousOutcome::AlreadyThere) => {
-            DeliveryFidelity::PcPrecise { steps: 0 }
-        }
+        Ok(RendezvousOutcome::AlreadyThere) => DeliveryFidelity::PcPrecise { steps: 0 },
         // PastIt / CapHit / AbortedSyscall / AbortedStop / Timeout
         // → fall back to deliver-at-current-PC.
         _ => DeliveryFidelity::ContentOnly,
@@ -989,7 +971,11 @@ fn try_replay_instruction_trap(
     loop {
         match cursor.next() {
             Ok(Some(e)) => match e {
-                Event::InstructionTrap { pc: tpc, kind: tkind, result } => {
+                Event::InstructionTrap {
+                    pc: tpc,
+                    kind: tkind,
+                    result,
+                } => {
                     if pc != tpc {
                         // PC mismatch — stash the count and
                         // pass through.

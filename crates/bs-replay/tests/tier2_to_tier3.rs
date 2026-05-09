@@ -33,8 +33,8 @@ use bs_replay::linux::proc_regs::capture_registers;
 use bs_replay::linux::tier2::{self, Tier2Capture};
 use bs_replay::ring::CheckpointMechanism;
 
-use bs_replay_engine::format::{Manifest, TraceReader, TraceWriter};
 use bs_replay_engine::format::version::FormatVersion;
+use bs_replay_engine::format::{Manifest, TraceReader, TraceWriter};
 
 fn manifest() -> Manifest {
     Manifest {
@@ -52,10 +52,8 @@ fn manifest() -> Manifest {
 }
 
 fn temp_trace_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "bs-replay-bridge-{label}-{}",
-        std::process::id(),
-    ));
+    let dir =
+        std::env::temp_dir().join(format!("bs-replay-bridge-{label}-{}", std::process::id(),));
     let _ = fs::remove_dir_all(&dir);
     dir
 }
@@ -85,8 +83,7 @@ fn tier2_capture_through_tier3_storage_round_trip() {
         Err(e) => panic!("tier2 capture failed: {e:?}"),
     };
     let a_pid = a.handle.pid;
-    let a_bytes_at_addr =
-        read_bytes_at(a_pid, addr, buf.len()).expect("read A buf");
+    let a_bytes_at_addr = read_bytes_at(a_pid, addr, buf.len()).expect("read A buf");
     assert!(a_bytes_at_addr.iter().all(|&b| b == 0));
     // Step 105 changed RegisterState to wrap a Vec<u8> blob
     // (cross-arch); compare the blobs directly rather than
@@ -98,7 +95,8 @@ fn tier2_capture_through_tier3_storage_round_trip() {
     let payload = tier2::to_payload(&a.state);
     {
         let mut w = TraceWriter::create(&dir, &manifest()).expect("create");
-        w.take_checkpoint(payload.clone()).expect("checkpoint write");
+        w.take_checkpoint(payload.clone())
+            .expect("checkpoint write");
         w.finish().expect("finish");
     }
 
@@ -108,7 +106,10 @@ fn tier2_capture_through_tier3_storage_round_trip() {
         let cp = r.open_checkpoint(1).expect("open checkpoint 1");
         cp.payload.clone()
     };
-    assert_eq!(read_payload, payload, "Tier 3 storage corrupted the payload");
+    assert_eq!(
+        read_payload, payload,
+        "Tier 3 storage corrupted the payload"
+    );
 
     // === Tier 2 decode ===
     let decoded = tier2::from_payload(&read_payload).expect("decode failed");
@@ -137,9 +138,11 @@ fn tier2_capture_through_tier3_storage_round_trip() {
     // restore primitives directly.
     use bs_replay::linux::checkpoint_capture::restore_writable_state;
     use bs_replay::linux::proc_regs::restore_registers;
-    let report =
-        restore_writable_state(b_handle.pid, &decoded.writable).expect("restore mem");
-    assert!(report.written > 0, "restore wrote nothing — payload was empty?");
+    let report = restore_writable_state(b_handle.pid, &decoded.writable).expect("restore mem");
+    assert!(
+        report.written > 0,
+        "restore wrote nothing — payload was empty?"
+    );
     restore_registers(b_handle.pid, &decoded.regs).expect("restore regs");
 
     // === Verify B now matches A ===

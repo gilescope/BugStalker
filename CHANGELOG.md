@@ -7,6 +7,242 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- time-travel (Phase 5 — syscall-boundary PC markers):
+  - The Linux recorder now emits `Event::PcMarker` immediately before
+    each recorded `Event::Syscall`, giving replay/reverse consumers a
+    source-resolvable PC at syscall boundaries without changing the
+    archived `Syscall` variant layout.
+  - Record summaries, the replay-record CLI, and the
+    `bs/replayRecord` typed response now report `pc_marker_events` so
+    total event counts include these display markers explicitly.
+- perf overlay (Phase 6 — cycles PMU portability hardening):
+  - `open_cycles_for_pid` still asks for `precise_ip = 2` first, but
+    now retries with `precise_ip = 0` when a host PMU rejects the
+    low-skid request with `EINVAL` or `EOPNOTSUPP`. This keeps the
+    universal cycles tier available on AMD and older PMUs instead of
+    treating a missing PEBS-style mode as a fatal open failure.
+- tracing roadmap (Phase 10/11 — AMD precise-trace planning):
+  - `doc/plans/phase-10-bytehound-integration.md` now records the
+    handoff from heap timelines to a vendor-neutral precise-trace
+    provider contract so Bytehound integration does not depend on
+    Intel PT specifically.
+  - `doc/plans/phase-11-cross-vendor-precise-tracing.md` adds the
+    follow-on plan for Intel PT, AMD Processor Trace / AMD LBR Stack,
+    Apple Processor Trace, and ARM CoreSight ETM behind one decoded
+    trace-event model, including explicit precision gates for
+    instruction-exact versus branch-exact providers.
+- perf overlay (Phase 6 — opt-in Intel PT live collector path, step 133):
+  - `bs/perfOverlayEnable` can now request Intel PT capture with
+    `arguments.intelPt: true` (or `arguments.precise: true`). Cycles
+    sampling remains the default and continues to run if PT capture or
+    decode is unavailable.
+  - The Linux DAP perf session opens an `IntelPtCapture` per sampled
+    TID when PT is requested and available, starts it with the run
+    window, stops/drains it at the next stop, and feeds AUX bytes
+    through `pt_decode -> SourceResolver -> PerfData` when the build
+    supports decode. Unsupported decode/builds are reported as PT
+    diagnostics without disabling cycles overlay data.
+  - The DAP `intelPt` diagnostic now reports request/active state and
+    last-stop PT counters: `requested`, `activeThreadCount`,
+    `lastAuxBytes`, `lastDecodedInstructions`,
+    `lastResolvedInstructions`, and `lastUnresolvedInstructions`.
+- perf overlay (Phase 6 — PT decode image snapshot in DAP session, step 132):
+  - When Intel PT is available, the Linux DAP perf session now
+    snapshots executable file-backed mappings from `/proc/<pid>/maps`
+    into an `IntelPtDecodeConfig` at run start. This records the file
+    path, file offset, mapping size, and virtual address needed by
+    libipt image setup while filtering anonymous, non-executable, and
+    non-file mappings.
+  - The DAP `intelPt` diagnostic now includes
+    `decodeImageSectionCount` and `decodeImageUnavailable`, allowing
+    clients and tests to see whether the session has enough executable
+    image context ready for PT decode before live PT capture is enabled.
+- perf overlay (Phase 6 — decoded PT source attribution boundary, step 131):
+  - `bs-perf::decoder` now exposes `ResolvedPtTrace` and
+    `SourceResolver::resolve_decoded_pt_trace`, bridging decoded PT
+    instruction IPs into source frames while preserving decode
+    sync/error/truncation stats.
+  - `bs-perf::aggregator::PerfData` can now ingest a
+    source-resolved PT instruction window through
+    `record_resolved_pt_trace`, returning `PtTraceAggregation` and
+    counting unresolved decoded instructions through the same
+    unresolved-sample path as cycles sampling.
+- perf overlay (Phase 6 — Intel PT decode feature boundary, step 130):
+  - Root `bugstalker` now exposes `--features intel-pt`, forwarding
+    to `bs-perf/intel-pt`. Default builds still keep the PT probe,
+    event-open, mmap, and raw-capture boundaries C-dep-free; opting
+    into `intel-pt` is the explicit point that introduces libipt.
+  - `bs-perf::pt_decode` adds the typed PT instruction decode
+    boundary: `IntelPtDecodeConfig`, file-backed
+    `IntelPtImageSection`s, optional CPU errata identity, bounded
+    decode output, and `decode_intel_pt_instructions`. On Linux
+    x86/x86_64 with `intel-pt`, it builds a libipt image and returns
+    reconstructed instruction IPs; on other builds it returns
+    `PerfError::Unsupported` while keeping the public boundary
+    available for DAP/live-collector wiring.
+- perf overlay (Phase 6 — Intel PT raw capture owner, step 129):
+  - `bs-perf::linux::intel_pt::IntelPtCapture` now owns the PT monitor,
+    data ring, and AUX buffer as one reusable capture object. It opens
+    with default or explicit buffer sizes, exposes `start` and
+    `stop_and_drain`, and returns `IntelPtCaptureDrain` with data-ring
+    metadata records, parser stats, raw AUX packet bytes, and AUX drain
+    cursors. Packet decode and DAP live-collector integration remain
+    pending.
+- perf overlay (Phase 6 — Intel PT data/AUX mmap boundary, step 128):
+  - `bs-perf::linux::intel_pt::IntelPtMonitor` now maps the PT perf
+    data ring and the AUX trace buffer. The AUX mapping owns a
+    duplicated event fd, validates the kernel-required non-zero
+    power-of-two page sizing, drains visible AUX bytes into owned
+    contiguous buffers after capture stops, and reports AUX overruns
+    explicitly instead of passing a broken packet stream to the future
+    decoder.
+  - `PerfRingBuffer` now understands the shared AUX metadata page:
+    it configures `aux_offset` / `aux_size`, reads `aux_head` /
+    `aux_tail`, publishes consumed AUX tails, and parses
+    `PERF_RECORD_AUX` records including the `sample_id_all` trailer
+    shape requested by the PT event attribute.
+- perf overlay (Phase 6 — Intel PT event opener, step 127):
+  - `bs-perf::linux::intel_pt` now exposes `IntelPtMonitor` plus
+    `open_intel_pt_for_pid` / `open_intel_pt_for_pid_with_pmu_type`.
+    The handle owns the PT perf fd, supports reset/enable/disable,
+    and deliberately stops before packet decode.
+- perf overlay (Phase 6 — Intel PT event attribute builder, step 126):
+  - `bs-perf::linux::intel_pt` now exposes
+    `build_intel_pt_attr(pmu_type)`, a pure builder for the
+    `perf_event_attr` shape used to open future Intel PT events. It
+    records the intended PT data/AUX buffer contract, excludes
+    kernel/hypervisor trace, requests sample ids on metadata records,
+    and keeps the event disabled until the debugger explicitly starts
+    capture.
+- perf overlay (Phase 6 — Intel PT DAP diagnostics, step 125):
+  - `bs/perfOverlay` and `bs/perfOverlayEnable` now include an
+    `intelPt` object when BugStalker is built with the root `perf`
+    feature. On Linux this projects the new `bs-perf` capability
+    probe into JSON (`status`, `pmuType`, `perfEventParanoid`, and a
+    structured unavailable `reason`); off Linux it is `null`.
+- perf overlay (Phase 6 — Intel PT capability probe, step 124):
+  - `bs-perf::linux::intel_pt` now probes the host for the
+    `/sys/bus/event_source/devices/intel_pt/type` PMU and
+    `/proc/sys/kernel/perf_event_paranoid` permission setting.
+    The result distinguishes available PT, likely permission
+    blockers, unsupported architectures, missing PMU exposure, and
+    malformed probe files.
+  - The probe is pure Rust and does not introduce the future PT
+    decoder's C linkage. Intel PT live capture orchestration and
+    packet decode remain pending, but the precise tier now has a
+    concrete host capability boundary to wire into UI/DAP diagnostics.
+- perf overlay (Phase 6 — thread coverage accounting, step 123):
+  - Stop handling now compares the TIDs that actually had active
+    perf rings with the debugger's current attached thread snapshot.
+    Any currently visible thread without a ring is reported through
+    `unavailable` instead of silently presenting the run as fully
+    sampled.
+  - `bs/perfOverlay` and `StoppedEvent.body.bs_perf` now include
+    `unsampledThreadCount`, making the DAP surface explicit when a
+    run missed threads that appeared after sampling started or whose
+    per-thread monitor could not be opened.
+- perf overlay (Phase 6 — all-thread live cycles collector, step 122):
+  - The Linux DAP live collector now snapshots the debugger's known
+    thread list when execution resumes and opens a cycles+IP
+    `perf_event_open` monitor plus mmap ring per TID. Threads that
+    fail to open are reported through `unavailable` while successful
+    thread rings continue sampling.
+  - Stop handling now disables and drains every active thread ring,
+    aggregates samples into the same `PerfData` stop, records
+    per-thread loss/drain failures as combined unavailable status, and
+    exposes `activeThreadCount` on `bs/perfOverlay`.
+- perf overlay (Phase 6 — focused-task live cycles collector, step 121):
+  - With the root `perf` feature enabled on Linux, the DAP session
+    now opens a cycles+IP `perf_event_open` monitor for the focused
+    task when execution resumes, maps the perf ring, resets/enables
+    sampling for that run, drains/disables it at the next stopped
+    event, and records samples into `PerfData`.
+  - Sampled PCs are resolved through the main executable's
+    `.debug_line` table when possible. PIE/dynamic executables use a
+    `/proc/<pid>/maps` load-bias lookup; unresolved PCs and kernel
+    loss records are surfaced as unresolved samples instead of being
+    dropped. This was intentionally the first live slice; step 122
+    generalizes it to the current thread set, while Intel PT remains
+    pending.
+- perf overlay (Phase 6 — DAP server boundary, step 120):
+  - Root `bugstalker` now has an optional `perf` feature that pulls
+    in `bs-perf`; default builds keep perf support gracefully
+    unavailable. The DAP session routes `bs/perfOverlay`,
+    `bs/perfOverlayEnable`, and `bs/perfOverlayDisable`
+    unconditionally: without the feature it returns
+    `enabled: false` plus an `unavailable` reason, and with the
+    feature it projects the session's `PerfData` through
+    `bs_perf::dap`.
+  - Stopped events now have a single insertion point for
+    `body.bs_perf` summaries. It remains empty until live collection
+    records a completed stop, which keeps the wire shape ready
+    without fabricating samples.
+- perf overlay (Phase 6 — DAP request shapes, step 119):
+  - `bs-perf::dap` adds serde-free Rust request/response types and
+    handlers for `bs/perfOverlay`, `bs/perfOverlayEnable`,
+    `bs/perfOverlayDisable`, and the `StoppedEvent.body.bs_perf`
+    summary. The shapes mirror the Phase 5 replay DAP pattern:
+    `bs-perf` owns semantics over `PerfData`; the DAP server keeps
+    JSON conversion at its boundary.
+  - `perf_overlay` projects the shared overlay rows into DAP-friendly
+    line objects (`sample_count`, `sample_share`, `heat`,
+    `hottest`), while `stopped_summary` exposes run cycles,
+    run wall time, hottest source line, and unresolved samples for
+    the most recent stop.
+- perf overlay (Phase 6 — UI-facing overlay model, step 118):
+  - `bs-perf::overlay` adds the shared view layer for console,
+    TUI, and DAP rendering. `source_overlay` projects
+    `PerfData` into per-source rows with sample counts, global
+    sample share, per-file heat, hottest-line marking, and
+    unresolved-sample visibility; source-path matching is exact
+    first and suffix-based after an exact miss so DAP absolute
+    paths can match relative DWARF rows.
+  - Stop/history helpers (`latest_stop_status`, `history_rows`)
+    resolve hot-line file ids back to paths, preserve absolute
+    stop numbering across bounded history eviction, and provide
+    compact console formatting for cycles, durations, stop status,
+    and `perf history` rows.
+- perf overlay (Phase 6 — mmap ring drain, step 115):
+  - `bs-perf` now exposes `PerfMonitor::mmap_ring(data_pages)` and
+    `PerfRingBuffer`, which maps the kernel perf data ring behind
+    the cycles+IP event opened in step 114. The ring owns a
+    duplicated event fd so drop order with `PerfMonitor` is not
+    fragile, validates the kernel-required non-zero power-of-two
+    data-page count, follows the `data_head` / `data_tail` protocol
+    with acquire/release fences, and detects unrecoverable ring
+    overrun instead of inventing record boundaries.
+  - The parser handles the exact Phase 6 sample shape currently
+    requested from `perf_event_open`
+    (`PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME |
+    PERF_SAMPLE_CPU`) and returns `PerfRecord::Sample` with
+    `ip/pid/tid/time/cpu`. `PERF_RECORD_LOST` and
+    `PERF_RECORD_LOST_SAMPLES` are surfaced through `DrainStats`
+    so the future overlay can show sampling loss; unknown record
+    kinds are counted and skipped. Pure parser unit tests cover
+    samples, lost records, unknown records, malformed sizes, and
+    page-count validation.
+- perf overlay (Phase 6 — PC-to-source resolver, step 116):
+  - `bs-perf::decoder` adds `SourceResolver`, a narrow
+    `.debug_line` resolver over object files using the same
+    pure-Rust `gimli` + `object` stack as the debugger. It parses
+    line tables into compact rows, supports a load bias for
+    PIE/shared-object runtime PCs, caches lookups by object PC, and
+    returns a `ResolvedPc` with a primary `SourceFrame` plus an
+    `inlined` frame slot for the later `DW_TAG_inlined_subroutine`
+    attribution work. Unit tests cover exact lookups, nearest
+    previous-row lookup, load-bias handling, end-sequence/line-zero
+    skipping, and before-first-row misses.
+- perf overlay (Phase 6 — aggregation model, step 117):
+  - `bs-perf::aggregator` adds `PerfData`, `SourceLine`,
+    `FileId`, `HotLine`, and `StopSummary`. It interns source
+    files into stable per-session ids, tracks cumulative and
+    last-run sample counts, records unresolved samples separately,
+    attributes both primary and future inlined frames from
+    `ResolvedPc`, deduplicates identical frames within one sampled
+    PC, and keeps a bounded stop-history deque (default 32).
+    Unit tests cover primary+inlined attribution, deduplication,
+    run-window reset semantics, sorted hot-line summaries, and
+    history eviction.
 - time-travel (Phase 5 — DAP record handler + aarch64 vDSO
   trampoline + CPUID-input-aware synthesis):
   - `bs/replayRecord` DAP handler (step 108). The type-only

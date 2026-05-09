@@ -46,8 +46,7 @@ use mach2::traps::{mach_task_self, task_for_pid};
 use mach2::vm::{mach_vm_read_overwrite, mach_vm_region_recurse, mach_vm_write};
 use mach2::vm_prot::VM_PROT_WRITE;
 use mach2::vm_region::{
-    vm_region_submap_info_64, SM_PRIVATE, SM_SHARED, SM_TRUESHARED,
-    VM_REGION_SUBMAP_INFO_COUNT,
+    SM_PRIVATE, SM_SHARED, SM_TRUESHARED, VM_REGION_SUBMAP_INFO_COUNT, vm_region_submap_info_64,
 };
 use mach2::vm_types::{mach_vm_address_t, mach_vm_size_t, natural_t};
 
@@ -147,7 +146,10 @@ pub fn from_payload(bytes: &[u8]) -> Result<WritableState, DecodeError> {
 
 fn read_u64(cur: &mut &[u8]) -> Result<u64, DecodeError> {
     if cur.len() < 8 {
-        return Err(DecodeError::Truncated { needed: 8, have: cur.len() });
+        return Err(DecodeError::Truncated {
+            needed: 8,
+            have: cur.len(),
+        });
     }
     let (head, tail) = cur.split_at(8);
     let v = u64::from_le_bytes(head.try_into().expect("split_at gives 8"));
@@ -176,7 +178,10 @@ pub fn task_port_for_pid(pid: i32) -> Result<task_t, MachError> {
     // through `&mut port`; we own the local.
     let kr = unsafe { task_for_pid(mach_task_self(), pid, &mut port) };
     if kr != KERN_SUCCESS {
-        return Err(MachError::TaskForPid { kern_return: kr, pid });
+        return Err(MachError::TaskForPid {
+            kern_return: kr,
+            pid,
+        });
     }
     Ok(port)
 }
@@ -205,9 +210,7 @@ pub enum MachError {
         kern_return: i32,
     },
     /// `mach_vm_read_overwrite` returned non-zero.
-    #[error(
-        "mach_vm_read_overwrite at {addr:#x} ({size} B): kern_return={kern_return}"
-    )]
+    #[error("mach_vm_read_overwrite at {addr:#x} ({size} B): kern_return={kern_return}")]
     Read {
         /// Address that failed.
         addr: u64,
@@ -217,9 +220,7 @@ pub enum MachError {
         kern_return: i32,
     },
     /// `mach_vm_write` returned non-zero.
-    #[error(
-        "mach_vm_write at {addr:#x} ({size} B): kern_return={kern_return}"
-    )]
+    #[error("mach_vm_write at {addr:#x} ({size} B): kern_return={kern_return}")]
     Write {
         /// Address that failed.
         addr: u64,
@@ -300,8 +301,8 @@ pub fn enumerate_regions(task: task_t) -> Result<Vec<MachRegion>, MachError> {
         }
         let prot = info.protection as u32;
         let private = info.share_mode == SM_PRIVATE as u8;
-        let shared_with_other_tasks = info.share_mode == SM_SHARED as u8
-            || info.share_mode == SM_TRUESHARED as u8;
+        let shared_with_other_tasks =
+            info.share_mode == SM_SHARED as u8 || info.share_mode == SM_TRUESHARED as u8;
         out.push(MachRegion {
             start: addr,
             size,
@@ -327,11 +328,7 @@ pub fn enumerate_writable_regions(task: task_t) -> Result<Vec<MachRegion>, MachE
 
 /// Read `size` bytes from `task`'s address space starting at
 /// `addr`. Wraps `mach_vm_read_overwrite`.
-pub fn read_region_bytes(
-    task: task_t,
-    addr: u64,
-    size: u64,
-) -> Result<Vec<u8>, MachError> {
+pub fn read_region_bytes(task: task_t, addr: u64, size: u64) -> Result<Vec<u8>, MachError> {
     let mut buf = vec![0u8; size as usize];
     let mut got: mach_vm_size_t = 0;
     // SAFETY: read_overwrite writes through buf.as_mut_ptr()
@@ -346,7 +343,11 @@ pub fn read_region_bytes(
         )
     };
     if kr != KERN_SUCCESS {
-        return Err(MachError::Read { addr, size, kern_return: kr });
+        return Err(MachError::Read {
+            addr,
+            size,
+            kern_return: kr,
+        });
     }
     buf.truncate(got as usize);
     Ok(buf)
@@ -422,10 +423,7 @@ pub fn capture_for_task(task: task_t) -> Result<WritableState, MachError> {
 /// space. Per-region failures are surfaced via
 /// [`RestoreReport`]; the function only returns `Err` for
 /// task_for_pid-class failures.
-pub fn restore_writable_state(
-    pid: i32,
-    state: &WritableState,
-) -> Result<RestoreReport, MachError> {
+pub fn restore_writable_state(pid: i32, state: &WritableState) -> Result<RestoreReport, MachError> {
     let task = task_port_for_pid(pid)?;
     Ok(restore_for_task(task, state))
 }
@@ -469,9 +467,18 @@ mod tests {
     fn payload_roundtrip_preserves_every_byte() {
         let state = WritableState {
             regions: vec![
-                CapturedRegion { start: 0x1_0000, bytes: vec![0xab; 16] },
-                CapturedRegion { start: 0x2_0000, bytes: vec![0xcd, 0xef] },
-                CapturedRegion { start: 0x3_0000, bytes: Vec::new() },
+                CapturedRegion {
+                    start: 0x1_0000,
+                    bytes: vec![0xab; 16],
+                },
+                CapturedRegion {
+                    start: 0x2_0000,
+                    bytes: vec![0xcd, 0xef],
+                },
+                CapturedRegion {
+                    start: 0x3_0000,
+                    bytes: Vec::new(),
+                },
             ],
         };
         let p = to_payload(&state);
@@ -516,7 +523,10 @@ mod tests {
     fn enumerate_regions_for_self_yields_the_address_space() {
         let task = task_port_for_self();
         let regions = enumerate_regions(task).expect("enumerate");
-        assert!(!regions.is_empty(), "process must have at least one VM region");
+        assert!(
+            !regions.is_empty(),
+            "process must have at least one VM region"
+        );
         // Every region's size should be positive; addresses
         // strictly increase by `size`.
         let mut prev_end: u64 = 0;
@@ -525,7 +535,8 @@ mod tests {
             assert!(
                 r.start >= prev_end,
                 "regions overlap or wrap: prev_end={:#x}, region_start={:#x}",
-                prev_end, r.start,
+                prev_end,
+                r.start,
             );
             prev_end = r.start + r.size;
         }
@@ -586,11 +597,12 @@ mod tests {
         match r {
             Ok(_port) => {
                 // Surprising — we may have run with the entitlement.
-                eprintln!(
-                    "task_for_pid(1) succeeded; supervisor is codesigned/root"
-                );
+                eprintln!("task_for_pid(1) succeeded; supervisor is codesigned/root");
             }
-            Err(MachError::TaskForPid { kern_return, pid: 1 }) => {
+            Err(MachError::TaskForPid {
+                kern_return,
+                pid: 1,
+            }) => {
                 assert!(
                     kern_return != KERN_SUCCESS,
                     "TaskForPid error must carry a non-zero kern_return",

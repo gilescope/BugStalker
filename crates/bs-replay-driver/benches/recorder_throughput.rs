@@ -26,7 +26,7 @@
 //! ~10–50 sessions/sec range; the headline number is per-syscall
 //! overhead (1 / (sessions/sec × syscalls/session)).
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(target_os = "linux")]
 fn bench_record_bin_true(c: &mut Criterion) {
@@ -36,7 +36,7 @@ fn bench_record_bin_true(c: &mut Criterion) {
 
     use bs_replay_driver::engine::format::manifest::Manifest;
     use bs_replay_driver::engine::format::version::FormatVersion;
-    use bs_replay_driver::{record_program, RecordOptions};
+    use bs_replay_driver::{RecordOptions, record_program};
 
     let prog = std::path::Path::new("/bin/true");
     if !prog.exists() {
@@ -60,10 +60,8 @@ fn bench_record_bin_true(c: &mut Criterion) {
     }
 
     fn temp_dir(seq: usize) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "bs-recorder-bench-{}-{seq}",
-            std::process::id(),
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("bs-recorder-bench-{}-{seq}", std::process::id(),));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -80,9 +78,7 @@ fn bench_record_bin_true(c: &mut Criterion) {
     );
     let _ = std::fs::remove_dir_all(&probe_dir);
     if let Err(e) = probe {
-        eprintln!(
-            "recorder_throughput: skipping — probe failed (kernel/perms?): {e}"
-        );
+        eprintln!("recorder_throughput: skipping — probe failed (kernel/perms?): {e}");
         return;
     }
 

@@ -26,8 +26,7 @@ use std::hint::black_box;
 use std::path::PathBuf;
 
 fn hello_world_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("examples/target/debug/hello_world")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/target/debug/hello_world")
 }
 
 fn bench_attach_cold(c: &mut Criterion) {

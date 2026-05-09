@@ -52,8 +52,7 @@ pub fn capture_one_shot(
     let payload = tier2::to_payload(&cap.state);
     let payload_bytes = payload.len() as u64;
 
-    let mut writer = TraceWriter::create(&trace_path, manifest)
-        .map_err(RecordError::Trace)?;
+    let mut writer = TraceWriter::create(&trace_path, manifest).map_err(RecordError::Trace)?;
     let checkpoint_index = 1; // first checkpoint in a fresh trace
     writer
         .take_checkpoint(payload)
@@ -62,7 +61,10 @@ pub fn capture_one_shot(
 
     cap.kill(&mut mech).map_err(RecordError::Tier2)?;
 
-    Ok(CaptureReport { checkpoint_index, payload_bytes })
+    Ok(CaptureReport {
+        checkpoint_index,
+        payload_bytes,
+    })
 }
 
 /// Errors arising from `capture_one_shot`.
@@ -84,14 +86,14 @@ use std::ffi::CString;
 
 use bs_replay_engine::record::linux::ptrace_driver::ProcMemReader;
 use bs_replay_engine::record::linux::record_session::{
-    self, record_to_completion, spawn_recorded_child_with, ChildSetupFlags,
-    RecordSessionError, RecordSummary, SpawnError, Terminal,
-};
-use bs_replay_engine::record::linux::vdso_patch::{
-    scan_remote_vdso, ScanRemoteError, VdsoPatchError,
+    ChildSetupFlags, RecordSessionError, RecordSummary, SpawnError, Terminal, record_to_completion,
+    spawn_recorded_child_with,
 };
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use bs_replay_engine::record::linux::vdso_patch::apply_vdso_trampolines;
+use bs_replay_engine::record::linux::vdso_patch::{
+    ScanRemoteError, VdsoPatchError, scan_remote_vdso,
+};
 
 /// How a recorded program ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +112,8 @@ pub enum ExitStatus {
 pub struct RecordReport {
     /// `Event::Syscall` events written.
     pub syscall_events: u64,
+    /// `Event::PcMarker` events written before replayable events.
+    pub pc_marker_events: u64,
     /// `Event::Signal` events written. Always 0 in step 70 —
     /// the signal-stop dispatcher (next commit) bumps this.
     pub signal_events: u64,
@@ -252,11 +256,9 @@ pub fn record_program(
     // semantics. Best-effort — yama/ proc_fs failures yield an
     // empty list, which falls back to V1's "inherit everything"
     // behaviour.
-    manifest_with_ts.format_version =
-        bs_replay_engine::format::version::FormatVersion::V2;
+    manifest_with_ts.format_version = bs_replay_engine::format::version::FormatVersion::V2;
     manifest_with_ts.initial_fds =
-        bs_replay_engine::record::linux::proc_fd::list_open_fds(pid)
-            .unwrap_or_default();
+        bs_replay_engine::record::linux::proc_fd::list_open_fds(pid).unwrap_or_default();
 
     let manifest = &manifest_with_ts;
     let mut writer =
@@ -268,8 +270,7 @@ pub fn record_program(
         let symbols = scan_remote_vdso(pid).map_err(RecordProgramError::VdsoScan)?;
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if !symbols.is_empty() {
-            apply_vdso_trampolines(pid, &symbols)
-                .map_err(RecordProgramError::VdsoPatch)?;
+            apply_vdso_trampolines(pid, &symbols).map_err(RecordProgramError::VdsoPatch)?;
         }
         // Other Linux arches: scan still runs to surface the
         // symbols for diagnostics; patching is skipped until
@@ -287,6 +288,7 @@ pub fn record_program(
 
     Ok(RecordReport {
         syscall_events: summary.syscalls,
+        pc_marker_events: summary.pc_markers,
         signal_events: summary.signals,
         instruction_traps: summary.instruction_traps,
         iterations: summary.steps,

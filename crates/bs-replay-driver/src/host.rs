@@ -138,10 +138,7 @@ fn parse_cpuinfo(text: &str) -> Vec<String> {
         None
     });
     let mut feats: Vec<String> = match line {
-        Some(s) => s
-            .split_ascii_whitespace()
-            .map(|t| t.to_owned())
-            .collect(),
+        Some(s) => s.split_ascii_whitespace().map(|t| t.to_owned()).collect(),
         None => Vec::new(),
     };
     feats.sort();
@@ -211,7 +208,10 @@ bogomips    : 4800
     fn parse_cpuinfo_dedups_repeated_flags() {
         let sample = "flags : sse2 sse2 avx avx avx2\n";
         let feats = parse_cpuinfo(sample);
-        assert_eq!(feats, vec!["avx".to_owned(), "avx2".to_owned(), "sse2".to_owned()]);
+        assert_eq!(
+            feats,
+            vec!["avx".to_owned(), "avx2".to_owned(), "sse2".to_owned()]
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -41,18 +41,26 @@ fn temp_dir(label: &str) -> PathBuf {
 fn make_4_segment_trace(dir: &PathBuf) {
     let mut writer = TraceWriter::create(dir, &manifest()).unwrap();
     for i in 0..3u32 {
-        writer.write_event(Event::Marker { tag: i, data: 1 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 1 })
+            .unwrap();
     }
     writer.rotate().unwrap();
     for i in 3..5u32 {
-        writer.write_event(Event::Marker { tag: i, data: 2 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 2 })
+            .unwrap();
     }
     writer.rotate().unwrap();
     for i in 5..10u32 {
-        writer.write_event(Event::Marker { tag: i, data: 3 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 3 })
+            .unwrap();
     }
     writer.rotate().unwrap();
-    writer.write_event(Event::Marker { tag: 10, data: 4 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 10, data: 4 })
+        .unwrap();
     writer.finish().unwrap();
 }
 
@@ -136,15 +144,21 @@ fn find_checkpoint_at_or_before_picks_the_latest_qualifying() {
     let dir = temp_dir("checkpoints");
     let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
     for i in 0..2u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.take_checkpoint(b"A".to_vec()).unwrap();
     for i in 2..7u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.take_checkpoint(b"B".to_vec()).unwrap();
     for i in 7..9u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.take_checkpoint(b"C".to_vec()).unwrap();
     writer.finish().unwrap();
@@ -153,31 +167,49 @@ fn find_checkpoint_at_or_before_picks_the_latest_qualifying() {
 
     // Target before any checkpoint exists.
     assert_eq!(
-        reader.find_checkpoint_at_or_before(0).unwrap().map(|h| h.index),
+        reader
+            .find_checkpoint_at_or_before(0)
+            .unwrap()
+            .map(|h| h.index),
         None,
     );
     assert_eq!(
-        reader.find_checkpoint_at_or_before(1).unwrap().map(|h| h.index),
+        reader
+            .find_checkpoint_at_or_before(1)
+            .unwrap()
+            .map(|h| h.index),
         None,
     );
     // Target == checkpoint A's event_index → A.
     assert_eq!(
-        reader.find_checkpoint_at_or_before(2).unwrap().map(|h| h.index),
+        reader
+            .find_checkpoint_at_or_before(2)
+            .unwrap()
+            .map(|h| h.index),
         Some(1),
     );
     // Target after A but before B → A.
     assert_eq!(
-        reader.find_checkpoint_at_or_before(5).unwrap().map(|h| h.index),
+        reader
+            .find_checkpoint_at_or_before(5)
+            .unwrap()
+            .map(|h| h.index),
         Some(1),
     );
     // Target == B → B.
     assert_eq!(
-        reader.find_checkpoint_at_or_before(7).unwrap().map(|h| h.index),
+        reader
+            .find_checkpoint_at_or_before(7)
+            .unwrap()
+            .map(|h| h.index),
         Some(2),
     );
     // Target after C → C (latest).
     assert_eq!(
-        reader.find_checkpoint_at_or_before(100).unwrap().map(|h| h.index),
+        reader
+            .find_checkpoint_at_or_before(100)
+            .unwrap()
+            .map(|h| h.index),
         Some(3),
     );
 
@@ -189,14 +221,19 @@ fn find_checkpoint_returns_event_index_pointer() {
     let dir = temp_dir("event-index-ptr");
     let mut writer = TraceWriter::create(&dir, &manifest()).unwrap();
     for i in 0..4u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.take_checkpoint(b"snap".to_vec()).unwrap();
     writer.finish().unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();
     let h = reader.find_checkpoint_at_or_before(10).unwrap().unwrap();
-    assert_eq!(h.event_index, 4, "checkpoint should mark events 0..4 as captured");
+    assert_eq!(
+        h.event_index, 4,
+        "checkpoint should mark events 0..4 as captured"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

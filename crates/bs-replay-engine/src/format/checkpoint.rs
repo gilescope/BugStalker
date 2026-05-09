@@ -56,8 +56,7 @@ impl Checkpoint {
     /// Write `self` to `path` as an lz4-frame-compressed rkyv
     /// archive.
     pub fn write_to(&self, path: &Path) -> Result<(), CheckpointIoError> {
-        let archived = rkyv::to_bytes::<RkyvError>(self)
-            .map_err(CheckpointIoError::Archive)?;
+        let archived = rkyv::to_bytes::<RkyvError>(self).map_err(CheckpointIoError::Archive)?;
         let file = File::create(path)?;
         let mut encoder = FrameEncoder::new(BufWriter::new(file));
         encoder.write_all(&archived)?;
@@ -74,8 +73,7 @@ impl Checkpoint {
         let mut decoder = FrameDecoder::new(file);
         let mut decompressed = Vec::with_capacity(64 * 1024);
         decoder.read_to_end(&mut decompressed)?;
-        rkyv::from_bytes::<Self, RkyvError>(&decompressed)
-            .map_err(CheckpointIoError::Archive)
+        rkyv::from_bytes::<Self, RkyvError>(&decompressed).map_err(CheckpointIoError::Archive)
     }
 }
 
@@ -123,7 +121,10 @@ mod tests {
     #[test]
     fn rkyv_roundtrip() {
         let c = Checkpoint {
-            header: CheckpointHeader { index: 3, event_index: 1024 },
+            header: CheckpointHeader {
+                index: 3,
+                event_index: 1024,
+            },
             payload: vec![0xde, 0xad, 0xbe, 0xef],
         };
         let bytes = rkyv::to_bytes::<RkyvError>(&c).unwrap();

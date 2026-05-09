@@ -39,9 +39,10 @@
 //! - [`RecordedEventKind`] — discriminator for what
 //!   [`step_until_event`] just emitted.
 //! - [`step_until_event`] — drive the tracee one event at a
-//!   time. Handles entry+exit-stop pairs (Event::Syscall),
-//!   signal-delivery (Event::Signal), SIGSEGV-at-classified-
-//!   instruction (Event::InstructionTrap), and exit/signalled.
+//!   time. Handles entry+exit-stop pairs (Event::PcMarker +
+//!   Event::Syscall), signal-delivery (Event::Signal),
+//!   SIGSEGV-at-classified-instruction (Event::InstructionTrap),
+//!   and exit/signalled.
 //! - [`record_to_completion`] — call step_until_event in a
 //!   loop until the tracee exits.
 //!
@@ -57,7 +58,7 @@
 //!         │                                 +-------------------+
 //!         │ PTRACE_SYSCALL                  | syscall-exit-stop |
 //!         │                                 +-------------------+
-//!         │ + emit Event::Syscall                    │
+//!         │ + emit Event::PcMarker + Event::Syscall  │
 //!         └──────────────────────────────────────────┘
 //! ```
 //!
@@ -68,34 +69,29 @@
 
 use std::ffi::CString;
 use std::io;
-use std::mem;
-use std::os::fd::RawFd;
 
 use crate::format::event::Event;
 use crate::format::trace_writer::{TraceWriteError, TraceWriter};
 use crate::record::linux::exit_stop::{
-    classify_wstatus, ptrace_cont, ptrace_syscall, ExitStopError, StopKind,
-    UserRegsX86_64,
+    ExitStopError, StopKind, UserRegsX86_64, classify_wstatus, ptrace_syscall,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::record::linux::exit_stop::{get_regs, set_regs};
 // Instruction trapping is x86-64 only — iced-x86 disassembly +
 // the InstrKind set are x86 ISA. aarch64 has analogues
 // (CNTVCT_EL0 trap, AT/MRS) that aren't ported yet.
-#[cfg(target_arch = "x86_64")]
-use crate::record::linux::instrs::{
-    classify_at_pc, event_for_instruction_trap, read_host_tsc, InstrKind,
-};
+use crate::record::linux::exit_stop::result_register_x86_64;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 use crate::record::linux::instrs::classify_at_pc as _classify_at_pc_keep;
+#[cfg(target_arch = "x86_64")]
+use crate::record::linux::instrs::{InstrKind, event_for_instruction_trap, read_host_tsc};
 use crate::record::linux::signals::{
-    event_for_signal, SignalCapture, SignalLengthError, SIGINFO_T_LEN_X86_64,
+    SIGINFO_T_LEN_X86_64, SignalCapture, SignalLengthError, event_for_signal,
 };
 use crate::record::syscall_capture::{
-    capture_post_syscall, capture_pre_syscall, CallFrame, CapturedSyscall, MemoryReader,
+    CallFrame, CapturedSyscall, MemoryReader, capture_post_syscall, capture_pre_syscall,
 };
-use crate::record::linux::exit_stop::result_register_x86_64;
 
 // ---------------------------------------------------------------------------
 // CallFrame extraction from registers
@@ -162,7 +158,10 @@ fn frame_from(regs: &Regs) -> CallFrame {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = regs;
-        CallFrame { nr: 0, args: [0; 6] }
+        CallFrame {
+            nr: 0,
+            args: [0; 6],
+        }
     }
 }
 
@@ -439,8 +438,8 @@ fn parent_setup(pid: i32) -> Result<RecordedChild, SpawnError> {
     // from real SIGTRAPs; TRACEEXEC adds a marker we can route
     // through; TRACECLONE/FORK could be added later for multi-
     // process recording.
-    let opts: libc::c_long = (libc::PTRACE_O_TRACESYSGOOD
-        | libc::PTRACE_O_TRACEEXEC) as libc::c_long;
+    let opts: libc::c_long =
+        (libc::PTRACE_O_TRACESYSGOOD | libc::PTRACE_O_TRACEEXEC) as libc::c_long;
     let r = unsafe {
         libc::ptrace(
             libc::PTRACE_SETOPTIONS,
@@ -497,10 +496,10 @@ pub enum SpawnError {
 
 /// Discriminator for [`step_until_event`]'s emit. The actual
 /// `Event::*` was already written to the trace; this tells the
-/// caller which one fired so it can update counts.
+/// caller which logical observation fired so it can update counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordedEventKind {
-    /// One full pre+post syscall pair was emitted.
+    /// One PC marker plus one full pre+post syscall pair was emitted.
     Syscall,
     /// A signal delivery was recorded; the signal will be
     /// delivered to the tracee on the next step.
@@ -595,13 +594,13 @@ fn synthesise_cpuid_result_at_regs(regs: &UserRegsX86_64) -> Vec<u64> {
 #[cfg(target_arch = "x86_64")]
 fn instruction_byte_len(kind: InstrKind) -> u64 {
     match kind {
-        InstrKind::Rdtsc => 2,   // 0F 31
-        InstrKind::Rdtscp => 3,  // 0F 01 F9
-        InstrKind::Rdrand => 3,  // 0F C7 /6 (REX.W adds 1, but we skip the
-                                  // ones we trapped; iced-x86 disassembly
-                                  // would give exact length)
+        InstrKind::Rdtsc => 2,  // 0F 31
+        InstrKind::Rdtscp => 3, // 0F 01 F9
+        InstrKind::Rdrand => 3, // 0F C7 /6 (REX.W adds 1, but we skip the
+        // ones we trapped; iced-x86 disassembly
+        // would give exact length)
         InstrKind::Rdseed => 3,
-        InstrKind::Cpuid => 2,   // 0F A2
+        InstrKind::Cpuid => 2, // 0F A2
     }
 }
 
@@ -612,7 +611,7 @@ fn instruction_byte_len(kind: InstrKind) -> u64 {
 /// - syscall-entry-stop: capture pre, stash on `child`,
 ///   return [`RecordedEventKind::PassThrough`] (no event yet).
 /// - syscall-exit-stop: capture post, merge with stashed pre,
-///   emit Event::Syscall.
+///   emit Event::PcMarker + Event::Syscall.
 /// - signal-delivery (SIGSEGV/SIGILL at a classified
 ///   instruction): emit Event::InstructionTrap, advance RIP
 ///   past the instruction, swallow the signal.
@@ -625,7 +624,10 @@ fn instruction_byte_len(kind: InstrKind) -> u64 {
 /// `child.in_flight_pre`; the post-side reads RAX from the
 /// exit-stop registers and merges the regions. Plan §3B's
 /// "one Event::Syscall per syscall" invariant holds because
-/// merge happens atomically before write_event.
+/// merge happens atomically before write_event. A `PcMarker` is
+/// emitted immediately before the syscall event so Tier 1 display can
+/// resolve the replay cursor's source location without changing the
+/// syscall event's archived field layout.
 pub fn step_until_event(
     child: &mut RecordedChild,
     reader: &dyn MemoryReader,
@@ -640,9 +642,7 @@ pub fn step_until_event(
         StopKind::Exited { code } => Ok(RecordedEventKind::Exited(code)),
         StopKind::Signalled { sig } => Ok(RecordedEventKind::Signalled(sig)),
         StopKind::SyscallStop => handle_syscall_stop(child, reader, writer),
-        StopKind::SignalDelivery { sig } => {
-            handle_signal_delivery(child, sig, reader, writer)
-        }
+        StopKind::SignalDelivery { sig } => handle_signal_delivery(child, sig, reader, writer),
         StopKind::PtraceEvent { .. } => Ok(RecordedEventKind::PassThrough),
     }
 }
@@ -666,7 +666,12 @@ fn handle_syscall_stop(
         let post = capture_post_syscall(frame, result, reader);
         let merged = merge_pre_post(&pre, &post);
         writer
-            .write_event(crate::record::linux::ptrace_driver::event_for_capture(&merged))
+            .write_event(Event::PcMarker { pc: pc_of(&regs) })
+            .map_err(RecordSessionError::Write)?;
+        writer
+            .write_event(crate::record::linux::ptrace_driver::event_for_capture(
+                &merged,
+            ))
             .map_err(RecordSessionError::Write)?;
         Ok(RecordedEventKind::Syscall)
     }
@@ -704,7 +709,10 @@ fn handle_signal_delivery(
                 .write_event(event_for_instruction_trap(pc, instr_kind, result))
                 .map_err(RecordSessionError::Write)?;
             let mut new_regs = regs;
-            set_pc(&mut new_regs, pc.saturating_add(instruction_byte_len(instr_kind)));
+            set_pc(
+                &mut new_regs,
+                pc.saturating_add(instruction_byte_len(instr_kind)),
+            );
             write_regs(child.pid, &new_regs).map_err(RecordSessionError::SetRegs)?;
             // Don't deliver the signal — we synthesised around it.
             child.pending_signal = 0;
@@ -717,8 +725,8 @@ fn handle_signal_delivery(
         let _ = (sig, reader, pc);
     }
 
-    let cap = SignalCapture::new(sig as u32, pc, siginfo)
-        .map_err(RecordSessionError::SignalLength)?;
+    let cap =
+        SignalCapture::new(sig as u32, pc, siginfo).map_err(RecordSessionError::SignalLength)?;
     writer
         .write_event(event_for_signal(&cap))
         .map_err(RecordSessionError::Write)?;
@@ -731,7 +739,10 @@ fn handle_signal_delivery(
 /// any OutBuf regions, the pre side carries InBuf+InCStr regions.
 fn merge_pre_post(pre: &CapturedSyscall, post: &CapturedSyscall) -> CapturedSyscall {
     debug_assert_eq!(pre.nr, post.nr, "pre/post nr divergence — recorder bug");
-    debug_assert_eq!(pre.args, post.args, "pre/post arg divergence — recorder bug");
+    debug_assert_eq!(
+        pre.args, post.args,
+        "pre/post arg divergence — recorder bug"
+    );
     let mut regions = pre.regions.clone();
     regions.extend(post.regions.iter().cloned());
     CapturedSyscall {
@@ -765,7 +776,10 @@ pub fn record_to_completion(
     for _ in 0..max_steps {
         summary.steps += 1;
         match step_until_event(child, reader, writer)? {
-            RecordedEventKind::Syscall => summary.syscalls += 1,
+            RecordedEventKind::Syscall => {
+                summary.pc_markers += 1;
+                summary.syscalls += 1;
+            }
             RecordedEventKind::Signal => summary.signals += 1,
             RecordedEventKind::InstructionTrap => summary.instruction_traps += 1,
             RecordedEventKind::PassThrough => {}
@@ -790,6 +804,8 @@ pub struct RecordSummary {
     pub steps: u64,
     /// Event::Syscall events written.
     pub syscalls: u64,
+    /// Event::PcMarker events written.
+    pub pc_markers: u64,
     /// Event::Signal events written.
     pub signals: u64,
     /// Event::InstructionTrap events written.
@@ -910,7 +926,10 @@ mod tests {
             InstrKind::Cpuid,
         ] {
             let n = instruction_byte_len(k);
-            assert!(n >= 2 && n <= 7, "{k:?} reported {n} bytes — out of plausible range");
+            assert!(
+                n >= 2 && n <= 7,
+                "{k:?} reported {n} bytes — out of plausible range"
+            );
         }
     }
 }

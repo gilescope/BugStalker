@@ -37,6 +37,121 @@ result is a load-bearing trace engine + driver layer that's
 independent of the kernel-touching pieces, ready for them to plug
 in when a Linux test path is available.
 
+## Phase 6 dependency status
+
+The Phase 5 plan deliberately makes Tier 1 reverse-step display and
+sub-phase 3H depend on Phase 6's processor-trace substrate. That
+dependency is now active, not theoretical:
+
+- Phase 6 step 114 shipped the `bs-perf` crate scaffold and Linux
+  cycles+IP `perf_event_open` event opener.
+- Phase 6 step 115 shipped the mmap data-ring drain and parser for
+  cycles samples plus loss accounting.
+- Phase 6 step 116 shipped the `.debug_line` PC-to-source resolver
+  boundary (`bs_perf::decoder::SourceResolver`) with load-bias-aware
+  PC lookup and a per-PC cache.
+- Phase 6 step 117 shipped the pure in-memory aggregation model
+  (`bs_perf::aggregator::PerfData`) for cumulative counts, last-run
+  counts, unresolved samples, and bounded per-stop hot-line history.
+- Phase 6 step 118 shipped the UI-facing overlay view layer
+  (`bs_perf::overlay`) so console, TUI, and DAP surfaces share the
+  same source-row projection, hot-line selection, sample-share math,
+  unresolved-sample visibility, and bounded history numbering.
+- Phase 6 step 119 shipped the serde-free Rust DAP shape/handler
+  layer (`bs_perf::dap`) for `bs/perfOverlay`,
+  `bs/perfOverlayEnable`, `bs/perfOverlayDisable`, and
+  `StoppedEvent.body.bs_perf`. JSON wiring into the active DAP
+  server remains a boundary concern, matching the Phase 5 replay
+  DAP pattern.
+- Phase 6 step 120 wired the active DAP server boundary behind the
+  root `perf` feature. Default builds now acknowledge perf overlay
+  custom requests as unavailable; `--features perf` routes them
+  through `bs_perf::dap` over the session aggregate state. The live
+  collector still has to populate that state.
+- Phase 6 step 121 added the first live cycles collector path:
+  `--features perf` on Linux opens cycles+IP sampling for the
+  focused task on resume, drains the ring at the next stop, resolves
+  sampled PCs through the main executable's line table with PIE load
+  bias from `/proc/<pid>/maps`, and records unresolved/lost samples
+  explicitly.
+- Phase 6 step 122 expanded that live collector from the focused
+  task to the debugger's current thread snapshot. It opens one
+  cycles+IP monitor/ring per known TID on resume, tolerates
+  per-thread open failures, drains every active ring at stop, and
+  aggregates all samples into the same `PerfData` stop summary.
+  New-thread live onboarding during the run remains pending.
+- Phase 6 step 123 added thread coverage accounting at stop. The DAP
+  session compares sampled TIDs with the debugger's current attached
+  thread snapshot, reports visible unsampled threads through
+  `unavailable`, and exposes `unsampledThreadCount` in both
+  `bs/perfOverlay` and `StoppedEvent.body.bs_perf`.
+- Phase 6 step 124 added the pure-Rust Intel PT host capability
+  probe (`bs_perf::linux::intel_pt`). It detects the `intel_pt` PMU
+  type in sysfs, reads `perf_event_paranoid`, and returns structured
+  availability/permission/missing-PMU diagnostics. PT packet capture
+  and decode are separate boundaries below.
+- Phase 6 step 125 projects that PT probe into the DAP perf overlay
+  boundary. `bs/perfOverlay` and `bs/perfOverlayEnable` now include
+  `intelPt` diagnostics (`status`, `pmuType`, `perfEventParanoid`,
+  and structured unavailable `reason`) when the root `perf` feature
+  is enabled.
+- Phase 6 step 126 added the pure Intel PT `perf_event_attr`
+  builder. `build_intel_pt_attr(pmu_type)` defines the future PT
+  event-open contract and records the planned 64 MiB AUX trace buffer
+  plus 4 MiB data-ring sizing, without opening events or decoding
+  packets yet.
+- Phase 6 step 127 added the Intel PT event opener boundary.
+  `IntelPtMonitor` owns the disabled PT perf fd and supports
+  reset/enable/disable.
+- Phase 6 step 128 added the Intel PT data/AUX mmap boundary.
+  `IntelPtMonitor` can now map the PT perf data ring and AUX trace
+  buffer, drain visible AUX bytes into owned contiguous buffers after
+  capture stops, and surface AUX overruns before decode.
+- Phase 6 step 129 added the raw Intel PT capture owner.
+  `IntelPtCapture` groups the PT monitor, data ring, and AUX buffer,
+  starts/stops capture windows, and returns data-ring metadata plus raw
+  AUX packet bytes for the decode boundary.
+- Phase 6 step 130 added the first Intel PT instruction decode
+  boundary behind `--features intel-pt`. `bs_perf::pt_decode` accepts
+  raw AUX bytes plus file-backed executable mappings, optionally takes
+  CPU family/model/stepping for libipt errata, and returns bounded
+  decoded instruction IPs. Default builds keep the same typed boundary
+  but return `Unsupported` without pulling libipt.
+- Phase 6 step 131 added the decoded-PT source attribution boundary.
+  `SourceResolver::resolve_decoded_pt_trace` maps decoded instruction
+  IPs to source frames and preserves decode sync/error/truncation stats;
+  `PerfData::record_resolved_pt_trace` ingests those resolved
+  instructions into the same line counters and unresolved-sample path as
+  cycles sampling.
+- Phase 6 step 132 added the DAP-session decode-image snapshot. When
+  Intel PT is available, the Linux perf session snapshots executable
+  file-backed `/proc/<pid>/maps` entries into `IntelPtDecodeConfig`
+  sections and reports `intelPt.decodeImageSectionCount` plus
+  `intelPt.decodeImageUnavailable` in the DAP diagnostic body.
+- Phase 6 step 133 added the opt-in Intel PT live collector path.
+  `bs/perfOverlayEnable` accepts `intelPt: true` / `precise: true`;
+  the Linux DAP perf session opens one `IntelPtCapture` per sampled TID,
+  drains AUX bytes at stop, and attempts
+  `pt_decode -> SourceResolver -> PerfData` attribution when the build
+  supports decode. Cycles sampling remains the default and survives PT
+  capture/decode failures.
+- Phase 6 Linux x86 verification on an AMD host hardened the cycles
+  opener to retry with `precise_ip = 0` when PEBS-style
+  `precise_ip = 2` is rejected by the PMU. `bs-perf` tests, the root
+  `perf` feature, and the root `intel-pt` feature now typecheck on
+  Linux x86 with the host's `LIBCLANG_PATH` set for bindgen.
+- Phase 6 still needs PT-capable Linux runtime verification on actual
+  Intel PT hardware and any follow-up fixes from that run. That means
+  Phase 5 can record/replay and expose reverse navigation over trace
+  events, but source-level Tier 1 reverse display and 3H PT-assisted
+  recording remain blocked on validating and hardening the Phase 6 PT
+  tier on real hardware, then feeding precise PCs into replay events.
+- Phase 5 now emits coarse `Event::PcMarker` records at syscall
+  boundaries. That gives replay/reverse consumers a source-resolvable
+  PC without changing the archived `Event::Syscall` layout. It is not
+  the final Tier 1 experience: PT decode still needs to supply the
+  fine-grained instruction PCs between syscalls.
+
 ## Architecture
 
 Three workspace crates under `crates/`:
@@ -154,7 +269,7 @@ let resp = replayer.dap_timeline(&ReplayTimelineRequest::default())?;
 
 | Plan section                                | Status                       | Why / what's pending                                          |
 | ------------------------------------------- | ---------------------------- | ------------------------------------------------------------- |
-| §"Tier 1 — Intel PT reverse step"           | navigation shipped           | Display ("at src/handler.rs:42") needs Phase 6 PT capture     |
+| §"Tier 1 — Intel PT reverse step"           | navigation + syscall-boundary PC markers shipped | Display is coarse until Phase 6 PT capture supplies fine-grained PCs |
 | §"Tier 2 — Checkpoint-based replay"         | Linux + Darwin shipped       | Linux fork(2) + Darwin mach_vm_remap-style capture/restore both functional |
 | §"Tier 3 — Clean-room record-and-replay"    | full record→replay shipped   | record_program + replay_program + replay-record + replay-load CLIs end-to-end |
 | Sub-phase 3A: trace format                  | shipped                      | manifest, segments, checkpoints, validator, properties        |
@@ -164,7 +279,7 @@ let resp = replayer.dap_timeline(&ReplayTimelineRequest::default())?;
 | Sub-phase 3E: signals                       | record + PC-precise replay   | step_until_event emits Event::Signal via PTRACE_GETSIGINFO; replay path: kill(2) (non-ptraced) / PTRACE_SETSIGINFO (ptraced, content-precise) / single-step rendezvous (step 100, PC-precise within a 64-instruction cap). |
 | Sub-phase 3F: multi-thread serialisation    | single-CPU pin shipped       | PMU-based instr-retired counts wait on 3H PT integration      |
 | Sub-phase 3G: aarch64 port                  | record + Tier 2 + vDSO trampoline cross-arch | data/syscall_aarch64.tbl (step 66); regs_aarch64 + UserRegsAarch64 + PTRACE_GETREGSET/SETREGSET (step 102); record_session arch dispatch + Linux build hygiene (step 103); proc_regs Tier 2 register-restore on aarch64 + cross-arch hygiene (step 105); aarch64 vDSO trampoline payload (step 109) — `MOVZ X8 + SVC #0 + RET` 12-byte sequence with arch-conditional `syscall_nr_for_vdso` and the merged target-symbol list. All five Phase 5 crates + tests now cross-compile to aarch64-unknown-linux-gnu and the existing `test-arm64` CI job covers them. Aarch64 instruction-trap classifier (CNTVCT_EL0 / MRS / AT) still pending — and largely academic absent a triggering mechanism (aarch64 has no PR_SET_TSC analogue). |
-| Sub-phase 3H: PT-assisted recording         | not started                  | Needs Phase 6 PT capture                                      |
+| Sub-phase 3H: PT-assisted recording         | not started                  | Needs PT-capable Linux verification/hardening; Phase 6 currently has cycles event + per-known-thread mmap rings + thread coverage accounting + PC-to-source resolver + aggregation + overlay/DAP view models + Intel PT host/DAP diagnostics + PT event fd opener + PT data/AUX mmap + raw PT capture owner + feature-gated PT instruction decode + decoded-PT source attribution + DAP-session decode-image snapshots + opt-in PT live collector path |
 | Sub-phase 3I: BugStalker driver integration | full pipeline + 3 CLIs + DAP record handler | record_program / replay_program + replay-record + replay-load + replay-doctor binaries. `bs/replayRecord` DAP handler landed in step 108 (last "stub" item closed); JSON wiring at the DAP-server boundary is the only remaining concern. |
 | §"DAP integration"                          | shapes + handlers (incl. record) | JSON wiring is the DAP server's concern (one `From` per type). `bs/replayRecord` joined `bs/replayCheckpointList`, `bs/replayJump`, `bs/replayTimeline`, `bs/replayCapture`, `bs/replayRestore`, `bs/replayLoad` in step 108 — every shape in the plan's request set is now backed by a handler. |
 | §"Pure-Rust policy"                         | upheld                       | rkyv + lz4_flex + iced-x86 + object; **zero C deps in Phase 5** |
@@ -281,10 +396,11 @@ Pick the sub-phase whose blocker matches your environment:
   syscall-args extraction → write `Event::Syscall`. Wire format
   is in place; the writer just needs callers.
 
-- **Want the Tier 1 display layer?** Wait for Phase 6's PT
-  capture, then add a `pc: Option<u64>` field to the relevant
-  `Event` variants (additive — no version bump per the
-  variant-ordering rule).
+- **Want the Tier 1 display layer?** Validate and harden Phase 6's
+  Intel PT live collector on PT-capable Linux hardware, then add a
+  `pc: Option<u64>` field to the relevant `Event` variants (additive
+  — no version bump per the variant-ordering rule) so replay
+  navigation can render source-level locations.
 
 - **DAP server integration?** The request/response types in
   `bs_replay_driver::dap` are JSON-ready; one `From` impl per

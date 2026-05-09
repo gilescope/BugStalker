@@ -526,10 +526,7 @@ pub fn render_value_to_string_with_viz(
                     r.find(&outer)
                 })
             {
-                let active_variant_name = re
-                    .value
-                    .as_ref()
-                    .and_then(|m| m.field_name.as_deref());
+                let active_variant_name = re.value.as_ref().and_then(|m| m.field_name.as_deref());
                 let variant_spec = active_variant_name
                     .and_then(|n| spec.variants.iter().find(|var| var.name == n));
                 let tmpl = variant_spec
@@ -547,23 +544,17 @@ pub fn render_value_to_string_with_viz(
                         let fmt = m
                             .field_name
                             .as_deref()
-                            .and_then(|name| {
-                                fields_for_lookup.iter().find(|f| f.name == name)
-                            })
+                            .and_then(|name| fields_for_lookup.iter().find(|f| f.name == name))
                             .map(|f| f.format)
                             .filter(|f| *f != bs_viz_spec::Format::Default);
                         if let Some(fmt) = fmt {
                             if let Some(s) =
-                                crate::ui::generic::variable::format_scalar_for_dap(
-                                    &m.value, fmt,
-                                )
+                                crate::ui::generic::variable::format_scalar_for_dap(&m.value, fmt)
                             {
                                 return s;
                             }
                             if let Some(s) =
-                                crate::ui::generic::variable::format_bytes_for_dap(
-                                    &m.value, fmt,
-                                )
+                                crate::ui::generic::variable::format_bytes_for_dap(&m.value, fmt)
                             {
                                 return s;
                             }
@@ -598,23 +589,17 @@ pub fn render_value_to_string_with_viz(
                         let fmt = m
                             .field_name
                             .as_deref()
-                            .and_then(|name| {
-                                spec.fields.iter().find(|f| f.name == name)
-                            })
+                            .and_then(|name| spec.fields.iter().find(|f| f.name == name))
                             .map(|f| f.format)
                             .filter(|f| *f != bs_viz_spec::Format::Default);
                         if let Some(fmt) = fmt {
                             if let Some(s) =
-                                crate::ui::generic::variable::format_scalar_for_dap(
-                                    &m.value, fmt,
-                                )
+                                crate::ui::generic::variable::format_scalar_for_dap(&m.value, fmt)
                             {
                                 return s;
                             }
                             if let Some(s) =
-                                crate::ui::generic::variable::format_bytes_for_dap(
-                                    &m.value, fmt,
-                                )
+                                crate::ui::generic::variable::format_bytes_for_dap(&m.value, fmt)
                             {
                                 return s;
                             }

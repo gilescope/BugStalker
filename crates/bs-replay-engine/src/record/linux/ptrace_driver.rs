@@ -51,7 +51,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use crate::format::event::Event;
 use crate::format::trace_writer::{TraceWriteError, TraceWriter};
 use crate::record::syscall_capture::{
-    self, capture_pre_syscall, CallFrame, CapturedSyscall, MemoryReader,
+    self, CallFrame, CapturedSyscall, MemoryReader, capture_pre_syscall,
 };
 
 /// Documented sentinel `Event::Syscall.result` value the
@@ -141,10 +141,7 @@ pub const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1 << 0;
 // integer.
 
 const fn ioc(dir: u32, type_: u32, nr: u32, size: u32) -> libc::c_ulong {
-    ((dir & 0x3) << 30
-        | (size & 0x3FFF) << 16
-        | (type_ & 0xFF) << 8
-        | (nr & 0xFF)) as libc::c_ulong
+    ((dir & 0x3) << 30 | (size & 0x3FFF) << 16 | (type_ & 0xFF) << 8 | (nr & 0xFF)) as libc::c_ulong
 }
 const IOC_NONE: u32 = 0;
 #[allow(dead_code)]
@@ -156,12 +153,22 @@ const SECCOMP_IOC_TYPE: u32 = b'!' as u32;
 
 /// `SECCOMP_IOCTL_NOTIF_RECV`.
 pub fn ioctl_notif_recv() -> libc::c_ulong {
-    ioc(IOC_RW, SECCOMP_IOC_TYPE, 0, std::mem::size_of::<SeccompNotif>() as u32)
+    ioc(
+        IOC_RW,
+        SECCOMP_IOC_TYPE,
+        0,
+        std::mem::size_of::<SeccompNotif>() as u32,
+    )
 }
 
 /// `SECCOMP_IOCTL_NOTIF_SEND`.
 pub fn ioctl_notif_send() -> libc::c_ulong {
-    ioc(IOC_RW, SECCOMP_IOC_TYPE, 1, std::mem::size_of::<SeccompNotifResp>() as u32)
+    ioc(
+        IOC_RW,
+        SECCOMP_IOC_TYPE,
+        1,
+        std::mem::size_of::<SeccompNotifResp>() as u32,
+    )
 }
 
 #[allow(dead_code)] // exported for completeness; used in step 7b
@@ -195,10 +202,7 @@ pub fn recv_notif(listener: BorrowedFd<'_>) -> io::Result<SeccompNotif> {
 
 /// Tell the kernel to run the syscall natively (record-mode
 /// FLAG_CONTINUE response).
-pub fn respond_continue(
-    listener: BorrowedFd<'_>,
-    id: u64,
-) -> io::Result<()> {
+pub fn respond_continue(listener: BorrowedFd<'_>, id: u64) -> io::Result<()> {
     let resp = SeccompNotifResp {
         id,
         val: 0,
@@ -225,13 +229,13 @@ pub fn respond_continue(
 /// `val` (or `-error`) to the tracee without running the
 /// syscall. Used by the replay shim (3C, step 8) — *not* by the
 /// recorder.
-pub fn respond_intercept(
-    listener: BorrowedFd<'_>,
-    id: u64,
-    val: i64,
-    err: i32,
-) -> io::Result<()> {
-    let resp = SeccompNotifResp { id, val, error: err, flags: 0 };
+pub fn respond_intercept(listener: BorrowedFd<'_>, id: u64, val: i64, err: i32) -> io::Result<()> {
+    let resp = SeccompNotifResp {
+        id,
+        val,
+        error: err,
+        flags: 0,
+    };
     let r = unsafe {
         libc::ioctl(
             listener.as_raw_fd(),
@@ -281,10 +285,7 @@ pub fn event_for_capture(cap: &CapturedSyscall) -> Event {
 /// Splitting the function keeps the actual ioctl out of the
 /// unit tests — every capture decision drops out of step (2),
 /// which is pure Rust.
-pub fn capture_from_notif(
-    notif: &SeccompNotif,
-    reader: &dyn MemoryReader,
-) -> CapturedSyscall {
+pub fn capture_from_notif(notif: &SeccompNotif, reader: &dyn MemoryReader) -> CapturedSyscall {
     let mut cap = capture_pre_syscall(frame_from_notif(notif), reader);
     // The result is stamped with the documented sentinel until
     // step 7b's syscall-exit-stop path lands. Out-buffer post-
@@ -443,7 +444,12 @@ mod tests {
         let cap = capture_from_notif(&n, &mem);
         let ev = event_for_capture(&cap);
         match ev {
-            Event::Syscall { nr, args, result, output } => {
+            Event::Syscall {
+                nr,
+                args,
+                result,
+                output,
+            } => {
                 assert_eq!(nr, 1);
                 assert_eq!(args[0], 2);
                 assert_eq!(args[1], 0xCAFE_BA00);

@@ -51,7 +51,11 @@ struct XorShift(u64);
 impl XorShift {
     fn new(seed: u64) -> Self {
         // xorshift64 misbehaves on a zero state; remap deterministically.
-        Self(if seed == 0 { 0xDEAD_BEEF_CAFE_BABE } else { seed })
+        Self(if seed == 0 {
+            0xDEAD_BEEF_CAFE_BABE
+        } else {
+            seed
+        })
     }
 
     fn next_u64(&mut self) -> u64 {

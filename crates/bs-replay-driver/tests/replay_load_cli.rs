@@ -71,8 +71,7 @@ fn missing_args_returns_exit_code_two() {
     let (code, _, stderr) = run(&[]);
     assert_eq!(code, 2);
     assert!(
-        stderr.contains("missing TRACE_DIR")
-            || stderr.contains("missing program"),
+        stderr.contains("missing TRACE_DIR") || stderr.contains("missing program"),
         "stderr missing diagnostic: {stderr}",
     );
     assert!(stderr.contains("Usage:"));
@@ -92,11 +91,7 @@ fn unknown_flag_returns_exit_code_two() {
 #[cfg(target_os = "linux")]
 #[test]
 fn nonexistent_trace_dir_fails_cleanly() {
-    let (code, _, stderr) = run(&[
-        "/tmp/nonexistent-trace-dir-xyz",
-        "--",
-        "/bin/true",
-    ]);
+    let (code, _, stderr) = run(&["/tmp/nonexistent-trace-dir-xyz", "--", "/bin/true"]);
     // Either exit code 1 (trace open failed) or 3 (perms).
     assert!(
         code == 1 || code == 3,

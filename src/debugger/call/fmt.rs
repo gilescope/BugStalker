@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::debugger::call::{CallArgs, CallContext, CallHelper, RegType};
 use crate::{
     debugger::{
         Debugger, Error, TypeDeclaration,
@@ -11,8 +13,6 @@ use crate::{
     version::RustVersion,
     version_switch,
 };
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use crate::debugger::call::{CallArgs, CallContext, CallHelper, RegType};
 use indexmap::IndexMap;
 use itertools::Itertools;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]

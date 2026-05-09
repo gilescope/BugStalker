@@ -30,13 +30,13 @@
 use std::ffi::CString;
 use std::path::PathBuf;
 
+use bs_replay_engine::format::TraceReader;
+use bs_replay_engine::format::TraceWriter;
 use bs_replay_engine::format::event::Event;
 use bs_replay_engine::format::manifest::Manifest;
 use bs_replay_engine::format::version::FormatVersion;
-use bs_replay_engine::format::TraceReader;
-use bs_replay_engine::format::TraceWriter;
 use bs_replay_engine::record::linux::exit_stop::{
-    record_syscall_with_exit, wait_for_next_stop, ExitStopError, StopKind,
+    ExitStopError, StopKind, record_syscall_with_exit, wait_for_next_stop,
 };
 use bs_replay_engine::record::linux::ptrace_driver::ProcMemReader;
 use bs_replay_engine::record::linux::record_child;
@@ -71,10 +71,8 @@ fn temp_dir(label: &str) -> PathBuf {
 /// this host" rather than "regression".
 fn is_skip(err: &record_child::SpawnError) -> bool {
     let msg = format!("{err}");
-    matches!(
-        err,
-        record_child::SpawnError::ChildSetupFailed { .. }
-    ) || msg.contains("EPERM")
+    matches!(err, record_child::SpawnError::ChildSetupFailed { .. })
+        || msg.contains("EPERM")
         || msg.contains("EACCES")
         || msg.contains("ENOSYS")
         || msg.contains("64")
@@ -142,18 +140,18 @@ fn record_bin_true_round_trips_through_trace_reader() {
                         // Bail-out — runaway signals.
                         break;
                     }
-                    if let Err(e) = bs_replay_engine::record::linux::exit_stop::ptrace_cont(
-                        child.pid(), 0,
-                    ) {
+                    if let Err(e) =
+                        bs_replay_engine::record::linux::exit_stop::ptrace_cont(child.pid(), 0)
+                    {
                         eprintln!("ptrace_cont after signal failed: {e}");
                         break;
                     }
                 }
                 StopKind::PtraceEvent { .. } => {
                     // execve sets PTRACE_EVENT_EXEC; keep going.
-                    if let Err(e) = bs_replay_engine::record::linux::exit_stop::ptrace_syscall(
-                        child.pid(), 0,
-                    ) {
+                    if let Err(e) =
+                        bs_replay_engine::record::linux::exit_stop::ptrace_syscall(child.pid(), 0)
+                    {
                         eprintln!("ptrace_syscall after event failed: {e}");
                         break;
                     }
@@ -182,9 +180,7 @@ fn record_bin_true_round_trips_through_trace_reader() {
 
     // Round-trip through TraceReader.
     let reader = TraceReader::open(&dir).expect("reopen trace");
-    let segments = reader
-        .segment_event_ranges()
-        .expect("segment ranges");
+    let segments = reader.segment_event_ranges().expect("segment ranges");
     let total_events: u64 = segments.iter().map(|r| r.event_count).sum();
     assert!(
         total_events as usize >= captures.len(),
@@ -198,7 +194,12 @@ fn record_bin_true_round_trips_through_trace_reader() {
     let mut syscall_events = 0u64;
     while let Some(ev) = cursor.next().expect("cursor walk") {
         match ev {
-            Event::Syscall { nr, args, result, output } => {
+            Event::Syscall {
+                nr,
+                args,
+                result,
+                output,
+            } => {
                 syscall_events += 1;
                 let _ = CapturedSyscall::decode_output(nr, args, result, &output)
                     .expect("decode captured-output blob");

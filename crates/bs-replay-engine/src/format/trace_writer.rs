@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use lz4_flex::frame::FrameEncoder;
 use rkyv::rancor::Error as RkyvError;
 
-use super::checkpoint::{checkpoint_path, Checkpoint, CheckpointHeader, CheckpointIoError};
+use super::checkpoint::{Checkpoint, CheckpointHeader, CheckpointIoError, checkpoint_path};
 use super::event::Event;
 use super::manifest::Manifest;
-use super::segment::{segment_filename, Segment, SegmentHeader, MANIFEST_FILENAME};
+use super::segment::{MANIFEST_FILENAME, Segment, SegmentHeader, segment_filename};
 
 /// Default segment-size cap before auto-rotation, in *uncompressed*
 /// bytes. Tracks the plan's "~16 MB segments" target. Conservative
@@ -160,8 +160,7 @@ impl TraceWriter {
             segment.events.len(),
             "SegmentHeader.event_count desynced from events.len()",
         );
-        let archived = rkyv::to_bytes::<RkyvError>(&segment)
-            .map_err(TraceWriteError::Archive)?;
+        let archived = rkyv::to_bytes::<RkyvError>(&segment).map_err(TraceWriteError::Archive)?;
         let path = self.dir.join(segment_filename(self.next_segment));
         let file = File::create(&path)?;
         let mut encoder = FrameEncoder::new(BufWriter::new(file));

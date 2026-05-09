@@ -19,12 +19,12 @@ use rkyv::rancor::Error as RkyvError;
 use rkyv::vec::ArchivedVec;
 
 use super::checkpoint::{
-    checkpoint_path, parse_checkpoint_filename, Checkpoint, CheckpointHeader, CheckpointIoError,
+    Checkpoint, CheckpointHeader, CheckpointIoError, checkpoint_path, parse_checkpoint_filename,
 };
 use super::event::{ArchivedEvent, Event};
 use super::manifest::{Manifest, ManifestParseError};
 use super::segment::{
-    parse_segment_filename, ArchivedSegment, ArchivedSegmentHeader, Segment, MANIFEST_FILENAME,
+    ArchivedSegment, ArchivedSegmentHeader, MANIFEST_FILENAME, Segment, parse_segment_filename,
 };
 
 /// Range info for one segment: where in the global event-index
@@ -78,7 +78,9 @@ impl TraceReader {
             .map_err(|e| TraceReadError::ManifestIo(manifest_path.clone(), e))?;
         let manifest = Manifest::from_text(&manifest_text)?;
         if !manifest.format_version.is_supported() {
-            return Err(TraceReadError::UnsupportedVersion(manifest.format_version.0));
+            return Err(TraceReadError::UnsupportedVersion(
+                manifest.format_version.0,
+            ));
         }
 
         let mut segments: Vec<u64> = Vec::new();
@@ -214,10 +216,7 @@ impl TraceReader {
     /// future iteration could index PcMarker positions at open
     /// time (parallel to `segment_event_ranges`); first cut keeps
     /// the implementation simple.
-    pub fn pc_at_or_before(
-        &self,
-        event_index: u64,
-    ) -> Result<Option<u64>, TraceReadError> {
+    pub fn pc_at_or_before(&self, event_index: u64) -> Result<Option<u64>, TraceReadError> {
         let mut cursor = self.cursor();
         let mut last_pc: Option<u64> = None;
         for _ in 0..=event_index {
@@ -270,17 +269,15 @@ impl TraceReader {
     /// and `header.event_count == events.len()`.
     pub fn open_segment(&self, idx: u64) -> Result<SegmentReader, TraceReadError> {
         let path = self.dir.join(super::segment::segment_filename(idx));
-        let file = File::open(&path)
-            .map_err(|e| TraceReadError::SegmentIo(path.clone(), e))?;
+        let file = File::open(&path).map_err(|e| TraceReadError::SegmentIo(path.clone(), e))?;
         let mut decoder = FrameDecoder::new(file);
         let mut decompressed = Vec::with_capacity(64 * 1024);
         decoder
             .read_to_end(&mut decompressed)
             .map_err(|e| TraceReadError::SegmentIo(path.clone(), e))?;
 
-        let archived =
-            rkyv::access::<ArchivedSegment, RkyvError>(&decompressed)
-                .map_err(TraceReadError::Archive)?;
+        let archived = rkyv::access::<ArchivedSegment, RkyvError>(&decompressed)
+            .map_err(TraceReadError::Archive)?;
         let stored_idx = archived.header.index.to_native();
         let stored_count = archived.header.event_count.to_native();
         let actual_count = archived.events.len() as u64;
@@ -380,9 +377,7 @@ pub enum TraceReadError {
     #[error("trace archive: {0}")]
     Archive(RkyvError),
     /// Segment header's `index` did not match its filename.
-    #[error(
-        "segment {file_index} header reports index {header_index}; file/header disagree"
-    )]
+    #[error("segment {file_index} header reports index {header_index}; file/header disagree")]
     HeaderMismatch {
         /// Index parsed from the filename.
         file_index: u64,
@@ -405,9 +400,7 @@ pub enum TraceReadError {
     #[error("checkpoint: {0}")]
     Checkpoint(CheckpointIoError),
     /// Checkpoint header's `index` did not match its filename.
-    #[error(
-        "checkpoint {file_index} header reports index {header_index}; file/header disagree"
-    )]
+    #[error("checkpoint {file_index} header reports index {header_index}; file/header disagree")]
     CheckpointHeaderMismatch {
         /// Index parsed from the filename.
         file_index: u64,

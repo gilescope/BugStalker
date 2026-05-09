@@ -42,7 +42,10 @@ fn roundtrip_one_segment_one_hundred_events() {
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
     for i in 0..100u32 {
         writer
-            .write_event(Event::Marker { tag: i, data: u64::from(i) * 7 + 1 })
+            .write_event(Event::Marker {
+                tag: i,
+                data: u64::from(i) * 7 + 1,
+            })
             .unwrap();
     }
     writer.finish().unwrap();
@@ -75,15 +78,21 @@ fn roundtrip_multiple_segments_via_explicit_rotate() {
 
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
     for i in 0..10u32 {
-        writer.write_event(Event::Marker { tag: i, data: 1 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 1 })
+            .unwrap();
     }
     writer.rotate().unwrap();
     for i in 10..25u32 {
-        writer.write_event(Event::Marker { tag: i, data: 2 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 2 })
+            .unwrap();
     }
     writer.rotate().unwrap();
     for i in 25..27u32 {
-        writer.write_event(Event::Marker { tag: i, data: 3 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 3 })
+            .unwrap();
     }
     writer.finish().unwrap();
 
@@ -115,8 +124,12 @@ fn segment_archived_view_is_zero_copy() {
     let manifest = sample_manifest();
 
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
-    writer.write_event(Event::Marker { tag: 1, data: 11 }).unwrap();
-    writer.write_event(Event::Marker { tag: 2, data: 22 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 1, data: 11 })
+        .unwrap();
+    writer
+        .write_event(Event::Marker { tag: 2, data: 22 })
+        .unwrap();
     writer.finish().unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();
@@ -172,7 +185,9 @@ fn auto_rotates_when_estimated_size_exceeds_threshold() {
         .unwrap()
         .with_segment_size(56);
     for i in 0..5u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.finish().unwrap();
 
@@ -181,7 +196,14 @@ fn auto_rotates_when_estimated_size_exceeds_threshold() {
     let counts: Vec<usize> = reader
         .segment_indices()
         .iter()
-        .map(|&i| reader.open_segment(i).unwrap().events_owned().unwrap().len())
+        .map(|&i| {
+            reader
+                .open_segment(i)
+                .unwrap()
+                .events_owned()
+                .unwrap()
+                .len()
+        })
         .collect();
     assert_eq!(counts, vec![2, 2, 1]);
 
@@ -196,10 +218,11 @@ fn segment_header_index_mismatch_is_caught() {
     let dir = temp_trace_dir("hdr-mismatch");
     let manifest = sample_manifest();
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
-    writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
-    writer.finish().unwrap();
-    fs::rename(dir.join("event-000001.lz4"), dir.join("event-000099.lz4"))
+    writer
+        .write_event(Event::Marker { tag: 0, data: 0 })
         .unwrap();
+    writer.finish().unwrap();
+    fs::rename(dir.join("event-000001.lz4"), dir.join("event-000099.lz4")).unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();
     assert_eq!(reader.segment_indices(), &[99]);
@@ -216,7 +239,9 @@ fn segment_reader_exposes_header() {
     let manifest = sample_manifest();
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
     for _ in 0..3 {
-        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: 0, data: 0 })
+            .unwrap();
     }
     writer.finish().unwrap();
 
@@ -261,7 +286,12 @@ fn syscall_event_roundtrip_preserves_args_result_and_output() {
     let evs = segment.events_owned().unwrap();
     assert_eq!(evs.len(), 2);
     match &evs[0] {
-        Event::Syscall { nr, args, result, output } => {
+        Event::Syscall {
+            nr,
+            args,
+            result,
+            output,
+        } => {
             assert_eq!(*nr, 0);
             assert_eq!(args[0], 3);
             assert_eq!(args[1], 0xdead_beef);
@@ -272,7 +302,9 @@ fn syscall_event_roundtrip_preserves_args_result_and_output() {
         other => panic!("unexpected variant: {other:?}"),
     }
     match &evs[1] {
-        Event::Syscall { nr, result, output, .. } => {
+        Event::Syscall {
+            nr, result, output, ..
+        } => {
             assert_eq!(*nr, 3);
             assert_eq!(*result, 0);
             assert!(output.is_empty());
@@ -304,7 +336,12 @@ fn syscall_archived_view_uses_endian_aware_accessors() {
     let segment = reader.open_segment(1).unwrap();
     let archived = segment.events().unwrap();
     match &archived[0] {
-        ArchivedEvent::Syscall { nr, args, result, output } => {
+        ArchivedEvent::Syscall {
+            nr,
+            args,
+            result,
+            output,
+        } => {
             assert_eq!(nr.to_native(), 42);
             // Each archived arg is a little-endian u64; .to_native()
             // does the host-order conversion.
@@ -332,7 +369,12 @@ fn marker_only_traces_still_read_after_syscall_added() {
 
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
     for i in 0..5u32 {
-        writer.write_event(Event::Marker { tag: i, data: u64::from(i) }).unwrap();
+        writer
+            .write_event(Event::Marker {
+                tag: i,
+                data: u64::from(i),
+            })
+            .unwrap();
     }
     writer.finish().unwrap();
 
@@ -384,7 +426,11 @@ fn signal_event_roundtrip_preserves_siginfo_bytes() {
     let evs = reader.open_segment(1).unwrap().events_owned().unwrap();
     assert_eq!(evs.len(), 2);
     match &evs[0] {
-        Event::Signal { sig_no, pc, siginfo: bytes } => {
+        Event::Signal {
+            sig_no,
+            pc,
+            siginfo: bytes,
+        } => {
             assert_eq!(*sig_no, 11);
             assert_eq!(*pc, 0x4000_1234);
             assert_eq!(bytes, &siginfo);
@@ -392,7 +438,11 @@ fn signal_event_roundtrip_preserves_siginfo_bytes() {
         other => panic!("unexpected variant: {other:?}"),
     }
     match &evs[1] {
-        Event::Signal { sig_no, siginfo: bytes, .. } => {
+        Event::Signal {
+            sig_no,
+            siginfo: bytes,
+            ..
+        } => {
             assert_eq!(*sig_no, 17);
             assert!(bytes.is_empty());
         }
@@ -422,7 +472,11 @@ fn signal_archived_view_uses_endian_aware_accessors() {
     let segment = reader.open_segment(1).unwrap();
     let archived = segment.events().unwrap();
     match &archived[0] {
-        ArchivedEvent::Signal { sig_no, pc, siginfo } => {
+        ArchivedEvent::Signal {
+            sig_no,
+            pc,
+            siginfo,
+        } => {
             assert_eq!(sig_no.to_native(), 9);
             assert_eq!(pc.to_native(), 0xff00_aa55);
             assert_eq!(siginfo.as_slice(), &[1u8, 2, 3, 4]);
@@ -517,7 +571,11 @@ fn instruction_trap_archived_view_uses_endian_aware_accessors() {
     let segment = reader.open_segment(1).unwrap();
     let archived = segment.events().unwrap();
     match &archived[0] {
-        ArchivedEvent::InstructionTrap { pc, kind: _, result } => {
+        ArchivedEvent::InstructionTrap {
+            pc,
+            kind: _,
+            result,
+        } => {
             assert_eq!(pc.to_native(), 0xff00_aa55);
             assert_eq!(result.len(), 2);
             assert_eq!(result[0].to_native(), 42);
@@ -534,8 +592,12 @@ fn pc_marker_event_roundtrip() {
     let dir = temp_trace_dir("pc-marker");
     let manifest = sample_manifest();
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
-    writer.write_event(Event::PcMarker { pc: 0x4000_0000 }).unwrap();
-    writer.write_event(Event::PcMarker { pc: 0xff00_aa55 }).unwrap();
+    writer
+        .write_event(Event::PcMarker { pc: 0x4000_0000 })
+        .unwrap();
+    writer
+        .write_event(Event::PcMarker { pc: 0xff00_aa55 })
+        .unwrap();
     writer.finish().unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();
@@ -559,7 +621,11 @@ fn pc_marker_archived_view_uses_endian_aware_accessor() {
     let dir = temp_trace_dir("pc-marker-archived");
     let manifest = sample_manifest();
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
-    writer.write_event(Event::PcMarker { pc: 0xdead_beef_cafe_babe }).unwrap();
+    writer
+        .write_event(Event::PcMarker {
+            pc: 0xdead_beef_cafe_babe,
+        })
+        .unwrap();
     writer.finish().unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();
@@ -586,10 +652,16 @@ fn pc_at_or_before_returns_latest_pcmarker_in_prefix() {
     // event 3: Marker
     // event 4: Marker
     writer.write_event(Event::PcMarker { pc: 0xaa }).unwrap();
-    writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 1, data: 0 })
+        .unwrap();
     writer.write_event(Event::PcMarker { pc: 0xbb }).unwrap();
-    writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
-    writer.write_event(Event::Marker { tag: 3, data: 0 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 2, data: 0 })
+        .unwrap();
+    writer
+        .write_event(Event::Marker { tag: 3, data: 0 })
+        .unwrap();
     writer.finish().unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();
@@ -610,8 +682,12 @@ fn pc_at_or_before_returns_none_when_no_pcmarker_in_prefix() {
     let manifest = sample_manifest();
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
     // No PcMarker before event 2.
-    writer.write_event(Event::Marker { tag: 1, data: 0 }).unwrap();
-    writer.write_event(Event::Marker { tag: 2, data: 0 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 1, data: 0 })
+        .unwrap();
+    writer
+        .write_event(Event::Marker { tag: 2, data: 0 })
+        .unwrap();
     writer.write_event(Event::PcMarker { pc: 0xcc }).unwrap();
     writer.finish().unwrap();
 
@@ -635,23 +711,31 @@ fn marker_through_instructiontrap_traces_still_read_after_pcmarker_added() {
     let dir = temp_trace_dir("4-stable");
     let manifest = sample_manifest();
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
-    writer.write_event(Event::Marker { tag: 1, data: 100 }).unwrap();
-    writer.write_event(Event::Syscall {
-        nr: 0,
-        args: [3, 0, 8, 0, 0, 0],
-        result: 8,
-        output: vec![0xaa; 8],
-    }).unwrap();
-    writer.write_event(Event::Signal {
-        sig_no: 11,
-        pc: 0x4000_5678,
-        siginfo: vec![0xbb; 16],
-    }).unwrap();
-    writer.write_event(Event::InstructionTrap {
-        pc: 0x4000_9abc,
-        kind: InstructionTrapKind::Rdtsc,
-        result: vec![0xdead_beef_cafe_babe],
-    }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 1, data: 100 })
+        .unwrap();
+    writer
+        .write_event(Event::Syscall {
+            nr: 0,
+            args: [3, 0, 8, 0, 0, 0],
+            result: 8,
+            output: vec![0xaa; 8],
+        })
+        .unwrap();
+    writer
+        .write_event(Event::Signal {
+            sig_no: 11,
+            pc: 0x4000_5678,
+            siginfo: vec![0xbb; 16],
+        })
+        .unwrap();
+    writer
+        .write_event(Event::InstructionTrap {
+            pc: 0x4000_9abc,
+            kind: InstructionTrapKind::Rdtsc,
+            result: vec![0xdead_beef_cafe_babe],
+        })
+        .unwrap();
     writer.finish().unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();
@@ -659,7 +743,13 @@ fn marker_through_instructiontrap_traces_still_read_after_pcmarker_added() {
     assert!(matches!(evs[0], Event::Marker { tag: 1, data: 100 }));
     assert!(matches!(evs[1], Event::Syscall { nr: 0, .. }));
     assert!(matches!(evs[2], Event::Signal { sig_no: 11, .. }));
-    assert!(matches!(evs[3], Event::InstructionTrap { kind: InstructionTrapKind::Rdtsc, .. }));
+    assert!(matches!(
+        evs[3],
+        Event::InstructionTrap {
+            kind: InstructionTrapKind::Rdtsc,
+            ..
+        }
+    ));
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -675,7 +765,9 @@ fn marker_syscall_signal_only_traces_still_read_after_instructiontrap_added() {
     let dir = temp_trace_dir("3-stable");
     let manifest = sample_manifest();
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
-    writer.write_event(Event::Marker { tag: 1, data: 100 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 1, data: 100 })
+        .unwrap();
     writer
         .write_event(Event::Syscall {
             nr: 0,
@@ -714,14 +806,20 @@ fn marker_and_syscall_only_traces_still_read_after_signal_added() {
     let manifest = sample_manifest();
 
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
-    writer.write_event(Event::Marker { tag: 0, data: 100 }).unwrap();
-    writer.write_event(Event::Syscall {
-        nr: 0,
-        args: [3, 0, 16, 0, 0, 0],
-        result: 16,
-        output: vec![0xaa; 16],
-    }).unwrap();
-    writer.write_event(Event::Marker { tag: 1, data: 200 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 0, data: 100 })
+        .unwrap();
+    writer
+        .write_event(Event::Syscall {
+            nr: 0,
+            args: [3, 0, 16, 0, 0, 0],
+            result: 16,
+            output: vec![0xaa; 16],
+        })
+        .unwrap();
+    writer
+        .write_event(Event::Marker { tag: 1, data: 200 })
+        .unwrap();
     writer.finish().unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();
@@ -736,7 +834,9 @@ fn marker_and_syscall_only_traces_still_read_after_signal_added() {
         ),
     }
     match &evs[1] {
-        Event::Syscall { nr: 0, result: 16, .. } => {}
+        Event::Syscall {
+            nr: 0, result: 16, ..
+        } => {}
         other => panic!("Syscall at index 1 decoded as: {other:?}"),
     }
     match &evs[2] {
@@ -753,14 +853,20 @@ fn mixed_marker_and_syscall_traces_in_one_segment() {
     let manifest = sample_manifest();
 
     let mut writer = TraceWriter::create(&dir, &manifest).unwrap();
-    writer.write_event(Event::Marker { tag: 1, data: 1 }).unwrap();
-    writer.write_event(Event::Syscall {
-        nr: 0,
-        args: [0; 6],
-        result: 0,
-        output: vec![1, 2, 3],
-    }).unwrap();
-    writer.write_event(Event::Marker { tag: 2, data: 2 }).unwrap();
+    writer
+        .write_event(Event::Marker { tag: 1, data: 1 })
+        .unwrap();
+    writer
+        .write_event(Event::Syscall {
+            nr: 0,
+            args: [0; 6],
+            result: 0,
+            output: vec![1, 2, 3],
+        })
+        .unwrap();
+    writer
+        .write_event(Event::Marker { tag: 2, data: 2 })
+        .unwrap();
     writer.finish().unwrap();
 
     let reader = TraceReader::open(&dir).unwrap();

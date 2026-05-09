@@ -11,9 +11,7 @@
 //! [`bs_syscall_spec`] vocabulary.
 
 use bs_syscall_macro::syscall;
-use bs_syscall_spec::{
-    KNOWN_X86_64, Param, ParamKind, ReturnKind, ScalarKind, SyscallSpec,
-};
+use bs_syscall_spec::{KNOWN_X86_64, Param, ParamKind, ReturnKind, ScalarKind, SyscallSpec};
 
 /// Reference shape — every grammar production exercised once.
 /// Compared against an inline fixed expected slice so anyone
@@ -34,8 +32,14 @@ fn reference_set_emits_documented_shapes() {
             name: "read",
             nr: 0,
             params: &[
-                Param { name: "fd", kind: ParamKind::Fd },
-                Param { name: "buf", kind: ParamKind::OutBuf { len_param: "ret" } },
+                Param {
+                    name: "fd",
+                    kind: ParamKind::Fd,
+                },
+                Param {
+                    name: "buf",
+                    kind: ParamKind::OutBuf { len_param: "ret" },
+                },
                 Param {
                     name: "count",
                     kind: ParamKind::Scalar(ScalarKind::USize),
@@ -47,8 +51,14 @@ fn reference_set_emits_documented_shapes() {
             name: "write",
             nr: 1,
             params: &[
-                Param { name: "fd", kind: ParamKind::Fd },
-                Param { name: "buf", kind: ParamKind::InBuf { len_param: "count" } },
+                Param {
+                    name: "fd",
+                    kind: ParamKind::Fd,
+                },
+                Param {
+                    name: "buf",
+                    kind: ParamKind::InBuf { len_param: "count" },
+                },
                 Param {
                     name: "count",
                     kind: ParamKind::Scalar(ScalarKind::USize),
@@ -60,34 +70,68 @@ fn reference_set_emits_documented_shapes() {
             name: "open",
             nr: 2,
             params: &[
-                Param { name: "pathname", kind: ParamKind::InCStr },
-                Param { name: "flags", kind: ParamKind::Scalar(ScalarKind::I32) },
-                Param { name: "mode", kind: ParamKind::Scalar(ScalarKind::U32) },
+                Param {
+                    name: "pathname",
+                    kind: ParamKind::InCStr,
+                },
+                Param {
+                    name: "flags",
+                    kind: ParamKind::Scalar(ScalarKind::I32),
+                },
+                Param {
+                    name: "mode",
+                    kind: ParamKind::Scalar(ScalarKind::U32),
+                },
             ],
             ret: ReturnKind::I32,
         },
         SyscallSpec {
             name: "close",
             nr: 3,
-            params: &[Param { name: "fd", kind: ParamKind::Fd }],
+            params: &[Param {
+                name: "fd",
+                kind: ParamKind::Fd,
+            }],
             ret: ReturnKind::I32,
         },
         SyscallSpec {
             name: "mmap",
             nr: 9,
             params: &[
-                Param { name: "addr", kind: ParamKind::OpaquePtr },
-                Param { name: "length", kind: ParamKind::Scalar(ScalarKind::USize) },
-                Param { name: "prot", kind: ParamKind::Scalar(ScalarKind::I32) },
-                Param { name: "flags", kind: ParamKind::Scalar(ScalarKind::I32) },
-                Param { name: "fd", kind: ParamKind::Fd },
-                Param { name: "offset", kind: ParamKind::Scalar(ScalarKind::I64) },
+                Param {
+                    name: "addr",
+                    kind: ParamKind::OpaquePtr,
+                },
+                Param {
+                    name: "length",
+                    kind: ParamKind::Scalar(ScalarKind::USize),
+                },
+                Param {
+                    name: "prot",
+                    kind: ParamKind::Scalar(ScalarKind::I32),
+                },
+                Param {
+                    name: "flags",
+                    kind: ParamKind::Scalar(ScalarKind::I32),
+                },
+                Param {
+                    name: "fd",
+                    kind: ParamKind::Fd,
+                },
+                Param {
+                    name: "offset",
+                    kind: ParamKind::Scalar(ScalarKind::I64),
+                },
             ],
             ret: ReturnKind::U64,
         },
     ];
 
-    assert_eq!(REFERENCE.len(), expected.len(), "macro emitted unexpected entry count");
+    assert_eq!(
+        REFERENCE.len(),
+        expected.len(),
+        "macro emitted unexpected entry count"
+    );
     for (i, (a, b)) in REFERENCE.iter().zip(expected.iter()).enumerate() {
         assert_eq!(a.name, b.name, "entry {i} name");
         assert_eq!(a.nr, b.nr, "entry {i} ({}) nr", a.name);
@@ -111,7 +155,10 @@ fn reference_subset_appears_in_curated_table() {
     // the canonical curated table — REFERENCE is a strict subset.
     for r in REFERENCE {
         let canonical = bs_syscall_spec::lookup_x86_64(r.nr).unwrap_or_else(|| {
-            panic!("curated KNOWN_X86_64 missing entry for `{}` (nr={})", r.name, r.nr)
+            panic!(
+                "curated KNOWN_X86_64 missing entry for `{}` (nr={})",
+                r.name, r.nr
+            )
         });
         assert_eq!(
             canonical.name, r.name,

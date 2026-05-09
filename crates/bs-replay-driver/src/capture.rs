@@ -6,9 +6,9 @@
 //! enumerator feeds both: at write time we stamp what the recorder
 //! observed; at replay time we verify the host can play it back.
 
+use bs_replay_engine::VERSION as ENGINE_VERSION;
 use bs_replay_engine::format::manifest::Manifest;
 use bs_replay_engine::format::version::FormatVersion;
-use bs_replay_engine::VERSION as ENGINE_VERSION;
 
 use crate::host::host_features;
 
@@ -38,9 +38,8 @@ pub fn capture_host_manifest(build_id: impl Into<String>) -> Manifest {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "<unknown>".to_owned());
     let initial_args: Vec<String> = std::env::args().skip(1).collect();
-    let initial_env: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| !k.contains('='))
-        .collect();
+    let initial_env: Vec<(String, String)> =
+        std::env::vars().filter(|(k, _)| !k.contains('=')).collect();
 
     Manifest {
         format_version: FormatVersion::V1,
@@ -123,11 +122,12 @@ mod tests {
     #[test]
     fn recorded_at_is_populated_and_rfc3339() {
         let m = capture_host_manifest("ts");
-        let ts = m.recorded_at.expect("recorded_at must be Some after step 27");
+        let ts = m
+            .recorded_at
+            .expect("recorded_at must be Some after step 27");
         // Round-trip through chrono confirms the format is what
         // we claim. UTC means the offset must be `+00:00` or `Z`.
-        let parsed = chrono::DateTime::parse_from_rfc3339(&ts)
-            .expect("recorded_at not RFC 3339");
+        let parsed = chrono::DateTime::parse_from_rfc3339(&ts).expect("recorded_at not RFC 3339");
         assert_eq!(parsed.timezone(), chrono::FixedOffset::east_opt(0).unwrap());
     }
 

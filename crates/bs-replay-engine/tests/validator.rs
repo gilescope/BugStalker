@@ -9,9 +9,7 @@ use std::path::PathBuf;
 use bs_replay_engine::format::event::Event;
 use bs_replay_engine::format::manifest::Manifest;
 use bs_replay_engine::format::version::FormatVersion;
-use bs_replay_engine::format::{
-    DiagKind, TraceWriter, ValidationOptions, validate, validate_with,
-};
+use bs_replay_engine::format::{DiagKind, TraceWriter, ValidationOptions, validate, validate_with};
 
 fn sample_manifest() -> Manifest {
     Manifest {
@@ -40,7 +38,9 @@ fn temp_dir(label: &str) -> PathBuf {
 fn write_one_segment_per_event(dir: &PathBuf, count: u32) {
     let mut writer = TraceWriter::create(dir, &sample_manifest()).unwrap();
     for i in 0..count {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
         writer.rotate().unwrap();
     }
     writer.finish().unwrap();
@@ -57,15 +57,18 @@ fn clean_trace_is_replayable_with_only_info_findings() {
 
     let report = validate(&dir);
     assert!(report.is_replayable(), "errors: {:?}", report.errors);
-    assert!(report.warnings.is_empty(), "warnings: {:?}", report.warnings);
+    assert!(
+        report.warnings.is_empty(),
+        "warnings: {:?}",
+        report.warnings
+    );
     assert!(has(&report, DiagKind::TotalSegments));
     assert!(has(&report, DiagKind::TotalEvents));
-    let totals: Vec<&str> = report
-        .info
-        .iter()
-        .map(|d| d.message.as_str())
-        .collect();
-    assert!(totals.contains(&"3"), "expected segments/events of 3 in {totals:?}");
+    let totals: Vec<&str> = report.info.iter().map(|d| d.message.as_str()).collect();
+    assert!(
+        totals.contains(&"3"),
+        "expected segments/events of 3 in {totals:?}"
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -235,7 +238,9 @@ fn validate_with_lists_every_missing_host_feature() {
     m.cpu_features = vec!["sse2".into(), "avx".into(), "avx2".into()];
     {
         let mut writer = TraceWriter::create(&dir, &m).unwrap();
-        writer.write_event(Event::Marker { tag: 0, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: 0, data: 0 })
+            .unwrap();
         writer.finish().unwrap();
     }
     let opts = ValidationOptions {

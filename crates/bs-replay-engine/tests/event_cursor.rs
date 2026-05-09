@@ -38,15 +38,21 @@ fn temp_dir(label: &str) -> PathBuf {
 fn make_3_segment_trace(dir: &PathBuf) {
     let mut writer = TraceWriter::create(dir, &manifest()).unwrap();
     for i in 0..4u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.rotate().unwrap();
     for i in 4..9u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.rotate().unwrap();
     for i in 9..11u32 {
-        writer.write_event(Event::Marker { tag: i, data: 0 }).unwrap();
+        writer
+            .write_event(Event::Marker { tag: i, data: 0 })
+            .unwrap();
     }
     writer.finish().unwrap();
 }
@@ -170,7 +176,7 @@ fn cursor_seek_to_other_segment_reloads() {
     let mut cursor = reader.cursor();
 
     cursor.next().unwrap(); // loads seg1
-    cursor.seek_to(9);       // jumps to seg3
+    cursor.seek_to(9); // jumps to seg3
     let e9 = marker_tag(&cursor.next().unwrap().unwrap());
     let e10 = marker_tag(&cursor.next().unwrap().unwrap());
     assert_eq!(e9, 9);
@@ -223,7 +229,9 @@ fn cursor_yields_owned_syscall_events_too() {
     let reader = TraceReader::open(&dir).unwrap();
     let mut cursor = reader.cursor();
     match cursor.next().unwrap().unwrap() {
-        Event::Syscall { nr, result, output, .. } => {
+        Event::Syscall {
+            nr, result, output, ..
+        } => {
             assert_eq!(nr, 0);
             assert_eq!(result, 42);
             assert_eq!(output, vec![0xaa, 0xbb]);

@@ -578,10 +578,8 @@ impl Tracer {
                                 self.tracee_ctl.tracee_ensure(pid).pc()?.as_u64()
                                     - crate::debugger::breakpoint::Breakpoint::PC_ADJUST,
                             );
-                            let mb_hit_brkpt = tcx
-                                .breakpoints
-                                .iter()
-                                .find(|brkpt| brkpt.addr == trap_pc);
+                            let mb_hit_brkpt =
+                                tcx.breakpoints.iter().find(|brkpt| brkpt.addr == trap_pc);
                             let Some(&brkpt) = mb_hit_brkpt else {
                                 // A trap we didn't install — surface it as a
                                 // SIGTRAP signal-stop so the UI can report and
@@ -880,9 +878,8 @@ impl Tracer {
             // / watchpoints / EXC_BAD_ACCESS routing still works.
             // SAFETY: ptrace's signature is `(req, pid, addr, data)`
             // and PT_ATTACHEXC ignores `addr` and `data`.
-            let pt_rc = unsafe {
-                libc::ptrace(libc::PT_ATTACHEXC, pid.as_raw(), std::ptr::null_mut(), 0)
-            };
+            let pt_rc =
+                unsafe { libc::ptrace(libc::PT_ATTACHEXC, pid.as_raw(), std::ptr::null_mut(), 0) };
             if pt_rc < 0 {
                 let err = nix::errno::Errno::last();
                 log::warn!(
@@ -957,8 +954,7 @@ impl Tracer {
         use std::collections::HashSet;
 
         let state = self.darwin_state.as_mut().expect("supervision must exist");
-        let live = darwin_mach::task_threads_vec(state.task)
-            .map_err(|e| Error::from(e))?;
+        let live = darwin_mach::task_threads_vec(state.task).map_err(|e| Error::from(e))?;
 
         let mut seen_tids: HashSet<u64> = HashSet::new();
         let mut faulting_pid: Option<nix::unistd::Pid> = None;
@@ -1120,9 +1116,8 @@ impl Tracer {
                 // SAFETY: PT_CONTINUE takes `(req, pid, addr, data)`;
                 // addr==1 means "continue from current PC", data==0
                 // is "deliver no signal".
-                let pt_rc = unsafe {
-                    libc::ptrace(libc::PT_CONTINUE, pid.as_raw(), 1 as *mut _, 0)
-                };
+                let pt_rc =
+                    unsafe { libc::ptrace(libc::PT_CONTINUE, pid.as_raw(), 1 as *mut _, 0) };
                 if pt_rc < 0 {
                     let err = nix::errno::Errno::last();
                     if err != nix::errno::Errno::ESRCH {
@@ -1464,13 +1459,10 @@ impl Tracer {
         // Watchpoint may also fire mid-step if the stepped
         // instruction touched a watched address. Check the
         // exception type before declaring a clean step.
-        if exc.exception == EXC_BAD_ACCESS
-            && exc.codes.first().copied() == Some(EXC_ARM_DA_DEBUG)
-        {
+        if exc.exception == EXC_BAD_ACCESS && exc.codes.first().copied() == Some(EXC_ARM_DA_DEBUG) {
             let raw_pc = RegisterMap::current(pid)?.pc();
             let fault_addr = exc.codes.get(1).copied().unwrap_or(0) as usize;
-            let mut hwstate =
-                crate::debugger::register::debug::HardwareDebugState::current(pid)?;
+            let mut hwstate = crate::debugger::register::debug::HardwareDebugState::current(pid)?;
             if let Some(dr) = hwstate.detect_and_flush_hit(Some(fault_addr)) {
                 let _ = hwstate.sync(pid);
                 return Ok(Some(StopReason::Watchpoint(
@@ -1490,9 +1482,6 @@ impl Tracer {
 
         // Anything else: surface as a SignalStop with SIGTRAP
         // (matches the linux Tracer's catch-all shape).
-        Ok(Some(StopReason::SignalStop(
-            pid,
-            nix::sys::signal::SIGTRAP,
-        )))
+        Ok(Some(StopReason::SignalStop(pid, nix::sys::signal::SIGTRAP)))
     }
 }

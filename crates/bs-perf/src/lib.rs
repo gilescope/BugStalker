@@ -10,12 +10,24 @@
 //! > Hardware writes; debuggee runs naked; decoding waits for
 //! > the stop.
 //!
-//! ## Scope of this step (step 114)
+//! ## Scope of this step (steps 114-133)
 //!
-//! Crate scaffold + the cycles event opener. Subsequent steps
-//! layer the ring buffer drain (step 115), DWARF crossover
-//! (step 116), aggregator + UI (step 117–118), DAP overlay
-//! request (step 119).
+//! Crate scaffold, cycles event opener, and the mmap ring buffer
+//! drain/parser, plus a DWARF `.debug_line` resolver from sampled
+//! PCs to source frames, the in-memory aggregation model, and
+//! UI-facing overlay view models, and Rust-side DAP shapes for the
+//! overlay request. The root debugger integration owns live DAP
+//! wiring; this crate also exposes a pure-Rust Intel PT capability
+//! probe so the later precise tier can fail with concrete host
+//! diagnostics before full capture/decode lands; the Intel PT
+//! event attribute builder records the future capture syscall
+//! contract, and `IntelPtMonitor` opens the disabled PT event fd,
+//! maps the PT data ring/AUX buffer, drains AUX bytes, groups those
+//! resources behind a raw capture owner, and provides the first
+//! feature-gated libipt instruction decode boundary plus decoded-PT
+//! source attribution into the shared aggregator. The root debugger
+//! integration now also snapshots decode image sections for future
+//! live PT decode and has an opt-in PT live collector path.
 //!
 //! ## Tier coverage
 //!
@@ -24,7 +36,8 @@
 //! | Linux x86_64          | scaffold       | cycles+IP via `PERF_TYPE_HARDWARE`                                   |
 //! | Linux aarch64         | scaffold       | identical event setup; PMU differs                                   |
 //! | Darwin (cycles+IP)    | unavailable    | private kperf API not yet bound; M4-or-higher silicon floor          |
-//! | Intel PT              | future feature | precise x86 tier under `intel-pt` cargo feature; pulls in `libipt`   |
+//! | Intel PT              | decode boundary | raw capture plus feature-gated libipt instruction decode              |
+//! | AMD Processor Trace   | future feature | Phase 11 provider; AMD LBR Stack first, packet PT if exposed         |
 //! | ARM CoreSight ETM     | future feature | precise aarch64-linux tier under `coresight-etm`; needs              |
 //! |                       |                | `CONFIG_CORESIGHT` + board DTS support; OpenCSD-equivalent decoder   |
 //! | Apple Processor Trace | future feature | precise Darwin tier (Instruments 16.3 / M4+); ~1% overhead;          |
@@ -47,15 +60,21 @@
 //! UAPI structs; it's pure Rust. `libc` for the ioctl/close
 //! primitives we still need around the fd.
 //!
-//! The `intel-pt` cargo feature (future step) opts into libipt
-//! for the precise tier — that's the single explicit step that
-//! introduces C linkage, exactly as the plan calls out in
-//! §"Pure-Rust policy". Default `cargo build` stays C-dep-free.
+//! Intel PT packet decoding opts into libipt behind the `intel-pt`
+//! cargo feature — that's the single explicit step that introduces C
+//! linkage, exactly as the plan calls out in §"Pure-Rust policy". The
+//! default Intel PT probe/capture boundary remains pure Rust, so
+//! default `cargo build` stays C-dep-free.
 
 #![warn(missing_docs)]
 
+pub mod aggregator;
+pub mod dap;
+pub mod decoder;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod overlay;
+pub mod pt_decode;
 
 #[cfg(not(target_os = "linux"))]
 pub mod stub;
@@ -65,9 +84,9 @@ pub mod stub;
 // a real PerfMonitor; off-Linux it's a stub that returns
 // `Err(PerfError::Unsupported)`.
 #[cfg(target_os = "linux")]
-pub use linux::{open_cycles_for_pid, PerfMonitor};
+pub use linux::{PerfMonitor, open_cycles_for_pid};
 #[cfg(not(target_os = "linux"))]
-pub use stub::{open_cycles_for_pid, PerfMonitor};
+pub use stub::{PerfMonitor, open_cycles_for_pid};
 
 /// Single error type for the crate. Layered: kernel/syscall
 /// failures are wrapped; cross-platform unavailability has its
@@ -86,6 +105,78 @@ pub enum PerfError {
     /// in practice — usually means the fd was closed underneath.
     #[error("perf event ioctl: {0}")]
     Ioctl(std::io::Error),
+
+    /// Duplicating the perf event fd for an owned ring mapping failed.
+    #[error("perf event fd dup: {0}")]
+    FdDup(std::io::Error),
+
+    /// `mmap(2)` or `munmap(2)` failed for the perf ring buffer.
+    #[error("perf ring mmap: {0}")]
+    Mmap(std::io::Error),
+
+    /// The requested ring size cannot be represented as a perf
+    /// data ring. The kernel expects a non-zero, power-of-two
+    /// number of data pages after the metadata page.
+    #[error("invalid perf ring data page count {pages}; expected a non-zero power of two")]
+    InvalidRingPages {
+        /// Requested data-page count.
+        pages: usize,
+    },
+
+    /// The requested AUX trace buffer size cannot be represented as a
+    /// perf AUX ring. The kernel expects a non-zero, power-of-two
+    /// byte size that is also an exact number of pages.
+    #[error(
+        "invalid perf AUX buffer size {bytes}; expected a non-zero power-of-two multiple of page size {page_size}"
+    )]
+    InvalidAuxBufferSize {
+        /// Requested AUX byte size.
+        bytes: usize,
+        /// System page size observed while validating the request.
+        page_size: usize,
+    },
+
+    /// The kernel advanced `data_head` beyond the unread ring
+    /// capacity. We cannot recover record boundaries, so the
+    /// caller should report lost samples and reset the tail.
+    #[error("perf ring overrun: unread bytes {available} exceed ring size {data_size}")]
+    RingOverrun {
+        /// Bytes between `data_tail` and `data_head`.
+        available: u64,
+        /// Data-ring byte size.
+        data_size: u64,
+    },
+
+    /// The kernel advanced `aux_head` beyond the unread AUX trace
+    /// capacity. The captured packet stream for that window is no
+    /// longer contiguous.
+    #[error("perf AUX overrun: unread bytes {available} exceed AUX size {aux_size}")]
+    AuxOverrun {
+        /// Bytes between `aux_tail` and `aux_head`.
+        available: u64,
+        /// AUX ring byte size.
+        aux_size: u64,
+    },
+
+    /// A perf ring record was structurally invalid.
+    #[error("malformed perf ring record: {0}")]
+    MalformedRecord(&'static str),
+
+    /// Reading an object/debug-info file failed.
+    #[error("debug-info file I/O: {0}")]
+    DebugInfoIo(std::io::Error),
+
+    /// Parsing an object/debug-info file failed.
+    #[error("object file parse: {0}")]
+    Object(#[from] object::Error),
+
+    /// DWARF decoding failed.
+    #[error("DWARF line decode: {0}")]
+    Dwarf(#[from] gimli::Error),
+
+    /// Intel PT packet/instruction decoding failed.
+    #[error("Intel PT decode: {0}")]
+    PtDecode(String),
 
     /// The target platform doesn't have a perf monitor implementation.
     /// Currently: anything that isn't Linux. Callers display a

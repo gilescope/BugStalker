@@ -180,8 +180,8 @@ fn apply_format_spec(val: &Value, spec: FormatSpec) -> Option<String> {
 /// `[u8; N]` arrays. Falls back to `None` for non-byte shapes;
 /// the print handler logs a `warn!` and uses the default render.
 fn format_byte_slice(val: &Value, mode: ByteRenderMode) -> Option<String> {
-    use crate::debugger::variable::value::SupportedScalar;
     use crate::debugger::variable::value::ArrayValue;
+    use crate::debugger::variable::value::SupportedScalar;
     let render_array = |arr: &ArrayValue| -> Option<String> {
         let items = arr.items.as_ref()?;
         if items.is_empty() {
@@ -208,8 +208,7 @@ fn format_byte_slice(val: &Value, mode: ByteRenderMode) -> Option<String> {
     };
     match val {
         Value::Specialized {
-            value: Some(SpecializedValue::Vector(vec))
-            | Some(SpecializedValue::VecDeque(vec)),
+            value: Some(SpecializedValue::Vector(vec)) | Some(SpecializedValue::VecDeque(vec)),
             ..
         } => crate::debugger::variable::render::render_byte_slice_members(
             vec.structure.members.as_ref(),
@@ -284,8 +283,10 @@ fn format_iso(val: &Value) -> Option<String> {
         return None;
     };
     match spec_val {
-        SpecializedValue::SystemTime((sec, n_sec)) => chrono::DateTime::from_timestamp(*sec, *n_sec)
-            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
+        SpecializedValue::SystemTime((sec, n_sec)) => {
+            chrono::DateTime::from_timestamp(*sec, *n_sec)
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+        }
         SpecializedValue::Duration((secs, nanos)) => Some(format_iso_duration(*secs, *nanos)),
         _ => None,
     }
@@ -361,8 +362,14 @@ mod byte_format_spec_tests {
         // "hi" is valid utf-8 — Auto would render `b"hi"`. ForceHex
         // bypasses the probe and emits the dump anyway.
         let rendered = render_bytes(b"hi", ByteRenderMode::ForceHex, false);
-        assert!(rendered.contains("68 69"), "expected hex `68 69` in {rendered:?}");
-        assert!(rendered.contains("|hi|"), "expected ASCII column in {rendered:?}");
+        assert!(
+            rendered.contains("68 69"),
+            "expected hex `68 69` in {rendered:?}"
+        );
+        assert!(
+            rendered.contains("|hi|"),
+            "expected ASCII column in {rendered:?}"
+        );
     }
 
     #[test]
@@ -380,6 +387,9 @@ mod byte_format_spec_tests {
     #[test]
     fn truncated_marker_present() {
         let rendered = render_bytes(b"abc", ByteRenderMode::Auto, true);
-        assert!(rendered.ends_with(" …"), "expected trailing ellipsis in {rendered:?}");
+        assert!(
+            rendered.ends_with(" …"),
+            "expected trailing ellipsis in {rendered:?}"
+        );
     }
 }

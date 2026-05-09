@@ -61,11 +61,41 @@ attr.precise_ip = 2              // PEBS for low-skid sampling on Intel
 attr.disabled = 1                // enable when target is launched
 ```
 
+If the host PMU rejects `precise_ip = 2` with `EINVAL` or
+`EOPNOTSUPP`, the cycles opener retries with `precise_ip = 0`. That
+keeps the universal cycles tier working on AMD and older PMUs, with
+honest skid rather than a hard feature failure.
+
 Open one event per debuggee thread (or one per CPU with
 `PERF_FLAG_FD_NO_GROUP` and tid-filter). `mmap` a 256-page
 (1 MB) ring buffer per event. Track new threads via the existing
 thread-management plumbing in
 `src/debugger/debugee/tracee/`.
+
+Current implementation status: steps 114-133 have the pure-Rust
+cycles tier wired through the DAP server behind the root `perf`
+feature. On Linux, resume snapshots the debugger's current thread
+list, opens one cycles+IP monitor/ring per known TID, drains all
+active rings at the next stop, resolves sampled PCs via `.debug_line`
+with PIE load-bias handling, and aggregates the samples into
+`PerfData`. The stop path also reports currently attached threads
+that did not have a ring for the run. Opening rings exactly when
+threads appear during the running window remains pending. Intel PT
+has a pure-Rust host capability probe surfaced through DAP diagnostics;
+the PT event attribute builder, disabled event fd opener, data-ring
+mapping, AUX mapping, AUX byte drain, and raw capture owner are in
+place. A feature-gated `bs_perf::pt_decode` boundary now wraps libipt
+for instruction IP decode from raw AUX bytes plus executable image
+sections, and `SourceResolver`/`PerfData` now bridge decoded PT
+instructions into the same source-line counters as cycles samples. The
+DAP session also snapshots executable file-backed maps into
+`IntelPtDecodeConfig` when PT is available and reports
+`intelPt.decodeImageSectionCount` / `intelPt.decodeImageUnavailable`.
+`bs/perfOverlayEnable` now has an opt-in Intel PT path
+(`intelPt: true` or `precise: true`) that opens/drains PT captures per
+sampled TID and feeds AUX bytes through decode/source attribution when
+the build supports it. PT-capable Linux runtime verification remains
+pending.
 
 ### Intel PT (precise tier)
 
@@ -74,12 +104,12 @@ Behind cargo feature `intel-pt`. Open the `intel_pt` PMU type
 size: 64 MB AUX area + 4 MB data area per CPU, large enough to capture
 ~5 s of trace at 1 GHz.
 
-Decode at-stop with `libipt-rs` (binding to Intel's C `libipt`) plus
-`iced-x86` (pure Rust) for instruction info. We deliberately do NOT
-use `libxed` (Intel's C disassembler that ships with libipt) — the
-pure-Rust `iced-x86` is mature, fast, and aligns with the project's
-pure-Rust policy. Decoded events carry exact PC sequences; we
-aggregate them into `(file, line) -> cycle_count` via `.debug_line`.
+Decode at-stop with `libipt-rs` (binding to Intel's C `libipt`).
+Decoded events carry exact PC sequences; we aggregate them into
+`(file, line) -> cycle_count` via `.debug_line`. `iced-x86` remains a
+possible later supplement if we need richer instruction metadata, but
+the first decode boundary only needs IPs, instruction length, and
+libipt's speculative/truncated flags.
 
 `libipt` is the only C dependency in this entire phase. It is gated
 behind the `intel-pt` cargo feature; the default `bs-perf` build does
@@ -95,6 +125,75 @@ PT requires:
 Detection: if any precondition fails, log an info message and fall
 back to cycles sampling. PT remains opt-in for the user; the default
 is sampling.
+
+Current detection boundary: `bs_perf::linux::intel_pt` probes the
+`intel_pt` PMU type from sysfs and the `perf_event_paranoid` sysctl
+from procfs, returning structured availability, permission, missing
+PMU, unsupported-architecture, or malformed-file status. The probe is
+diagnostic only; event open/mmap and decode are separate boundaries.
+The active DAP server exposes this as `intelPt` on `bs/perfOverlay` and
+`bs/perfOverlayEnable` when built with the root `perf` feature.
+
+Current event-open boundary: `build_intel_pt_attr(pmu_type)` records
+the exact `perf_event_attr` shape for a PT event. It uses the
+discovered PMU type, keeps the event disabled until explicit capture,
+excludes kernel/hypervisor trace, requests sample ids on metadata
+records, and defines the planned 64 MiB AUX trace buffer plus 4 MiB
+data ring sizing constants.
+
+Current monitor boundary: `IntelPtMonitor` owns the disabled PT
+perf fd and exposes reset/enable/disable.
+
+Current mmap boundary: `IntelPtMonitor::mmap_data_ring` maps the PT
+perf data ring, and `mmap_aux_buffer` configures the metadata page's
+`aux_offset` / `aux_size` before mapping the AUX trace buffer.
+`IntelPtAuxBuffer::drain` copies visible AUX bytes into owned
+contiguous buffers after capture has been disabled and reports AUX
+overrun when the packet stream is no longer contiguous. The live
+collector consumes this through `IntelPtCapture`.
+
+Current raw-capture boundary: `IntelPtCapture` owns the PT monitor,
+data ring, and AUX buffer together. It provides `start` and
+`stop_and_drain`, returning metadata records, parser counters, raw AUX
+packet bytes, and AUX cursors for `bs_perf::pt_decode`. The DAP live
+collector opens this capture object when `intelPt` or `precise` is
+requested.
+
+Current decode boundary: `bs_perf::pt_decode` exposes
+`decode_intel_pt_instructions`. It accepts raw AUX bytes plus
+file-backed executable image sections, optionally takes CPU
+family/model/stepping for libipt errata, and returns bounded decoded
+instruction IPs. The implementation is compiled only with
+`bs-perf/intel-pt` on Linux x86/x86_64; all other builds keep the same
+typed API and return `Unsupported`.
+
+Current source-attribution boundary:
+`SourceResolver::resolve_decoded_pt_trace` maps decoded PT instruction
+IPs to source frames while preserving decode sync/error/truncation stats.
+`PerfData::record_resolved_pt_trace` then records that window into the
+same line counters and unresolved-sample accounting used by cycles
+sampling.
+
+Current DAP-session image boundary: when Intel PT is available at run
+start, the Linux perf session snapshots executable file-backed
+`/proc/<pid>/maps` entries into `IntelPtDecodeConfig` sections. The DAP
+`intelPt` diagnostic includes `decodeImageSectionCount` and
+`decodeImageUnavailable` so clients can distinguish "PT exists" from
+"PT exists and image context is ready for decode".
+
+Current live PT boundary: `bs/perfOverlayEnable` accepts
+`arguments.intelPt: true` or `arguments.precise: true`. The Linux DAP
+collector then opens one `IntelPtCapture` per sampled TID, starts it for
+the run window, drains it at stop, and attempts to aggregate decoded PT
+instructions through the same source-line model. `intelPt` diagnostics
+report request/active state and last-stop AUX/decode/source counters.
+Cycles sampling remains active if PT open, drain, or decode fails.
+
+AMD Processor Trace / AMD LBR Stack is deliberately deferred to
+Phase 11's cross-vendor precise-trace provider model. Phase 6 remains
+the Intel PT proving ground; Phase 11 decides whether a target AMD
+machine exposes instruction-exact packets or only branch-exact LBR
+records and reports that precision to Phase 5 and Phase 10 consumers.
 
 ### Ring buffer drain
 
@@ -155,8 +254,9 @@ decoding. Everything else is pure Rust.
 - Cycles + IP sampling tier (universal): pure Rust. Uses `rustix`
   (preferred) or `perf-event-open-sys` for `perf_event_open(2)`
   bindings; ring buffer drain is pure Rust.
-- Intel PT tier: `libipt` (C) gated behind cargo feature `intel-pt`;
-  paired with `iced-x86` (pure Rust) for instruction decoding.
+- Intel PT tier: `libipt` (C) gated behind cargo feature `intel-pt`
+  for instruction-flow decoding. Richer instruction metadata can add
+  `iced-x86` later if needed.
 - Darwin `kperf` tier: pure Rust FFI to Apple private symbols via
   `dlsym`; no C library bundled.
 - ARM SPE tier (future): expected to be pure Rust against

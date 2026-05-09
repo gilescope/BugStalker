@@ -374,8 +374,7 @@ pub fn disassemble_from_address(
     instruction_count: usize,
     timeout: Duration,
 ) -> anyhow::Result<Vec<DisasmInstruction>> {
-    let cs = new_capstone()
-        .map_err(|err| anyhow!("disassemble: init capstone: {err}"))?;
+    let cs = new_capstone().map_err(|err| anyhow!("disassemble: init capstone: {err}"))?;
     let max_len = 16usize;
     let read_len = instruction_count.saturating_mul(max_len).max(max_len);
     let start = Instant::now();
@@ -429,8 +428,7 @@ pub fn disassemble_from_range(
     let len = end_addr - start_addr;
     let max_len = 0x10000usize;
     let read_len = len.min(max_len);
-    let cs = new_capstone()
-        .map_err(|err| anyhow!("disassemble: init capstone: {err}"))?;
+    let cs = new_capstone().map_err(|err| anyhow!("disassemble: init capstone: {err}"))?;
     let start = Instant::now();
     let bytes = dbg
         .read_memory(start_addr, read_len)

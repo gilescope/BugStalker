@@ -17,14 +17,12 @@
 use nix::unistd::Pid;
 
 use super::checkpoint_capture::{
-    capture_writable_state, from_payload as writable_from_payload,
-    restore_writable_state, to_payload as writable_to_payload,
-    CaptureError, DecodeError, RestoreReport, WritableState,
+    CaptureError, DecodeError, RestoreReport, WritableState, capture_writable_state,
+    from_payload as writable_from_payload, restore_writable_state,
+    to_payload as writable_to_payload,
 };
 use super::fork_self::{ForkHandle, ForkMechanismError, LinuxForkSelfMechanism};
-use super::proc_regs::{
-    capture_registers, restore_registers, RegError, RegisterState,
-};
+use super::proc_regs::{RegError, RegisterState, capture_registers, restore_registers};
 use crate::ring::CheckpointMechanism;
 
 /// Pure-data half of a Tier 2 capture: writable memory plus
@@ -51,10 +49,7 @@ impl Tier2Capture {
     /// One-shot capture: fork(2) + raise(SIGSTOP) + PTRACE_SEIZE,
     /// then snapshot writable memory and registers. Returns the
     /// owned [`Tier2Capture`] on success.
-    pub fn capture(
-        mech: &mut LinuxForkSelfMechanism,
-        key: u64,
-    ) -> Result<Self, Tier2Error> {
+    pub fn capture(mech: &mut LinuxForkSelfMechanism, key: u64) -> Result<Self, Tier2Error> {
         let handle = mech.take(key)?;
         // Briefly let the kernel deliver the self-SIGSTOP.
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -91,10 +86,7 @@ impl Tier2Capture {
     }
 
     /// Drop the capture and SIGKILL the underlying fork.
-    pub fn kill(
-        self,
-        mech: &mut LinuxForkSelfMechanism,
-    ) -> Result<(), Tier2Error> {
+    pub fn kill(self, mech: &mut LinuxForkSelfMechanism) -> Result<(), Tier2Error> {
         mech.kill(self.handle).map_err(Tier2Error::Mechanism)
     }
 }
@@ -135,11 +127,12 @@ pub fn from_payload(bytes: &[u8]) -> Result<Tier2State, Tier2DecodeError> {
         });
     }
     let (reg_bytes, writable_bytes) = rest.split_at(reg_len);
-    let writable =
-        writable_from_payload(writable_bytes).map_err(Tier2DecodeError::Writable)?;
+    let writable = writable_from_payload(writable_bytes).map_err(Tier2DecodeError::Writable)?;
     Ok(Tier2State {
         writable,
-        regs: RegisterState { bytes: reg_bytes.to_vec() },
+        regs: RegisterState {
+            bytes: reg_bytes.to_vec(),
+        },
     })
 }
 
@@ -273,8 +266,7 @@ mod tests {
 
         // Perturb B at addr.
         let sentinel = vec![0xfe; 128];
-        write_bytes_at(b_handle.pid, addr, &sentinel)
-            .expect("write sentinel");
+        write_bytes_at(b_handle.pid, addr, &sentinel).expect("write sentinel");
 
         // Reconstruct an owned Tier2Capture-shaped value pointing
         // at A's PID — but for restore we just need the state.

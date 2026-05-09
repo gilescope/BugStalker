@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: MIT
 
 use crate::debugger::address::RelocatedAddress;
-use nix::unistd::Pid;
-use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use nix::libc;
+use nix::unistd::Pid;
 #[cfg(target_os = "linux")]
 use object::elf::DT_DEBUG;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct LinkMap {
@@ -128,18 +128,15 @@ impl Rendezvous {
         _sections: &HashMap<String, u64>,
     ) -> Result<Self, RendezvousError> {
         use crate::debugger::darwin_mach;
-        let task = darwin_mach::task_for_pid(proc_pid)
-            .map_err(|_| RendezvousError::NotFound)?;
-        let images = darwin_mach::dyld_image_list(task)
-            .map_err(|_| RendezvousError::NotFound)?;
+        let task = darwin_mach::task_for_pid(proc_pid).map_err(|_| RendezvousError::NotFound)?;
+        let images = darwin_mach::dyld_image_list(task).map_err(|_| RendezvousError::NotFound)?;
         if images.is_empty() {
             return Err(RendezvousError::NotFound);
         }
         // Best-effort: dyld may not have populated `notification`
         // yet — that's fine, callers retry once the inferior has
         // taken at least one stop.
-        let notification_addr =
-            darwin_mach::dyld_notification_addr(task).unwrap_or(0);
+        let notification_addr = darwin_mach::dyld_notification_addr(task).unwrap_or(0);
         Ok(Self {
             pid: proc_pid,
             images,
@@ -152,11 +149,7 @@ impl Rendezvous {
     /// linux's `link_map` head pointer.
     #[cfg(not(target_os = "linux"))]
     pub fn link_map_main(&self) -> RelocatedAddress {
-        let load = self
-            .images
-            .first()
-            .map(|i| i.load_addr)
-            .unwrap_or(0);
+        let load = self.images.first().map(|i| i.load_addr).unwrap_or(0);
         RelocatedAddress::from(load)
     }
 
@@ -173,10 +166,8 @@ impl Rendezvous {
     #[cfg(not(target_os = "linux"))]
     pub fn link_maps(&self) -> Result<Vec<LinkMap>, RendezvousError> {
         use crate::debugger::darwin_mach;
-        let task = darwin_mach::task_for_pid(self.pid)
-            .map_err(|_| RendezvousError::NotFound)?;
-        let images = darwin_mach::dyld_image_list(task)
-            .map_err(|_| RendezvousError::NotFound)?;
+        let task = darwin_mach::task_for_pid(self.pid).map_err(|_| RendezvousError::NotFound)?;
+        let images = darwin_mach::dyld_image_list(task).map_err(|_| RendezvousError::NotFound)?;
         Ok(images
             .into_iter()
             .map(|i| LinkMap {

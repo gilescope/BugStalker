@@ -677,15 +677,12 @@ impl ValueParser {
                     // parser that derefs to read the strong / weak
                     // counts; `Rc<T>` keeps the existing parse_rc
                     // pointer-only path.
-                    let value = if struct_name
-                        .as_ref()
-                        .map(|n| n.starts_with("Weak<"))
-                        == Some(true)
-                    {
-                        parser_ext.parse_weak(pcx, &struct_var)
-                    } else {
-                        parser_ext.parse_rc(pcx, &mut struct_var)
-                    };
+                    let value =
+                        if struct_name.as_ref().map(|n| n.starts_with("Weak<")) == Some(true) {
+                            parser_ext.parse_weak(pcx, &struct_var)
+                        } else {
+                            parser_ext.parse_rc(pcx, &mut struct_var)
+                        };
                     return Some(Value::Specialized {
                         value,
                         original: struct_var,
@@ -699,15 +696,12 @@ impl ValueParser {
                     && type_ns_h.contains(&["sync"])
                 {
                     // Phase 1 S15 — same Weak split for the sync flavour.
-                    let value = if struct_name
-                        .as_ref()
-                        .map(|n| n.starts_with("Weak<"))
-                        == Some(true)
-                    {
-                        parser_ext.parse_weak(pcx, &struct_var)
-                    } else {
-                        parser_ext.parse_arc(pcx, &mut struct_var)
-                    };
+                    let value =
+                        if struct_name.as_ref().map(|n| n.starts_with("Weak<")) == Some(true) {
+                            parser_ext.parse_weak(pcx, &struct_var)
+                        } else {
+                            parser_ext.parse_arc(pcx, &mut struct_var)
+                        };
                     return Some(Value::Specialized {
                         value,
                         original: struct_var,
@@ -729,10 +723,7 @@ impl ValueParser {
                 // `AtomicUsize`, `AtomicIsize`, `AtomicPtr<T>`. We
                 // detect by name prefix + namespace; `parse_atomic`
                 // peels the `UnsafeCell<T>` wrapper.
-                if struct_name
-                    .as_ref()
-                    .map(|name| name.starts_with("Atomic"))
-                    == Some(true)
+                if struct_name.as_ref().map(|name| name.starts_with("Atomic")) == Some(true)
                     && type_ns_h.contains(&["sync", "atomic"])
                 {
                     return Some(Value::Specialized {
@@ -771,7 +762,8 @@ impl ValueParser {
                     && type_ns_h.contains(&["ops", "range"])
                 {
                     return Some(Value::Specialized {
-                        value: parser_ext.parse_range(struct_name.as_deref().unwrap_or(""), &struct_var),
+                        value: parser_ext
+                            .parse_range(struct_name.as_deref().unwrap_or(""), &struct_var),
                         original: struct_var,
                     });
                 };
@@ -798,9 +790,7 @@ impl ValueParser {
                 // `std::time::Duration`. The type lives in `time` for
                 // both core and std re-exports; we accept either by
                 // matching the bare namespace component.
-                if struct_name.as_deref() == Some("Duration")
-                    && type_ns_h.contains(&["time"])
-                {
+                if struct_name.as_deref() == Some("Duration") && type_ns_h.contains(&["time"]) {
                     return Some(Value::Specialized {
                         value: parser_ext.parse_duration(&struct_var),
                         original: struct_var,
@@ -809,9 +799,7 @@ impl ValueParser {
 
                 // Phase 1 S12 — `alloc::ffi::c_str::CString`. Detect by
                 // exact name plus the `ffi` namespace component.
-                if struct_name.as_deref() == Some("CString")
-                    && type_ns_h.contains(&["ffi"])
-                {
+                if struct_name.as_deref() == Some("CString") && type_ns_h.contains(&["ffi"]) {
                     return Some(Value::Specialized {
                         value: parser_ext.parse_cstring(pcx, &struct_var),
                         original: struct_var,
@@ -821,9 +809,7 @@ impl ValueParser {
                 // Phase 1 S13 — `std::ffi::OsString`. The `ffi`
                 // namespace is shared with `CString`, so we
                 // discriminate on the type name alone.
-                if struct_name.as_deref() == Some("OsString")
-                    && type_ns_h.contains(&["ffi"])
-                {
+                if struct_name.as_deref() == Some("OsString") && type_ns_h.contains(&["ffi"]) {
                     return Some(Value::Specialized {
                         value: parser_ext.parse_os_string(pcx, &struct_var),
                         original: struct_var,
@@ -833,9 +819,7 @@ impl ValueParser {
                 // Phase 1 S14 — `std::path::PathBuf`. Wraps `OsString`
                 // wraps `Buf` wraps `Vec<u8>`; the BFS-based parser
                 // walks all four layers.
-                if struct_name.as_deref() == Some("PathBuf")
-                    && type_ns_h.contains(&["path"])
-                {
+                if struct_name.as_deref() == Some("PathBuf") && type_ns_h.contains(&["path"]) {
                     return Some(Value::Specialized {
                         value: parser_ext.parse_os_string(pcx, &struct_var),
                         original: struct_var,
@@ -848,9 +832,7 @@ impl ValueParser {
                 // The CStr / OsString parsers BFS for those fields,
                 // so we can route by the wrapper-name suffix.
                 if let Some(name) = struct_name.as_deref() {
-                    if name.ends_with("c_str::CStr")
-                        || name == "&CStr"
-                        || name.ends_with("::CStr")
+                    if name.ends_with("c_str::CStr") || name == "&CStr" || name.ends_with("::CStr")
                     {
                         return Some(Value::Specialized {
                             value: parser_ext.parse_cstring(pcx, &struct_var),
@@ -877,11 +859,7 @@ impl ValueParser {
                 // include the type parameters in the name string
                 // (`MaybeUninit<i32>`) so match by prefix. The name
                 // is unique to libcore so we don't gate on namespace.
-                if struct_name
-                    .as_ref()
-                    .map(|n| n.starts_with("MaybeUninit"))
-                    == Some(true)
-                {
+                if struct_name.as_ref().map(|n| n.starts_with("MaybeUninit")) == Some(true) {
                     return Some(Value::Specialized {
                         value: parser_ext.parse_maybe_uninit(&struct_var),
                         original: struct_var,
@@ -894,17 +872,14 @@ impl ValueParser {
                 // suffix on the type name + the `sync` namespace.
                 // Must be tested BEFORE `Mutex`/`RwLock` because
                 // `MutexGuard<i32>` matches `starts_with("Mutex")`.
-                if struct_name
-                    .as_ref()
-                    .map(|n| {
-                        n.starts_with("MutexGuard")
-                            || n.starts_with("MappedMutexGuard")
-                            || n.starts_with("RwLockReadGuard")
-                            || n.starts_with("RwLockWriteGuard")
-                            || n.starts_with("MappedRwLockReadGuard")
-                            || n.starts_with("MappedRwLockWriteGuard")
-                    })
-                    == Some(true)
+                if struct_name.as_ref().map(|n| {
+                    n.starts_with("MutexGuard")
+                        || n.starts_with("MappedMutexGuard")
+                        || n.starts_with("RwLockReadGuard")
+                        || n.starts_with("RwLockWriteGuard")
+                        || n.starts_with("MappedRwLockReadGuard")
+                        || n.starts_with("MappedRwLockWriteGuard")
+                }) == Some(true)
                     && type_ns_h.contains(&["sync"])
                 {
                     return Some(Value::Specialized {
@@ -989,11 +964,7 @@ impl ValueParser {
                 // type name `MaybeUninit` is unique to libcore so we
                 // match on it alone with a fallback `mem` namespace
                 // sanity check.
-                if union_name
-                    .as_ref()
-                    .map(|n| n.starts_with("MaybeUninit"))
-                    == Some(true)
-                {
+                if union_name.as_ref().map(|n| n.starts_with("MaybeUninit")) == Some(true) {
                     let parser_ext = VariableParserExtension::new(self);
                     return Some(Value::Specialized {
                         value: parser_ext.parse_maybe_uninit(&struct_var),
@@ -1229,8 +1200,7 @@ fn resolve_trait_object_concrete_type(
         if matches!(
             m.field_name.as_deref(),
             Some("vtable") | Some("v_table") | Some("vtbl")
-        )
-            && let Value::Pointer(p) = &m.value
+        ) && let Value::Pointer(p) = &m.value
         {
             return p.value.map(|raw| raw as u64);
         }

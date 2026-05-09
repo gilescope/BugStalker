@@ -10,13 +10,22 @@
 // `thread_db` only ships on linux (where libthread_db.so.1 actually
 // exists). On macOS the dependency itself isn't present in Cargo.toml
 // (target-conditional), so the import has to be cfg-gated to match.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 pub use ::thread_db::{Lib, Process, Thread, ThreadDbError};
 
-#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 pub use stub::{Lib, Process, Thread, ThreadDbError};
 
-#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 mod stub {
     use nix::unistd::Pid;
     use std::fmt;
@@ -27,10 +36,7 @@ mod stub {
 
     impl fmt::Display for ThreadDbError {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(
-                f,
-                "libthread_db is not available on this architecture"
-            )
+            write!(f, "libthread_db is not available on this architecture")
         }
     }
 

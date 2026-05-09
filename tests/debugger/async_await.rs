@@ -245,9 +245,7 @@ fn test_await_trace_join() {
         let any_branch_visible = direct_names
             .iter()
             .chain(multi_branch_names.iter().map(|s| s.as_str()))
-            .any(|n| {
-                n.ends_with("branch_a") || n.ends_with("branch_b") || n.ends_with("branch_c")
-            });
+            .any(|n| n.ends_with("branch_a") || n.ends_with("branch_b") || n.ends_with("branch_c"));
         assert!(
             any_branch_visible,
             "join active-branch frame missing — direct={direct_names:?} multi={multi_branch_names:?}",

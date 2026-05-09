@@ -1298,7 +1298,10 @@ fn test_stdio_dap_visualiser_list() -> anyhow::Result<()> {
         }
     };
 
-    assert_eq!(response["success"], true, "request should succeed: {response:?}");
+    assert_eq!(
+        response["success"], true,
+        "request should succeed: {response:?}"
+    );
     let visualisers = response["body"]["visualisers"]
         .as_array()
         .expect("body.visualisers should be an array");

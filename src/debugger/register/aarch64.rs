@@ -206,7 +206,11 @@ impl From<RegisterMap> for user_regs_struct {
 }
 
 #[cfg(target_os = "linux")]
-fn ptrace_regset(request: libc::c_uint, pid: Pid, regs: &mut user_regs_struct) -> Result<(), Error> {
+fn ptrace_regset(
+    request: libc::c_uint,
+    pid: Pid,
+    regs: &mut user_regs_struct,
+) -> Result<(), Error> {
     let mut iov = iovec {
         iov_base: regs as *mut _ as *mut c_void,
         iov_len: std::mem::size_of::<user_regs_struct>(),
@@ -460,9 +464,7 @@ impl From<RegisterMap> for DwarfRegisterMap {
 pub mod debug_impl {
     use crate::debugger::Error;
     use crate::debugger::darwin_mach::{self, arm_debug_state64_t};
-    use crate::debugger::register::debug::{
-        BreakCondition, BreakSize, DebugRegisterNumber,
-    };
+    use crate::debugger::register::debug::{BreakCondition, BreakSize, DebugRegisterNumber};
     use nix::unistd::Pid;
 
     pub type DebugAddressRegister = usize;
@@ -625,9 +627,7 @@ pub mod debug_impl {
 
     use crate::debugger::Error;
     use crate::debugger::error::Error::Ptrace;
-    use crate::debugger::register::debug::{
-        BreakCondition, BreakSize, DebugRegisterNumber,
-    };
+    use crate::debugger::register::debug::{BreakCondition, BreakSize, DebugRegisterNumber};
     use nix::errno::Errno;
     use nix::libc::{self, c_void, iovec};
     use nix::unistd::Pid;

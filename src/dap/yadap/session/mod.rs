@@ -24,6 +24,7 @@ pub mod data;
 pub mod frame;
 pub mod init;
 pub mod other;
+pub mod perf;
 pub mod source;
 
 pub struct DebugSession {
@@ -54,6 +55,8 @@ pub struct DebugSession {
     module_info: Option<init::ModuleInfo>,
     canceled_request_ids: HashSet<i64>,
     canceled_progress_ids: HashSet<String>,
+    #[cfg(feature = "perf")]
+    perf_overlay: perf::PerfOverlaySession,
 }
 
 const EXCEPTION_FILTER_SIGNAL: &str = "signal";
@@ -126,6 +129,8 @@ impl DebugSession {
             module_info: None,
             canceled_request_ids: HashSet::new(),
             canceled_progress_ids: HashSet::new(),
+            #[cfg(feature = "perf")]
+            perf_overlay: perf::PerfOverlaySession::default(),
         }
     }
 
@@ -199,6 +204,7 @@ impl DebugSession {
         self.vars.clear();
         self.scope_cache.clear();
         self.child_links.clear();
+        self.begin_perf_run();
     }
 
     fn enqueue_thread_event(&mut self, reason: &'static str, thread_id: i64) {
@@ -294,12 +300,18 @@ impl DebugSession {
                     thread_id,
                     description,
                 } => {
-                    let body = json!({
+                    self.finish_perf_stop();
+                    let mut body = json!({
                         "reason": reason,
                         "threadId": thread_id,
                         "allThreadsStopped": true,
                         "description": description,
                     });
+                    if let Some(perf) = self.perf_stopped_summary_body()
+                        && let Some(obj) = body.as_object_mut()
+                    {
+                        obj.insert("bs_perf".to_owned(), perf);
+                    }
                     self.send_event_raw("stopped", Some(body))?;
                 }
                 InternalEvent::Continued {
@@ -659,6 +671,10 @@ impl DebugSession {
             "bs/visualiserList" => self.handle_visualiser_list(req)?,
             // Phase 4 step 13 — per-session toggle.
             "bs/visualiserToggle" => self.handle_visualiser_toggle(req)?,
+            // Phase 6 step 120 — perf overlay DAP JSON boundary.
+            "bs/perfOverlay" => self.handle_perf_overlay(req)?,
+            "bs/perfOverlayEnable" => self.handle_perf_overlay_enable(req)?,
+            "bs/perfOverlayDisable" => self.handle_perf_overlay_disable(req)?,
             other => {
                 self.send_err(req, format!("Unsupported DAP command: {other}"))?;
             }

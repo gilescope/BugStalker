@@ -82,9 +82,7 @@ pub fn current_affinity_for_self() -> io::Result<AffinityMask> {
     // SAFETY: zero-init is the documented sentinel; the kernel
     // fills the mask via the pointer + size we pass.
     let mut set: libc::cpu_set_t = unsafe { mem::zeroed() };
-    let r = unsafe {
-        libc::sched_getaffinity(0, mem::size_of::<libc::cpu_set_t>(), &mut set)
-    };
+    let r = unsafe { libc::sched_getaffinity(0, mem::size_of::<libc::cpu_set_t>(), &mut set) };
     if r != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -122,9 +120,7 @@ pub fn pin_to_single_cpu_for_self(cpu: u32) -> Result<SingleCpuPin, AffinityErro
     // local was zeroed above so the resulting mask has exactly
     // one bit set.
     unsafe { libc::CPU_SET(cpu as usize, &mut set) };
-    let r = unsafe {
-        libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set)
-    };
+    let r = unsafe { libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set) };
     if r != 0 {
         return Err(AffinityError::SetFailed(io::Error::last_os_error()));
     }
@@ -142,9 +138,7 @@ impl SingleCpuPin {
         for c in &self.previous.cpus {
             unsafe { libc::CPU_SET(*c as usize, &mut set) };
         }
-        let r = unsafe {
-            libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set)
-        };
+        let r = unsafe { libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &set) };
         if r != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -227,7 +221,9 @@ mod tests {
         // CPU 4096 is well outside any plausible mask.
         let err = pin_to_single_cpu_for_self(4096).unwrap_err();
         match err {
-            AffinityError::CpuNotInCurrentMask { requested: 4096, .. } => {}
+            AffinityError::CpuNotInCurrentMask {
+                requested: 4096, ..
+            } => {}
             other => panic!("expected CpuNotInCurrentMask, got {other:?}"),
         }
     }

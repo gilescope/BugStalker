@@ -403,8 +403,7 @@ impl<'a> DwarfUnwinder<'a> {
             // Synthesise registers for the caller frame: x29 = next_fp,
             // x30 = lr, sp = fp + 16 (caller's sp = our fp record top),
             // pc = lr.
-            let mut next_regs: DwarfRegisterMap =
-                DwarfRegisterMap::from(raw_registers.clone());
+            let mut next_regs: DwarfRegisterMap = DwarfRegisterMap::from(raw_registers.clone());
             let dw_x29 = Register::X29
                 .dwarf_register()
                 .expect("aarch64 x29 has a dwarf register number");

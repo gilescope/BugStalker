@@ -94,8 +94,7 @@ mod tests {
     fn rkyv_roundtrip() {
         let v = FormatVersion::V1;
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&v).unwrap();
-        let back =
-            rkyv::from_bytes::<FormatVersion, rkyv::rancor::Error>(&bytes).unwrap();
+        let back = rkyv::from_bytes::<FormatVersion, rkyv::rancor::Error>(&bytes).unwrap();
         assert_eq!(v, back);
     }
 }

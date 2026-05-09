@@ -21,7 +21,7 @@ use std::fs;
 use std::path::Path;
 
 use super::manifest::{Manifest, ManifestParseError};
-use super::segment::{parse_segment_filename, MANIFEST_FILENAME};
+use super::segment::{MANIFEST_FILENAME, parse_segment_filename};
 use super::trace_reader::{TraceReadError, TraceReader};
 
 /// Severity level of a validator finding.
@@ -125,7 +125,13 @@ pub struct Diag {
 
 impl fmt::Display for Diag {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: [{}] {}", self.severity, self.kind.code(), self.message)
+        write!(
+            f,
+            "{}: [{}] {}",
+            self.severity,
+            self.kind.code(),
+            self.message
+        )
     }
 }
 
@@ -154,7 +160,11 @@ impl ValidationReport {
     }
 
     fn push(&mut self, severity: Severity, kind: DiagKind, message: impl Into<String>) {
-        let diag = Diag { severity, kind, message: message.into() };
+        let diag = Diag {
+            severity,
+            kind,
+            message: message.into(),
+        };
         match severity {
             Severity::Error => self.errors.push(diag),
             Severity::Warning => self.warnings.push(diag),
@@ -166,11 +176,19 @@ impl ValidationReport {
 impl fmt::Display for ValidationReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.is_replayable() && self.warnings.is_empty() {
-            writeln!(f, "trace OK ({} segments, {} events)",
-                self.info.iter().find(|d| d.kind == DiagKind::TotalSegments)
-                    .map(|d| d.message.as_str()).unwrap_or("?"),
-                self.info.iter().find(|d| d.kind == DiagKind::TotalEvents)
-                    .map(|d| d.message.as_str()).unwrap_or("?"),
+            writeln!(
+                f,
+                "trace OK ({} segments, {} events)",
+                self.info
+                    .iter()
+                    .find(|d| d.kind == DiagKind::TotalSegments)
+                    .map(|d| d.message.as_str())
+                    .unwrap_or("?"),
+                self.info
+                    .iter()
+                    .find(|d| d.kind == DiagKind::TotalEvents)
+                    .map(|d| d.message.as_str())
+                    .unwrap_or("?"),
             )?;
             return Ok(());
         }
@@ -254,7 +272,11 @@ pub fn validate_with(dir: impl AsRef<Path>, opts: &ValidationOptions<'_>) -> Val
             report.push(
                 Severity::Error,
                 DiagKind::ManifestMissing,
-                format!("expected `{}` at {}", MANIFEST_FILENAME, manifest_path.display()),
+                format!(
+                    "expected `{}` at {}",
+                    MANIFEST_FILENAME,
+                    manifest_path.display()
+                ),
             );
             None
         }
@@ -376,7 +398,10 @@ pub fn validate_with(dir: impl AsRef<Path>, opts: &ValidationOptions<'_>) -> Val
                                 format!("segment {idx}: {e}"),
                             ),
                         },
-                        Err(TraceReadError::HeaderMismatch { file_index, header_index }) => {
+                        Err(TraceReadError::HeaderMismatch {
+                            file_index,
+                            header_index,
+                        }) => {
                             report.push(
                                 Severity::Error,
                                 DiagKind::SegmentHeaderIndexMismatch,

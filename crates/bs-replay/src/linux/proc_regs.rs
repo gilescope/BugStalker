@@ -82,10 +82,7 @@ fn capture_arch(pid: Pid) -> Result<RegisterState, RegError> {
     // SAFETY: user_regs_struct is POD; reinterpreting its
     // memory as &[u8] for the duration of the copy is sound.
     unsafe {
-        let src = std::slice::from_raw_parts(
-            &regs as *const _ as *const u8,
-            n,
-        );
+        let src = std::slice::from_raw_parts(&regs as *const _ as *const u8, n);
         bytes.extend_from_slice(src);
     }
     Ok(RegisterState { bytes })
@@ -96,9 +93,8 @@ fn restore_arch(pid: Pid, bytes: &[u8]) -> Result<(), RegError> {
     // Reconstruct the user_regs_struct from bytes and call
     // setregs. The struct is POD so a read_unaligned is fine
     // even if the buffer's start isn't 8-aligned.
-    let regs: libc::user_regs_struct = unsafe {
-        std::ptr::read_unaligned(bytes.as_ptr() as *const _)
-    };
+    let regs: libc::user_regs_struct =
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const _) };
     nix::sys::ptrace::setregs(pid, regs)?;
     Ok(())
 }
@@ -188,15 +184,14 @@ mod tests {
     fn arch_byte_len_is_nontrivial() {
         let n = RegisterState::arch_byte_len();
         // x86_64: 216, aarch64: 272.
-        assert!(
-            n == 216 || n == 272,
-            "unexpected arch byte len: {n}",
-        );
+        assert!(n == 216 || n == 272, "unexpected arch byte len: {n}",);
     }
 
     #[test]
     fn restore_rejects_wrong_len() {
-        let bad = RegisterState { bytes: vec![0u8; 7] };
+        let bad = RegisterState {
+            bytes: vec![0u8; 7],
+        };
         let err = restore_registers(Pid::from_raw(1), &bad).unwrap_err();
         match err {
             RegError::WrongLen { got: 7, expected } => {
@@ -277,18 +272,15 @@ mod tests {
             // before it). Reconstruct, flip, restore.
             const RAX_OFFSET: usize = 80;
             const SENTINEL: u64 = 0xdead_beef_cafe_babe;
-            state.bytes[RAX_OFFSET..RAX_OFFSET + 8]
-                .copy_from_slice(&SENTINEL.to_le_bytes());
+            state.bytes[RAX_OFFSET..RAX_OFFSET + 8].copy_from_slice(&SENTINEL.to_le_bytes());
             restore_registers(h.pid, &state).expect("setregs failed");
             let recaptured = capture_registers(h.pid).expect("getregs2 failed");
             let read_back = u64::from_le_bytes(
                 recaptured.bytes[RAX_OFFSET..RAX_OFFSET + 8]
-                    .try_into().unwrap(),
+                    .try_into()
+                    .unwrap(),
             );
-            assert_eq!(
-                read_back, SENTINEL,
-                "rax did not survive setregs roundtrip",
-            );
+            assert_eq!(read_back, SENTINEL, "rax did not survive setregs roundtrip",);
             mech.kill(h).expect("kill failed");
         }
     }

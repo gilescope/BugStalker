@@ -161,10 +161,7 @@ impl Drop for ReplayChild {
     fn drop(&mut self) {
         if !self.cleaned_up {
             if let Err(e) = self.do_shutdown() {
-                tracing::warn!(
-                    "ReplayChild::drop: cleanup(pid={}) failed: {e}",
-                    self.pid,
-                );
+                tracing::warn!("ReplayChild::drop: cleanup(pid={}) failed: {e}", self.pid,);
             }
         }
     }
