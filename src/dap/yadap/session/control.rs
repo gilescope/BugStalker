@@ -31,6 +31,10 @@ impl super::DebugSession {
         self.debugger
             .as_ref()
             .map(|d| d.ecx().pid_on_focus().as_raw() as i64)
+            .or_else(|| {
+                self.has_replay_session()
+                    .then_some(super::replay::REPLAY_THREAD_ID)
+            })
     }
 
     fn literal_truthy(literal: &Literal) -> bool {
@@ -357,6 +361,7 @@ impl super::DebugSession {
 
         self.begin_stop_epoch();
         let _ = self.refresh_threads_with_events();
+        self.capture_live_reverse_stop();
 
         let (source_path, line, column, stack_trace) = self
             .debugger
@@ -505,6 +510,7 @@ impl super::DebugSession {
                 });
                 self.send_success_body(req, json!({"allThreadsContinued": true}))?;
                 self.begin_stop_epoch();
+                self.capture_live_reverse_stop();
 
                 self.last_stop = Some(LastStop {
                     reason: "pause".to_string(),
@@ -555,6 +561,7 @@ impl super::DebugSession {
                 });
                 self.send_success_body(req, json!({"allThreadsContinued": true}))?;
                 self.begin_stop_epoch();
+                self.capture_live_reverse_stop();
 
                 let thread_id = self.current_thread_id();
                 self.enqueue_event(InternalEvent::Stopped {
@@ -595,6 +602,7 @@ impl super::DebugSession {
                 });
                 self.send_success_body(req, json!({"allThreadsContinued": true}))?;
                 self.begin_stop_epoch();
+                self.capture_live_reverse_stop();
 
                 let thread_id = self.current_thread_id();
                 self.enqueue_event(InternalEvent::Stopped {
@@ -618,7 +626,9 @@ impl super::DebugSession {
         }
     }
 
-    fn current_stop_snapshot(&self) -> (Option<String>, Option<i64>, Option<i64>, Option<String>) {
+    pub(super) fn current_stop_snapshot(
+        &self,
+    ) -> (Option<String>, Option<i64>, Option<i64>, Option<String>) {
         self.debugger
             .as_ref()
             .and_then(|dbg| {
@@ -668,6 +678,7 @@ impl super::DebugSession {
     ) -> anyhow::Result<()> {
         self.begin_stop_epoch();
         let _ = self.refresh_threads_with_events();
+        self.capture_live_reverse_stop();
 
         let (source_path, line, column, stack_trace) = self.current_stop_snapshot();
 
@@ -936,6 +947,9 @@ impl super::DebugSession {
     }
 
     pub(super) fn handle_step_back(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        if self.has_replay_session() {
+            return self.handle_replay_step_back(req);
+        }
         let args = req
             .arguments
             .as_object()
@@ -952,13 +966,13 @@ impl super::DebugSession {
             return self.send_err(req, "stepBack: threadId must be non-negative");
         }
         let _ = i32::try_from(thread_id).map_err(|_| anyhow!("stepBack: threadId out of range"))?;
-        self.send_err(
-            req,
-            "stepBack: reverse execution is not supported by the current engine",
-        )
+        self.handle_live_step_back(req, thread_id)
     }
 
     pub(super) fn handle_reverse_continue(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        if self.has_replay_session() {
+            return self.handle_replay_reverse_continue(req);
+        }
         let args = req
             .arguments
             .as_object()

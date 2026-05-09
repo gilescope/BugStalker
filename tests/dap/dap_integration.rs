@@ -2,10 +2,16 @@
 use crate::dap_client;
 
 use base64::Engine as _;
+use bs_replay_driver::engine::format::TraceWriter;
+use bs_replay_driver::engine::format::event::Event;
+use bs_replay_driver::engine::format::manifest::Manifest;
+use bs_replay_driver::engine::format::version::FormatVersion;
 use dap_client::{DapSession, example_bin, example_source, spawn_attach_target, wait_for_exit};
 use serde_json::{Value, json};
 use serial_test::serial;
+use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const HELLO_LINE: i64 = 5;
@@ -146,6 +152,17 @@ fn first_frame_id(session: &mut DapSession, thread_id: i64) -> anyhow::Result<Op
     Ok(Some(frame_id))
 }
 
+fn top_frame_line(session: &mut DapSession, thread_id: i64) -> anyhow::Result<Option<i64>> {
+    let stack_seq = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let stack_response = session.client.read_response(stack_seq)?;
+    if !assert_response(&stack_response, "stackTrace", stack_seq, true) {
+        return Ok(None);
+    }
+    Ok(stack_response["body"]["stackFrames"][0]["line"].as_i64())
+}
+
 fn wait_for_event_or_terminated(
     session: &mut DapSession,
     event_name: &str,
@@ -167,6 +184,33 @@ fn wait_for_event_or_terminated(
             _ => continue,
         }
     }
+}
+
+fn replay_manifest() -> Manifest {
+    Manifest {
+        format_version: FormatVersion::V1,
+        build_id: "deadbeef".repeat(8),
+        kernel_release: "test".to_owned(),
+        cpu_features: vec![],
+        engine_version: env!("CARGO_PKG_VERSION").to_owned(),
+        initial_env: vec![],
+        initial_cwd: "/tmp".to_owned(),
+        initial_args: vec![],
+        recorded_at: None,
+        initial_fds: vec![],
+    }
+}
+
+fn temp_replay_trace(label: &str) -> anyhow::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("bs-dap-replay-{label}-{}", std::process::id(),));
+    let _ = fs::remove_dir_all(&dir);
+
+    let mut writer = TraceWriter::create(&dir, &replay_manifest())?;
+    writer.write_event(Event::Marker { tag: 1, data: 0 })?;
+    writer.write_event(Event::Marker { tag: 2, data: 0 })?;
+    writer.write_event(Event::Marker { tag: 3, data: 0 })?;
+    writer.finish()?;
+    Ok(dir)
 }
 
 #[test]
@@ -262,6 +306,38 @@ fn test_set_breakpoints_request() -> anyhow::Result<()> {
     assert!(bp_response["body"]["breakpoints"].is_array());
     let event = session.client.wait_for_event("breakpoint")?;
     assert_eq!(event["event"], "breakpoint");
+    session.shutdown();
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_set_breakpoint_slides_from_blank_line() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    initialize(&mut session)?;
+    let program = example_bin("hello_world");
+    let launch_seq = session
+        .client
+        .send_request("launch", json!({ "program": program }))?;
+    let launch_response = session.client.read_response(launch_seq)?;
+    ensure_response!(session, &launch_response, "launch", launch_seq, true);
+
+    let bp_seq = session.client.send_request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": example_source("examples/hello_world/src/hello_world.rs") },
+            "breakpoints": [{ "line": 3 }],
+        }),
+    )?;
+    let bp_response = session.client.read_response(bp_seq)?;
+    ensure_response!(session, &bp_response, "setBreakpoints", bp_seq, true);
+    let bp = &bp_response["body"]["breakpoints"][0];
+    assert_eq!(bp["verified"].as_bool(), Some(true));
+    assert!(
+        bp["line"].as_i64().unwrap_or_default() > 3,
+        "breakpoint should bind to the next statement: {bp_response}"
+    );
+
     session.shutdown();
     Ok(())
 }
@@ -648,6 +724,131 @@ fn test_step_back_request() -> anyhow::Result<()> {
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "stepBack", seq, false);
     session.shutdown();
+    Ok(())
+}
+
+#[test]
+#[serial]
+#[cfg(target_os = "macos")]
+fn test_live_step_back_restores_previous_stop() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    assert_eq!(top_frame_line(&mut session, thread_id)?, Some(HELLO_LINE));
+
+    let next_seq = session
+        .client
+        .send_request("next", json!({ "threadId": thread_id }))?;
+    let next_response = session.client.read_response(next_seq)?;
+    ensure_response!(session, &next_response, "next", next_seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    let stepped_line = top_frame_line(&mut session, thread_id)?;
+    assert_ne!(stepped_line, Some(HELLO_LINE));
+
+    let step_back_seq = session
+        .client
+        .send_request("stepBack", json!({ "threadId": thread_id }))?;
+    let step_back_response = session.client.read_response(step_back_seq)?;
+    ensure_response!(
+        session,
+        &step_back_response,
+        "stepBack",
+        step_back_seq,
+        true
+    );
+    let stopped = session.client.wait_for_event("stopped")?;
+    assert_eq!(
+        stopped
+            .get("body")
+            .and_then(|b| b.get("reason"))
+            .and_then(Value::as_str),
+        Some("step")
+    );
+
+    assert_eq!(top_frame_line(&mut session, thread_id)?, Some(HELLO_LINE));
+
+    session.shutdown();
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_step_back_request_with_loaded_replay_trace() -> anyhow::Result<()> {
+    let trace_dir = temp_replay_trace("step-back")?;
+    let mut session = DapSession::start()?;
+    initialize(&mut session)?;
+
+    let launch_seq = session.client.send_request(
+        "launch",
+        json!({ "tracePath": trace_dir.to_string_lossy() }),
+    )?;
+    let launch_response = session.client.read_response(launch_seq)?;
+    ensure_response!(session, &launch_response, "launch", launch_seq, true);
+    assert_eq!(launch_response["body"]["totalEvents"], 3);
+    assert_eq!(launch_response["body"]["eventIndex"], 3);
+
+    let config_seq = session
+        .client
+        .send_request("configurationDone", json!({}))?;
+    let config_response = session.client.read_response(config_seq)?;
+    ensure_response!(
+        session,
+        &config_response,
+        "configurationDone",
+        config_seq,
+        true
+    );
+    let _ = session.client.wait_for_event("stopped")?;
+
+    let seq = session
+        .client
+        .send_request("stepBack", json!({ "threadId": 1 }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "stepBack", seq, true);
+    assert_eq!(response["body"]["eventIndex"], 2);
+
+    let stopped = session.client.wait_for_event("stopped")?;
+    assert_eq!(
+        stopped
+            .get("body")
+            .and_then(|b| b.get("reason"))
+            .and_then(Value::as_str),
+        Some("step")
+    );
+    assert_eq!(
+        stopped
+            .get("body")
+            .and_then(|b| b.get("threadId"))
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+
+    let threads_seq = session.client.send_request("threads", json!({}))?;
+    let threads_response = session.client.read_response(threads_seq)?;
+    ensure_response!(session, &threads_response, "threads", threads_seq, true);
+    assert_eq!(threads_response["body"]["threads"][0]["id"], 1);
+
+    let stack_seq = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": 1 }))?;
+    let stack_response = session.client.read_response(stack_seq)?;
+    ensure_response!(session, &stack_response, "stackTrace", stack_seq, true);
+    assert_eq!(stack_response["body"]["totalFrames"], 1);
+    assert!(
+        stack_response["body"]["stackFrames"][0]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replay event 2")
+    );
+
+    session.shutdown();
+    fs::remove_dir_all(&trace_dir).ok();
     Ok(())
 }
 

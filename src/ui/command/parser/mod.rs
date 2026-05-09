@@ -643,6 +643,7 @@ impl Command {
                 Command::ApplyPatch(apply_patch::Command::ApplyPatch {
                     path: std::path::PathBuf::from(path),
                     base: base.map(|b| b as nix::libc::uintptr_t),
+                    verify_executable_hash: true,
                 })
             })
             .padded()
@@ -659,6 +660,7 @@ impl Command {
                     path: std::path::PathBuf::from(path),
                     base: base.map(|b| b as nix::libc::uintptr_t),
                     interval_ms: 250,
+                    verify_executable_hash: true,
                 })
             })
             .padded()

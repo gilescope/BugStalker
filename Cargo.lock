@@ -383,6 +383,7 @@ dependencies = [
  "bit_field",
  "blake3",
  "bs-perf",
+ "bs-replay",
  "bs-replay-driver",
  "bs-test-harness",
  "bs-viz-spec",

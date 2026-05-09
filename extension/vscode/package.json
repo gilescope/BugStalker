@@ -1,59 +1,107 @@
 {
-  "name": "bugstalker",
+  "name": "vscode-lldb",
   "displayName": "BugStalker",
-  "description": "Debugging Rust applications with BugStalker in Visual Studio Code",
+  "description": "Pure-Rust Rust debugger exposed through the CodeLLDB-compatible VS Code/Rust Analyzer extension id.",
   "license": "MIT",
-  "version": "0.1.1",
+  "version": "0.1.0",
+  "publisher": "vadimcn",
   "engines": {
     "vscode": "^1.98.0"
   },
-  "platforms": [
-    "linux"
-  ],
-  "architecture": {
-    "type": [
-      "x64"
-    ]
-  },
   "keywords": [
     "rust",
-    "debug"
-  ],
-  "author": {
-    "name": "Konstantin Derevtsov",
-    "email": "godzie@yandex.ru"
-  },
-  "contributors": [
-    {
-      "name": "Hasan Mohsin",
-      "email": "hasan@hasali.dev"
-    }
+    "debug",
+    "bugstalker",
+    "lldb"
   ],
   "categories": [
     "Debuggers"
   ],
   "activationEvents": [
-    "onDebug"
+    "onDebug",
+    "onDebugResolve:bugstalker",
+    "onDebugResolve:lldb",
+    "onCommand:bugstalker.applyPatch",
+    "onCommand:bugstalker.startEditContinue",
+    "onCommand:bugstalker.stopEditContinue"
   ],
   "repository": {
-    "url": "https://github.com/godzie44/BugStalker"
-  },
-  "bugs": {
-    "url": "https://github.com/godzie44/BugStalker/issues"
+    "url": "https://github.com/gilescope/vscode-lldb.git"
   },
   "main": "./out/extension.js",
-  "publisher": "BugStalker",
+  "private": true,
   "icon": "icon.png",
   "contributes": {
     "commands": [
       {
-        "command": "bugstalker.helloWorld",
-        "title": "Hello World"
+        "category": "BugStalker",
+        "command": "bugstalker.applyPatch",
+        "title": "Apply Patch"
+      },
+      {
+        "category": "BugStalker",
+        "command": "bugstalker.startEditContinue",
+        "title": "Start Edit and Continue"
+      },
+      {
+        "category": "BugStalker",
+        "command": "bugstalker.stopEditContinue",
+        "title": "Stop Edit and Continue"
       }
     ],
+    "configuration": {
+      "type": "object",
+      "title": "BugStalker",
+      "properties": {
+        "bugstalker.executable": {
+          "description": "Path to the BugStalker binary used as the DAP adapter.",
+          "default": "bs",
+          "type": "string",
+          "scope": "resource"
+        },
+        "bugstalker.logFile": {
+          "description": "Optional path. When set, BugStalker writes adapter diagnostics here.",
+          "type": "string",
+          "scope": "resource"
+        },
+        "bugstalker.adapterEnv": {
+          "description": "Extra environment variables for the spawned BugStalker adapter and cargo invocations.",
+          "type": "object",
+          "patternProperties": {
+            ".*": {
+              "type": "string"
+            }
+          },
+          "default": {},
+          "scope": "resource"
+        }
+      }
+    },
     "breakpoints": [
       {
         "language": "rust"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "workbench.action.debug.stepOver",
+        "key": "alt+down",
+        "when": "inDebugMode && (debugType == 'bugstalker' || debugType == 'lldb')"
+      },
+      {
+        "command": "workbench.action.debug.stepInto",
+        "key": "alt+right",
+        "when": "inDebugMode && (debugType == 'bugstalker' || debugType == 'lldb')"
+      },
+      {
+        "command": "workbench.action.debug.stepOut",
+        "key": "alt+left",
+        "when": "inDebugMode && (debugType == 'bugstalker' || debugType == 'lldb')"
+      },
+      {
+        "command": "workbench.action.debug.stepBack",
+        "key": "alt+up",
+        "when": "inDebugMode && (debugType == 'bugstalker' || debugType == 'lldb')"
       }
     ],
     "debuggers": [
@@ -65,50 +113,109 @@
         ],
         "configurationAttributes": {
           "launch": {
-            "required": [
-              "program"
-            ],
             "properties": {
-              "program": {
-                "type": "string",
-                "description": "Path to the program to debug."
+              "program": { "type": "string" },
+              "cargo": {
+                "description": "Cargo invocation parameters. Rust Analyzer and CodeLLDB-compatible launch configs use this shape.",
+                "type": "object",
+                "properties": {
+                  "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "default": [ "build" ]
+                  },
+                  "filter": {
+                    "type": "object",
+                    "properties": {
+                      "name": { "type": "string" },
+                      "kind": { "type": "string" }
+                    }
+                  }
+                }
               },
-              "args": {
-                "type": [
-                  "array"
-                ],
-                "items": {
-                  "type": "string"
-                },
-                "description": "Program arguments.",
-                "default": []
+              "args": { "type": [ "array", "string" ], "default": [] },
+              "cwd": { "type": "string", "default": "${workspaceFolder}" },
+              "env": { "type": "object", "default": {} },
+              "stopOnEntry": { "type": "boolean", "default": false },
+              "editContinue": { "type": "boolean", "default": false },
+              "editContinueCommand": { "type": "string" },
+              "editContinuePatchPath": { "type": "string" },
+              "editContinueLinker": { "type": "string" },
+              "editContinueTarget": { "type": "string" },
+              "editContinueWatch": {
+                "type": [ "string", "array" ],
+                "items": { "type": "string" },
+                "default": [ "**/*.rs" ]
               },
-              "env": {
-                "type": [
-                  "array"
-                ],
-                "items": {
-                  "type": "string"
-                },
-                "description": "Program environment variables.",
-                "default": []
-              },
-              "cwd": {
-                "type": "string"
-              },
-              "debugMode": {
-                "type": "bool"
-              }
+              "editContinueCwd": { "type": "string" },
+              "editContinueDebounceMs": { "type": "number", "default": 150 },
+              "editContinueBase": { "type": [ "string", "number" ] }
+            }
+          },
+          "attach": {
+            "required": [ "pid" ],
+            "properties": {
+              "pid": { "type": [ "integer", "string" ] }
             }
           }
-        },
-        "initialConfigurations": [
-          {
-            "type": "bugstalker",
-            "request": "launch",
-            "name": "BugStalker"
+        }
+      },
+      {
+        "type": "lldb",
+        "label": "BugStalker (CodeLLDB-compatible)",
+        "languages": [
+          "rust"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": { "type": "string" },
+              "cargo": {
+                "description": "Cargo invocation parameters. Rust Analyzer and CodeLLDB-compatible launch configs use this shape.",
+                "type": "object",
+                "properties": {
+                  "args": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "default": [ "build" ]
+                  },
+                  "filter": {
+                    "type": "object",
+                    "properties": {
+                      "name": { "type": "string" },
+                      "kind": { "type": "string" }
+                    }
+                  }
+                }
+              },
+              "args": { "type": [ "array", "string" ], "default": [] },
+              "cwd": { "type": "string", "default": "${workspaceFolder}" },
+              "env": { "type": "object", "default": {} },
+              "stopOnEntry": { "type": "boolean", "default": false },
+              "sourceMap": { "type": "object", "default": {} },
+              "sourceLanguages": { "type": "array", "default": [ "rust" ] },
+              "editContinue": { "type": "boolean", "default": false },
+              "editContinueCommand": { "type": "string" },
+              "editContinuePatchPath": { "type": "string" },
+              "editContinueLinker": { "type": "string" },
+              "editContinueTarget": { "type": "string" },
+              "editContinueWatch": {
+                "type": [ "string", "array" ],
+                "items": { "type": "string" },
+                "default": [ "**/*.rs" ]
+              },
+              "editContinueCwd": { "type": "string" },
+              "editContinueDebounceMs": { "type": "number", "default": 150 },
+              "editContinueBase": { "type": [ "string", "number" ] }
+            }
+          },
+          "attach": {
+            "required": [ "pid" ],
+            "properties": {
+              "pid": { "type": [ "integer", "string" ] }
+            }
           }
-        ]
+        }
       }
     ]
   },

@@ -90,6 +90,7 @@ pub enum Command {
     ApplyPatch {
         path: PathBuf,
         base: Option<uintptr_t>,
+        verify_executable_hash: bool,
     },
     /// Apply the patch every time `path`'s mtime changes. Polls
     /// every 250 ms; blocks the REPL until the user kills BugStalker
@@ -102,6 +103,7 @@ pub enum Command {
         path: PathBuf,
         base: Option<uintptr_t>,
         interval_ms: u64,
+        verify_executable_hash: bool,
     },
 }
 
@@ -124,12 +126,17 @@ impl<'a> Handler<'a> {
 
     pub fn handle(&self, cmd: Command) -> command::CommandResult<ApplyReport> {
         match cmd {
-            Command::ApplyPatch { path, base } => self.apply_once(&path, base),
+            Command::ApplyPatch {
+                path,
+                base,
+                verify_executable_hash,
+            } => self.apply_once(&path, base, verify_executable_hash),
             Command::WatchPatch {
                 path,
                 base,
                 interval_ms,
-            } => self.watch_loop(&path, base, interval_ms),
+                verify_executable_hash,
+            } => self.watch_loop(&path, base, interval_ms, verify_executable_hash),
         }
     }
 
@@ -137,6 +144,7 @@ impl<'a> Handler<'a> {
         &self,
         path: &std::path::Path,
         base: Option<uintptr_t>,
+        verify_executable_hash: bool,
     ) -> command::CommandResult<ApplyReport> {
         let text = std::fs::read_to_string(path).map_err(|e| {
             command::CommandError::Parsing(format!(
@@ -150,12 +158,16 @@ impl<'a> Handler<'a> {
                 path.display()
             ))
         })?;
-        verify_executable_hash(self.dbg.debugee().path(), &patch.header).map_err(|msg| {
-            command::CommandError::Parsing(format!(
-                "refusing to apply patch {}: {msg}",
-                path.display()
-            ))
-        })?;
+        if verify_executable_hash {
+            verify_executable_hash_guard(self.dbg.debugee().path(), &patch.header).map_err(
+                |msg| {
+                    command::CommandError::Parsing(format!(
+                        "refusing to apply patch {}: {msg}",
+                        path.display()
+                    ))
+                },
+            )?;
+        }
 
         let mut report = ApplyReport::default();
         for entry in &patch.entries {
@@ -215,10 +227,11 @@ impl<'a> Handler<'a> {
         path: &std::path::Path,
         base: Option<uintptr_t>,
         interval_ms: u64,
+        verify_executable_hash: bool,
     ) -> command::CommandResult<ApplyReport> {
         // Apply once up front (so the user gets immediate feedback if
         // the file already exists / parses).
-        let initial = self.apply_once(path, base)?;
+        let initial = self.apply_once(path, base, verify_executable_hash)?;
         eprintln!(
             "[watch-patch] initial apply: {} entries, {} bytes. \
              Polling {} every {} ms; Ctrl-C to stop.",
@@ -237,7 +250,7 @@ impl<'a> Handler<'a> {
             let now_mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
             if now_mtime != last_mtime {
                 last_mtime = now_mtime;
-                match self.apply_once(path, base) {
+                match self.apply_once(path, base, verify_executable_hash) {
                     Ok(rep) => {
                         eprintln!(
                             "[watch-patch] reapplied: {} entries, {} bytes",
@@ -364,7 +377,10 @@ fn patch_symbol_suffix(entry: &PatchEntry) -> String {
         .unwrap_or_default()
 }
 
-fn verify_executable_hash(path: &std::path::Path, header: &PatchHeader) -> Result<(), String> {
+fn verify_executable_hash_guard(
+    path: &std::path::Path,
+    header: &PatchHeader,
+) -> Result<(), String> {
     let Some(old_hash) = header.old_blake3 else {
         return Ok(());
     };
@@ -592,11 +608,11 @@ mod tests {
         };
 
         let old_path = write_temp_patch_test_file(old_bytes);
-        verify_executable_hash(&old_path, &header).unwrap();
+        verify_executable_hash_guard(&old_path, &header).unwrap();
         std::fs::remove_file(&old_path).ok();
 
         let new_path = write_temp_patch_test_file(new_bytes);
-        verify_executable_hash(&new_path, &header).unwrap();
+        verify_executable_hash_guard(&new_path, &header).unwrap();
         std::fs::remove_file(&new_path).ok();
     }
 
@@ -609,7 +625,7 @@ mod tests {
             ..PatchHeader::default()
         };
         let path = write_temp_patch_test_file(b"other");
-        let err = verify_executable_hash(&path, &header).unwrap_err();
+        let err = verify_executable_hash_guard(&path, &header).unwrap_err();
         std::fs::remove_file(&path).ok();
         assert!(err.contains("expected old-blake3"), "got: {err}");
     }

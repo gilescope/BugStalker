@@ -195,6 +195,19 @@ impl super::DebugSession {
         req: &DapRequest,
         oracles: &[String],
     ) -> anyhow::Result<()> {
+        if req
+            .arguments
+            .get("tracePath")
+            .or_else(|| req.arguments.get("trace_path"))
+            .is_some()
+        {
+            self.source_map = SourceMap::from_launch_args(&req.arguments);
+            self.terminated = false;
+            self.exit_code = None;
+            self.session_mode = Some(SessionMode::Launch);
+            return self.handle_replay_load(req);
+        }
+
         let program = req
             .arguments
             .get("program")
@@ -293,6 +306,7 @@ impl super::DebugSession {
     fn emit_attached_stop(&mut self) -> anyhow::Result<()> {
         self.begin_stop_epoch();
         let _ = self.refresh_threads_with_events();
+        self.capture_live_reverse_stop();
 
         let pid_info = self
             .debugger
@@ -363,6 +377,18 @@ impl super::DebugSession {
     }
 
     pub(super) fn handle_configuration_done(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        if self.has_replay_session() && self.debugger.is_none() {
+            self.send_success(req)?;
+            let event_index = self.replay_position().unwrap_or_default();
+            self.enqueue_event(InternalEvent::Stopped {
+                reason: "pause".to_string(),
+                thread_id: Some(super::replay::REPLAY_THREAD_ID),
+                description: Some(format!("Replay at event {event_index}")),
+            });
+            self.drain_events()?;
+            return Ok(());
+        }
+
         let dbg = self
             .debugger
             .as_mut()

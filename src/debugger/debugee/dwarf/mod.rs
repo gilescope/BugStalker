@@ -411,13 +411,21 @@ impl DebugInformation {
         let mut unique_subprograms = HashSet::new();
         let mut result = vec![];
 
-        let possible_lines = &[line, line + 1];
-
-        for &needle_line in possible_lines {
-            if !result.is_empty() {
-                break;
+        let mut next_statement_line: Option<u64> = None;
+        for (unit_idx, file_lines) in &files {
+            let unit = self.unit_ensure(*unit_idx);
+            for &line_idx in file_lines {
+                let line_row = unit.line(line_idx);
+                if line_row.is_stmt() && line_row.line >= line {
+                    next_statement_line = Some(match next_statement_line {
+                        Some(current) => current.min(line_row.line),
+                        None => line_row.line,
+                    });
+                }
             }
+        }
 
+        if let Some(needle_line) = next_statement_line {
             for (unit_idx, file_lines) in &files {
                 let unit = self.unit_ensure(*unit_idx);
 

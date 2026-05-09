@@ -7,6 +7,7 @@ use crate::dap::yadap::sourcemap::SourceMap;
 use crate::debugger;
 use crate::oracle::{Oracle, builtin};
 use anyhow::{Context, anyhow};
+use bs_replay_driver::ReverseDebugger;
 use log::{info, warn};
 use nix::unistd::Pid;
 use serde::Serialize;
@@ -21,10 +22,13 @@ use std::time::Duration;
 pub mod breakpoint;
 pub mod control;
 pub mod data;
+pub mod edit_continue;
 pub mod frame;
 pub mod init;
+pub mod live_reverse;
 pub mod other;
 pub mod perf;
+pub mod replay;
 pub mod source;
 
 pub struct DebugSession {
@@ -53,6 +57,8 @@ pub struct DebugSession {
     exception_filters: Vec<String>,
     last_stop: Option<control::LastStop>,
     module_info: Option<init::ModuleInfo>,
+    replay_session: Option<ReverseDebugger>,
+    live_reverse: live_reverse::LiveReverseHistory,
     canceled_request_ids: HashSet<i64>,
     canceled_progress_ids: HashSet<String>,
     #[cfg(feature = "perf")]
@@ -127,6 +133,8 @@ impl DebugSession {
             ],
             last_stop: None,
             module_info: None,
+            replay_session: None,
+            live_reverse: live_reverse::LiveReverseHistory::default(),
             canceled_request_ids: HashSet::new(),
             canceled_progress_ids: HashSet::new(),
             #[cfg(feature = "perf")]
@@ -675,6 +683,11 @@ impl DebugSession {
             "bs/perfOverlay" => self.handle_perf_overlay(req)?,
             "bs/perfOverlayEnable" => self.handle_perf_overlay_enable(req)?,
             "bs/perfOverlayDisable" => self.handle_perf_overlay_disable(req)?,
+            "bs/replayLoad" => self.handle_replay_load(req)?,
+            "bs/replayCheckpointList" => self.handle_replay_checkpoint_list(req)?,
+            "bs/replayJump" => self.handle_replay_jump(req)?,
+            "bs/replayTimeline" => self.handle_replay_timeline(req)?,
+            "bs/applyPatch" => self.handle_apply_patch(req)?,
             other => {
                 self.send_err(req, format!("Unsupported DAP command: {other}"))?;
             }

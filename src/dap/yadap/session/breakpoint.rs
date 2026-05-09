@@ -259,13 +259,23 @@ impl DebugSession {
                 match views {
                     Ok(mut v) if !v.is_empty() => {
                         let first = v.remove(0);
+                        let (resolved_line, resolved_column) = first
+                            .place
+                            .as_ref()
+                            .map(|place| {
+                                (place.line_number as i64, Some(place.column_number as i64))
+                            })
+                            .unwrap_or((line as i64, None));
                         let id = alloc_id();
-                        let dap_bp = json!({
+                        let mut dap_bp = json!({
                             "id": id,
                             "verified": true,
-                            "line": line,
+                            "line": resolved_line,
                             "source": { "path": client_source_path },
                         });
+                        if let Some(column) = resolved_column {
+                            dap_bp["column"] = json!(column);
+                        }
                         new_breakpoints.push(BreakpointRecord {
                             id,
                             addresses: vec![first.addr],
