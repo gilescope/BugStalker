@@ -44,12 +44,27 @@ impl DebugSession {
             })
             .map_err(apply_patch_error)?;
 
+        let drift_details: Vec<_> = report
+            .drift_details
+            .iter()
+            .map(|d| {
+                json!({
+                    "offset": d.offset,
+                    "runtimeAddr": d.runtime_addr,
+                    "symbol": d.symbol,
+                    "expectedHex": d.expected_hex,
+                    "actualHex": d.actual_hex,
+                })
+            })
+            .collect();
         self.send_success_body(
             req,
             json!({
                 "entriesApplied": report.entries_applied,
                 "bytesWritten": report.bytes_written,
                 "entriesSkippedDrift": report.entries_skipped_drift,
+                "entriesSkippedReadonly": report.entries_skipped_readonly,
+                "driftDetails": drift_details,
             }),
         )?;
         self.send_event_body(

@@ -113,6 +113,34 @@ pub struct ApplyReport {
     pub entries_applied: usize,
     pub bytes_written: usize,
     pub entries_skipped_drift: usize,
+    /// Entries whose target landed in a region whose `max_protection`
+    /// forbids write (typical: LC_CODE_SIGNATURE blob, dyld shared
+    /// cache, sealed `__DATA_CONST`). Counted separately from `_drift`
+    /// because the cause is fundamentally different — drift means the
+    /// running process is on a later image, read-only means the kernel
+    /// won't let *anyone* modify those pages.
+    pub entries_skipped_readonly: usize,
+    /// Per-entry diagnostics for callers (the DAP layer, the IDE)
+    /// who want to render a rustc-style "expected X, found Y at
+    /// offset Z" report — invaluable for diagnosing drift, since
+    /// the running process's bytes diverging from wild's old-bytes
+    /// means the inferior is on a *different* binary than the
+    /// linker thought. Capped at 16 entries to avoid growing the
+    /// DAP response unboundedly when a re-link diffs widely.
+    pub drift_details: Vec<DriftDetail>,
+}
+
+/// One drift mismatch detail: file offset, the symbol we know it
+/// was inside (if any), the bytes wild expected the running
+/// process to currently hold, and the bytes the running process
+/// actually has.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DriftDetail {
+    pub offset: u64,
+    pub runtime_addr: usize,
+    pub symbol: Option<String>,
+    pub expected_hex: String,
+    pub actual_hex: String,
 }
 
 pub struct Handler<'a> {
@@ -178,10 +206,38 @@ impl<'a> Handler<'a> {
                     .debugee()
                     .file_offset_to_runtime(entry.offset)
                     .ok_or_else(|| {
+                        let exe = self.dbg.debugee().path();
+                        let canonical = exe
+                            .canonicalize()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|e| format!("<canonicalize failed: {e}>"));
+                        let known: Vec<String> = self
+                            .dbg
+                            .debugee()
+                            .dwarf_registry()
+                            .mapping_keys()
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect();
                         command::CommandError::Parsing(format!(
-                            "could not auto-detect runtime address for file offset \
-                             0x{:x}: main executable not mapped yet",
-                            entry.offset
+                            "could not map file offset 0x{:x} to a runtime address.\n\
+                             help: BugStalker looks up the load mapping for the main \
+                             executable by path; nothing matched.\n  \
+                             debugee path: {}\n  \
+                             canonicalised: {}\n  \
+                             known mapping keys ({}): {}\n  \
+                             likely cause: the debugee hasn't reached its entry-point \
+                             breakpoint yet, or the launched binary's path differs from \
+                             what proc_maps reports.",
+                            entry.offset,
+                            exe.display(),
+                            canonical,
+                            known.len(),
+                            if known.is_empty() {
+                                "<empty>".to_string()
+                            } else {
+                                known.join(", ")
+                            },
                         ))
                     })?,
             };
@@ -202,6 +258,15 @@ impl<'a> Handler<'a> {
                         hex_summary(&actual),
                     );
                     report.entries_skipped_drift += 1;
+                    if report.drift_details.len() < 16 {
+                        report.drift_details.push(DriftDetail {
+                            offset: entry.offset,
+                            runtime_addr: target,
+                            symbol: entry.symbol_name.clone(),
+                            expected_hex: hex_summary(&entry.old_bytes),
+                            actual_hex: hex_summary(&actual),
+                        });
+                    }
                     continue;
                 }
             }
@@ -215,9 +280,33 @@ impl<'a> Handler<'a> {
                     entry.new_bytes.len(),
                 );
             }
-            write_aligned(self.dbg, target, &entry.new_bytes)?;
-            report.entries_applied += 1;
-            report.bytes_written += entry.new_bytes.len();
+            match write_aligned(self.dbg, target, &entry.new_bytes) {
+                Ok(()) => {
+                    report.entries_applied += 1;
+                    report.bytes_written += entry.new_bytes.len();
+                }
+                #[cfg(target_os = "macos")]
+                Err(command::CommandError::Handle(
+                    crate::debugger::Error::DarwinReadOnlyRegion { addr, max_prot },
+                )) => {
+                    // Wild emits byte runs for everything that
+                    // changed including the LC_CODE_SIGNATURE blob.
+                    // That blob is in a sealed segment (max_prot
+                    // lacks WRITE) and is irrelevant to the running
+                    // process — the signature was checked at load
+                    // time. Skip + count, don't fail.
+                    eprintln!(
+                        "[apply-patch] read-only{} at file offset 0x{:x} (runtime 0x{:x}, max_prot=0x{:x}): skipping — \
+                         likely codesign blob or sealed __DATA_CONST",
+                        patch_symbol_suffix(entry),
+                        entry.offset,
+                        addr,
+                        max_prot,
+                    );
+                    report.entries_skipped_readonly += 1;
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(report)
     }

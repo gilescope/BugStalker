@@ -7,7 +7,7 @@ mod rendezvous;
 pub mod tracee;
 pub mod tracer;
 
-pub use registry::RegionInfo;
+pub use registry::{DwarfRegistry, RegionInfo};
 pub use rendezvous::RendezvousError;
 
 use super::r#async::TokioVersion;
@@ -19,7 +19,6 @@ use crate::debugger::debugee::dwarf::DebugInformation;
 use crate::debugger::debugee::dwarf::unit::PlaceDescriptorOwned;
 use crate::debugger::debugee::dwarf::unwind;
 use crate::debugger::debugee::dwarf::unwind::Backtrace;
-use crate::debugger::debugee::registry::DwarfRegistry;
 use crate::debugger::debugee::rendezvous::Rendezvous;
 use crate::debugger::debugee::tracee::{Tracee, TraceeCtl};
 use crate::debugger::debugee::tracer::{StopReason, TraceContext, Tracer};
@@ -253,6 +252,13 @@ impl Debugee {
         &self.path
     }
 
+    /// Read-only access to the DWARF/load-mapping registry. Used by
+    /// callers (e.g. `apply-patch`) that want to render diagnostics
+    /// listing the mapping keys we know about.
+    pub fn dwarf_registry(&self) -> &DwarfRegistry {
+        &self.dwarf_registry
+    }
+
     /// Translate a file offset within the main executable (the kind
     /// `wild --emit-patch` outputs) into the runtime virtual address
     /// it ended up at in the running process. Returns `None` if the
@@ -269,11 +275,19 @@ impl Debugee {
     /// `__TEXT.vmaddr` would need a more thorough calculation that
     /// reads the load commands at runtime.
     pub fn file_offset_to_runtime(&self, file_offset: u64) -> Option<usize> {
-        let path = self
-            .path
-            .canonicalize()
-            .unwrap_or_else(|_| self.path.clone());
-        let mapping = self.dwarf_registry.find_mapping_offset_by_path(&path)?;
+        // `update_mappings` stores under the original `self.path` key
+        // (registry.rs `mappings.insert(file.clone(), …)`). Try that
+        // first; only fall back to a canonicalised form if the original
+        // isn't there — covers cases where the path BugStalker was
+        // launched with differs in spelling from what proc_maps reports
+        // (e.g. relative input, trailing slash, /var ↔ /private/var).
+        let mapping = self
+            .dwarf_registry
+            .find_mapping_offset_by_path(&self.path)
+            .or_else(|| {
+                let canonical = self.path.canonicalize().ok()?;
+                self.dwarf_registry.find_mapping_offset_by_path(&canonical)
+            })?;
         #[cfg(target_os = "linux")]
         {
             Some(mapping + file_offset as usize)

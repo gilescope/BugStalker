@@ -148,9 +148,21 @@ impl From<MachError> for Error {
             let binary = std::env::current_exe()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "<path-to-binary>".to_string());
+
+            // Auto-recovery: write the bundled entitlements XML to a
+            // stable temp path, codesign ourselves, and re-exec with
+            // the same argv. On success this never returns. On failure
+            // we fall through to the descriptive error so the user
+            // gets a one-line shell command that always works.
+            let entitlements_path = stage_entitlements_xml();
+            if let Err(why) = try_auto_codesign_and_reexec(&entitlements_path) {
+                eprintln!("[bs] auto-sign failed: {why}");
+            }
+
             return Error::DarwinDebuggerEntitlementMissing {
                 mach: e.to_string(),
                 binary,
+                entitlements: entitlements_path,
             };
         }
         // Preserve the kr verbatim and capture the stack so the
@@ -350,7 +362,18 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
     } else {
         VM_PROT_READ | VM_PROT_EXECUTE
     };
-    let _ = max_prot; // currently informational; only cur drives restore
+
+    // No pre-check on `max_prot`. The dyld shared cache reports
+    // `max_prot=R` for pages that are genuinely executable in
+    // practice, and the kernel sometimes accepts `mach_vm_write`
+    // against them through a non-`mach_vm_protect` path that the
+    // shared-cache layer arranges itself. If we refused based on
+    // `max_prot` alone we'd block legitimate breakpoint plants in
+    // dyld-resolved addresses (and EnC code patches that land in
+    // shared-cache pages). The decision happens *after* the write
+    // attempt below, where a real `KERN_INVALID_ADDRESS` from
+    // `mach_vm_write` paired with a failed `mach_vm_protect`
+    // tells us the page is genuinely sealed.
 
     // Widen protection to W (CoW). The VM_PROT_COPY bit makes the
     // kernel turn the shared text page into a private CoW copy
@@ -387,6 +410,29 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
         )
     };
     if kr != mach2::kern_return::KERN_SUCCESS {
+        // Decide: is this a genuinely sealed page (LC_CODE_SIGNATURE,
+        // post-init `__DATA_CONST_DIRTY`) or some other Mach failure?
+        //
+        // Sealed-page signature requires *all three*:
+        //   1. `mach_vm_protect(R|W|COPY)` failed.
+        //   2. `mach_vm_write` failed (we're in this branch).
+        //   3. `max_prot` lacks BOTH WRITE and EXECUTE.
+        //
+        // (3) is the strict version. `__TEXT` is `R+X` (max_prot=0x5)
+        // — it lacks WRITE but has EXECUTE, so the VM_PROT_COPY path
+        // can rescue it. Misclassifying an otherwise-recoverable
+        // `__TEXT` failure as "read-only forever" makes `apply-patch`
+        // silently skip valid code patches. Only `max_prot` of
+        // `0x0` (`__PAGEZERO`) or `0x1` (`__LINKEDIT`, sealed
+        // `__DATA_CONST_DIRTY`) is genuinely unrescuable.
+        if protect_kr != mach2::kern_return::KERN_SUCCESS
+            && max_prot & (VM_PROT_WRITE | VM_PROT_EXECUTE) == 0
+        {
+            return Err(Error::DarwinReadOnlyRegion {
+                addr,
+                max_prot: max_prot as u32,
+            });
+        }
         // Surface every diagnostic we have. If the user ever
         // re-hits this path the error message itself names the
         // address, the page protection at entry, and whether the
@@ -1992,4 +2038,87 @@ pub fn dyld_image_list(task: task_t) -> Result<Vec<ImageInfo>, MachError> {
         });
     }
     Ok(out)
+}
+
+/// Bundled `darwin.entitlements` XML — kept at compile time so a
+/// runtime bs install (which has no source tree) can still hand the
+/// user (or its own auto-sign path) something to feed `codesign`.
+const DARWIN_ENTITLEMENTS_XML: &str = include_str!("../../tests/darwin.entitlements");
+
+/// Write the bundled entitlements to a stable, per-user path and
+/// return its absolute filesystem path as a String.
+///
+/// We use a per-user (not per-pid) path so the same file gets reused
+/// across runs — keeps `codesign` invocations idempotent and stops
+/// `/tmp` from accumulating clutter when auto-sign fires repeatedly.
+fn stage_entitlements_xml() -> String {
+    let path = std::env::temp_dir().join("bs-darwin.entitlements");
+    // Best-effort: if we can't write it, the error message will say
+    // so via a fallback path — the user can always recreate the XML
+    // by hand, the auto-sign path is the optimisation, not the only
+    // route.
+    if let Err(e) = std::fs::write(&path, DARWIN_ENTITLEMENTS_XML) {
+        log::warn!(target: "darwin_mach",
+            "failed to stage entitlements at {}: {e}", path.display());
+    }
+    path.display().to_string()
+}
+
+/// Attempt to codesign the running bs binary with the bundled
+/// entitlements and re-exec with the same argv.
+///
+/// Returns `Err(reason)` only on failure paths. On success this
+/// `execv`s and never returns.
+///
+/// Guards:
+/// - `BS_NO_AUTO_SIGN=1` opts out entirely (returns Err).
+/// - `BS_AUTO_SIGN_TRIED=1` indicates a previous re-exec already
+///   tried; returns Err to avoid infinite recursion if the
+///   newly-signed binary still hits KERN_FAILURE for some other
+///   reason.
+fn try_auto_codesign_and_reexec(entitlements_path: &str) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+
+    if std::env::var_os("BS_NO_AUTO_SIGN").is_some() {
+        return Err("disabled by BS_NO_AUTO_SIGN".into());
+    }
+    if std::env::var_os("BS_AUTO_SIGN_TRIED").is_some() {
+        return Err(
+            "auto-sign already attempted in this process tree (re-exec did not clear KERN_FAILURE)"
+                .into(),
+        );
+    }
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+
+    eprintln!(
+        "[bs] cs.debugger entitlement missing — auto-signing {} with {}",
+        exe.display(),
+        entitlements_path,
+    );
+
+    let status = std::process::Command::new("codesign")
+        .arg("-s")
+        .arg("-")
+        .arg("--entitlements")
+        .arg(entitlements_path)
+        .arg("--force")
+        .arg(&exe)
+        .status()
+        .map_err(|e| format!("codesign spawn: {e}"))?;
+
+    if !status.success() {
+        return Err(format!("codesign exited with {status}"));
+    }
+
+    eprintln!("[bs] auto-signed {}; re-executing", exe.display());
+
+    // Re-exec preserving original argv. `exec` only returns on
+    // failure (otherwise it replaces this process image).
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let err = std::process::Command::new(&exe)
+        .args(&argv[1..])
+        .env("BS_AUTO_SIGN_TRIED", "1")
+        .exec();
+    Err(format!("re-exec failed: {err}"))
 }

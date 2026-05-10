@@ -333,6 +333,13 @@ impl DwarfRegistry {
         self.mappings.get(path).copied()
     }
 
+    /// Snapshot of every path currently in the mapping table. Used by
+    /// callers who want to render a rustc-style "expected X, but
+    /// found these instead" diagnostic when a lookup misses.
+    pub fn mapping_keys(&self) -> Vec<std::path::PathBuf> {
+        self.mappings.keys().cloned().collect()
+    }
+
     /// Find main executable object debug information.
     pub fn find_main_program_dwarf(&self) -> Option<&DebugInformation> {
         self.files.get(&self.program_path)
