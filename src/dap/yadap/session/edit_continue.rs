@@ -36,10 +36,7 @@ const AUTO_CONTINUE_MAX_SKIPS: usize = 64;
 ///
 /// Pulled out as a free function so the loop's filter is unit-
 /// testable without needing a live debug session.
-fn should_continue_past_during_auto_resume(
-    stop: &StopReason,
-    target_pc: Option<u64>,
-) -> bool {
+fn should_continue_past_during_auto_resume(stop: &StopReason, target_pc: Option<u64>) -> bool {
     match (stop, target_pc) {
         (StopReason::Breakpoint(_, addr), Some(target)) => addr.as_u64() != target,
         _ => false,
@@ -109,9 +106,7 @@ impl DebugSession {
                         .debugger
                         .as_mut()
                         .ok_or_else(|| anyhow!("bs/applyPatch: debugger gone"))?;
-                    if let Err(e) =
-                        dbg_mut.restart_top_frame(pid, current_fn_start.as_u64())
-                    {
+                    if let Err(e) = dbg_mut.restart_top_frame(pid, current_fn_start.as_u64()) {
                         log::warn!(
                             target: "apply_patch",
                             "auto restart-frame failed ({e}); patch is applied but the user will see the new code only on next call into the function"
@@ -186,9 +181,10 @@ impl DebugSession {
             let target = original_user_pc;
             let mut skipped: usize = 0;
             let final_stop = loop {
-                let dbg_mut = self.debugger.as_mut().ok_or_else(|| {
-                    anyhow!("bs/applyPatch: debugger gone before auto-resume")
-                })?;
+                let dbg_mut = self
+                    .debugger
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("bs/applyPatch: debugger gone before auto-resume"))?;
                 let stop = dbg_mut
                     .continue_debugee_with_reason()
                     .context("bs/applyPatch: auto-resume after restart")?;
@@ -358,8 +354,7 @@ mod tests {
 
         #[test]
         fn breakpoint_at_other_address_is_continued_past() {
-            let stop =
-                StopReason::Breakpoint(pid(), RelocatedAddress::from(TARGET_PC - 0x100));
+            let stop = StopReason::Breakpoint(pid(), RelocatedAddress::from(TARGET_PC - 0x100));
             assert!(should_continue_past_during_auto_resume(
                 &stop,
                 Some(TARGET_PC)
@@ -399,8 +394,7 @@ mod tests {
             // restart_top_frame failed earlier and we never set
             // original_user_pc), surface every stop reason as-is —
             // never silently swallow.
-            let stop =
-                StopReason::Breakpoint(pid(), RelocatedAddress::from(TARGET_PC - 0x100));
+            let stop = StopReason::Breakpoint(pid(), RelocatedAddress::from(TARGET_PC - 0x100));
             assert!(!should_continue_past_during_auto_resume(&stop, None));
         }
 
@@ -442,9 +436,7 @@ mod tests {
                 "allThreadsStopped": true,
                 "description": description,
             });
-            if preserve_focus_hint
-                && let Some(obj) = body.as_object_mut()
-            {
+            if preserve_focus_hint && let Some(obj) = body.as_object_mut() {
                 obj.insert("preserveFocusHint".to_owned(), json!(true));
             }
             body
