@@ -12,10 +12,13 @@ use serial_test::serial;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const HELLO_LINE: i64 = 5;
 const SET_VAR_LINE: i64 = 35;
+const BS_VIZ_SPEC_REQUESTED_COMMENT_LINE: i64 = 91;
+const BS_VIZ_SPEC_BOUND_STATEMENT_LINE: i64 = 96;
 const OPTIONAL_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn assert_response(response: &Value, command: &str, request_seq: i64, success: bool) -> bool {
@@ -213,6 +216,355 @@ fn temp_replay_trace(label: &str) -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+fn bs_viz_spec_test_binary() -> anyhow::Result<PathBuf> {
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "bs-viz-spec",
+            "--lib",
+            "--no-run",
+            "--message-format=json",
+        ])
+        .current_dir(dap_client::repo_root())
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to build bs-viz-spec test binary: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_artifact = msg.get("reason").and_then(Value::as_str) == Some("compiler-artifact");
+        let is_bs_viz_spec = msg
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(Value::as_str)
+            == Some("bs_viz_spec");
+        let is_test_executable = msg
+            .get("profile")
+            .and_then(|profile| profile.get("test"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if is_artifact
+            && is_bs_viz_spec
+            && is_test_executable
+            && let Some(executable) = msg.get("executable").and_then(Value::as_str)
+        {
+            return Ok(PathBuf::from(executable));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "cargo did not report the bs-viz-spec test executable"
+    ))
+}
+
+fn bs_viz_spec_target_test_binary() -> anyhow::Result<Option<PathBuf>> {
+    let Some(target) = edit_continue_target() else {
+        eprintln!("skipping target breakpoint diagnostic: unsupported target platform");
+        return Ok(None);
+    };
+
+    let target_dir =
+        std::env::temp_dir().join(format!("bugstalker-target-dap-test-{}", std::process::id()));
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "bs-viz-spec",
+            "--lib",
+            "--no-run",
+            "--target",
+            target,
+            "--message-format=json",
+        ])
+        .current_dir(dap_client::repo_root())
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to build target bs-viz-spec test binary: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_artifact = msg.get("reason").and_then(Value::as_str) == Some("compiler-artifact");
+        let is_bs_viz_spec = msg
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(Value::as_str)
+            == Some("bs_viz_spec");
+        let is_test_executable = msg
+            .get("profile")
+            .and_then(|profile| profile.get("test"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if is_artifact
+            && is_bs_viz_spec
+            && is_test_executable
+            && let Some(executable) = msg.get("executable").and_then(Value::as_str)
+        {
+            return Ok(Some(PathBuf::from(executable)));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "cargo did not report the target bs-viz-spec test executable"
+    ))
+}
+
+fn bs_viz_spec_edit_continue_rustflags_test_binary() -> anyhow::Result<Option<PathBuf>> {
+    let Some(target) = edit_continue_target() else {
+        eprintln!(
+            "skipping edit-and-continue rustflags breakpoint diagnostic: unsupported target platform"
+        );
+        return Ok(None);
+    };
+
+    let target_dir = std::env::temp_dir().join(format!(
+        "bugstalker-enc-rustflags-dap-test-{}",
+        std::process::id()
+    ));
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "bs-viz-spec",
+            "--lib",
+            "--no-run",
+            "--target",
+            target,
+            "--message-format=json",
+        ])
+        .current_dir(dap_client::repo_root())
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env(
+            cargo_target_rustflags_env(target),
+            "-C symbol-mangling-version=v0 -C linker=clang",
+        )
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to build edit-and-continue rustflags bs-viz-spec test binary: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_artifact = msg.get("reason").and_then(Value::as_str) == Some("compiler-artifact");
+        let is_bs_viz_spec = msg
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(Value::as_str)
+            == Some("bs_viz_spec");
+        let is_test_executable = msg
+            .get("profile")
+            .and_then(|profile| profile.get("test"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if is_artifact
+            && is_bs_viz_spec
+            && is_test_executable
+            && let Some(executable) = msg.get("executable").and_then(Value::as_str)
+        {
+            return Ok(Some(PathBuf::from(executable)));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "cargo did not report the edit-and-continue rustflags bs-viz-spec test executable"
+    ))
+}
+
+fn bs_viz_spec_edit_continue_test_binary() -> anyhow::Result<Option<PathBuf>> {
+    let Some(linker) = edit_continue_linker() else {
+        eprintln!("skipping edit-and-continue breakpoint diagnostic: wild linker not found");
+        return Ok(None);
+    };
+    let Some(target) = edit_continue_target() else {
+        eprintln!("skipping edit-and-continue breakpoint diagnostic: unsupported target platform");
+        return Ok(None);
+    };
+
+    let target_dir =
+        std::env::temp_dir().join(format!("bugstalker-enc-dap-test-{}", std::process::id()));
+    let patch_path = target_dir.join("bugstalker.wild-patch");
+    let rustflags = format!(
+        "-C symbol-mangling-version=v0 \
+         -C linker=clang \
+         -C link-arg=-fuse-ld={} \
+         -C link-arg=-Wl,--incremental-cache=read-write \
+         -C link-arg=-Wl,--emit-patch={}",
+        linker.display(),
+        patch_path.display()
+    );
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "bs-viz-spec",
+            "--lib",
+            "--no-run",
+            "--target",
+            target,
+            "--message-format=json",
+        ])
+        .current_dir(dap_client::repo_root())
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env(cargo_target_rustflags_env(target), rustflags)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to build edit-and-continue bs-viz-spec test binary: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_artifact = msg.get("reason").and_then(Value::as_str) == Some("compiler-artifact");
+        let is_bs_viz_spec = msg
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(Value::as_str)
+            == Some("bs_viz_spec");
+        let is_test_executable = msg
+            .get("profile")
+            .and_then(|profile| profile.get("test"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if is_artifact
+            && is_bs_viz_spec
+            && is_test_executable
+            && let Some(executable) = msg.get("executable").and_then(Value::as_str)
+        {
+            return Ok(Some(PathBuf::from(executable)));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "cargo did not report the edit-and-continue bs-viz-spec test executable"
+    ))
+}
+
+fn edit_continue_linker() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("BUGSTALKER_WILD_LINKER") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    [
+        dap_client::repo_root().join("../linker/target/release/wild"),
+        dap_client::repo_root().join("../linker/target/debug/wild"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+}
+
+fn edit_continue_target() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
+fn cargo_target_rustflags_env(target: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_RUSTFLAGS",
+        target.to_uppercase().replace('-', "_")
+    )
+}
+
+fn assert_bs_viz_spec_breakpoint_binds_to_requested_statement(
+    program: &Path,
+) -> anyhow::Result<()> {
+    let source = example_source("crates/bs-viz-spec/src/lib.rs");
+    let mut session = DapSession::start()?;
+    initialize(&mut session)?;
+
+    let launch_seq = session.client.send_request(
+        "launch",
+        json!({
+            "program": program,
+            "args": ["roundtrip_one", "--nocapture"],
+        }),
+    )?;
+    let launch_response = session.client.read_response(launch_seq)?;
+    ensure_response!(session, &launch_response, "launch", launch_seq, true);
+
+    let bp_seq = session.client.send_request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": source },
+            "breakpoints": [{ "line": BS_VIZ_SPEC_REQUESTED_COMMENT_LINE }],
+        }),
+    )?;
+    let bp_response = session.client.read_response(bp_seq)?;
+    ensure_response!(session, &bp_response, "setBreakpoints", bp_seq, true);
+    let bp = &bp_response["body"]["breakpoints"][0];
+    assert_eq!(bp["verified"].as_bool(), Some(true), "{bp_response}");
+    assert_eq!(
+        bp["line"].as_i64(),
+        Some(BS_VIZ_SPEC_BOUND_STATEMENT_LINE),
+        "breakpoint must slide from the comment at line {BS_VIZ_SPEC_REQUESTED_COMMENT_LINE} \
+         to Format::from_tag, not to the unrelated layout line 25: {bp_response}"
+    );
+
+    let config_seq = session
+        .client
+        .send_request("configurationDone", json!({}))?;
+    let config_response = session.client.read_response(config_seq)?;
+    ensure_response!(
+        session,
+        &config_response,
+        "configurationDone",
+        config_seq,
+        true
+    );
+
+    let stopped = session.client.wait_for_event("stopped")?;
+    let thread_id = stopped
+        .get("body")
+        .and_then(|body| body.get("threadId"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let stopped_line = top_frame_line(&mut session, thread_id)?;
+    assert_eq!(
+        stopped_line,
+        Some(BS_VIZ_SPEC_BOUND_STATEMENT_LINE),
+        "debuggee stopped at the wrong source line; stopped event was {stopped}"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_initialize_request() -> anyhow::Result<()> {
@@ -340,6 +692,40 @@ fn test_set_breakpoint_slides_from_blank_line() -> anyhow::Result<()> {
 
     session.shutdown();
     Ok(())
+}
+
+#[test]
+#[serial]
+fn test_bs_viz_spec_breakpoint_binds_to_requested_file_statement() -> anyhow::Result<()> {
+    let program = bs_viz_spec_test_binary()?;
+    assert_bs_viz_spec_breakpoint_binds_to_requested_statement(&program)
+}
+
+#[test]
+#[serial]
+fn test_bs_viz_spec_breakpoint_with_explicit_target() -> anyhow::Result<()> {
+    let Some(program) = bs_viz_spec_target_test_binary()? else {
+        return Ok(());
+    };
+    assert_bs_viz_spec_breakpoint_binds_to_requested_statement(&program)
+}
+
+#[test]
+#[serial]
+fn test_bs_viz_spec_breakpoint_with_edit_continue_rustflags() -> anyhow::Result<()> {
+    let Some(program) = bs_viz_spec_edit_continue_rustflags_test_binary()? else {
+        return Ok(());
+    };
+    assert_bs_viz_spec_breakpoint_binds_to_requested_statement(&program)
+}
+
+#[test]
+#[serial]
+fn test_bs_viz_spec_breakpoint_with_edit_continue_linker() -> anyhow::Result<()> {
+    let Some(program) = bs_viz_spec_edit_continue_test_binary()? else {
+        return Ok(());
+    };
+    assert_bs_viz_spec_breakpoint_binds_to_requested_statement(&program)
 }
 
 #[test]
