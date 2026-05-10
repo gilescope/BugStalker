@@ -128,6 +128,12 @@ pub struct ApplyReport {
     /// linker thought. Capped at 16 entries to avoid growing the
     /// DAP response unboundedly when a re-link diffs widely.
     pub drift_details: Vec<DriftDetail>,
+    /// Runtime addresses of every successfully applied entry. The
+    /// DAP layer uses these to decide whether the patch landed
+    /// inside the currently-stopped thread's function and an
+    /// auto-restart-frame is wanted (so the user sees the patched
+    /// code execute without manually triggering Restart Frame).
+    pub applied_runtime_addrs: Vec<usize>,
 }
 
 /// One drift mismatch detail: file offset, the symbol we know it
@@ -284,6 +290,7 @@ impl<'a> Handler<'a> {
                 Ok(()) => {
                     report.entries_applied += 1;
                     report.bytes_written += entry.new_bytes.len();
+                    report.applied_runtime_addrs.push(target);
                 }
                 #[cfg(target_os = "macos")]
                 Err(command::CommandError::Handle(

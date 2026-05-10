@@ -228,6 +228,7 @@ impl super::DebugSession {
                 reason: "step".to_string(),
                 thread_id: Some(restored.focused_pid.as_raw() as i64),
                 description: Some(format!("Restored checkpoint {}", restored.sequence)),
+                preserve_focus_hint: false,
             });
             self.drain_events()
         }

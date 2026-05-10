@@ -274,7 +274,23 @@ impl super::DebugSession {
     }
 
     pub fn emit_stop_reason(&mut self, stop: debugger::StopReason) -> anyhow::Result<()> {
+        self.emit_stop_reason_with_options(stop, false)
+    }
+
+    /// `emit_stop_reason` variant with the DAP `preserveFocusHint`
+    /// flag. Set the flag on stops that fire while the user is
+    /// editing — VSCode otherwise grabs the text-editor cursor away
+    /// from where they're typing onto the stop line. Used by
+    /// `bs/applyPatch`'s auto-resume path: when a frame restart
+    /// lands the user back at their original breakpoint, we don't
+    /// want their typing focus snatched.
+    pub fn emit_stop_reason_with_options(
+        &mut self,
+        stop: debugger::StopReason,
+        preserve_focus_hint: bool,
+    ) -> anyhow::Result<()> {
         let mut stop = stop;
+        let _focus_hint_for_event = preserve_focus_hint;
         loop {
             while !self.should_stop_on_exception(&stop) {
                 let dbg = self
@@ -419,6 +435,7 @@ impl super::DebugSession {
             reason,
             thread_id,
             description,
+            preserve_focus_hint: _focus_hint_for_event,
         });
         self.drain_events()?;
         Ok(())
@@ -463,6 +480,7 @@ impl super::DebugSession {
                     reason: "pause".to_string(),
                     thread_id,
                     description: Some("Paused".to_string()),
+                    preserve_focus_hint: false,
                 });
             }
             Err(e) => {
@@ -527,6 +545,7 @@ impl super::DebugSession {
                     reason: "step".to_string(),
                     thread_id,
                     description: None,
+                    preserve_focus_hint: false,
                 });
                 self.drain_events()
             }
@@ -568,6 +587,7 @@ impl super::DebugSession {
                     reason: "step".to_string(),
                     thread_id,
                     description: None,
+                    preserve_focus_hint: false,
                 });
                 self.drain_events()
             }
@@ -609,6 +629,7 @@ impl super::DebugSession {
                     reason: "step".to_string(),
                     thread_id,
                     description: None,
+                    preserve_focus_hint: false,
                 });
                 self.drain_events()
             }
@@ -697,6 +718,7 @@ impl super::DebugSession {
             reason: reason.to_string(),
             thread_id,
             description,
+            preserve_focus_hint: false,
         });
         self.drain_events()
     }

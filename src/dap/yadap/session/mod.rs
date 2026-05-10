@@ -307,6 +307,7 @@ impl DebugSession {
                     reason,
                     thread_id,
                     description,
+                    preserve_focus_hint,
                 } => {
                     self.finish_perf_stop();
                     let mut body = json!({
@@ -315,6 +316,11 @@ impl DebugSession {
                         "allThreadsStopped": true,
                         "description": description,
                     });
+                    if *preserve_focus_hint
+                        && let Some(obj) = body.as_object_mut()
+                    {
+                        obj.insert("preserveFocusHint".to_owned(), json!(true));
+                    }
                     if let Some(perf) = self.perf_stopped_summary_body()
                         && let Some(obj) = body.as_object_mut()
                     {

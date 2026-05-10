@@ -371,6 +371,7 @@ impl super::DebugSession {
             reason: "pause".to_string(),
             thread_id,
             description,
+            preserve_focus_hint: false,
         });
         self.drain_events()?;
         Ok(())
@@ -384,6 +385,7 @@ impl super::DebugSession {
                 reason: "pause".to_string(),
                 thread_id: Some(super::replay::REPLAY_THREAD_ID),
                 description: Some(format!("Replay at event {event_index}")),
+                preserve_focus_hint: false,
             });
             self.drain_events()?;
             return Ok(());

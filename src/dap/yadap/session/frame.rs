@@ -217,8 +217,18 @@ impl super::DebugSession {
             return self.send_err(req, "restartFrame: function start address is unavailable");
         };
 
-        dbg.set_pc(start_ip.as_u64())
-            .context("restartFrame: set pc")?;
+        // Full state restoration on aarch64: SP, LR, callee-saved
+        // regs all reset to function-entry values. On x86_64 this
+        // currently falls back to set_pc only (writing the return
+        // address to the new stack slot is a Phase-2 follow-up).
+        if let Err(e) = dbg.restart_top_frame(pid, start_ip.as_u64()) {
+            log::warn!(
+                target: "restart_frame",
+                "full state restore failed ({e}); falling back to PC-only"
+            );
+            dbg.set_pc(start_ip.as_u64())
+                .context("restartFrame: set pc fallback")?;
+        }
         let _ = dbg.set_frame_into_focus(0);
 
         self.send_success(req)?;

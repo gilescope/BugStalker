@@ -137,6 +137,7 @@ impl super::DebugSession {
             reason: "goto".to_string(),
             thread_id: Some(REPLAY_THREAD_ID),
             description: Some(format!("Replay at event {target_event}")),
+            preserve_focus_hint: false,
         });
         self.drain_events()
     }
@@ -197,6 +198,7 @@ impl super::DebugSession {
             reason: "step".to_string(),
             thread_id: Some(REPLAY_THREAD_ID),
             description: Some(format!("Replay at event {event_index}")),
+            preserve_focus_hint: false,
         });
         self.drain_events()
     }
@@ -221,6 +223,7 @@ impl super::DebugSession {
             reason: "step".to_string(),
             thread_id: Some(REPLAY_THREAD_ID),
             description: Some(format!("Replay at event {event_index}")),
+            preserve_focus_hint: false,
         });
         self.drain_events()
     }

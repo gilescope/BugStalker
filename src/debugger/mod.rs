@@ -1367,6 +1367,115 @@ impl Debugger {
         map.persist(in_focus_pid)
     }
 
+    /// Return the function-entry runtime address (`fn_start_ip` in
+    /// FrameSpan terminology) of the function that contains `addr`,
+    /// or `None` if `addr` lies outside any function we have DWARF
+    /// for. Used by `bs/applyPatch` to decide whether the just-
+    /// applied patch landed in the same function the focused thread
+    /// is currently paused inside, which is the trigger for an
+    /// auto-restart-frame.
+    pub fn function_start_ip_at(&self, addr: usize) -> Option<RelocatedAddress> {
+        let reloc = RelocatedAddress::from(addr);
+        let global = reloc.into_global(&self.debugee).ok()?;
+        let dwarf = self.debugee.debug_info(reloc).ok()?;
+        let (die_ref, _) = dwarf.find_function_by_pc(global).ok().flatten()?;
+        let prolog = die_ref.prolog_start_place().ok()?;
+        prolog
+            .address
+            .relocate_to_segment_by_pc(&self.debugee, reloc)
+            .ok()
+    }
+
+    /// "Drop and re-enter" the top frame at `fn_start` with full
+    /// state restoration: PC ← `fn_start`, SP ← function-entry SP
+    /// (CFA computed from DWARF), and every callee-saved register
+    /// reset to the value it held at function entry (recovered via
+    /// the same DWARF unwind rules `backtrace` uses). On aarch64,
+    /// LR is set to the original return address so that a future
+    /// RET out of the function still returns to the caller correctly.
+    ///
+    /// Why all this matters: the naive form (just `set_pc`) re-runs
+    /// the prologue, which pushes another `fp/lr` pair, growing the
+    /// stack by one frame per restart and clobbering the saved-
+    /// register slots so a later step-out would land somewhere
+    /// nonsense. Resetting SP + LR + the callee-saved set makes the
+    /// prologue write into the SAME slots the original entry's
+    /// prologue wrote into — net effect is a clean re-entry as if
+    /// the function had been called fresh from the caller.
+    ///
+    /// **Caller-saved registers (x0..x18 on aarch64) are NOT
+    /// restored** — we don't have entry-time arg values without an
+    /// explicit snapshot, which is a Phase-2-snapshot-args item. If
+    /// the function modified its args you'll re-enter with the
+    /// modified ones; use Set Variable to fix manually if needed.
+    pub fn restart_top_frame(&self, pid: Pid, fn_start: u64) -> Result<(), Error> {
+        disable_when_not_stared!(self);
+
+        // Compute the caller's register state by unwinding one
+        // frame. After this call `unwound` holds:
+        //   SP = CFA of frame 0 = function-entry SP
+        //   PC = caller's resume address = return address LR had at fn entry
+        //   X29, X19..X28, etc = values restored per DWARF register rules
+        let raw = RegisterMap::current(pid)?;
+        let mut unwound = DwarfRegisterMap::from(raw.clone());
+        crate::debugger::debugee::dwarf::unwind::restore_registers_at_frame(
+            &self.debugee,
+            pid,
+            &mut unwound,
+            1,
+        )?;
+
+        // Helper: read a value from the unwound map by Register
+        // (architecture-typed), via DWARF's numeric register id.
+        let read_unwound = |reg: Register| -> Option<u64> {
+            let dwarf_reg = reg.dwarf_register()?;
+            unwound.value(dwarf_reg.into()).ok()
+        };
+
+        let mut map = raw;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if let Some(sp) = read_unwound(Register::SP) {
+                map.set_sp(sp);
+            }
+            // Return-address column → x30. On aarch64 the CIE's
+            // `return_address_register` is conventionally x30, so the
+            // unwound x30 holds the value lr had at fn entry.
+            if let Some(ra) = read_unwound(Register::RA) {
+                map.update(Register::X30, ra);
+            }
+            // Callee-saved set: x19..x28 plus x29 (frame pointer).
+            for reg in [
+                Register::X19,
+                Register::X20,
+                Register::X21,
+                Register::X22,
+                Register::X23,
+                Register::X24,
+                Register::X25,
+                Register::X26,
+                Register::X27,
+                Register::X28,
+                Register::X29,
+            ] {
+                if let Some(v) = read_unwound(reg) {
+                    map.update(reg, v);
+                }
+            }
+        }
+
+        // x86_64 path: would need to write [new_rsp] = return_addr
+        // and adjust rsp by -8 for the implicit CALL push. Not
+        // implemented here — falls through to set_pc only, same as
+        // the partial behaviour we shipped previously. Tracked
+        // separately.
+
+        map.set_pc(fn_start);
+        map.persist(pid)?;
+        Ok(())
+    }
+
     /// Return list of known files income from dwarf parser.
     pub fn known_files(&self) -> impl Iterator<Item = &PathBuf> {
         self.debugee
