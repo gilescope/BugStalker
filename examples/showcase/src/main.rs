@@ -97,9 +97,12 @@ fn main() {
     // 10. references — shared, mutable, raw
     let n = 100i32;
     let shared_ref: &i32 = &n;
-    let raw_ptr: *const i32 = &n;
-    let mut m = 200i32;
-    let mut_ref: &mut i32 = &mut m;
+    if let Ok(unlock) = mutex.lock() {
+        println!("{}", *unlock);
+        let raw_ptr: *const i32 = &n;
+        let mut m = 200i32;
+        let mut_ref: &mut i32 = &mut m;
+    }
 
     // 11. trait objects — vtable-driven concrete-type recovery
     trait Greeter {

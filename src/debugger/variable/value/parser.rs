@@ -539,6 +539,41 @@ impl ValueParser {
                     });
                 };
 
+                // `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]`.
+                // DWARF emits these as structs with `data_ptr` + `length`
+                // fields, same shape as `&str` but without the implicit
+                // UTF-8 interpretation. We pull the element type out of
+                // the `data_ptr` member (which is a `*const T`) so we
+                // don't have to text-parse `T` from the type name.
+                let is_slice_type_name = struct_name
+                    .as_ref()
+                    .map(|name| {
+                        let n = name.as_str();
+                        n.starts_with("&[")
+                            || n.starts_with("&mut [")
+                            || n.starts_with("*const [")
+                            || n.starts_with("*mut [")
+                    })
+                    .unwrap_or(false);
+                if is_slice_type_name {
+                    let element_type =
+                        struct_var.members.iter().find_map(|m| {
+                            if m.field_name.as_deref() != Some("data_ptr") {
+                                return None;
+                            }
+                            match &m.value {
+                                Value::Pointer(p) => p.target_type,
+                                _ => None,
+                            }
+                        });
+                    if let Some(element_type) = element_type {
+                        return Some(Value::Specialized {
+                            value: parser_ext.parse_slice(pcx, &struct_var, element_type),
+                            original: struct_var,
+                        });
+                    }
+                }
+
                 if struct_name.as_ref().map(|name| name.starts_with("Vec")) == Some(true)
                     && type_ns_h.contains(&["vec"])
                 {
@@ -902,7 +937,7 @@ impl ValueParser {
                     && type_ns_h.contains(&["sync"])
                 {
                     return Some(Value::Specialized {
-                        value: parser_ext.parse_mutex(&struct_var),
+                        value: parser_ext.parse_mutex(pcx, &struct_var),
                         original: struct_var,
                     });
                 };
@@ -944,6 +979,18 @@ impl ValueParser {
                 // vtable resolution from Phase 3 — for now they
                 // round-trip as a fat-pointer struct via the parent
                 // type-graph walk and don't reach this branch.
+                //
+                // We attempted to also eager-deref `&T` / `&mut T` /
+                // `*const T` / `*mut T` so the Variables panel could
+                // show `&10` instead of `0x16fdfef18` — but this
+                // started killing the debug session on programs with
+                // recursive types (`enum List { Cons(i32, Box<List>),
+                // Nil }`) and fat-pointer `Box<dyn Trait>` allocations.
+                // Reverted; see git history for the attempt. The
+                // approach to revisit: route through
+                // `eager_deref_with_cycle_check` AND skip DSTs by
+                // checking `target_type_size`, but test against the
+                // showcase example before re-enabling.
                 let name = ptr.type_ident.name_fmt();
                 if name.starts_with("alloc::boxed::Box<") {
                     ptr.dereffed = ptr.deref(pcx).map(Box::new);

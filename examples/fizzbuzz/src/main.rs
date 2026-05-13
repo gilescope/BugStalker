@@ -86,11 +86,12 @@ impl<P: Printer, CMP: Comparator> FizzBuzzSolver<P, CMP> {
 }
 
 pub fn main() {
+    let x = 179;
     let ok_solver = FizzBuzzSolver::new(PrettyPrinter {}, GoodComparator {});
     ok_solver.solve(9);
-
+    println!("Hello Pip {}", 4);
     let not_ok_solver = FizzBuzzSolver::new(BrokenPrinter {}, GoodComparator {});
-    not_ok_solver.solve(9);
+    not_ok_solver.solve(x);
 
     let not_ok_solver = FizzBuzzSolver::new(PrettyPrinter {}, BadComparator {});
     not_ok_solver.solve(9);

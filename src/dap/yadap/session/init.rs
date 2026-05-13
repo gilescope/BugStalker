@@ -33,6 +33,14 @@ impl super::DebugSession {
             "supportsCancelRequest": true,
             "supportsSetVariable": true,
             "supportsSetExpression": true,
+            // Tell DAP clients the `type` field on Variable responses
+            // is meaningful — VSCode renders it in grey alongside the
+            // value (e.g. `pair = (1, "one")   (i32, &str)`), which
+            // is enormously more useful than the default
+            // type-less name/value pair. We've been populating
+            // `type` in the responses all along; without this flag
+            // the IDE silently drops it on the floor.
+            "supportsVariableType": true,
             "supportsStepBack": false,
             "supportsReverseContinue": false,
             "supportsStepInTargetsRequest": true,

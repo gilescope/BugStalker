@@ -538,6 +538,13 @@ impl Value {
                 }
                 SpecializedValue::String(str) => Some(Literal::String(str.value.clone())),
                 SpecializedValue::Str(str) => Some(Literal::String(str.value.clone())),
+                SpecializedValue::Slice(slice) => {
+                    let mut array = vec![];
+                    for item in &slice.items {
+                        array.push(LiteralOrWildcard::Literal(item.value.as_literal()?))
+                    }
+                    Some(Literal::Array(array.into_boxed_slice()))
+                }
                 SpecializedValue::Tls(tls) => tls.inner_value.as_ref()?.as_literal(),
                 SpecializedValue::Cell(c) => c.as_literal(),
                 SpecializedValue::RefCell(c) => c.as_literal(),

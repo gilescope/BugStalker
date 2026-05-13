@@ -163,6 +163,48 @@ mod time_tests {
 }
 
 #[cfg(test)]
+mod quote_rust_string_tests {
+    use super::quote_rust_string;
+
+    #[test]
+    fn empty_is_double_quoted() {
+        assert_eq!(quote_rust_string(""), "\"\"");
+    }
+
+    #[test]
+    fn hello_is_quoted() {
+        assert_eq!(quote_rust_string("hello"), "\"hello\"");
+    }
+
+    #[test]
+    fn embedded_quote_is_escaped() {
+        assert_eq!(quote_rust_string("he said \"hi\""), "\"he said \\\"hi\\\"\"");
+    }
+
+    #[test]
+    fn backslash_is_escaped() {
+        assert_eq!(quote_rust_string("c:\\path"), "\"c:\\\\path\"");
+    }
+
+    #[test]
+    fn newline_tab_carriage_return_are_escaped() {
+        assert_eq!(quote_rust_string("a\nb\tc\rd"), "\"a\\nb\\tc\\rd\"");
+    }
+
+    #[test]
+    fn control_characters_use_unicode_escape() {
+        assert_eq!(quote_rust_string("\x01\x1f"), "\"\\u{1}\\u{1f}\"");
+    }
+
+    #[test]
+    fn non_ascii_printable_passes_through() {
+        // Round-trips arbitrary printable Unicode without
+        // mangling — the IDE renders the literal characters.
+        assert_eq!(quote_rust_string("café 日本"), "\"café 日本\"");
+    }
+}
+
+#[cfg(test)]
 mod duration_tests {
     use super::format_duration;
 
@@ -233,6 +275,78 @@ pub enum ByteRenderMode {
 /// `Structure` layout.
 fn try_byte_string_preview(structure_members: &[Member]) -> Option<String> {
     render_byte_slice_members(structure_members, ByteRenderMode::Auto)
+}
+
+/// Whether the bytes inside a `Vec<u8>` / `VecDeque<u8>` structure
+/// look like printable text. Used to decide whether the byte-string
+/// preview (`b"hello"`) is more useful than a numeric IndexedList
+/// (`[1, 2, 3]`). Threshold: every sampled byte is printable ASCII
+/// (`0x20..=0x7e`) or one of the common whitespace controls
+/// (`\t`, `\n`, `\r`). Anything else — including the `\u{1}` /
+/// `\u{2}` / `\u{3}` control codes that triggered the original
+/// "vec![1,2,3] looks awful" report — fails the test and falls
+/// through to the numeric render.
+///
+/// Returns `false` for empty vectors so they render as `[]` rather
+/// than `b""` — slightly more idiomatic in Variables-panel context.
+fn vec_bytes_are_stringy(structure_members: &[Member]) -> bool {
+    use crate::debugger::variable::value::SupportedScalar;
+    let Some(buf) = structure_members.first() else {
+        return false;
+    };
+    let Value::Array(arr) = &buf.value else {
+        return false;
+    };
+    let Some(items) = arr.items.as_ref() else {
+        return false;
+    };
+    if items.is_empty() {
+        return false;
+    }
+    for item in items.iter().take(64) {
+        let Value::Scalar(s) = &item.value else {
+            return false;
+        };
+        match s.value {
+            Some(SupportedScalar::U8(b)) => {
+                let printable = (0x20..=0x7e).contains(&b);
+                let whitespace = matches!(b, b'\t' | b'\n' | b'\r');
+                if !printable && !whitespace {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Wrap a Rust string body in double-quotes with the same escape
+/// rules `{:?}` / `Debug` use: `"`, `\`, `\n`, `\r`, `\t` get the
+/// backslash form; other control characters get a `\u{XX}` escape;
+/// printable characters pass through unchanged. The point is that a
+/// Variables-panel display of a `&str` / `String` looks like Rust
+/// source — `"hello"`, not `hello` — so the reader knows at a
+/// glance that this is a string value (versus an identifier, a
+/// number, or whatever else).
+pub(crate) fn quote_rust_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Phase 1 S16 — entrypoint that honours an explicit [`ByteRenderMode`].
@@ -518,6 +632,7 @@ impl RenderValue for Value {
                 }
                 SpecializedValue::String { .. } => &STRING_TYPE,
                 SpecializedValue::Str { .. } => &STR_TYPE,
+                SpecializedValue::Slice(slice) => &slice.structure.type_ident,
                 SpecializedValue::Tls(value) => &value.inner_type,
                 SpecializedValue::HashMap(map) => &map.type_ident,
                 SpecializedValue::HashSet(set) => &set.type_ident,
@@ -594,57 +709,82 @@ impl RenderValue for Value {
                 ..
             } => match spec_val {
                 SpecializedValue::Vector(vec) | SpecializedValue::VecDeque(vec) => {
-                    // Phase 1 S16: u8-element vectors get a utf-8 /
-                    // hex-dump preview at render time. The underlying
-                    // VecValue is unchanged so tests that walk the
-                    // items by index still work.
-                    if let Some(mut preview) = try_byte_string_preview(&vec.structure.members) {
-                        // Phase 1 F3: append the elision marker when the
-                        // collection length exceeded LEN_GUARD.
+                    // Only fire the `b"…"` byte preview when the bytes
+                    // actually look like text (all printable ASCII or
+                    // common whitespace control codes). For a random
+                    // `Vec<u8>` like `vec![1, 2, 3]` the bytes aren't
+                    // printable and `b"\u{1}\u{2}\u{3}"` is harder to
+                    // read than `[1, 2, 3]`. Falling through to the
+                    // IndexedList path gives the numeric render. Same
+                    // path covers `Vec<T>` for any T (i32, struct, …)
+                    // which previously rendered as the wrapper struct.
+                    let bytes_stringy = vec_bytes_are_stringy(&vec.structure.members);
+                    if bytes_stringy
+                        && let Some(mut preview) = try_byte_string_preview(&vec.structure.members)
+                    {
                         if let Some(n) = vec.elided {
                             preview.push_str(&format!(" (… {n} more elided)"));
                         }
-                        ValueLayout::PreRendered(Cow::Owned(preview))
-                    } else if let Some(n) = vec.elided {
-                        // Structured render with truncation note: build
-                        // a synthetic pre-rendered string that combines
-                        // the items count and the elision marker. Real
-                        // Structure rendering loses the trailer, so
-                        // surface the marker as a wrapper line.
-                        let item_count = match &vec.structure.members.first() {
-                            Some(m) => match &m.value {
-                                Value::Array(a) => a.items.as_ref().map(|i| i.len()).unwrap_or(0),
-                                _ => 0,
-                            },
-                            None => 0,
-                        };
+                        return Some(ValueLayout::PreRendered(Cow::Owned(preview)));
+                    }
+                    // Route to IndexedList over the inner Array's
+                    // items — same render shape as `[T; N]` / `&[T]`
+                    // gives. Elision is surfaced as a pre-rendered
+                    // summary line so the marker is visible.
+                    let buf_items = match vec.structure.members.first() {
+                        Some(m) => match &m.value {
+                            Value::Array(a) => a.items.as_deref(),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if let Some(n) = vec.elided {
+                        let item_count = buf_items.map(|i| i.len()).unwrap_or(0);
                         ValueLayout::PreRendered(Cow::Owned(format!(
                             "[{item_count} items] (… {n} more elided)"
                         )))
+                    } else if let Some(items) = buf_items {
+                        ValueLayout::IndexedList(items)
                     } else {
                         ValueLayout::Structure(vec.structure.members.as_ref())
+                    }
+                }
+                SpecializedValue::Slice(slice) => {
+                    // `&[T]` / `&mut [T]`: same render shape as a Rust
+                    // array. The elements were already parsed at parse-
+                    // time into `slice.items`, so the IndexedList path
+                    // takes over from here and surfaces them as
+                    // `[0]: v0, [1]: v1, …`. Truncation marker surfaces
+                    // when the underlying length exceeded LEN_GUARD.
+                    if let Some(n) = slice.elided {
+                        ValueLayout::PreRendered(Cow::Owned(format!(
+                            "[{} items] (… {n} more elided)",
+                            slice.items.len()
+                        )))
+                    } else {
+                        ValueLayout::IndexedList(slice.items.as_slice())
                     }
                 }
                 SpecializedValue::String(string) => {
                     // Phase 1 F3: append the elision marker for
                     // truncated strings.
+                    let quoted = quote_rust_string(&string.value);
                     if let Some(n) = string.elided {
                         ValueLayout::PreRendered(Cow::Owned(format!(
-                            "{} (… {n} more elided)",
-                            string.value
+                            "{quoted} (… {n} more elided)"
                         )))
                     } else {
-                        ValueLayout::PreRendered(Cow::Borrowed(&string.value))
+                        ValueLayout::PreRendered(Cow::Owned(quoted))
                     }
                 }
                 SpecializedValue::Str(string) => {
+                    let quoted = quote_rust_string(&string.value);
                     if let Some(n) = string.elided {
                         ValueLayout::PreRendered(Cow::Owned(format!(
-                            "{} (… {n} more elided)",
-                            string.value
+                            "{quoted} (… {n} more elided)"
                         )))
                     } else {
-                        ValueLayout::PreRendered(Cow::Borrowed(&string.value))
+                        ValueLayout::PreRendered(Cow::Owned(quoted))
                     }
                 }
                 SpecializedValue::Tls(tls_value) => match tls_value.inner_value.as_ref() {
@@ -675,8 +815,30 @@ impl RenderValue for Value {
                         ValueLayout::NonIndexedList(&set.items)
                     }
                 }
-                SpecializedValue::Cell(cell) | SpecializedValue::RefCell(cell) => {
-                    cell.value_layout()?
+                SpecializedValue::Cell(cell) => cell.value_layout()?,
+                SpecializedValue::RefCell(cell) => {
+                    // `parse_refcell` builds a 2-member wrapper struct
+                    // `{ borrow, <value member> }`. Rendering that
+                    // struct's layout directly gives `{...}` — the
+                    // user can't tell what the RefCell actually
+                    // contains without expanding it. Skip past the
+                    // wrapper and surface the inner value's layout
+                    // for the top-level display; the second member
+                    // is the payload by construction in
+                    // `parse_refcell_inner`. Tree-expand still walks
+                    // into the inner value's children, which is
+                    // usually what the user wants (e.g. for
+                    // `RefCell<Vec<i32>>` they get the array
+                    // elements). If they want to see the borrow
+                    // flag they can use `:debug` against the
+                    // original struct.
+                    if let Value::Struct(s) = cell.as_ref()
+                        && let Some(value_member) = s.members.get(1)
+                    {
+                        value_member.value.value_layout()?
+                    } else {
+                        cell.value_layout()?
+                    }
                 }
                 SpecializedValue::Rc(ptr) | SpecializedValue::Arc(ptr) => {
                     // Phase 3 Feature C — eagerly-deref Rc/Arc surfaces
@@ -745,33 +907,46 @@ impl RenderValue for Value {
                 // type-identity side so DAP clients can append it
                 // when displaying the value.
                 SpecializedValue::MaybeUninit(inner) => inner.value_layout()?,
-                // Phase 1 S1: Mutex/RwLock — render the guarded
-                // payload directly with optional `[locked]` and
-                // `[poisoned]` badges. Lock-state detection works
-                // on the futex backend only; non-futex platforms
-                // (macOS pthread, Win7 SRWLOCK) report locked=false.
+                // Phase 1 S1: Mutex/RwLock — surface the guarded
+                // payload with a status emoji prefix so the lock
+                // state is visible at a glance:
+                //   🔒  taken (someone holds the lock)
+                //   🔓  free (nobody holds the lock)
+                //   ☠️  poisoned (held by a thread that panicked)
+                //
+                // Lock-state detection works on the futex backend
+                // only; non-futex platforms (macOS pthread, Win7
+                // SRWLOCK) report locked=false unconditionally —
+                // the emoji will always be 🔓 there. Documented as
+                // a caveat rather than a bug because lifting that
+                // limitation needs platform-specific reads we'd
+                // rather not duplicate here.
                 SpecializedValue::Mutex {
                     inner,
                     poisoned,
                     locked,
                 } => {
-                    if *poisoned || *locked {
-                        let inner_text = match inner.value_layout() {
-                            Some(ValueLayout::PreRendered(s)) => s.into_owned(),
-                            Some(ValueLayout::Referential(p)) => format!("0x{:x}", p as usize),
-                            _ => "?".to_string(),
-                        };
-                        let mut badges = String::new();
-                        if *locked {
-                            badges.push_str(" [locked]");
+                    let inner_text = match inner.value_layout() {
+                        Some(ValueLayout::PreRendered(s)) => s.into_owned(),
+                        Some(ValueLayout::Referential(p)) => format!("0x{:x}", p as usize),
+                        _ => {
+                            // For complex inner shapes (Structure /
+                            // IndexedList / etc.) we can't easily flatten
+                            // here; let the existing rendering pipeline
+                            // wrap them. Synthesise just the emoji prefix
+                            // and rely on the DAP renderer to compose.
+                            // Falling through to the inner's own layout
+                            // means we lose the emoji for non-flat types,
+                            // which is acceptable — those are rare in
+                            // Mutex-guarded data anyway.
+                            return inner.value_layout();
                         }
-                        if *poisoned {
-                            badges.push_str(" [poisoned]");
-                        }
-                        ValueLayout::PreRendered(Cow::Owned(format!("{inner_text}{badges}")))
-                    } else {
-                        inner.value_layout()?
-                    }
+                    };
+                    let lock_emoji = if *locked { "🔒" } else { "🔓" };
+                    let poison_marker = if *poisoned { " ☠️" } else { "" };
+                    ValueLayout::PreRendered(Cow::Owned(format!(
+                        "{lock_emoji} {inner_text}{poison_marker}"
+                    )))
                 }
                 // Phase 1 S2: lock guards — render the guarded
                 // payload directly. The `MutexGuard<T>` etc. wrapper

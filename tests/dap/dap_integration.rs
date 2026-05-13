@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 use crate::dap_client;
 
+use anyhow::Context as _;
 use base64::Engine as _;
 use bs_replay_driver::engine::format::TraceWriter;
 use bs_replay_driver::engine::format::event::Event;
@@ -19,6 +20,9 @@ const HELLO_LINE: i64 = 5;
 const SET_VAR_LINE: i64 = 35;
 const BS_VIZ_SPEC_REQUESTED_COMMENT_LINE: i64 = 91;
 const BS_VIZ_SPEC_BOUND_STATEMENT_LINE: i64 = 96;
+/// Last line of `showcase`'s `main`, after every local in sections
+/// 1..12 is in scope. Used by the showcase regression test below.
+const SHOWCASE_LINE: i64 = 144;
 const OPTIONAL_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn assert_response(response: &Value, command: &str, request_seq: i64, success: bool) -> bool {
@@ -903,6 +907,166 @@ fn test_variables_request() -> anyhow::Result<()> {
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "variables", seq, true);
     assert!(response["body"]["variables"].is_array());
+    session.shutdown();
+    Ok(())
+}
+
+/// Regression test: walking every local in the showcase example
+/// (which exercises most variable shapes BugStalker renders) must
+/// not crash bs. Currently reproduces a kill-on-debug seen when
+/// `let captured_copy = 10;` is uncommented at showcase main.rs:120
+/// — that shifts the stack layout and exposes a panic somewhere in
+/// the variable-rendering code. The test:
+///
+///   1. builds `showcase` so the example binary exists,
+///   2. launches it under bs DAP and breaks at the last line of
+///      `main` (every local in sections 1..12 is in scope),
+///   3. requests `variables` for the top-level locals scope,
+///   4. recursively expands every child whose `variablesReference`
+///      is non-zero (depth-first walk),
+///
+/// Any DAP error / EOF during the walk is treated as bs crashing
+/// or hanging — the test fails with the captured error. When the
+/// underlying panic is fixed the walk completes and the test passes.
+#[test]
+#[serial]
+fn test_showcase_locals_no_crash() -> anyhow::Result<()> {
+    // Build showcase the same way the codelldb-fork extension does
+    // when EnC is enabled: with the `wild` linker and the
+    // symbol-mangling / emit-patch RUSTFLAGS. The original kill-on-
+    // debug report came from that exact build path; default ld64
+    // builds may not reproduce it (this is the test's main reason
+    // to exist).
+    let linker_dir = dap_client::repo_root()
+        .parent()
+        .map(|p| p.join("linker").join("target").join("release").join("wild"));
+    let mut env_args: Vec<(String, String)> = Vec::new();
+    let target_triple = "aarch64-apple-darwin";
+    if let Some(wild) = linker_dir.as_ref().filter(|p| p.exists()) {
+        // CARGO_TARGET_<triple>_RUSTFLAGS — same key the extension uses.
+        let key = format!(
+            "CARGO_TARGET_{}_RUSTFLAGS",
+            target_triple.to_uppercase().replace('-', "_")
+        );
+        let rustflags = format!(
+            "-C symbol-mangling-version=v0 -C linker=clang -C link-arg=-fuse-ld={} \
+             -C link-arg=-Wl,--incremental-cache=read-write",
+            wild.display()
+        );
+        env_args.push((key, rustflags));
+    }
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "-p", "showcase", "--target", target_triple])
+        .current_dir(dap_client::repo_root().join("examples"));
+    // Strip the inherited RUSTFLAGS so cargo's precedence doesn't
+    // override our CARGO_TARGET_<triple>_RUSTFLAGS.
+    cmd.env_remove("RUSTFLAGS");
+    cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
+    for (k, v) in &env_args {
+        cmd.env(k, v);
+    }
+    let status = cmd.status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build showcase example");
+    }
+
+    let showcase_bin = dap_client::repo_root()
+        .join("examples")
+        .join("target")
+        .join(target_triple)
+        .join("debug")
+        .join("showcase");
+    if !showcase_bin.exists() {
+        anyhow::bail!(
+            "showcase binary not at expected path {} after build",
+            showcase_bin.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Showcase has to be debuggable by the spawned bs — give it
+        // the get-task-allow entitlement the existing
+        // `ensure_example_binaries` codesign would normally apply.
+        let _ = Command::new("codesign")
+            .args(["--entitlements"])
+            .arg(dap_client::repo_root().join("tests").join("darwin.entitlements"))
+            .args(["--force", "--sign", "-"])
+            .arg(&showcase_bin)
+            .status();
+    }
+
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &showcase_bin,
+        &dap_client::example_source("examples/showcase/src/main.rs"),
+        SHOWCASE_LINE
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+
+    let scopes_seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes_response = session
+        .client
+        .read_response(scopes_seq)
+        .context("scopes response — bs likely crashed")?;
+    ensure_response!(session, &scopes_response, "scopes", scopes_seq, true);
+    let locals_ref = scopes_response["body"]["scopes"][0]["variablesReference"]
+        .as_i64()
+        .unwrap_or(0);
+
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": locals_ref }))?;
+    let response = session
+        .client
+        .read_response(seq)
+        .context("variables (locals) response — bs likely crashed")?;
+    ensure_response!(session, &response, "variables", seq, true);
+
+    // DFS-expand every child reference. The walk is bounded so a
+    // bogus self-referential `variablesReference` chain can't loop
+    // forever.
+    let mut queue: Vec<i64> = response["body"]["variables"]
+        .as_array()
+        .map(|vars| {
+            vars.iter()
+                .filter_map(|v| v["variablesReference"].as_i64())
+                .filter(|r| *r > 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut visited: std::collections::HashSet<i64> = Default::default();
+    let mut depth = 0usize;
+    const MAX_EXPAND_DEPTH: usize = 8;
+    while let Some(r) = queue.pop() {
+        if !visited.insert(r) {
+            continue;
+        }
+        depth += 1;
+        if depth > MAX_EXPAND_DEPTH * 64 {
+            break;
+        }
+        let s = session
+            .client
+            .send_request("variables", json!({ "variablesReference": r }))?;
+        let resp = session
+            .client
+            .read_response(s)
+            .with_context(|| format!("variables ref={r} — bs likely crashed mid-walk"))?;
+        ensure_response!(session, &resp, "variables", s, true);
+        if let Some(arr) = resp["body"]["variables"].as_array() {
+            for v in arr {
+                if let Some(child_ref) = v["variablesReference"].as_i64() {
+                    if child_ref > 0 {
+                        queue.push(child_ref);
+                    }
+                }
+            }
+        }
+    }
+
     session.shutdown();
     Ok(())
 }
