@@ -178,7 +178,10 @@ mod quote_rust_string_tests {
 
     #[test]
     fn embedded_quote_is_escaped() {
-        assert_eq!(quote_rust_string("he said \"hi\""), "\"he said \\\"hi\\\"\"");
+        assert_eq!(
+            quote_rust_string("he said \"hi\""),
+            "\"he said \\\"hi\\\"\""
+        );
     }
 
     #[test]

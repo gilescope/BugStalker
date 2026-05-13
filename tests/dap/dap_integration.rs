@@ -989,7 +989,11 @@ fn test_showcase_locals_no_crash() -> anyhow::Result<()> {
         // `ensure_example_binaries` codesign would normally apply.
         let _ = Command::new("codesign")
             .args(["--entitlements"])
-            .arg(dap_client::repo_root().join("tests").join("darwin.entitlements"))
+            .arg(
+                dap_client::repo_root()
+                    .join("tests")
+                    .join("darwin.entitlements"),
+            )
             .args(["--force", "--sign", "-"])
             .arg(&showcase_bin)
             .status();

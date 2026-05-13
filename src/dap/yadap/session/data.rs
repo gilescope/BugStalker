@@ -79,9 +79,7 @@ impl super::DebugSession {
             // like `struct Marker;`).
             let child_ref = match v.child.as_ref() {
                 Some(child) if !child.is_empty() => {
-                    if let Some(r) =
-                        self.child_links.get(&(variables_reference, index)).copied()
-                    {
+                    if let Some(r) = self.child_links.get(&(variables_reference, index)).copied() {
                         r
                     } else {
                         let r = self.vars.alloc(child.clone());
@@ -647,10 +645,7 @@ pub fn strip_type_namespace(type_name: &str) -> String {
                 let c = bytes[i];
                 if c.is_ascii_alphanumeric() || c == b'_' {
                     i += 1;
-                } else if c == b':'
-                    && i + 1 < bytes.len()
-                    && bytes[i + 1] == b':'
-                {
+                } else if c == b':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
                     i += 2;
                     last_segment_start = i;
                 } else {
@@ -1443,16 +1438,14 @@ mod collection_preview_tests {
         // COLLECTION_PREVIEW_BUDGET. The renderer should fall back
         // to `{...} (len=N)` rather than emit the whole thing.
         let big_strings: Vec<debugger::variable::value::Value> = (0..50)
-            .map(|i| {
-                debugger::variable::value::Value::Specialized {
-                    value: Some(debugger::variable::value::SpecializedValue::Str(
-                        debugger::variable::value::specialization::StrVariable {
-                            value: format!("item-{i:03}"),
-                            elided: None,
-                        },
-                    )),
-                    original: debugger::variable::value::StructValue::default(),
-                }
+            .map(|i| debugger::variable::value::Value::Specialized {
+                value: Some(debugger::variable::value::SpecializedValue::Str(
+                    debugger::variable::value::specialization::StrVariable {
+                        value: format!("item-{i:03}"),
+                        elided: None,
+                    },
+                )),
+                original: debugger::variable::value::StructValue::default(),
             })
             .collect();
         let rendered = non_indexed_list_preview(&big_strings, None);
@@ -1496,18 +1489,13 @@ mod strip_type_namespace_tests {
     #[test]
     fn single_namespace_segment_dropped() {
         assert_eq!(strip_type_namespace("alloc::string::String"), "String");
-        assert_eq!(
-            strip_type_namespace("core::option::Option"),
-            "Option"
-        );
+        assert_eq!(strip_type_namespace("core::option::Option"), "Option");
     }
 
     #[test]
     fn generic_args_are_stripped_too() {
         assert_eq!(
-            strip_type_namespace(
-                "std::collections::HashMap<alloc::string::String, i32>"
-            ),
+            strip_type_namespace("std::collections::HashMap<alloc::string::String, i32>"),
             "HashMap<String, i32>"
         );
     }
@@ -1515,19 +1503,14 @@ mod strip_type_namespace_tests {
     #[test]
     fn nested_generics_strip_recursively() {
         assert_eq!(
-            strip_type_namespace(
-                "core::option::Option<core::result::Result<i32, std::io::Error>>"
-            ),
+            strip_type_namespace("core::option::Option<core::result::Result<i32, std::io::Error>>"),
             "Option<Result<i32, Error>>"
         );
     }
 
     #[test]
     fn slice_and_array_punctuation_preserved() {
-        assert_eq!(
-            strip_type_namespace("&[std::path::PathBuf]"),
-            "&[PathBuf]"
-        );
+        assert_eq!(strip_type_namespace("&[std::path::PathBuf]"), "&[PathBuf]");
         assert_eq!(
             strip_type_namespace("[std::path::PathBuf; 4]"),
             "[PathBuf; 4]"

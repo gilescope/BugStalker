@@ -556,16 +556,15 @@ impl ValueParser {
                     })
                     .unwrap_or(false);
                 if is_slice_type_name {
-                    let element_type =
-                        struct_var.members.iter().find_map(|m| {
-                            if m.field_name.as_deref() != Some("data_ptr") {
-                                return None;
-                            }
-                            match &m.value {
-                                Value::Pointer(p) => p.target_type,
-                                _ => None,
-                            }
-                        });
+                    let element_type = struct_var.members.iter().find_map(|m| {
+                        if m.field_name.as_deref() != Some("data_ptr") {
+                            return None;
+                        }
+                        match &m.value {
+                            Value::Pointer(p) => p.target_type,
+                            _ => None,
+                        }
+                    });
                     if let Some(element_type) = element_type {
                         return Some(Value::Specialized {
                             value: parser_ext.parse_slice(pcx, &struct_var, element_type),
