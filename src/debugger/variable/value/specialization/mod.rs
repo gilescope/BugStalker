@@ -1702,34 +1702,71 @@ impl<'a> VariableParserExtension<'a> {
             })
             .unwrap_or(false);
 
-        // macOS Mutex lock-state probe. libstd's pthread backend on
-        // Darwin emits `sys::Mutex` as `UnsafeCell<pthread_mutex_t>`,
-        // where `pthread_mutex_t` is an opaque `[u8; 56]` array in
-        // DWARF — no `futex` u32 for the BFS above to pick up, so
-        // `locked` defaulted to `false` regardless of lock state.
+        // macOS Mutex lock-state probe. On Darwin libstd uses the
+        // pthread backend, but since Rust 1.78 `sys::Mutex` is no
+        // longer `UnsafeCell<pthread_mutex_t>` inline — it is
+        //   `OnceBox<pal::Mutex>` ≅ `AtomicPtr<pal::Mutex>`
+        // (8 bytes). The real `pthread_mutex_t` is `Box`-allocated
+        // on the first lock and the pointer is cached forever; on
+        // unlock the box stays put. So:
+        //   * AtomicPtr == 0  ⇒  never been locked (definitely free)
+        //   * AtomicPtr != 0  ⇒  follow the pointer and inspect the
+        //                        pthread_mutex_t owner field
         //
-        // Apple's `_pthread_mutex` layout starts with `long sig`
-        // (offset 0, 8 bytes) followed by `_pthread_lock lock`
-        // (offset 8, 4 bytes) which on current Darwin is an
-        // `os_unfair_lock` containing the holding thread's mach
-        // port. Owner != 0 ⇒ held; owner == 0 ⇒ free.
+        // Apple's `_pthread_mutex` (PTHREAD_MUTEX_NORMAL, psynch
+        // backend — the mode libstd's `pal::Mutex::init` selects)
+        // has this layout after `pthread_mutex_init`, verified
+        // empirically on macOS 14 arm64:
+        //   +0x00 (u32) sig = 0x4D55545A  ('MUTZ'; initialised)
+        //   +0x14 (u32) sig = 0x4D55545A  (separator sig)
+        //   +0x18 (u32) m_tid[1] — owner thread id (0 when free,
+        //               current-thread tid when held).
+        //   +0x20 (u32) m_seq[0] — also flips 0 ↔ non-zero on lock.
+        //   +0x38..+0x40 trailing sig pair, footer.
+        // Apple keeps the actual `opaque[]` private; we treat the
+        // sig + owner pair as a soft contract. If the leading sig
+        // doesn't match (different libpthread version, foreign mutex
+        // type), we fall through to `locked = false` rather than
+        // guess from arbitrary bytes.
         //
-        // Best-effort: if the inferior address isn't readable
-        // (KERN_INVALID_ADDRESS, region not mapped), we silently
-        // keep `locked = false` rather than poisoning the render.
-        // `vm_read_n`'s 16 MiB sanity cap protects us if the
-        // `inner_member` address is garbage.
+        // Note: the older `_pthread_lock` at +0x08 holds an opaque
+        // kernel handle that does NOT toggle on user-space lock/
+        // unlock — reading it gives stale `false` regardless of
+        // current state. A previous version of this probe used +8
+        // for that reason.
+        //
+        // Best-effort: any read failure (KERN_INVALID_ADDRESS,
+        // region not mapped, garbage AtomicPtr value) keeps
+        // `locked = false` rather than poisoning the render.
+        // `vm_read_n`'s 16 MiB sanity cap is the backstop.
         #[cfg(target_os = "macos")]
-        if let Some(addr) = inner_member.and_then(|m| m.value.in_memory_location()) {
-            const OS_UNFAIR_LOCK_OFFSET: usize = 8;
-            if let Ok(bytes) = debugger::read_memory_by_pid(
-                pcx.evcx.ecx.pid_on_focus(),
-                addr + OS_UNFAIR_LOCK_OFFSET,
-                4,
-            ) && bytes.len() == 4
+        if let Some(inner_addr) = inner_member.and_then(|m| m.value.in_memory_location()) {
+            let pid = pcx.evcx.ecx.pid_on_focus();
+            // Read the OnceBox<pal::Mutex> pointer at offset 0 of
+            // `sys::Mutex`. 8 bytes on 64-bit Darwin.
+            if let Ok(ptr_bytes) = debugger::read_memory_by_pid(pid, inner_addr, 8)
+                && let Ok(arr) = <[u8; 8]>::try_from(ptr_bytes.as_slice())
             {
-                let owner = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                locked = owner != 0;
+                let pal_ptr = u64::from_ne_bytes(arr) as usize;
+                if pal_ptr == 0 {
+                    // OnceBox uninitialised: mutex has never been
+                    // locked, therefore not held.
+                    locked = false;
+                } else if let Ok(buf) = debugger::read_memory_by_pid(pid, pal_ptr, 0x24)
+                    && buf.len() == 0x24
+                {
+                    const PTHREAD_MUTEX_SIG_INITIALISED: u32 = 0x4D55545A; // 'MUTZ'
+                    let sig = u32::from_ne_bytes(buf[0x00..0x04].try_into().unwrap());
+                    if sig == PTHREAD_MUTEX_SIG_INITIALISED {
+                        // Owner field at +0x18 is non-zero iff held;
+                        // the count field at +0x20 mirrors this. OR
+                        // them so a future layout shuffle that only
+                        // zeroes one of the two still works.
+                        let owner = u32::from_ne_bytes(buf[0x18..0x1c].try_into().unwrap());
+                        let count = u32::from_ne_bytes(buf[0x20..0x24].try_into().unwrap());
+                        locked = owner != 0 || count != 0;
+                    }
+                }
             }
         }
         #[cfg(not(target_os = "macos"))]
