@@ -1702,15 +1702,38 @@ impl<'a> VariableParserExtension<'a> {
             })
             .unwrap_or(false);
 
-        // macOS Mutex/RwLock raw-byte probe DISABLED for now. The
-        // earlier attempt (reading bytes 8..12 of the `inner` field's
-        // runtime address) coincided with a debug-session crash in
-        // showcase when `let captured_copy = 10;` was uncommented, so
-        // the probe is parked while we bisect the actual culprit. Once
-        // the kill is rooted out, restore by reading 4 bytes at offset
-        // 8 (os_unfair_lock owner word) and setting locked = nonzero.
-        // See the git history at this file for the previous shape.
-        let _ = (pcx, inner_member); // silence unused-variable warnings
+        // macOS Mutex lock-state probe. libstd's pthread backend on
+        // Darwin emits `sys::Mutex` as `UnsafeCell<pthread_mutex_t>`,
+        // where `pthread_mutex_t` is an opaque `[u8; 56]` array in
+        // DWARF — no `futex` u32 for the BFS above to pick up, so
+        // `locked` defaulted to `false` regardless of lock state.
+        //
+        // Apple's `_pthread_mutex` layout starts with `long sig`
+        // (offset 0, 8 bytes) followed by `_pthread_lock lock`
+        // (offset 8, 4 bytes) which on current Darwin is an
+        // `os_unfair_lock` containing the holding thread's mach
+        // port. Owner != 0 ⇒ held; owner == 0 ⇒ free.
+        //
+        // Best-effort: if the inferior address isn't readable
+        // (KERN_INVALID_ADDRESS, region not mapped), we silently
+        // keep `locked = false` rather than poisoning the render.
+        // `vm_read_n`'s 16 MiB sanity cap protects us if the
+        // `inner_member` address is garbage.
+        #[cfg(target_os = "macos")]
+        if let Some(addr) = inner_member.and_then(|m| m.value.in_memory_location()) {
+            const OS_UNFAIR_LOCK_OFFSET: usize = 8;
+            if let Ok(bytes) = debugger::read_memory_by_pid(
+                pcx.evcx.ecx.pid_on_focus(),
+                addr + OS_UNFAIR_LOCK_OFFSET,
+                4,
+            ) && bytes.len() == 4
+            {
+                let owner = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                locked = owner != 0;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (pcx, inner_member); // silence unused-variable warnings on non-macOS
         // `data` is the only field we care about; the `inner` lock
         // primitive and `poison` flag are ignored.
         let data_member = outer
