@@ -141,8 +141,19 @@ fn guard_cap(cap: i64) -> i64 {
 /// elements were elided. Returned tuple is `(clamped_len, elided)`
 /// where `elided` is `Some(n)` when `len > LEN_GUARD` and `n` is the
 /// number of items that won't be rendered; `None` otherwise.
+///
+/// Negative inputs clamp to `0`. A negative length is never valid —
+/// when we see one it means the field we read came from a slot that
+/// isn't actually a live `&str` / collection (uninitialised stack,
+/// the wrong DIE picked from an inlined variant, etc.). Passing
+/// `len as usize` downstream with the bits intact yields ~16 EiB
+/// and panics the allocator with `capacity overflow`. Clamp to 0
+/// so the caller renders an empty string / collection instead of
+/// killing the adapter.
 fn guard_len_with_truncation(len: i64) -> (i64, Option<u64>) {
-    if len > LEN_GUARD {
+    if len <= 0 {
+        (0, None)
+    } else if len > LEN_GUARD {
         (LEN_GUARD, Some((len - LEN_GUARD) as u64))
     } else {
         (len, None)
@@ -182,11 +193,13 @@ mod render_budget_tests {
     }
 
     #[test]
-    fn truncation_negative_unchanged() {
-        // Defensive: negative lengths shouldn't be possible in
-        // practice but the helper must not panic on them.
+    fn truncation_negative_clamped_to_zero() {
+        // Defensive: negative lengths happen when we read a slot
+        // that isn't actually a live `&str` / collection. Clamp to
+        // 0 so the caller's `len as usize` doesn't sign-extend to
+        // ~16 EiB and crash the allocator.
         let (clamped, elided) = guard_len_with_truncation(-5);
-        assert_eq!(clamped, -5);
+        assert_eq!(clamped, 0);
         assert_eq!(elided, None);
     }
 }
@@ -265,6 +278,28 @@ pub struct StrVariable {
     pub elided: Option<u64>,
 }
 
+/// Specialised view over `&[T]` / `&mut [T]` slices (the non-string
+/// kind). DWARF lowers a Rust slice to a struct with `data_ptr` +
+/// `length` fields, which without specialisation surfaces in the
+/// Variables panel as a fat-pointer view — useless for inspecting
+/// the elements. The parser reads `length` items of element-type
+/// size starting at `data_ptr` and stores them here; the renderer
+/// then surfaces them through `IndexedList` so the user sees
+/// `[20, 30]` for `let slice: &[i32] = &arr[1..3]`.
+#[derive(Clone, PartialEq)]
+pub struct SliceVariable {
+    /// Original fat-pointer struct, retained so a `:debug` view can
+    /// still surface `data_ptr` + `length`.
+    pub structure: StructValue,
+    /// Parsed slice elements (index + Value). Same shape as
+    /// `ArrayValue::items` so the existing `IndexedList` render
+    /// path drives the display.
+    pub items: Vec<ArrayItem>,
+    /// Number of items the renderer elided because length exceeded
+    /// LEN_GUARD. `None` when the slice fits in budget.
+    pub elided: Option<u64>,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct TlsVariable {
     pub inner_value: Option<Box<Value>>,
@@ -292,6 +327,7 @@ pub enum SpecializedValue {
     BTreeSet(HashSetVariable),
     String(StringVariable),
     Str(StrVariable),
+    Slice(SliceVariable),
     Tls(TlsVariable),
     Cell(Box<Value>),
     RefCell(Box<Value>),
@@ -477,6 +513,79 @@ impl<'a> VariableParserExtension<'a> {
 
         Ok(StrVariable {
             value: String::from_utf8(data.to_vec()).map_err(AssumeError::from)?,
+            elided,
+        })
+    }
+
+    /// Parse a Rust slice `&[T]` / `&mut [T]`. The fat-pointer struct
+    /// has fields `data_ptr` and `length`; we read `length` items of
+    /// element-type size starting at `data_ptr` and parse each as a
+    /// `Value`. Used by the parser dispatch when the underlying
+    /// struct's type name is a slice (`&[T]` or `&mut [T]`).
+    pub fn parse_slice(
+        &self,
+        pcx: &ParseContext,
+        structure: &StructValue,
+        element_type: crate::debugger::debugee::dwarf::r#type::TypeId,
+    ) -> Option<SpecializedValue> {
+        weak_error!(
+            self.parse_slice_inner(pcx, structure.clone(), element_type)
+                .context("&[T] slice interpretation")
+        )
+        .map(SpecializedValue::Slice)
+    }
+
+    fn parse_slice_inner(
+        &self,
+        pcx: &ParseContext,
+        structure: StructValue,
+        element_type: crate::debugger::debugee::dwarf::r#type::TypeId,
+    ) -> Result<SliceVariable, ParsingError> {
+        let val = Value::Struct(structure.clone());
+        let len = val.assume_field_as_scalar_number("length")?;
+        let (len, elided) = guard_len_with_truncation(len);
+        let data_ptr = val.assume_field_as_pointer("data_ptr")? as usize;
+
+        let el_type = pcx.type_graph;
+        let el_type_size = el_type
+            .type_size_in_bytes(pcx.evcx, element_type)
+            .ok_or(UnknownSize(el_type.identity(element_type)))?
+            as usize;
+
+        let raw_data = debugger::read_memory_by_pid(
+            pcx.evcx.ecx.pid_on_focus(),
+            data_ptr,
+            len as usize * el_type_size,
+        )
+        .map(Bytes::from)?;
+
+        let (mut bytes_chunks, mut empty_chunks);
+        let raw_items_iter: &mut dyn Iterator<Item = (usize, &[u8])> = if el_type_size != 0 {
+            bytes_chunks = raw_data.chunks(el_type_size).enumerate();
+            &mut bytes_chunks
+        } else {
+            let v: Vec<&[u8]> = vec![&[]; len as usize];
+            empty_chunks = v.into_iter().enumerate();
+            &mut empty_chunks
+        };
+
+        let items: Vec<ArrayItem> = raw_items_iter
+            .filter_map(|(i, chunk)| {
+                let data = ObjectBinaryRepr {
+                    raw_data: raw_data.slice_ref(chunk),
+                    address: Some(data_ptr + (i * el_type_size)),
+                    size: el_type_size,
+                };
+                Some(ArrayItem {
+                    index: i as i64,
+                    value: self.parser.parse_inner(pcx, Some(data), element_type)?,
+                })
+            })
+            .collect();
+
+        Ok(SliceVariable {
+            structure,
+            items,
             elided,
         })
     }
@@ -1328,6 +1437,12 @@ impl<'a> VariableParserExtension<'a> {
                 .type_ident
                 .set_name(format!("{original} {marker}"));
         }
+        // Leave `dereffed` pointing at the full `RcInner<T>` struct
+        // — that way `value_children` can iterate `strong`, `weak`,
+        // `value` and the user can open the tree. The top-level
+        // value rendering peels to `value` at render time (see
+        // `data.rs` `Wrapped` branch) so the inline display reads
+        // `* "shared"` rather than `* RcInner<String> {...}`.
         Some(SpecializedValue::Rc(ptr))
     }
 
@@ -1362,6 +1477,10 @@ impl<'a> VariableParserExtension<'a> {
                 .type_ident
                 .set_name(format!("{original} {marker}"));
         }
+        // Same shape as Rc — leave dereffed pointing at the full
+        // `ArcInner<T>` so child iteration works. Render-time
+        // peels the `data` (or `value`) field for the inline
+        // display.
         Some(SpecializedValue::Arc(ptr))
     }
 
@@ -1523,14 +1642,22 @@ impl<'a> VariableParserExtension<'a> {
     /// trailer when set. The `inner: sys::Mutex` field stays opaque;
     /// the `[locked]` badge is still deferred (lock-state requires
     /// platform-specific layout knowledge).
-    pub fn parse_mutex(&self, structure: &StructValue) -> Option<SpecializedValue> {
+    pub fn parse_mutex(
+        &self,
+        pcx: &ParseContext,
+        structure: &StructValue,
+    ) -> Option<SpecializedValue> {
         weak_error!(
-            self.parse_mutex_inner(Value::Struct(structure.clone()))
+            self.parse_mutex_inner(pcx, Value::Struct(structure.clone()))
                 .context("Mutex<T> / RwLock<T> interpretation")
         )
     }
 
-    fn parse_mutex_inner(&self, val: Value) -> Result<SpecializedValue, ParsingError> {
+    fn parse_mutex_inner(
+        &self,
+        pcx: &ParseContext,
+        val: Value,
+    ) -> Result<SpecializedValue, ParsingError> {
         let outer = match val {
             Value::Struct(s) => s,
             _ => return Err(UnexpectedType("Mutex outer is not a struct").into()),
@@ -1559,10 +1686,11 @@ impl<'a> VariableParserExtension<'a> {
         // iff the first u32 in the inner member is non-zero. Other
         // backends (pthread on macOS, SRWLOCK on Win7) don't have
         // the `futex`/`state` field so this defaults to false.
-        let locked = outer
+        let inner_member = outer
             .members
             .iter()
-            .find(|m| m.field_name.as_deref() == Some("inner"))
+            .find(|m| m.field_name.as_deref() == Some("inner"));
+        let mut locked = inner_member
             .and_then(|m| {
                 m.value.bfs_iterator().find_map(|(_, child)| match child {
                     Value::Scalar(s) => match s.value {
@@ -1573,6 +1701,16 @@ impl<'a> VariableParserExtension<'a> {
                 })
             })
             .unwrap_or(false);
+
+        // macOS Mutex/RwLock raw-byte probe DISABLED for now. The
+        // earlier attempt (reading bytes 8..12 of the `inner` field's
+        // runtime address) coincided with a debug-session crash in
+        // showcase when `let captured_copy = 10;` was uncommented, so
+        // the probe is parked while we bisect the actual culprit. Once
+        // the kill is rooted out, restore by reading 4 bytes at offset
+        // 8 (os_unfair_lock owner word) and setting locked = nonzero.
+        // See the git history at this file for the previous shape.
+        let _ = (pcx, inner_member); // silence unused-variable warnings
         // `data` is the only field we care about; the `inner` lock
         // primitive and `poison` flag are ignored.
         let data_member = outer

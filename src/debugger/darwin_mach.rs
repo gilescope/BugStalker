@@ -279,7 +279,20 @@ pub fn task_for_pid_or_proc(pid: Pid) -> Result<task_t, MachError> {
 
 /// Read `n` bytes from the inferior's address space starting at
 /// `addr`. One Mach round-trip regardless of `n`.
+///
+/// `n` is sanity-capped at `VM_READ_MAX` (16 MiB) so a garbage
+/// length read from the inferior — e.g. a sign-extended `-1`
+/// pretending to be a `&str` length — can't ask `Vec::with_capacity`
+/// for ~16 EiB and panic the allocator. Anything legitimately
+/// larger should call this in a loop.
 pub fn vm_read_n(task: task_t, addr: usize, n: usize) -> Result<Vec<u8>, MachError> {
+    const VM_READ_MAX: usize = 16 * 1024 * 1024;
+    if n > VM_READ_MAX {
+        log::error!(target: "darwin_mach",
+            "vm_read_n refusing implausible n={n} (addr=0x{addr:x}, cap=0x{VM_READ_MAX:x}) — \
+             returning KERN_INVALID_ARGUMENT instead of allocating");
+        return Err(MachError(mach2::kern_return::KERN_INVALID_ARGUMENT));
+    }
     let mut buf = vec![0u8; n];
     let mut out_size: mach_vm_size_t = 0;
     // SAFETY: buf is uniquely owned and large enough; the kernel
