@@ -914,16 +914,19 @@ impl RenderValue for Value {
                 // payload with a status emoji prefix so the lock
                 // state is visible at a glance:
                 //   🔒  taken (someone holds the lock)
-                //   🔓  free (nobody holds the lock)
+                //   🔑  free (nobody holds the lock — the key is
+                //        sitting on the table, anyone may take it)
                 //   ☠️  poisoned (held by a thread that panicked)
                 //
+                // Key vs padlock has distinct silhouettes (long
+                // thin key vs boxy padlock), unlike the open-vs-
+                // closed padlock pair which renders nearly
+                // identical at the font sizes DAP clients use.
+                //
                 // Lock-state detection works on the futex backend
-                // only; non-futex platforms (macOS pthread, Win7
-                // SRWLOCK) report locked=false unconditionally —
-                // the emoji will always be 🔓 there. Documented as
-                // a caveat rather than a bug because lifting that
-                // limitation needs platform-specific reads we'd
-                // rather not duplicate here.
+                // and on Darwin pthread (via the os_unfair_lock
+                // owner probe in parse_mutex_inner). Win7 SRWLOCK
+                // still reports locked=false unconditionally.
                 SpecializedValue::Mutex {
                     inner,
                     poisoned,
@@ -945,7 +948,7 @@ impl RenderValue for Value {
                             return inner.value_layout();
                         }
                     };
-                    let lock_emoji = if *locked { "🔒" } else { "🔓" };
+                    let lock_emoji = if *locked { "🔒" } else { "🔑" };
                     let poison_marker = if *poisoned { " ☠️" } else { "" };
                     ValueLayout::PreRendered(Cow::Owned(format!(
                         "{lock_emoji} {inner_text}{poison_marker}"
