@@ -28,6 +28,7 @@ pub use debugee::FunctionRange;
 pub use debugee::RegionInfo;
 pub use debugee::ThreadSnapshot;
 pub use debugee::dwarf::CandidateStatus as LineCandidateStatus;
+pub use debugee::dwarf::InlineFrame;
 pub use debugee::dwarf::LineCandidate;
 pub use debugee::dwarf::LineDiagnostics;
 pub use debugee::dwarf::Symbol;
@@ -106,6 +107,24 @@ pub trait EventHook {
         thread_num: Option<u32>,
     ) -> anyhow::Result<()>;
 
+    /// Phase 9 follow-up — same as `on_breakpoint`, but the call
+    /// site also provides the `addr2line`-computed inline chain
+    /// (innermost first; `chain.last()` is the concrete enclosing
+    /// subprogram). Default impl drops the chain and forwards to
+    /// `on_breakpoint`, so existing hooks compile unchanged. Hooks
+    /// that want the chain (the JSON-RPC ScriptHook) override this.
+    fn on_breakpoint_with_chain(
+        &self,
+        pc: RelocatedAddress,
+        num: u32,
+        place: Option<PlaceDescriptor<'_>>,
+        function: Option<&FunctionInfo>,
+        thread_num: Option<u32>,
+        _inline_chain: &[InlineFrame],
+    ) -> anyhow::Result<()> {
+        self.on_breakpoint(pc, num, place, function, thread_num)
+    }
+
     /// Called when watchpoint is activated.
     ///
     /// # Arguments
@@ -146,6 +165,20 @@ pub trait EventHook {
         function: Option<&FunctionInfo>,
         thread_num: Option<u32>,
     ) -> anyhow::Result<()>;
+
+    /// Step-event variant carrying the inline chain (same shape as
+    /// `on_breakpoint_with_chain`). Default impl forwards to
+    /// `on_step`.
+    fn on_step_with_chain(
+        &self,
+        pc: RelocatedAddress,
+        place: Option<PlaceDescriptor<'_>>,
+        function: Option<&FunctionInfo>,
+        thread_num: Option<u32>,
+        _inline_chain: &[InlineFrame],
+    ) -> anyhow::Result<()> {
+        self.on_step(pc, place, function, thread_num)
+    }
 
     /// Called when one of async step commands is done.
     ///
@@ -736,13 +769,24 @@ impl Debugger {
                                 let tracee_in_focus = tracee_ctl
                                     .tracee(self.ecx().pid_on_focus())
                                     .map(|t| t.number);
+                                let inline_chain = current_pc
+                                    .into_global(&self.debugee)
+                                    .ok()
+                                    .and_then(|gpc| {
+                                        self.debugee
+                                            .debug_info(current_pc)
+                                            .ok()
+                                            .map(|d| d.find_inline_chain(gpc))
+                                    })
+                                    .unwrap_or_default();
                                 self.hooks
-                                    .on_breakpoint(
+                                    .on_breakpoint_with_chain(
                                         current_pc,
                                         bp.number(),
                                         place,
                                         func,
                                         tracee_in_focus,
+                                        &inline_chain,
                                     )
                                     .map_err(Hook)?;
                                 break event;
@@ -1064,11 +1108,12 @@ impl Debugger {
         let func = weak_error!(dwarf.find_function_by_pc(global_pc))
             .flatten()
             .map(|(_, info)| info);
+        let inline_chain = dwarf.find_inline_chain(global_pc);
         let tracee_ctl = self.debugee.tracee_ctl();
         let thread_in_focus = tracee_ctl.tracee(ecx.pid_on_focus()).map(|t| t.number);
 
         self.hooks
-            .on_step(pc, place, func, thread_in_focus)
+            .on_step_with_chain(pc, place, func, thread_in_focus, &inline_chain)
             .map_err(Hook)
     }
 

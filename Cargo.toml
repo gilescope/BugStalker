@@ -74,6 +74,11 @@ blake3 = { version = "=1.5.5", default-features = false, features = ["pure"] }
 rustyline = "17.0.2"
 rustyline-derive = "0.11.1"
 gimli = "=0.33.0"
+# Phase 9 follow-up — canonical PC→function (and inline chain) lookup.
+# Pinned to the addr2line release whose gimli dep matches ours
+# exactly; doing the inline-frame walk by hand is what the upstream
+# crate already does correctly (see `addr2line/src/function.rs`).
+addr2line = "=0.26.1"
 object = "0.32.2"
 memmap2 = "0.9.9"
 ouroboros = "0.18.5"

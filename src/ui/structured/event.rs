@@ -21,11 +21,21 @@ pub enum Event {
         breakpoint_id: u32,
         thread: i32,
         frame: Option<EventFrame>,
+        /// Inline-call chain at this PC, innermost first
+        /// (`chain[0]` is where execution actually is;
+        /// `chain.last()` is the concrete enclosing
+        /// subprogram). Computed via the `addr2line` crate so
+        /// this is the same chain LLDB / llvm-symbolizer would
+        /// report. Empty when no DWARF info covers the PC.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inline_chain: Vec<InlineFrameDto>,
     },
     /// Debuggee paused after a step command finished.
     Step {
         thread: i32,
         frame: Option<EventFrame>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inline_chain: Vec<InlineFrameDto>,
     },
     /// Debuggee stopped on an OS signal (SIGSEGV, SIGINT, etc.).
     Signal {
@@ -60,4 +70,25 @@ pub struct EventFrame {
     pub file: Option<String>,
     pub line: Option<u64>,
     pub address: String,
+}
+
+/// Serialisable form of `crate::debugger::InlineFrame` — one entry of
+/// the inline-call chain surfaced on `breakpoint_hit` / `step` events.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InlineFrameDto {
+    pub function: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u64>,
+    pub column: Option<u64>,
+}
+
+impl From<&crate::debugger::InlineFrame> for InlineFrameDto {
+    fn from(f: &crate::debugger::InlineFrame) -> Self {
+        Self {
+            function: f.function.clone(),
+            file: f.file.clone(),
+            line: f.line,
+            column: f.column,
+        }
+    }
 }

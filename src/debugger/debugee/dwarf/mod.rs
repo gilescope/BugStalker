@@ -64,6 +64,21 @@ pub struct DebugInformation<R: gimli::Reader = EndianArcSlice> {
     /// indexes of lines in [`Unit::lines`] vector that belongs to a file, indexes are ordered by
     /// line number, column number and address.
     files_index: PathSearchIndex<(usize, Vec<usize>)>,
+    /// Canonical PC → function-frame walker, courtesy of the
+    /// `addr2line` crate. Built lazily on first use because not every
+    /// load needs it. Same author / repo as gimli, kept in lockstep
+    /// with the pinned gimli version; we reuse it rather than
+    /// reimplementing inline-frame chain walking. See
+    /// `find_inline_chain`.
+    ///
+    /// Wrapped in `Mutex` because `addr2line::Context` is `!Sync`:
+    /// the surrounding `DebugInformation` must stay `Sync` to keep
+    /// the existing rayon `par_iter` chains working. Lock contention
+    /// is a non-issue — chain lookups happen on user-visible events
+    /// (breakpoint hits, step responses), not in hot loops.
+    addr2_ctx: once_cell::sync::OnceCell<
+        std::sync::Mutex<addr2line::Context<EndianArcSlice>>,
+    >,
 }
 
 impl Clone for DebugInformation {
@@ -102,6 +117,10 @@ impl Clone for DebugInformation {
             pub_names: None,
             pub_types: self.pub_types.clone(),
             files_index: self.files_index.clone(),
+            // Don't transfer the addr2line context across clones —
+            // it'll be rebuilt lazily on first use against the cloned
+            // Dwarf sections.
+            addr2_ctx: once_cell::sync::OnceCell::new(),
         }
     }
 }
@@ -323,6 +342,98 @@ impl DebugInformation {
     ) -> Result<Option<PlaceDescriptor<'_>>, Error> {
         let mb_unit = self.find_unit_by_pc(pc)?;
         Ok(mb_unit.and_then(|u| u.find_exact_place_by_pc(pc)))
+    }
+
+    /// Lazy accessor for the addr2line context built over our gimli
+    /// `Dwarf`. addr2line owns the canonical PC → function-and-inline-
+    /// chain walker; reimplementing it would be silly. Built once per
+    /// `DebugInformation` and cached.
+    fn addr2line_ctx(&self) -> &std::sync::Mutex<addr2line::Context<EndianArcSlice>> {
+        self.addr2_ctx.get_or_init(|| {
+            // `gimli::Dwarf` is not `Clone`; rebuild the wrapper by
+            // cloning each Arc-wrapped section (cheap). Same shape
+            // the manual `Clone for DebugInformation` impl uses
+            // above — keep them in lockstep.
+            let dwarf = clone_dwarf(&self.inner);
+            let ctx = addr2line::Context::from_dwarf(dwarf).unwrap_or_else(|err| {
+                log::warn!(
+                    target: "dwarf-loader",
+                    "addr2line::Context::from_dwarf failed for {:?}: {err}; \
+                     inline-frame chain will be unavailable",
+                    self.file,
+                );
+                // Return an addr2line context over an empty Dwarf
+                // so callers get empty chains instead of crashes.
+                addr2line::Context::from_dwarf(empty_dwarf())
+                    .expect("empty Dwarf always builds")
+            });
+            std::sync::Mutex::new(ctx)
+        })
+    }
+
+    /// Return the inline-call chain at `pc`, innermost first.
+    ///
+    /// At a PC inside inlined code, addr2line returns:
+    /// * frame `[0]` — the innermost `DW_TAG_inlined_subroutine` if
+    ///   any, otherwise the concrete enclosing `DW_TAG_subprogram`,
+    /// * frame `[1..n-1]` — successive outer inlined frames,
+    /// * frame `[n-1]` — the concrete enclosing subprogram.
+    ///
+    /// This is the algorithm LLDB / llvm-symbolizer / `cargo flamegraph`
+    /// all use; see the prior-art memo in the v0.4.x release notes.
+    /// Returns an empty vec when no debug info covers the PC.
+    pub fn find_inline_chain(&self, pc: GlobalAddress) -> Vec<InlineFrame> {
+        let mutex = self.addr2line_ctx();
+        let ctx = match mutex.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let probe = u64::from(pc);
+        let frame_iter = match ctx.find_frames(probe).skip_all_loads() {
+            Ok(it) => it,
+            Err(err) => {
+                log::debug!(
+                    target: "debugger",
+                    "addr2line find_frames({probe:#x}) failed: {err}"
+                );
+                return vec![];
+            }
+        };
+        let mut frames = vec![];
+        let mut iter = frame_iter;
+        loop {
+            match iter.next() {
+                Ok(Some(frame)) => {
+                    let function = frame
+                        .function
+                        .as_ref()
+                        .and_then(|f| f.demangle().ok().map(|c| c.into_owned()));
+                    let (file, line, column) = match &frame.location {
+                        Some(loc) => (
+                            loc.file.map(|s| s.to_string()),
+                            loc.line.map(|l| l as u64),
+                            loc.column.map(|c| c as u64),
+                        ),
+                        None => (None, None, None),
+                    };
+                    frames.push(InlineFrame {
+                        function,
+                        file,
+                        line,
+                        column,
+                    });
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    log::debug!(
+                        target: "debugger",
+                        "addr2line frame iter at {probe:#x}: {err}"
+                    );
+                    break;
+                }
+            }
+        }
+        frames
     }
 
     /// Return a function inside which the given instruction is located.
@@ -872,6 +983,76 @@ impl DebugInformation {
     }
 }
 
+/// Clone a `gimli::Dwarf<EndianArcSlice>` by reconstructing it with
+/// each section's Arc-wrapped bytes cloned. `gimli::Dwarf` doesn't
+/// implement `Clone`; this is the same dance the manual
+/// `Clone for DebugInformation` impl does.
+fn clone_dwarf(d: &Dwarf<EndianArcSlice>) -> Dwarf<EndianArcSlice> {
+    Dwarf {
+        debug_abbrev: d.debug_abbrev.clone(),
+        debug_addr: d.debug_addr.clone(),
+        debug_aranges: d.debug_aranges.clone(),
+        debug_info: d.debug_info.clone(),
+        debug_line: d.debug_line.clone(),
+        debug_line_str: d.debug_line_str.clone(),
+        debug_macro: d.debug_macro.clone(),
+        debug_macinfo: d.debug_macinfo.clone(),
+        debug_names: d.debug_names.clone(),
+        debug_str: d.debug_str.clone(),
+        debug_str_offsets: d.debug_str_offsets.clone(),
+        debug_types: d.debug_types.clone(),
+        locations: d.locations.clone(),
+        ranges: d.ranges.clone(),
+        file_type: d.file_type,
+        sup: d.sup.clone(),
+        abbreviations_cache: Default::default(),
+    }
+}
+
+/// Build an empty `Dwarf<EndianArcSlice>` for fallback paths.
+fn empty_dwarf() -> Dwarf<EndianArcSlice> {
+    use gimli::{EndianArcSlice, RunTimeEndian};
+    let empty = EndianArcSlice::new(std::sync::Arc::from(&[][..]), RunTimeEndian::Little);
+    Dwarf {
+        debug_abbrev: gimli::DebugAbbrev::from(empty.clone()),
+        debug_addr: gimli::DebugAddr::from(empty.clone()),
+        debug_aranges: gimli::DebugAranges::from(empty.clone()),
+        debug_info: gimli::DebugInfo::from(empty.clone()),
+        debug_line: gimli::DebugLine::from(empty.clone()),
+        debug_line_str: gimli::DebugLineStr::from(empty.clone()),
+        debug_macro: gimli::DebugMacro::from(empty.clone()),
+        debug_macinfo: gimli::DebugMacinfo::from(empty.clone()),
+        debug_names: gimli::DebugNames::from(empty.clone()),
+        debug_str: gimli::DebugStr::from(empty.clone()),
+        debug_str_offsets: gimli::DebugStrOffsets::from(empty.clone()),
+        debug_types: gimli::DebugTypes::from(empty.clone()),
+        locations: gimli::LocationLists::new(
+            gimli::DebugLoc::from(empty.clone()),
+            gimli::DebugLocLists::from(empty.clone()),
+        ),
+        ranges: gimli::RangeLists::new(
+            gimli::DebugRanges::from(empty.clone()),
+            gimli::DebugRngLists::from(empty.clone()),
+        ),
+        file_type: gimli::DwarfFileType::Main,
+        sup: None,
+        abbreviations_cache: Default::default(),
+    }
+}
+
+/// One frame from `find_inline_chain`. Demangled function name + the
+/// source location the call site was inlined from. Frames stack
+/// innermost-first: `frames[0]` is the deepest `DW_TAG_inlined_subroutine`
+/// (or the concrete subprogram if no inlining), `frames.last()` is
+/// always the concrete `DW_TAG_subprogram`.
+#[derive(Debug, Clone)]
+pub struct InlineFrame {
+    pub function: Option<String>,
+    pub file: Option<String>,
+    pub line: Option<u64>,
+    pub column: Option<u64>,
+}
+
 /// Outcome of a single line-table candidate after the chooser ran.
 /// Surfaced by `set_breakpoint_at_line_with_diagnostics` so callers
 /// can show users *which* address was picked when a source line maps
@@ -1314,6 +1495,7 @@ impl DebugInformationBuilder {
                 pub_names,
                 pub_types: pub_types.unwrap_or_default(),
                 files_index: PathSearchIndex::new(""),
+                addr2_ctx: once_cell::sync::OnceCell::new(),
             });
         }
 
@@ -1351,6 +1533,7 @@ impl DebugInformationBuilder {
             pub_names,
             pub_types: pub_types.unwrap_or_default(),
             files_index,
+            addr2_ctx: once_cell::sync::OnceCell::new(),
         })
     }
 }

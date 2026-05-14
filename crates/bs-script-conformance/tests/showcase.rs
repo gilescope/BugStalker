@@ -76,11 +76,33 @@ fn showcase_dyn_ref_typed() {
     );
 
     // ProcessInstalled was reported as an event before the first call.
+    let events = bs.drain_events();
     assert!(
-        bs.drain_events()
+        events
             .iter()
             .any(|e| matches!(e, Event::ProcessInstalled { .. })),
         "missing process_installed event"
+    );
+    // addr2line-derived inline_chain is non-empty for any breakpoint
+    // hit that has DWARF debug info at the PC. Each chain entry
+    // carries a function name (the innermost-first chain ends at the
+    // concrete enclosing subprogram).
+    let bp_hit_with_chain = events.iter().find_map(|e| match e {
+        Event::BreakpointHit { inline_chain, .. } if !inline_chain.is_empty() => {
+            Some(inline_chain.clone())
+        }
+        _ => None,
+    });
+    assert!(
+        bp_hit_with_chain.is_some(),
+        "expected at least one breakpoint_hit event with a populated inline_chain"
+    );
+    let chain = bp_hit_with_chain.unwrap();
+    assert!(
+        chain
+            .iter()
+            .any(|f| f.function.as_deref().is_some_and(|n| n.contains("main"))),
+        "inline chain doesn't mention main anywhere: {chain:#?}"
     );
 }
 

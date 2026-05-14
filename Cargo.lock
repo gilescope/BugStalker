@@ -3,6 +3,22 @@
 version = 4
 
 [[package]]
+name = "addr2line"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59317f77929f0e679d39364702289274de2f0f0b22cbf50b2b8cff2169a0b27a"
+dependencies = [
+ "cpp_demangle",
+ "fallible-iterator",
+ "gimli",
+ "memmap2",
+ "object 0.39.1",
+ "rustc-demangle",
+ "smallvec",
+ "typed-arena",
+]
+
+[[package]]
 name = "adler"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -270,7 +286,7 @@ dependencies = [
  "gimli",
  "libc",
  "libipt",
- "object",
+ "object 0.32.2",
  "perf-event-open-sys",
  "thiserror 1.0.69",
 ]
@@ -311,7 +327,7 @@ dependencies = [
  "iced-x86",
  "libc",
  "lz4_flex",
- "object",
+ "object 0.32.2",
  "proptest",
  "rkyv",
  "rustix 0.38.34",
@@ -396,6 +412,7 @@ dependencies = [
 name = "bugstalker"
 version = "0.4.5"
 dependencies = [
+ "addr2line",
  "anyhow",
  "ariadne",
  "base64 0.22.1",
@@ -427,7 +444,7 @@ dependencies = [
  "mach2 0.6.0",
  "memmap2",
  "nix 0.27.1",
- "object",
+ "object 0.32.2",
  "once_cell",
  "os_pipe",
  "ouroboros",
@@ -739,6 +756,15 @@ name = "core-foundation-sys"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5827cebf4670468b8772dd191856768aedcb1b0278a04f989f7766351917b9dc"
+
+[[package]]
+name = "cpp_demangle"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0667304c32ea56cb4cd6d2d7c0cfe9a2f8041229db8c033af7f8d69492429def"
+dependencies = [
+ "cfg-if",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -1947,7 +1973,18 @@ checksum = "a6a622008b6e321afc04970976f62ee297fdbaa6f95318ca343e3eebb9648441"
 dependencies = [
  "flate2",
  "memchr",
- "ruzstd",
+ "ruzstd 0.5.0",
+]
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "flate2",
+ "memchr",
+ "ruzstd 0.8.3",
 ]
 
 [[package]]
@@ -2697,6 +2734,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzstd"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
+dependencies = [
+ "twox-hash 2.1.2",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3134,7 +3180,7 @@ dependencies = [
  "dlopen_derive",
  "libloading 0.8.9",
  "nix 0.27.1",
- "object",
+ "object 0.32.2",
  "proc-maps",
  "thiserror 1.0.69",
 ]

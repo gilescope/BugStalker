@@ -12,8 +12,8 @@ use nix::unistd::Pid;
 use crate::debugger::address::RelocatedAddress;
 use crate::debugger::register::debug::BreakCondition;
 use crate::debugger::variable::value::Value;
-use crate::debugger::{EventHook, FunctionInfo, PlaceDescriptor};
-use crate::ui::structured::event::{Event, EventFrame};
+use crate::debugger::{EventHook, FunctionInfo, InlineFrame, PlaceDescriptor};
+use crate::ui::structured::event::{Event, EventFrame, InlineFrameDto};
 
 use super::transport::OutputSink;
 
@@ -40,6 +40,10 @@ fn frame_for(
     }
 }
 
+fn dtos(chain: &[InlineFrame]) -> Vec<InlineFrameDto> {
+    chain.iter().map(InlineFrameDto::from).collect()
+}
+
 impl EventHook for ScriptHook {
     fn on_breakpoint(
         &self,
@@ -53,6 +57,25 @@ impl EventHook for ScriptHook {
             breakpoint_id: num,
             thread: thread_num.map(|n| n as i32).unwrap_or(0),
             frame: Some(frame_for(pc, place, function)),
+            inline_chain: vec![],
+        });
+        Ok(())
+    }
+
+    fn on_breakpoint_with_chain(
+        &self,
+        pc: RelocatedAddress,
+        num: u32,
+        place: Option<PlaceDescriptor<'_>>,
+        function: Option<&FunctionInfo>,
+        thread_num: Option<u32>,
+        inline_chain: &[InlineFrame],
+    ) -> anyhow::Result<()> {
+        self.sink.emit_event(Event::BreakpointHit {
+            breakpoint_id: num,
+            thread: thread_num.map(|n| n as i32).unwrap_or(0),
+            frame: Some(frame_for(pc, place, function)),
+            inline_chain: dtos(inline_chain),
         });
         Ok(())
     }
@@ -90,6 +113,23 @@ impl EventHook for ScriptHook {
         self.sink.emit_event(Event::Step {
             thread: thread_num.map(|n| n as i32).unwrap_or(0),
             frame: Some(frame_for(pc, place, function)),
+            inline_chain: vec![],
+        });
+        Ok(())
+    }
+
+    fn on_step_with_chain(
+        &self,
+        pc: RelocatedAddress,
+        place: Option<PlaceDescriptor<'_>>,
+        function: Option<&FunctionInfo>,
+        thread_num: Option<u32>,
+        inline_chain: &[InlineFrame],
+    ) -> anyhow::Result<()> {
+        self.sink.emit_event(Event::Step {
+            thread: thread_num.map(|n| n as i32).unwrap_or(0),
+            frame: Some(frame_for(pc, place, function)),
+            inline_chain: dtos(inline_chain),
         });
         Ok(())
     }

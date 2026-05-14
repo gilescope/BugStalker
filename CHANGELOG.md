@@ -7,6 +7,37 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- addr2line integration for canonical inline-chain reporting:
+  - New `DebugInformation::find_inline_chain(pc)` returns the
+    inline-call chain at a PC (innermost-first), delegating to the
+    `addr2line` crate (same author/repo as gimli, pinned to the
+    release whose gimli version matches ours exactly). This is the
+    algorithm LLDB and llvm-symbolizer use; reimplementing was
+    declined after a prior-art review.
+  - `EventHook` gains `on_breakpoint_with_chain` and
+    `on_step_with_chain` default-impl wrappers carrying an
+    `&[InlineFrame]` parameter. Existing hooks (NopHook,
+    TerminalHook, TestHooks) compile unchanged; the JSON-RPC
+    ScriptHook overrides them and surfaces the chain on
+    `breakpoint_hit` / `step` events as
+    `inline_chain: [{function, file, line, column}, …]`. Agents
+    can now see "you stopped in main, deepest inlined frame is
+    `HashMap::insert`" without re-parsing DWARF themselves.
+  - `addr2line::Context` is `!Sync` so it's wrapped in a
+    `std::sync::Mutex` inside a `OnceCell` on the
+    `DebugInformation`; lock contention is irrelevant because
+    chain lookups happen on user-visible events, not in rayon
+    hot loops.
+  - Note: on the showcase debuggee bs and addr2line agree that
+    a particular questionable PC is inside `showcase::main` per
+    DWARF, yet reading locals at that PC still gives garbage.
+    The original investigation tentatively blamed rustc DWARF
+    emission, but a similar-looking rust-lang/rust issue
+    (#136171) was closed in Jan 2025 as a `perf`-on-AMD
+    unwinder bug, not a rustc bug. So this is most likely a
+    BugStalker DWARF-evaluation issue at PCs in a function's
+    cold/secondary chunks — separate from the line-resolution
+    work in this release. Tracked as further investigation.
 - line-to-address resolution follow-up:
   - `find_closest_place` now prefers line-table candidates whose
     enclosing subprogram's `DW_AT_decl_file` actually matches the
