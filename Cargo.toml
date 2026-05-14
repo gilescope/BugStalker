@@ -79,6 +79,15 @@ gimli = "=0.33.0"
 # exactly; doing the inline-frame walk by hand is what the upstream
 # crate already does correctly (see `addr2line/src/function.rs`).
 addr2line = "=0.26.1"
+# macOS arm64 unwind: Rust release+debug binaries put most functions
+# in `__compact_unwind` (indexed by `__unwind_info`); `__eh_frame`
+# only covers functions whose unwinder is too complex for the
+# compact encoding. Without this, bs can't compute CFA / frame_base
+# for the majority of functions on macOS arm64, so variable reads
+# at PCs whose function lacks eh_frame coverage return garbage.
+# Crate is from the same Mozilla / Markus Stange family that
+# maintains addr2line; zero-copy parser used by Firefox Profiler.
+macho-unwind-info = "0.5"
 object = "0.32.2"
 memmap2 = "0.9.9"
 ouroboros = "0.18.5"

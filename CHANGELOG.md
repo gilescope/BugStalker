@@ -7,6 +7,44 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- compact-unwind support (macOS arm64):
+  - Rust binaries on macOS arm64 emit unwind info for most
+    functions into `__compact_unwind` (indexed by `__unwind_info`);
+    `__eh_frame` only carries entries for functions whose unwind
+    logic is too complex for the compact encoding. Before this
+    change, bs only consulted `__eh_frame` + `.debug_frame`, so for
+    any PC inside a function lacking eh_frame coverage `get_cfa`
+    raised `NoUnwindInfoForAddress` and downstream paths
+    (`frame.info`, the variable evaluator's CFA-dependent
+    expressions) failed.
+  - New dep `macho-unwind-info` (0.5, Mozilla / Markus Stange,
+    zero-copy; same family as `addr2line`). On Mach-O loads,
+    `DebugInformation` now stashes the `__unwind_info` section
+    bytes.
+  - `DebugInformation::get_cfa` now falls back to compact unwind
+    when `__eh_frame` misses: it parses the bytes, looks up the
+    `OpcodeArm64` for the probe PC, and synthesises the CFA as
+    `FP + 16` for `FrameBased` or `SP + stack_size` for
+    `Frameless`. `Dwarf { fde_offset }` / `Null` / unrecognised
+    encodings fall through (no info, caller errors as before).
+  - **Known follow-up**: the step-by-step unwinder
+    (`unwind.rs::UnwindContext::new`) still goes through gimli's
+    `FrameDescriptionEntry` + `UnwindTableRow`, so multi-frame
+    backtraces don't yet use compact unwind. That needs the gimli
+    row abstraction replaced with a thin local enum
+    (Compact{cfa,saves} vs Gimli{fde,row}) before backtrace can
+    cross into compact-unwind functions. Tracked separately.
+  - Caveat the diagnosis surfaced: this fix doesn't repair the
+    "showcase variable read returns garbage at PC X" symptom
+    we've been investigating, because the variable expressions
+    in question (`DW_OP_fbreg -160`, `DW_OP_breg31 WSP+720`) read
+    registers directly without ever calling `get_cfa`. That
+    symptom is downstream of bs's `break.set "main.rs:117"`
+    landing at a PC inside a different function's compiled body
+    where main's locals' DWARF location expressions don't apply.
+    Mitigation today: rebuild the debuggee with
+    `RUSTFLAGS="-C force-unwind-tables=yes"`; the binary lays
+    out differently and the bp lands in real main code.
 - addr2line integration for canonical inline-chain reporting:
   - New `DebugInformation::find_inline_chain(pc)` returns the
     inline-call chain at a PC (innermost-first), delegating to the

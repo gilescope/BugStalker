@@ -79,6 +79,11 @@ pub struct DebugInformation<R: gimli::Reader = EndianArcSlice> {
     addr2_ctx: once_cell::sync::OnceCell<
         std::sync::Mutex<addr2line::Context<EndianArcSlice>>,
     >,
+    /// macOS Mach-O `__unwind_info` section bytes. Empty on Linux /
+    /// ELF or when the binary has no compact-unwind section. Parsed
+    /// lazily on each query (zero-copy parser; the per-query cost is
+    /// just header reads). See `compact_cfa_at`.
+    compact_unwind_bytes: Option<std::sync::Arc<Vec<u8>>>,
 }
 
 impl Clone for DebugInformation {
@@ -121,6 +126,7 @@ impl Clone for DebugInformation {
             // it'll be rebuilt lazily on first use against the cloned
             // Dwarf sections.
             addr2_ctx: once_cell::sync::OnceCell::new(),
+            compact_unwind_bytes: self.compact_unwind_bytes.clone(),
         }
     }
 }
@@ -231,18 +237,103 @@ impl DebugInformation {
         ecx: &ExplorationContext,
     ) -> Result<RelocatedAddress, Error> {
         let mut ucx = Box::new(UnwindContext::new());
-        let row = self.eh_frame.unwind_info_for_address(
+        let global_pc = ecx.location().global_pc;
+        let pid = ecx.pid_on_focus();
+        match self.eh_frame.unwind_info_for_address(
             &self.bases,
             &mut ucx,
-            ecx.location().global_pc.into(),
+            global_pc.into(),
             EhFrame::cie_from_offset,
-        )?;
-        self.evaluate_cfa(
-            debugee,
-            &DwarfRegisterMap::from(RegisterMap::current(ecx.pid_on_focus())?),
-            row,
-            ecx,
-        )
+        ) {
+            Ok(row) => self.evaluate_cfa(
+                debugee,
+                &DwarfRegisterMap::from(RegisterMap::current(pid)?),
+                row,
+                ecx,
+            ),
+            Err(gimli::Error::NoUnwindInfoForAddress) => {
+                // macOS arm64 falls back to compact unwind for the
+                // majority of functions. Without this fallback,
+                // computing CFA / frame_base for any non-eh_frame-
+                // covered function would fail and downstream variable
+                // reads would return garbage.
+                if let Some(cfa) = self.compact_cfa_at(global_pc, pid)? {
+                    return Ok(cfa);
+                }
+                Err(Error::from(gimli::Error::NoUnwindInfoForAddress))
+            }
+            Err(e) => Err(Error::from(e)),
+        }
+    }
+
+    /// Compute the canonical frame address (CFA) at `pc` using
+    /// Mach-O `__compact_unwind` data when present. Returns `Ok(None)`
+    /// when the binary has no compact-unwind section, when the lookup
+    /// misses, or when the encoding asks us to fall through to a
+    /// `__eh_frame` FDE (in which case the caller should already have
+    /// resolved that path).
+    ///
+    /// The compact-unwind ARM64 encoding tells us directly how the
+    /// frame is laid out at a PC:
+    /// * `FrameBased` — standard `[fp, lr]` pair on the stack; CFA is
+    ///   `old_fp + 16`.
+    /// * `Frameless` — no frame pointer; CFA is `sp + stack_size`.
+    /// * `Dwarf { eh_frame_fde }` — defer to the FDE at that offset.
+    /// * `Null` / unrecognised — no info available.
+    pub fn compact_cfa_at(
+        &self,
+        pc: GlobalAddress,
+        pid: nix::unistd::Pid,
+    ) -> Result<Option<RelocatedAddress>, Error> {
+        let Some(bytes) = self.compact_unwind_bytes.as_ref() else {
+            return Ok(None);
+        };
+        let info = match macho_unwind_info::UnwindInfo::parse(bytes.as_ref()) {
+            Ok(i) => i,
+            Err(err) => {
+                log::warn!(target: "debugger", "compact unwind parse error: {err}");
+                return Ok(None);
+            }
+        };
+        let probe: u64 = pc.into();
+        let probe_u32 = match u32::try_from(probe) {
+            Ok(v) => v,
+            // Compact unwind keys are u32; PCs beyond 4 GiB into the
+            // image aren't representable. Fall through to "no info".
+            Err(_) => return Ok(None),
+        };
+        let function = match info.lookup(probe_u32) {
+            Ok(Some(f)) => f,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                log::debug!(
+                    target: "debugger",
+                    "compact unwind lookup at {probe:#x} failed: {err}"
+                );
+                return Ok(None);
+            }
+        };
+        use macho_unwind_info::opcodes::OpcodeArm64;
+        let opcode = OpcodeArm64::parse(function.opcode);
+        let regs = DwarfRegisterMap::from(RegisterMap::current(pid)?);
+        // arm64 DWARF register numbers: x0..x30 -> 0..30, SP -> 31,
+        // x29 (FP) -> 29. Same numbering gimli uses.
+        const FP: gimli::Register = gimli::Register(29);
+        const SP: gimli::Register = gimli::Register(31);
+        let cfa: u64 = match opcode {
+            OpcodeArm64::FrameBased { .. } => {
+                let fp = regs.value(FP)?;
+                fp.saturating_add(16)
+            }
+            OpcodeArm64::Frameless { stack_size_in_bytes } => {
+                let sp = regs.value(SP)?;
+                sp.saturating_add(stack_size_in_bytes as u64)
+            }
+            OpcodeArm64::Dwarf { .. } | OpcodeArm64::Null | OpcodeArm64::UnrecognizedKind(_) => {
+                return Ok(None);
+            }
+        };
+        Ok(Some(RelocatedAddress::from(cfa as usize)))
     }
 
     pub fn debug_addr(&self) -> &DebugAddr<EndianArcSlice> {
@@ -1367,6 +1458,17 @@ impl DebugInformationBuilder {
                 }
             })
         };
+        // macOS-only: `__unwind_info` (compact unwind) is read in
+        // addition to `__eh_frame`. Most Rust functions on macOS arm64
+        // live only in compact unwind; without this fallback bs can't
+        // compute CFA / frame_base at their PCs and variable reads
+        // return garbage. The bytes are stored on the
+        // `DebugInformation` and parsed lazily on each query.
+        let compact_unwind_bytes: Option<std::sync::Arc<Vec<u8>>> = file
+            .sections()
+            .find(|s| s.name().ok() == Some("__unwind_info"))
+            .and_then(|s| s.data().ok())
+            .map(|d| std::sync::Arc::new(d.to_vec()));
         let mut bases = BaseAddresses::default();
         if let Some(got) = section_addr(&[".got", "__got"]) {
             bases = bases.set_got(got);
@@ -1496,6 +1598,7 @@ impl DebugInformationBuilder {
                 pub_types: pub_types.unwrap_or_default(),
                 files_index: PathSearchIndex::new(""),
                 addr2_ctx: once_cell::sync::OnceCell::new(),
+                compact_unwind_bytes: None,
             });
         }
 
@@ -1534,6 +1637,7 @@ impl DebugInformationBuilder {
             pub_types: pub_types.unwrap_or_default(),
             files_index,
             addr2_ctx: once_cell::sync::OnceCell::new(),
+            compact_unwind_bytes,
         })
     }
 }
