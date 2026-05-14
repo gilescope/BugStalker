@@ -7,6 +7,49 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- AI-bot scripting front-end (Phase 9):
+  - New `bs --script <debuggee>` mode reads JSON-RPC 2.0 requests
+    (JSON5 with `// comments` and trailing commas allowed) on stdin
+    and writes responses + events on stdout.
+  - New `bs --describe-commands` flag dumps the full JSON Schema
+    catalogue for every method, the request/response/notification
+    envelopes, the `BsError` shape, and the event variants. Pin to a
+    schema to insulate agents from version drift.
+  - 18 methods wired through a typed `StructuredCommand` core: `bt`,
+    `frame.info`, `thread.info`, `sharedlib.info`, `break.{info,set,
+    remove}`, `watch.{info,set,remove}`, `var`, `arg`, `run`,
+    `continue`, and `step.{into,over,out,instruction}`. Each method's
+    request and response is `JsonSchema`-derived so the catalogue
+    cannot drift from the wire format.
+  - Stable `BsError` envelope with both JSON-RPC reserved codes
+    (`-32700`, `-32601`, `-32602`, `-32603`) and an
+    implementation-defined range (`-32001..-32020`) for domain errors
+    like `PROCESS_NOT_STARTED`, `VAR_NOT_FOUND`, `BREAKPOINT_NOT_FOUND`.
+  - `EventHook` adapter (`ScriptHook`) fans `breakpoint_hit`,
+    `step`, `signal`, `watchpoint_hit`, `async_step`, `exit`, and
+    `process_installed` events out as JSON-RPC notifications,
+    serialised under the same writer mutex as request responses so
+    interleaving is safe.
+  - Output budgeting: list-shaped responses carry
+    `items / total / truncated / cursor`, with an opaque cursor that
+    starts with `bs:`. Per-request `max_response_bytes` hint sets the
+    item cap before serialisation so context-tight agents don't get
+    swamped by a `var print local_map` on a 100k-entry HashMap.
+  - New `ScriptClient` Rust API in `bugstalker::ui::script::client`
+    that spawns the subprocess and exposes a single typed entry point:
+    `bs.call(BreakSet { at: ..., deferred: false })` returns
+    `BreakSetResponse`, `bs.call(Run::default())` returns
+    `StopReason`. Server errors surface as typed
+    `ClientError::Server(BsError)` with the original `ErrorCode`.
+    `call_raw(method, params)` is the escape hatch for methods the
+    Rust DTOs don't yet expose. Drives the same wire as any other
+    agent — equally usable for tests, hosting, and language bindings.
+  - New `bs-script-conformance` workspace crate exercises the typed
+    client against `examples/showcase`. Three tests cover the happy
+    path (`break.set` → `run` → `var dyn_ref`), method-not-found via
+    `call_raw`, and ProcessNotStarted before run surfacing as a
+    typed server error.
+  - Docs at `doc/scripting/usage.md` and `doc/scripting/examples.md`.
 - time-travel (Phase 5 — syscall-boundary PC markers):
   - The Linux recorder now emits `Event::PcMarker` immediately before
     each recorded `Event::Syscall`, giving replay/reverse consumers a

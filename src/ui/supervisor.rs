@@ -95,6 +95,23 @@ pub enum ControlFlow {
     Switch(Application),
 }
 
+/// Resolve oracle names to instantiated oracle Arcs. Shared between the
+/// console/TUI/DAP supervisor flow and the script transport.
+pub fn resolve_oracles(names: &[String]) -> Vec<Arc<dyn crate::oracle::Oracle>> {
+    names
+        .iter()
+        .filter_map(|ora_name| {
+            if let Some(oracle) = builtin::make_builtin(ora_name) {
+                info!(target: "debugger", "oracle `{ora_name}` discovered");
+                Some(oracle)
+            } else {
+                warn!(target: "debugger", "oracle `{ora_name}` not found");
+                None
+            }
+        })
+        .collect()
+}
+
 /// Supervisor control application execution process.
 /// Makes it possible to switch between applications in runtime
 pub struct Supervisor;
@@ -107,7 +124,7 @@ impl Supervisor {
     /// * `src`: debugee source
     /// * `ui`: determines what application will be created
     /// * `oracles`: list of oracle names
-    pub fn run(ui: Interface, oracles: &[String]) -> anyhow::Result<()> {
+    pub fn run(ui: Interface<'_>, oracles: &[String]) -> anyhow::Result<()> {
         let (stdout_reader, stdout_writer) = os_pipe::pipe()?;
         let (stderr_reader, stderr_writer) = os_pipe::pipe()?;
 

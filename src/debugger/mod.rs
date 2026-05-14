@@ -36,6 +36,7 @@ pub use debugee::dwarf::unit::PlaceDescriptorOwned;
 /// Public unwind API backed by the internal DWARF unwinder (no libunwind feature gate).
 pub use debugee::dwarf::unwind;
 pub use debugee::tracee::Tracee;
+pub use debugee::tracee::TraceeStatus;
 pub use debugee::tracer::StopReason;
 pub use error::Error;
 pub use watchpoint::WatchpointView;

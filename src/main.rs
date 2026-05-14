@@ -42,6 +42,20 @@ pub struct Args {
     #[clap(long)]
     dap_log_file: Option<PathBuf>,
 
+    /// Phase 9 AI-bot scripting front-end: read JSON-RPC 2.0 requests
+    /// (JSON5 with comments allowed) on stdin, write responses + events
+    /// on stdout. See `doc/scripting/usage.md`.
+    #[clap(long)]
+    #[arg(default_value_t = false)]
+    script: bool,
+
+    /// Pure metadata mode: write the JSON Schema catalogue of every
+    /// scripting method to stdout and exit. Pair with `bs --script` to
+    /// drive the debugger from an agent.
+    #[clap(long)]
+    #[arg(default_value_t = false)]
+    describe_commands: bool,
+
     /// Attach to running process PID
     #[clap(long, short)]
     pid: Option<i32>,
@@ -125,6 +139,14 @@ fn main() {
 
     rust::Environment::init(args.std_lib_path.as_ref().map(fun_name));
 
+    // --describe-commands is a pure metadata path: no debuggee required.
+    if args.describe_commands {
+        let mut stdout = std::io::stdout().lock();
+        bugstalker::ui::script::run_describe(&mut stdout)
+            .unwrap_or_exit(ErrorKind::Io, "describe-commands");
+        return;
+    }
+
     let debugee_src = || {
         if let Some(ref debugee) = args.debugee {
             DebugeeSource::File {
@@ -141,6 +163,13 @@ fn main() {
             );
         }
     };
+
+    // --script bypasses the supervisor entirely. JSON-RPC over stdio.
+    if args.script {
+        bugstalker::ui::script::run_script(debugee_src(), args.oracle.clone())
+            .unwrap_or_exit(ErrorKind::Io, "script");
+        return;
+    }
 
     // Determine interface mode
     let interface = if args.dap_local {
