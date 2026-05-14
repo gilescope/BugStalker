@@ -400,6 +400,27 @@ impl DebugInformation {
         file_tpl: &str,
         line: u64,
     ) -> Result<Vec<PlaceDescriptor<'_>>, Error> {
+        let (places, _diag) = self.find_closest_place_inner(file_tpl, line, false)?;
+        Ok(places)
+    }
+
+    /// Same as `find_closest_place` but also reports every candidate
+    /// it considered and why it was kept or dropped. Used by the
+    /// structured `break.set` so agents see the disambiguation.
+    pub fn find_closest_place_with_diagnostics(
+        &self,
+        file_tpl: &str,
+        line: u64,
+    ) -> Result<(Vec<PlaceDescriptor<'_>>, LineDiagnostics), Error> {
+        self.find_closest_place_inner(file_tpl, line, true)
+    }
+
+    fn find_closest_place_inner(
+        &self,
+        file_tpl: &str,
+        line: u64,
+        record_diagnostics: bool,
+    ) -> Result<(Vec<PlaceDescriptor<'_>>, LineDiagnostics), Error> {
         let files = self.files_index.get(file_tpl);
 
         #[derive(PartialEq, Hash, Eq)]
@@ -409,7 +430,19 @@ impl DebugInformation {
         }
 
         let mut unique_subprograms = HashSet::new();
-        let mut result = vec![];
+        let mut diagnostics = LineDiagnostics::default();
+        // Phase 9 follow-up — `result` holds the canonical matches:
+        // line entries whose enclosing subprogram was *declared* in the
+        // requested source file. `inline_fallback` holds matches where
+        // the line is only present as an inlined / monomorphized copy
+        // in some other function (e.g. main.rs:122 inside an inlined
+        // chunk of `HashMap::insert`). The two are kept separate so we
+        // can prefer canonical entries when both exist, but still fall
+        // back to inlined matches when canonical entries are missing
+        // (which happens when the line was optimised out of its source
+        // function entirely).
+        let mut result: Vec<PlaceDescriptor> = vec![];
+        let mut inline_fallback: Vec<PlaceDescriptor> = vec![];
 
         let mut next_statement_line: Option<u64> = None;
         for (unit_idx, file_lines) in &files {
@@ -510,19 +543,91 @@ impl DebugInformation {
                             name: info.name.clone(),
                             range: func.ranges(),
                         };
-                        if !unique_subprograms.contains(&key) {
-                            unique_subprograms.insert(key);
+                        if unique_subprograms.contains(&key) {
+                            if record_diagnostics {
+                                diagnostics.candidates.push(LineCandidate {
+                                    address: suitable_place.address,
+                                    function: info.full_name(),
+                                    decl_file: subprogram_decl_file(func, info),
+                                    status: CandidateStatus::DuplicateSubprogram,
+                                });
+                            }
+                            continue;
+                        }
+                        unique_subprograms.insert(key);
+
+                        let decl_file = subprogram_decl_file(func, info);
+                        let canonical = subprogram_decl_file_matches(func, info, file_tpl);
+                        if record_diagnostics {
+                            diagnostics.candidates.push(LineCandidate {
+                                address: suitable_place.address,
+                                function: info.full_name(),
+                                decl_file,
+                                status: if canonical {
+                                    CandidateStatus::Selected
+                                } else {
+                                    CandidateStatus::InlineCopy
+                                },
+                            });
+                        }
+                        if canonical {
                             result.push(suitable_place);
+                        } else {
+                            inline_fallback.push(suitable_place);
                         }
                     } else {
-                        // do we need place if we cant find a function?
+                        // No enclosing subprogram — keep it as a canonical
+                        // match. Synthetic / orphaned addresses are rare
+                        // enough that we don't bucket them as inline-only.
+                        if record_diagnostics {
+                            diagnostics.candidates.push(LineCandidate {
+                                address: suitable_place.address,
+                                function: None,
+                                decl_file: None,
+                                status: CandidateStatus::Selected,
+                            });
+                        }
                         result.push(suitable_place);
                     }
                 }
             }
         }
 
-        Ok(result)
+        // When canonical entries exist, return only those — they are
+        // the addresses where the source line was actually compiled.
+        // Otherwise fall back to the inline copies so the user still
+        // gets *some* breakpoint when the original line got optimised
+        // out of its source function (e.g. a `let _ = ...` that the
+        // compiler dropped from main but kept inside an inlined
+        // callee). The fallback is logged via `log::debug!` so
+        // perplexed users can grep for "fell back to inline copies"
+        // and understand why their bp landed in a foreign function.
+        if result.is_empty() && !inline_fallback.is_empty() {
+            log::debug!(
+                target: "debugger",
+                "find_closest_place({file_tpl}, {line}): no canonical entry, \
+                 fell back to {} inline copies; bp will land in foreign \
+                 functions where the source line was inlined",
+                inline_fallback.len(),
+            );
+            diagnostics.inline_fallback_used = true;
+            // Promote the inline-copy candidates' status: the first one
+            // (per unique subprogram) was actually used.
+            if record_diagnostics {
+                for c in diagnostics.candidates.iter_mut() {
+                    if c.status == CandidateStatus::InlineCopy {
+                        c.status = CandidateStatus::Selected;
+                        // Only the first per subprogram is used;
+                        // subsequent ones already bear DuplicateSubprogram
+                        // status from the dedup gate above.
+                        break;
+                    }
+                }
+            }
+            return Ok((inline_fallback, diagnostics));
+        }
+
+        Ok((result, diagnostics))
     }
 
     /// Return all places that correspond to the given file and line range.
@@ -765,6 +870,109 @@ impl DebugInformation {
 
         Some(Range { begin, end })
     }
+}
+
+/// Outcome of a single line-table candidate after the chooser ran.
+/// Surfaced by `set_breakpoint_at_line_with_diagnostics` so callers
+/// can show users *which* address was picked when a source line maps
+/// to many — typical with heavy monomorphization and inlining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateStatus {
+    /// Picked for the breakpoint.
+    Selected,
+    /// Skipped because another candidate in the same subprogram was
+    /// chosen first (dedup by enclosing subprogram).
+    DuplicateSubprogram,
+    /// Skipped because the enclosing subprogram's `decl_file` didn't
+    /// match the user's `file_tpl`. The line entry exists at this
+    /// address only because the source line got inlined into a
+    /// different function.
+    InlineCopy,
+}
+
+/// One line-table candidate. Several can collapse to a single
+/// breakpoint per unique subprogram; the chooser records what it did
+/// here so users see the disambiguation in plain words.
+#[derive(Debug, Clone)]
+pub struct LineCandidate {
+    pub address: GlobalAddress,
+    pub function: Option<String>,
+    /// Path the enclosing subprogram was declared in. `None` when no
+    /// enclosing subprogram could be found (synthetic / orphaned
+    /// address).
+    pub decl_file: Option<PathBuf>,
+    pub status: CandidateStatus,
+}
+
+/// Diagnostic record for one `find_closest_place` call.
+#[derive(Debug, Clone, Default)]
+pub struct LineDiagnostics {
+    pub candidates: Vec<LineCandidate>,
+    /// `true` when no canonical candidate was found and the chooser
+    /// fell back to inline-copy addresses. Callers may want to warn
+    /// the user that the breakpoint will land in foreign functions.
+    pub inline_fallback_used: bool,
+}
+
+/// True when the subprogram `info` was *declared* in a source file
+/// matching `file_tpl` — i.e. the function whose ranges enclose the
+/// candidate breakpoint address really was written in the file the
+/// user asked about. False for subprograms (e.g. monomorphizations of
+/// `HashMap::insert`) that merely *inline* code from the requested
+/// file: those carry their own decl_file in some other crate.
+///
+/// Used by `find_closest_place` to prefer canonical line entries over
+/// inline-attributed ones in foreign functions. See the diagnosis
+/// transcript in the Phase 9 conformance suite — without this filter,
+/// `break.set main.rs:117` on the showcase example lands inside
+/// `hashbrown::HashMap::insert` and the agent reads garbage for
+/// `dyn_ref`.
+fn subprogram_decl_file_matches(
+    func: FatDieRef<'_, Function>,
+    info: &FunctionInfo,
+    file_tpl: &str,
+) -> bool {
+    // No decl_file recorded — conservatively call it canonical so we
+    // don't drop genuinely-orphaned places. (Synthetic functions
+    // emitted without DW_AT_decl_file fall here.)
+    let Some(path) = subprogram_decl_file(func, info) else {
+        return true;
+    };
+    // The template is a suffix match against the path components — the
+    // same shape `files_index` uses. Compare component-wise so that
+    // "main.rs" matches "/x/y/main.rs" but NOT "/x/y/main.rs.bk".
+    let path_str = path.to_string_lossy();
+    path_ends_with_components(&path_str, file_tpl)
+}
+
+/// Look up the source file in which a subprogram was *declared*, via
+/// its `DW_AT_decl_file` index resolved against the subprogram's CU
+/// file table. `None` when the DIE carries no decl_file, or when the
+/// file index points outside the CU's file table.
+fn subprogram_decl_file(
+    func: FatDieRef<'_, Function>,
+    info: &FunctionInfo,
+) -> Option<PathBuf> {
+    let (decl_file_idx, _) = info.decl_file_line?;
+    let unit = func.unit();
+    unit.files().get(decl_file_idx as usize).cloned()
+}
+
+/// True when the slash-separated path ends with the slash-separated
+/// suffix `tail`, on whole-component boundaries. Mirrors the matching
+/// semantics of [`PathSearchIndex::get`] so the filter and the
+/// candidate-generation step agree on which files match the template.
+fn path_ends_with_components(path: &str, tail: &str) -> bool {
+    let path_parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    let tail_parts: Vec<&str> = tail.split('/').filter(|p| !p.is_empty()).collect();
+    if tail_parts.len() > path_parts.len() {
+        return false;
+    }
+    path_parts
+        .iter()
+        .rev()
+        .zip(tail_parts.iter().rev())
+        .all(|(a, b)| a == b)
 }
 
 #[derive(Default)]

@@ -118,6 +118,62 @@ pub struct BreakSetResponse {
     /// resolve at the time of the call. The breakpoint will activate
     /// later when the matching shared library is loaded.
     pub deferred: bool,
+    /// When the source line mapped to multiple candidate addresses
+    /// (typical with monomorphization and inlining), this records what
+    /// the chooser saw and what it picked. Empty when there was only
+    /// one candidate or when the request didn't target a source line
+    /// (function-name and address forms skip the line-table search).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<LineCandidateEntry>,
+    /// True when no canonical candidate was found and the chooser fell
+    /// back to inline copies of the source line — the breakpoint will
+    /// land inside a different function where the line got inlined.
+    /// Set this expectation in the agent before any var-read fails.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inline_fallback_used: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LineCandidateEntry {
+    pub address: String,
+    pub function: Option<String>,
+    pub decl_file: Option<String>,
+    pub status: LineCandidateStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LineCandidateStatus {
+    /// Used as a breakpoint address.
+    Selected,
+    /// Another candidate in the same subprogram won the dedup.
+    DuplicateSubprogram,
+    /// Source line was only present here via inlining — the enclosing
+    /// subprogram is declared in a different file.
+    InlineCopy,
+}
+
+impl From<crate::debugger::LineCandidate> for LineCandidateEntry {
+    fn from(c: crate::debugger::LineCandidate) -> Self {
+        Self {
+            address: format!("0x{:x}", u64::from(c.address)),
+            function: c.function,
+            decl_file: c.decl_file.map(|p| p.display().to_string()),
+            status: match c.status {
+                crate::debugger::LineCandidateStatus::Selected => LineCandidateStatus::Selected,
+                crate::debugger::LineCandidateStatus::DuplicateSubprogram => {
+                    LineCandidateStatus::DuplicateSubprogram
+                }
+                crate::debugger::LineCandidateStatus::InlineCopy => {
+                    LineCandidateStatus::InlineCopy
+                }
+            },
+        }
+    }
 }
 
 impl StructuredCommand for BreakSet {
@@ -131,8 +187,24 @@ impl StructuredCommand for BreakSet {
         _budget: &ResponseBudget,
     ) -> Result<Self::Response, BsError> {
         let loc = self.at.parse()?;
+        let mut candidates: Vec<LineCandidateEntry> = vec![];
+        let mut inline_fallback_used = false;
+
         let result = match &loc {
-            LocationObject::Line { file, line } => dbg.set_breakpoint_at_line(file, *line),
+            LocationObject::Line { file, line } => {
+                match dbg.set_breakpoint_at_line_with_diagnostics(file, *line) {
+                    Ok((views, diags)) => {
+                        for d in diags {
+                            inline_fallback_used |= d.inline_fallback_used;
+                            for c in d.candidates {
+                                candidates.push(LineCandidateEntry::from(c));
+                            }
+                        }
+                        Ok(views)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
             LocationObject::Function { name } => dbg.set_breakpoint_at_fn(name),
             LocationObject::Address { address } => {
                 let addr = parse_addr(address)?;
@@ -144,6 +216,8 @@ impl StructuredCommand for BreakSet {
             Ok(views) => Ok(BreakSetResponse {
                 breakpoints: views.iter().map(BreakpointEntry::from).collect(),
                 deferred: false,
+                candidates,
+                inline_fallback_used,
             }),
             Err(e) if self.deferred => {
                 // Register as deferred and report success.
@@ -159,6 +233,8 @@ impl StructuredCommand for BreakSet {
                 Ok(BreakSetResponse {
                     breakpoints: vec![],
                     deferred: true,
+                    candidates,
+                    inline_fallback_used,
                 })
             }
             Err(e) => Err(BsError::from(e)),

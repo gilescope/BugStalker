@@ -101,6 +101,46 @@ fn unknown_method_is_method_not_found() {
 
 #[test]
 #[serial]
+fn break_set_surfaces_candidate_disambiguation() {
+    use bs_script_conformance::structured::commands::r#break::LineCandidateStatus;
+    let mut bs = spawn_example("showcase");
+    // Showcase's main.rs:122 is heavy on inlining and yields multiple
+    // line-table candidates. We don't assert exact addresses (ASLR
+    // varies them) but we do assert that the chooser surfaces what it
+    // saw so the agent can disambiguate.
+    let resp = bs
+        .call(BreakSet {
+            at: Location::Shorthand("main.rs:122".into()),
+            deferred: false,
+        })
+        .expect("break.set");
+    assert!(
+        !resp.candidates.is_empty(),
+        "candidate list is empty — did diagnostics fall through? response: {resp:?}"
+    );
+    assert!(
+        resp.candidates
+            .iter()
+            .any(|c| matches!(c.status, LineCandidateStatus::Selected)),
+        "no Selected candidate; chooser must label at least one. response: {resp:?}"
+    );
+    // Every selected candidate's decl_file should match the request
+    // (or be None for orphaned synthetic addresses). Inline copies
+    // would surface with status: InlineCopy.
+    for c in &resp.candidates {
+        if matches!(c.status, LineCandidateStatus::Selected)
+            && let Some(decl) = &c.decl_file
+        {
+            assert!(
+                decl.ends_with("main.rs"),
+                "selected candidate's decl_file is not main.rs: {decl:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn server_error_surfaces_typed() {
     let mut bs = spawn_example("showcase");
     // Asking for a variable before `run` should fail with

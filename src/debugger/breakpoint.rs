@@ -356,6 +356,44 @@ impl Debugger {
         self.add_breakpoints(brkpts)
     }
 
+    /// Same as `set_breakpoint_at_line` but also returns the line-
+    /// resolution diagnostics so callers (e.g. the structured
+    /// `break.set` front-end) can surface what choices the chooser
+    /// made when the source line maps to multiple addresses across
+    /// inlined / monomorphized copies.
+    pub fn set_breakpoint_at_line_with_diagnostics(
+        &mut self,
+        fine_path_tpl: &str,
+        line: u64,
+    ) -> Result<
+        (
+            Vec<BreakpointView<'_>>,
+            Vec<crate::debugger::debugee::dwarf::LineDiagnostics>,
+        ),
+        Error,
+    > {
+        let dwarfs = self.debugee.debug_info_all();
+        let mut per_dwarf_places: Vec<(&DebugInformation, Vec<PlaceDescriptorOwned>)> = vec![];
+        let mut diagnostics: Vec<crate::debugger::debugee::dwarf::LineDiagnostics> = vec![];
+
+        for dwarf in dwarfs.iter().filter(|d| d.has_debug_info()) {
+            let (places, diag) = dwarf.find_closest_place_with_diagnostics(fine_path_tpl, line)?;
+            if !diag.candidates.is_empty() {
+                diagnostics.push(diag);
+            }
+            let owned: Vec<PlaceDescriptorOwned> = places.into_iter().map(|p| p.to_owned()).collect();
+            per_dwarf_places.push((*dwarf, owned));
+        }
+
+        if per_dwarf_places.iter().all(|(_, p)| p.is_empty()) {
+            return Err(NoSuitablePlace);
+        }
+
+        let brkpts = self.create_breakpoint_at_places(per_dwarf_places)?;
+        let views = self.add_breakpoints(brkpts)?;
+        Ok((views, diagnostics))
+    }
+
     /// Disable and remove breakpoint at the following file and line number.
     ///
     /// # Arguments

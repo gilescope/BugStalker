@@ -7,6 +7,25 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- line-to-address resolution follow-up:
+  - `find_closest_place` now prefers line-table candidates whose
+    enclosing subprogram's `DW_AT_decl_file` actually matches the
+    user-supplied source file. Without this, on heavily monomorphized
+    Rust binaries a request like `break.set "main.rs:122"` could land
+    inside an inlined copy in `hashbrown::HashMap::insert` —
+    technically the correct DWARF line entry, but useless for the
+    user. The filter prefers canonical entries (subprogram declared
+    in the requested file) and falls back to inline-only copies
+    when no canonical entry exists.
+  - New `Debugger::set_breakpoint_at_line_with_diagnostics` API
+    returns a `LineDiagnostics` sidecar describing every candidate
+    the chooser considered: address, enclosing function name,
+    subprogram decl_file, and a `CandidateStatus` tag
+    (`Selected`/`DuplicateSubprogram`/`InlineCopy`). The structured
+    `break.set` response now surfaces this as a `candidates: [...]`
+    array plus an `inline_fallback_used: bool` flag, so agents can
+    see *which* candidate bs picked when a source line maps to many
+    and warn when no canonical entry was available.
 - AI-bot scripting front-end (Phase 9):
   - New `bs --script <debuggee>` mode reads JSON-RPC 2.0 requests
     (JSON5 with `// comments` and trailing commas allowed) on stdin
