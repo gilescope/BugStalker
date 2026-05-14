@@ -80,6 +80,13 @@ pub(super) struct SymbolTab {
     /// rust-mangle-tree consumer can re-parse and walk to
     /// `impl_self_type()`.
     by_address: HashMap<u64, String>,
+    /// Sorted list of `(symbol_address, mangled_name)`, ordered by
+    /// address. Used to look up the *containing* function for an
+    /// arbitrary PC: `addresses.binary_search_by_key(probe, |p| p.0)`
+    /// then take the previous entry. Built from text-section symbol
+    /// kinds only so we don't include data symbols that would skew
+    /// range computations.
+    sorted_text: Vec<(u64, String)>,
 }
 
 impl SymbolTab {
@@ -91,13 +98,24 @@ impl SymbolTab {
         object_file.symbol_table().as_ref().map(|sym_table| {
             let mut by_name: HashMap<Name, SymbolVal> = HashMap::new();
             let mut by_address: HashMap<u64, String> = HashMap::new();
+            let mut sorted_text: Vec<(u64, String)> = Vec::new();
             for symbol in sym_table.symbols() {
                 let raw = symbol.name().unwrap_or_default();
+                // Mach-O nlist names carry a leading underscore that
+                // ELF doesn't — `__R...` for a Rust v0 symbol, `__ZN`
+                // for legacy. `rust-mangle-tree` expects the stripped
+                // form (`_R...` / `_ZN...`); peel one leading
+                // underscore if the symbol looks like a mangled name.
+                let demangle_input = if raw.starts_with("__R") || raw.starts_with("__Z") {
+                    &raw[1..]
+                } else {
+                    raw
+                };
                 // Phase 2 batch H: drive demangling through
                 // `rust-mangle-tree`. Falls back to the raw
                 // mangled string on parse error so a single
                 // bad symbol can't poison the whole table.
-                let demangled = match rust_mangle_tree::parse(raw) {
+                let demangled = match rust_mangle_tree::parse(demangle_input) {
                     Ok(sym) => sym.to_string(),
                     Err(_) => raw.to_string(),
                 };
@@ -112,10 +130,16 @@ impl SymbolTab {
                 // vtable resolution re-parses it via rust-mangle-tree
                 // and walks to `impl_self_type()`.
                 by_address.insert(symbol.address(), raw.to_string());
+                if symbol.kind() == object::SymbolKind::Text {
+                    sorted_text.push((symbol.address(), raw.to_string()));
+                }
             }
+            sorted_text.sort_unstable_by_key(|p| p.0);
+            sorted_text.dedup_by_key(|p| p.0);
             SymbolTab {
                 by_name,
                 by_address,
+                sorted_text,
             }
         })
     }
@@ -126,6 +150,44 @@ impl SymbolTab {
     /// stripped binaries or compiler-internal anonymous globals).
     pub fn mangled_at(&self, addr: u64) -> Option<&str> {
         self.by_address.get(&addr).map(String::as_str)
+    }
+
+    /// Reverse lookup — given a demangled symbol name (the form
+    /// `rust-mangle-tree` produces, e.g. `showcase::main`), return
+    /// the address the linker placed it at. Used by the line-
+    /// resolution filter to validate that a candidate PC is
+    /// physically in the expected function, not in foreign code
+    /// that DWARF mis-claims as part of the same subprogram.
+    pub fn address_of(
+        &self,
+        demangled_name: &str,
+    ) -> Option<crate::debugger::address::GlobalAddress> {
+        self.by_name.get(demangled_name).map(|v| v.addr)
+    }
+
+    /// Find the text symbol whose address range `[addr, next_addr)`
+    /// contains `pc`. Returns `(start, end, mangled_name)`. Used to
+    /// answer "what function does this PC physically belong to" —
+    /// the linker's view, which is more reliable than DWARF
+    /// subprogram ranges (those can claim impossibly-wide ranges
+    /// after LTO).
+    ///
+    /// `next_addr` is the next text symbol's address (or `u64::MAX`
+    /// past the last symbol). Caller treats `pc >= end` as "outside
+    /// any known function".
+    pub fn containing_text_symbol(&self, pc: u64) -> Option<(u64, u64, &str)> {
+        let idx = match self.sorted_text.binary_search_by_key(&pc, |p| p.0) {
+            Ok(i) => i,
+            Err(i) if i > 0 => i - 1,
+            Err(_) => return None,
+        };
+        let (start, ref name) = self.sorted_text[idx];
+        let end = self
+            .sorted_text
+            .get(idx + 1)
+            .map(|p| p.0)
+            .unwrap_or(u64::MAX);
+        Some((start, end, name.as_str()))
     }
 
     pub fn find(&'_ self, regex: &Regex) -> Vec<Symbol<'_>> {

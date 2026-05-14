@@ -759,7 +759,22 @@ impl DebugInformation {
                         unique_subprograms.insert(key);
 
                         let decl_file = subprogram_decl_file(func, info);
-                        let canonical = subprogram_decl_file_matches(func, info, file_tpl);
+                        let decl_file_match = subprogram_decl_file_matches(func, info, file_tpl);
+                        // Stronger physical-function check: the line
+                        // entry's PC must be in the SAME
+                        // compact-unwind function as the DWARF
+                        // subprogram's *real* entry (per nm). This
+                        // catches the case where DWARF claims a wide
+                        // subprogram range that overlaps with foreign
+                        // physical functions (LTO / cold-block split
+                        // / generic instantiation interleave); the
+                        // candidate PC is in main per DWARF but
+                        // physically in HashMap::insert, where main's
+                        // locals' DWARF expressions don't apply.
+                        let physical_match =
+                            self.candidate_in_subprogram_range(suitable_place.address, info);
+                        let canonical = decl_file_match
+                            && physical_match.unwrap_or(true);
                         if record_diagnostics {
                             diagnostics.candidates.push(LineCandidate {
                                 address: suitable_place.address,
@@ -916,6 +931,66 @@ impl DebugInformation {
     /// for the address's module.
     pub fn mangled_symbol_at(&self, addr: u64) -> Option<&str> {
         self.symbol_table.as_ref()?.mangled_at(addr)
+    }
+
+    /// Reverse — find the linker-assigned address of a symbol named
+    /// `name` (in the form `rust-mangle-tree` would print).
+    pub fn symbol_address(&self, name: &str) -> Option<GlobalAddress> {
+        self.symbol_table.as_ref()?.address_of(name)
+    }
+
+    /// Symbol-table-based "what function contains this PC?". Returns
+    /// the `(start, end, mangled_name)` of the linker symbol whose
+    /// range covers `pc`. The Mach-O / ELF symbol table is the
+    /// linker's view of function boundaries — independent of DWARF
+    /// subprogram ranges, which can claim impossibly-wide ranges
+    /// after LTO.
+    pub fn containing_text_symbol(&self, pc: u64) -> Option<(u64, u64, &str)> {
+        self.symbol_table.as_ref()?.containing_text_symbol(pc)
+    }
+
+    /// True when `candidate_pc` falls inside the same physical
+    /// (linker-visible) function as the subprogram `info`. Returns
+    /// `None` when we don't have the data to make the call (no
+    /// symbol table, no entry for the linkage name) — caller treats
+    /// `None` as "no signal, don't demote".
+    ///
+    /// The check uses the linker's symbol table (more reliable than
+    /// DWARF subprogram ranges, which lie after LTO and far more
+    /// densely-populated than `__compact_unwind`): look up the
+    /// subprogram's canonical entry by name; find the text-symbol
+    /// range that contains it; check whether `candidate_pc` is in
+    /// that same range.
+    fn candidate_in_subprogram_range(
+        &self,
+        candidate_pc: GlobalAddress,
+        info: &FunctionInfo,
+    ) -> Option<bool> {
+        // Resolve the subprogram's canonical linker address.
+        // `SymbolTab::address_of` keys by the `rust-mangle-tree`
+        // demangled form (e.g. `showcase::main`); `full_name`
+        // produces that form for us.
+        let lookup_name = info.full_name().or_else(|| info.name.clone())?;
+        let sym_addr = u64::from(self.symbol_address(&lookup_name)?);
+        let (sym_start, sym_end, _sym_name) = self.containing_text_symbol(sym_addr)?;
+        let pc = u64::from(candidate_pc);
+        Some(pc >= sym_start && pc < sym_end)
+    }
+
+    /// Look up the macOS `__compact_unwind` entry whose range covers
+    /// `pc`. Returns `(start_address, end_address)` for the function;
+    /// `None` if no compact unwind data, no entry, or `pc >= 4 GiB`
+    /// from the image base (compact unwind keys are u32).
+    ///
+    /// This is the linker's view of "what physical function does this
+    /// PC belong to" — independent of DWARF subprogram ranges, which
+    /// can lie after LTO. See the prior-art notes for the rationale.
+    pub fn compact_function_range_at(&self, pc: GlobalAddress) -> Option<(u64, u64)> {
+        let bytes = self.compact_unwind_bytes.as_ref()?;
+        let info = macho_unwind_info::UnwindInfo::parse(bytes.as_ref()).ok()?;
+        let probe = u32::try_from(u64::from(pc)).ok()?;
+        let f = info.lookup(probe).ok().flatten()?;
+        Some((f.start_address as u64, f.end_address as u64))
     }
 
     pub fn tls_symbol_offset(&self, mangled_name: &str) -> Option<u64> {
@@ -1537,7 +1612,13 @@ impl DebugInformationBuilder {
         } else {
             None
         };
-        let symbol_table = SymbolTab::new(debug_info_file);
+        // SymbolTab is the *linker's* view of function and global
+        // symbol locations. On macOS, the dSYM bundle's nlist table
+        // reports DWARF-claimed addresses (which can lie after LTO);
+        // the original binary's nlist is the truth. Always source
+        // from `file` (the runtime image), not `debug_info_file`
+        // (which may be a separate dSYM).
+        let symbol_table = SymbolTab::new(file);
         let tls_symbol_tab = TlsSymbolTab::new(debug_info_file);
 
         // let mb_pub_names_sect = muted_error!(DebugPubNames::load(|id| {

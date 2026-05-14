@@ -7,6 +7,32 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- physical-function range filter for line breakpoints (macOS):
+  - On macOS arm64 with `-C symbol-mangling-version=v0` + LTO, the
+    DWARF subprogram for `showcase::main` claims it spans
+    `0x1000083e8..0x100009128` (per `DW_AT_low_pc`/`DW_AT_high_pc`),
+    but Mach-O's symbol table records the actual entry at
+    `0x100008d80`. The DWARF range engulfs other physical
+    functions, so `break.set "main.rs:117"` was landing at
+    `0x100008c60` — physically inside *other* functions' code,
+    where main's local-variable DWARF expressions don't apply
+    (returns garbage).
+  - `SymbolTab` now keeps a sorted `(addr, mangled_name)` list of
+    text-kind symbols. `containing_text_symbol(pc)` answers "what
+    linker symbol's range covers this PC" — independent of DWARF.
+  - `find_closest_place` now cross-checks each candidate's PC
+    against the linker symbol range for the subprogram. Candidates
+    whose physical function differs from the DWARF subprogram's
+    canonical entry are demoted to `InlineCopy`. Surfaced in the
+    response's `candidates` array; `inline_fallback_used: true`
+    when no canonical entry exists in the named function.
+  - **Critical fix:** `SymbolTab::new` was being constructed from
+    the dSYM bundle's symbol table on macOS, which reports DWARF-
+    claimed addresses (the same wide ranges that lie). Switched to
+    the original binary's symbol table — the linker's view. Also
+    fixed `rust-mangle-tree` demangling to strip Mach-O's leading
+    underscore (`__R...` -> `_R...`) so v0 names actually demangle
+    into the `showcase::main`-style keys callers look up.
 - compact-unwind support (macOS arm64):
   - Rust binaries on macOS arm64 emit unwind info for most
     functions into `__compact_unwind` (indexed by `__unwind_info`);
