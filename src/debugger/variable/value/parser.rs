@@ -1318,6 +1318,18 @@ fn resolve_trait_object_concrete_type(
 ///   AST structure for us to walk.
 fn concrete_from_vtable_symbol(mangled: &str) -> Option<String> {
     use rust_mangle_tree::{Symbol as RmSymbol, Type as RmType};
+    // `SymbolTab::by_address` stores raw nlist names (e.g.
+    // `__RNv…` on Mach-O, `__ZN…` for legacy). `rust-mangle-tree`
+    // accepts the legacy `__ZN…` form leniently but *rejects* a
+    // v0 symbol with two leading underscores — `__R…` parses as
+    // `Err` and silently kills concrete-type recovery. Peel one
+    // leading underscore for the Rust prefixes, matching the
+    // pre-demangle peel `SymbolTab::new` does for `by_name`.
+    let mangled = if mangled.starts_with("__R") || mangled.starts_with("__Z") {
+        &mangled[1..]
+    } else {
+        mangled
+    };
     let parsed = rust_mangle_tree::parse(mangled).ok()?;
     match parsed {
         RmSymbol::V0(path) => {
@@ -1350,6 +1362,13 @@ fn concrete_from_vtable_symbol(mangled: &str) -> Option<String> {
 /// demangle, find the `<` after `drop_in_place`, take the matching
 /// `>`-balanced span.
 fn concrete_from_drop_in_place_symbol(mangled: &str) -> Option<String> {
+    // Same Mach-O double-underscore peel as concrete_from_vtable_symbol —
+    // `__R…` would otherwise fail to parse and skip the drop-fn fallback.
+    let mangled = if mangled.starts_with("__R") || mangled.starts_with("__Z") {
+        &mangled[1..]
+    } else {
+        mangled
+    };
     let demangled = match rust_mangle_tree::parse(mangled).ok()? {
         rust_mangle_tree::Symbol::V0(p) => p.to_string(),
         rust_mangle_tree::Symbol::Legacy(p) => format!("{p:#}"),
@@ -1408,5 +1427,71 @@ impl std::fmt::Display for DisplayType<'_> {
             // of a vtable symbol; render as `<complex>` for now.
             _ => f.write_str("<complex>"),
         }
+    }
+}
+
+#[cfg(test)]
+mod dyn_resolver_tests {
+    use super::{concrete_from_drop_in_place_symbol, concrete_from_vtable_symbol};
+
+    /// Showcase's `<showcase::main::Point as showcase::main::Greeter>::greet`
+    /// in legacy mangling — the actual symbol present in the
+    /// `target/debug/showcase` binary on Mach-O. Strategy 1 reads
+    /// the vtable's slot-3 fn pointer, looks the address up in the
+    /// symbol table, and feeds the mangled name through this helper.
+    #[test]
+    fn legacy_greet_resolves_to_point() {
+        let mangled = "__ZN65_$LT$showcase..main..Point$u20$as$u20$showcase..main..Greeter$GT$5greet17h57300c1f61dfdadaE";
+        let got = concrete_from_vtable_symbol(mangled);
+        assert_eq!(got.as_deref(), Some("showcase::main::Point"),
+                   "showcase legacy resolver should yield the concrete impl self-type");
+    }
+
+    /// Same, but with the leading underscore peeled off so the
+    /// caller treats the Mach-O `__ZN…` and the ELF `_ZN…` forms
+    /// identically.
+    #[test]
+    fn legacy_greet_resolves_stripped() {
+        let mangled = "_ZN65_$LT$showcase..main..Point$u20$as$u20$showcase..main..Greeter$GT$5greet17h57300c1f61dfdadaE";
+        assert_eq!(concrete_from_vtable_symbol(mangled).as_deref(),
+                   Some("showcase::main::Point"));
+    }
+
+    /// Drop slot for a type that *does* impl Drop — `core::ptr::
+    /// drop_in_place::<MyError>` etc. Smoke-test the drop-fn
+    /// fallback so we know Strategy 1's second extractor still works.
+    #[test]
+    fn legacy_drop_in_place_resolves() {
+        let mangled = "__ZN4core3ptr59drop_in_place$LT$vars..phase3_dyn_trait..MyError$GT$17h0000000000000000E";
+        assert_eq!(concrete_from_drop_in_place_symbol(mangled).as_deref(),
+                   Some("vars::phase3_dyn_trait::MyError"));
+    }
+
+    /// v0 form of `<showcase::main::Point as showcase::main::Greeter>
+    /// ::greet`, taken from a `RUSTFLAGS=-C symbol-mangling-version=v0`
+    /// build of `examples/target/debug/showcase`. The leading `__R`
+    /// is Mach-O's two-underscore convention; the helper must peel
+    /// one off and feed `_R…` to `rust-mangle-tree`. This is the
+    /// path the user's reported binary takes — if `walk_for_impl`
+    /// doesn't surface `showcase::main::Point` here, the
+    /// `[concrete type unavailable]` message they saw is explained.
+    #[test]
+    fn v0_greet_resolves_to_point() {
+        let mangled = "__RNvXNvCsdCBZUK1EFOO_8showcase4mainNtB2_5PointNtB2_7Greeter5greet";
+        let got = concrete_from_vtable_symbol(mangled);
+        assert_eq!(
+            got.as_deref(),
+            Some("showcase::main::Point"),
+            "v0 resolver should walk the TraitImpl spine to the self-type"
+        );
+    }
+
+    #[test]
+    fn v0_greet_resolves_stripped() {
+        let mangled = "_RNvXNvCsdCBZUK1EFOO_8showcase4mainNtB2_5PointNtB2_7Greeter5greet";
+        assert_eq!(
+            concrete_from_vtable_symbol(mangled).as_deref(),
+            Some("showcase::main::Point")
+        );
     }
 }

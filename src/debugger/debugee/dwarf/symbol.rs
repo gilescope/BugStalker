@@ -221,3 +221,103 @@ impl SymbolTab {
         .collect()
     }
 }
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod showcase_lookup_tests {
+    //! Static smoke tests: build a `SymbolTab` straight from
+    //! `examples/target/debug/showcase` on disk and assert the
+    //! address-keyed lookups bs's trait-object resolver depends
+    //! on. No debuggee, no ptrace, no mach syscalls — purely
+    //! exercises the object-file parse path. Helps tell apart
+    //! "resolver logic broken" from "lookup misses at runtime
+    //! because of slide" when investigating the `&dyn` rendering
+    //! gap on darwin.
+    use super::SymbolTab;
+    use object::{Object as _, ObjectSymbol as _};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn binary_path() -> PathBuf {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        PathBuf::from(manifest).join("examples/target/debug/showcase")
+    }
+
+    #[test]
+    fn greet_method_resolves_by_address() {
+        let path = binary_path();
+        if !path.exists() {
+            eprintln!("skipping — showcase debug binary not built at {path:?}");
+            return;
+        }
+        let data = fs::read(&path).expect("read showcase");
+        let obj = object::File::parse(&*data).expect("parse showcase");
+        let tab = SymbolTab::new(&obj).expect("symbol table");
+
+        // The greet method address is rustc/wild dependent. Find it
+        // by name, then round-trip through the address lookup.
+        // Legacy mangling renders `<X as Y>` inside a single
+        // length-prefixed segment using `..` for `::`, so we match on
+        // the readable forms rather than the `8showcase4main` shape
+        // that only appears for top-level paths.
+        let greet_name = obj
+            .symbols()
+            .filter_map(|s| s.name().ok().map(|n| (n.to_string(), s.address())))
+            .find(|(n, _)| {
+                (n.contains("showcase..main..Point")
+                    || n.contains("8showcase4main"))
+                    && n.contains("Greeter")
+                    && n.contains("5greet")
+            });
+        let Some((expected_name, addr)) = greet_name else {
+            panic!("no greet method symbol in showcase — has the binary been rebuilt?");
+        };
+        eprintln!("[lookup] found {expected_name} @ {addr:#x}");
+
+        let got = tab.mangled_at(addr);
+        assert!(
+            got.is_some(),
+            "SymbolTab.mangled_at({addr:#x}) returned None — \
+             this is bs's runtime resolution path; if it misses statically \
+             nothing else can save us"
+        );
+        let got = got.unwrap();
+        assert!(
+            got.contains("Greeter") && got.contains("5greet"),
+            "mangled_at returned {got:?}, expected the greet method"
+        );
+        eprintln!("[lookup] mangled_at({addr:#x}) = {got}");
+    }
+
+    #[test]
+    fn vtable_base_has_no_symbol() {
+        // The `<Point as Greeter>` vtable lives in `__DATA_CONST,__const`
+        // and rustc does NOT export it as a named symbol on darwin.
+        // bs's Strategy 2 (exact-address lookup of the vtable's own
+        // symbol) therefore always misses for showcase — Strategy 1
+        // (probe slots, look up the fn ptrs) is the only path that
+        // can succeed.
+        let path = binary_path();
+        if !path.exists() {
+            eprintln!("skipping — showcase debug binary not built at {path:?}");
+            return;
+        }
+        let data = fs::read(&path).expect("read showcase");
+        let obj = object::File::parse(&*data).expect("parse showcase");
+        let tab = SymbolTab::new(&obj).expect("symbol table");
+
+        // No symbol should sit at any plausibly-vtable address inside
+        // __DATA_CONST,__const. Sweep a small window around our
+        // hypothesised base to be tolerant to layout drift.
+        for probe_addr in (0x100068000u64..0x100069000u64).step_by(8) {
+            if let Some(name) = tab.mangled_at(probe_addr) {
+                // Only fail if any name we found mentions Greeter —
+                // unrelated data symbols are fine.
+                assert!(
+                    !name.contains("Greeter"),
+                    "unexpected Greeter-named symbol at {probe_addr:#x}: {name}"
+                );
+            }
+        }
+    }
+}
