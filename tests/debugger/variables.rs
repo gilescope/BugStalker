@@ -2945,6 +2945,29 @@ fn test_niche_option_recovery() {
 /// pending — Phase 3A follow-up]` annotation. Concrete type recovery
 /// itself lands in a follow-up batch; this test guards the
 /// detection layer.
+///
+/// **macOS 26.4.1 (`xnu-12377.101.15`) — DISABLED ON DARWIN PENDING APPLE FIX.**
+/// Two reproducible kernel panics observed on this kernel
+/// (2026-05-14 20:09 and 20:20, `/Library/Logs/DiagnosticReports/
+/// panic-full-2026-05-14-{200917,202052}.0002.panic`) with byte-
+/// identical fingerprint: panicked task = this cargo-test binary,
+/// 19 threads, PC = kernel_text_exec_base + 0x66970, caller =
+/// +0x956338, ESR=0x96000007 (data abort level-3) with FAR landing
+/// inside the kernel Zone Metadata range — a zone-allocator UAF/race
+/// in xnu, tripped by the bs darwin harness (mach_vm_read_overwrite /
+/// mach_vm_protect / task_for_pid across multiple worker threads).
+/// Apple Feedback Assistant report filed 2026-05-15.
+///
+/// Re-enable when one of:
+///   - macOS ships a kernel build past `xnu-12377.101.15`/`25.4.0`
+///     and the panic no longer reproduces on a single rerun of this
+///     test, OR
+///   - `src/debugger/darwin_mach.rs` grows a process-wide serialising
+///     mutex around every `mach_vm_*` and `task_for_pid` call so
+///     concurrent worker threads can't race the kernel zone code.
+/// To undo: delete the `cfg(not(target_os = "macos"))` line below
+/// and grep this file for "26.4.1" to find the banner.
+#[cfg(not(target_os = "macos"))]
 #[test]
 #[serial]
 fn test_dyn_trait_detection() {
