@@ -26,10 +26,7 @@ pub fn run_describe<W: Write>(out: &mut W) -> anyhow::Result<()> {
 }
 
 /// Long-running JSON-RPC loop driving a single debuggee.
-pub fn run_script(
-    source: DebugeeSource<'_>,
-    oracles: Vec<String>,
-) -> anyhow::Result<()> {
+pub fn run_script(source: DebugeeSource<'_>, oracles: Vec<String>) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let sink = OutputSink::new(stdout);
     let event_sink = sink.clone();

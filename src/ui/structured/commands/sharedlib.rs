@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::debugger::Debugger;
-use crate::ui::structured::error::BsError;
 use crate::ui::structured::envelope::ListResponse;
+use crate::ui::structured::error::BsError;
 use crate::ui::structured::{ResponseBudget, StructuredCommand};
 
 #[derive(Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -37,7 +37,10 @@ impl StructuredCommand for SharedlibInfo {
             .map(|r| SharedlibEntry {
                 path: r.path.display().to_string(),
                 has_debug_info: r.has_debug_info,
-                from: r.range.as_ref().map(|rg| format!("0x{:x}", rg.from.as_u64())),
+                from: r
+                    .range
+                    .as_ref()
+                    .map(|rg| format!("0x{:x}", rg.from.as_u64())),
                 to: r.range.as_ref().map(|rg| format!("0x{:x}", rg.to.as_u64())),
             })
             .collect();

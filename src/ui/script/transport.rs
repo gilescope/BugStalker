@@ -378,7 +378,10 @@ fn parse_request(value: serde_json::Value) -> Result<Request, (serde_json::Value
                 Null,
                 BsError::new(
                     ErrorCode::InvalidParams,
-                    format!("expected JSON object at top level, got {}", short_kind(&other)),
+                    format!(
+                        "expected JSON object at top level, got {}",
+                        short_kind(&other)
+                    ),
                 ),
             ));
         }

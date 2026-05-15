@@ -1443,8 +1443,11 @@ mod dyn_resolver_tests {
     fn legacy_greet_resolves_to_point() {
         let mangled = "__ZN65_$LT$showcase..main..Point$u20$as$u20$showcase..main..Greeter$GT$5greet17h57300c1f61dfdadaE";
         let got = concrete_from_vtable_symbol(mangled);
-        assert_eq!(got.as_deref(), Some("showcase::main::Point"),
-                   "showcase legacy resolver should yield the concrete impl self-type");
+        assert_eq!(
+            got.as_deref(),
+            Some("showcase::main::Point"),
+            "showcase legacy resolver should yield the concrete impl self-type"
+        );
     }
 
     /// Same, but with the leading underscore peeled off so the
@@ -1453,8 +1456,10 @@ mod dyn_resolver_tests {
     #[test]
     fn legacy_greet_resolves_stripped() {
         let mangled = "_ZN65_$LT$showcase..main..Point$u20$as$u20$showcase..main..Greeter$GT$5greet17h57300c1f61dfdadaE";
-        assert_eq!(concrete_from_vtable_symbol(mangled).as_deref(),
-                   Some("showcase::main::Point"));
+        assert_eq!(
+            concrete_from_vtable_symbol(mangled).as_deref(),
+            Some("showcase::main::Point")
+        );
     }
 
     /// Drop slot for a type that *does* impl Drop — `core::ptr::
@@ -1463,8 +1468,10 @@ mod dyn_resolver_tests {
     #[test]
     fn legacy_drop_in_place_resolves() {
         let mangled = "__ZN4core3ptr59drop_in_place$LT$vars..phase3_dyn_trait..MyError$GT$17h0000000000000000E";
-        assert_eq!(concrete_from_drop_in_place_symbol(mangled).as_deref(),
-                   Some("vars::phase3_dyn_trait::MyError"));
+        assert_eq!(
+            concrete_from_drop_in_place_symbol(mangled).as_deref(),
+            Some("vars::phase3_dyn_trait::MyError")
+        );
     }
 
     /// v0 form of `<showcase::main::Point as showcase::main::Greeter>

@@ -168,9 +168,7 @@ impl From<crate::debugger::LineCandidate> for LineCandidateEntry {
                 crate::debugger::LineCandidateStatus::DuplicateSubprogram => {
                     LineCandidateStatus::DuplicateSubprogram
                 }
-                crate::debugger::LineCandidateStatus::InlineCopy => {
-                    LineCandidateStatus::InlineCopy
-                }
+                crate::debugger::LineCandidateStatus::InlineCopy => LineCandidateStatus::InlineCopy,
             },
         }
     }
@@ -342,7 +340,10 @@ impl StructuredCommand for BreakInfo {
 }
 
 fn parse_addr(s: &str) -> Result<usize, BsError> {
-    let trimmed = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let trimmed = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     usize::from_str_radix(trimmed, 16)
         .map_err(|_| BsError::new(ErrorCode::BadAddress, format!("invalid hex address: {s}")))
 }

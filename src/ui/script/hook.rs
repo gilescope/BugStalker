@@ -162,8 +162,7 @@ impl EventHook for ScriptHook {
     }
 
     fn on_process_install(&self, pid: Pid, _object: Option<&object::File<'_>>) {
-        self.sink.emit_event(Event::ProcessInstalled {
-            pid: pid.as_raw(),
-        });
+        self.sink
+            .emit_event(Event::ProcessInstalled { pid: pid.as_raw() });
     }
 }

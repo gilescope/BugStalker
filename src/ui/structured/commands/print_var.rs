@@ -28,8 +28,8 @@ use crate::debugger::variable::execute::QueryResult;
 use crate::debugger::variable::render::RenderValue;
 use crate::ui::command::parser::expression;
 use crate::ui::generic::variable::render_value;
-use crate::ui::structured::error::{BsError, ErrorCode};
 use crate::ui::structured::envelope::ListResponse;
+use crate::ui::structured::error::{BsError, ErrorCode};
 use crate::ui::structured::{ResponseBudget, StructuredCommand};
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -80,15 +80,21 @@ fn build_dqe(name: Option<&str>, expression: Option<&str>) -> Result<Dqe, BsErro
         )),
         (None, None) => Ok(Dqe::Variable(Selector::Any)),
         (Some(n), None) => Ok(Dqe::Variable(Selector::by_name(n, false))),
-        (None, Some(expr)) => expression::parser().parse(expr).into_result().map_err(|errs| {
-            BsError::new(
-                ErrorCode::BadExpression,
-                format!(
-                    "DQE parse failed: {}",
-                    errs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ")
-                ),
-            )
-        }),
+        (None, Some(expr)) => expression::parser()
+            .parse(expr)
+            .into_result()
+            .map_err(|errs| {
+                BsError::new(
+                    ErrorCode::BadExpression,
+                    format!(
+                        "DQE parse failed: {}",
+                        errs.iter()
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                )
+            }),
     }
 }
 
@@ -112,8 +118,7 @@ impl StructuredCommand for Var {
 
 impl StructuredCommand for Arg {
     const METHOD: &'static str = "arg";
-    const SUMMARY: &'static str =
-        "Read argument(s) in the focused frame. Returns all arguments when no name/expression given.";
+    const SUMMARY: &'static str = "Read argument(s) in the focused frame. Returns all arguments when no name/expression given.";
     type Response = ListResponse<VarResult>;
 
     fn execute(

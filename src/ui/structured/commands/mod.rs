@@ -91,6 +91,8 @@ pub fn current_stop(
         file: top
             .as_ref()
             .and_then(|f| f.place.as_ref().map(|p| p.file.display().to_string())),
-        line: top.as_ref().and_then(|f| f.place.as_ref().map(|p| p.line_number)),
+        line: top
+            .as_ref()
+            .and_then(|f| f.place.as_ref().map(|p| p.line_number)),
     })
 }

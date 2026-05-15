@@ -10,9 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-pub use bugstalker::ui::script::client::{
-    ClientError, ClientResult, ScriptClient,
-};
+pub use bugstalker::ui::script::client::{ClientError, ClientResult, ScriptClient};
 pub use bugstalker::ui::structured;
 
 /// Locate the `bs` binary built by `cargo build`.

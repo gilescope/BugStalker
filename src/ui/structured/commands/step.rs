@@ -35,9 +35,24 @@ macro_rules! step_command {
     };
 }
 
-step_command!(StepInto, "step.into", "Step into the next source line", step_into);
-step_command!(StepOver, "step.over", "Step over the next source line", step_over);
-step_command!(StepOut, "step.out", "Step out of the current function", step_out);
+step_command!(
+    StepInto,
+    "step.into",
+    "Step into the next source line",
+    step_into
+);
+step_command!(
+    StepOver,
+    "step.over",
+    "Step over the next source line",
+    step_over
+);
+step_command!(
+    StepOut,
+    "step.out",
+    "Step out of the current function",
+    step_out
+);
 step_command!(
     StepInstruction,
     "step.instruction",

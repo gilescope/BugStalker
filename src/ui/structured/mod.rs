@@ -51,8 +51,11 @@ pub trait StructuredCommand:
     /// Run the command. The trait is intentionally infallible at the
     /// signature level — fallible work returns `Err(BsError)`. The
     /// transport never sees mixed Ok/Err state.
-    fn execute(self, dbg: &mut Debugger, budget: &ResponseBudget)
-    -> Result<Self::Response, BsError>;
+    fn execute(
+        self,
+        dbg: &mut Debugger,
+        budget: &ResponseBudget,
+    ) -> Result<Self::Response, BsError>;
 }
 
 /// Macro-style shortcut for the dispatch table. Each invocation generates:

@@ -156,20 +156,22 @@ impl ScriptClient {
     /// variable, or fall back to `which bs`. Convenient for in-tree
     /// integration tests.
     pub fn spawn_default(debuggee: impl AsRef<Path>) -> ClientResult<Self> {
-        let bs = std::env::var_os("BS_BIN").map(PathBuf::from).unwrap_or_else(|| {
-            // Walk up from CARGO_MANIFEST_DIR looking for target/debug/bs.
-            // Falls back to `bs` on PATH if not found.
-            let manifest = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
-            if let Some(start) = manifest {
-                for ancestor in start.ancestors() {
-                    let candidate = ancestor.join("target/debug/bs");
-                    if candidate.exists() {
-                        return candidate;
+        let bs = std::env::var_os("BS_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                // Walk up from CARGO_MANIFEST_DIR looking for target/debug/bs.
+                // Falls back to `bs` on PATH if not found.
+                let manifest = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);
+                if let Some(start) = manifest {
+                    for ancestor in start.ancestors() {
+                        let candidate = ancestor.join("target/debug/bs");
+                        if candidate.exists() {
+                            return candidate;
+                        }
                     }
                 }
-            }
-            PathBuf::from("bs")
-        });
+                PathBuf::from("bs")
+            });
         Self::spawn(bs, debuggee)
     }
 
@@ -209,7 +211,10 @@ impl ScriptClient {
             if let Some(method) = value.get("method").and_then(|m| m.as_str())
                 && method == "event"
             {
-                let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                let params = value
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 let ev: Event = serde_json::from_value(params.clone())
                     .map_err(|e| ClientError::Deserialise(e, params))?;
                 self.events.push(ev);
@@ -272,7 +277,10 @@ impl ScriptClient {
             if let Some(method) = value.get("method").and_then(|m| m.as_str())
                 && method == "event"
             {
-                let params = value.get("params").cloned().unwrap_or(serde_json::Value::Null);
+                let params = value
+                    .get("params")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
                 if let Ok(ev) = serde_json::from_value::<Event>(params) {
                     self.events.push(ev);
                 }

@@ -264,8 +264,7 @@ mod showcase_lookup_tests {
             .symbols()
             .filter_map(|s| s.name().ok().map(|n| (n.to_string(), s.address())))
             .find(|(n, _)| {
-                (n.contains("showcase..main..Point")
-                    || n.contains("8showcase4main"))
+                (n.contains("showcase..main..Point") || n.contains("8showcase4main"))
                     && n.contains("Greeter")
                     && n.contains("5greet")
             });
@@ -312,12 +311,14 @@ mod showcase_lookup_tests {
         let tab = SymbolTab::new(&obj).expect("symbol table");
 
         // Find `greet`'s address.
-        let greet_addr: u64 = obj.symbols()
+        let greet_addr: u64 = obj
+            .symbols()
             .filter_map(|s| s.name().ok().map(|n| (n, s.address())))
-            .find(|(n, _)| (n.contains("showcase..main..Point")
-                || n.contains("8showcase4mainNtB2_5Point"))
-                && n.contains("Greeter")
-                && n.contains("5greet"))
+            .find(|(n, _)| {
+                (n.contains("showcase..main..Point") || n.contains("8showcase4mainNtB2_5Point"))
+                    && n.contains("Greeter")
+                    && n.contains("5greet")
+            })
             .map(|(_, a)| a)
             .expect("greet symbol present");
 
@@ -327,7 +328,8 @@ mod showcase_lookup_tests {
         // Mach-O sections by their bare `sectname` (with collisions
         // across segments resolved by iteration order); the safer
         // probe is to iterate all sections and filter by segment.
-        let section = obj.sections()
+        let section = obj
+            .sections()
             .find(|s| {
                 let seg = s.segment_name_bytes().ok().flatten();
                 let name = s.name_bytes().ok();
@@ -358,7 +360,10 @@ mod showcase_lookup_tests {
                 Some(u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()))
             })
             .collect();
-        eprintln!("[sim] slots: {:?}", slots.iter().map(|s| format!("{s:#x}")).collect::<Vec<_>>());
+        eprintln!(
+            "[sim] slots: {:?}",
+            slots.iter().map(|s| format!("{s:#x}")).collect::<Vec<_>>()
+        );
 
         // Replay Strategy 1 — return the first slot whose mangled
         // name extracts a concrete type. (Pulling the helper out of
@@ -388,8 +393,12 @@ mod showcase_lookup_tests {
             let s = match parsed {
                 rust_mangle_tree::Symbol::V0(path) => {
                     // Walk for an impl_self_type.
-                    fn walk<'a>(p: &'a rust_mangle_tree::Path<'a>) -> Option<rust_mangle_tree::Type<'a>> {
-                        if let Some(t) = p.impl_self_type() { return Some(t.clone()); }
+                    fn walk<'a>(
+                        p: &'a rust_mangle_tree::Path<'a>,
+                    ) -> Option<rust_mangle_tree::Type<'a>> {
+                        if let Some(t) = p.impl_self_type() {
+                            return Some(t.clone());
+                        }
                         match p {
                             rust_mangle_tree::Path::Nested { parent, .. }
                             | rust_mangle_tree::Path::Generic { parent, .. } => walk(parent),

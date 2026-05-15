@@ -76,9 +76,7 @@ pub struct DebugInformation<R: gimli::Reader = EndianArcSlice> {
     /// the existing rayon `par_iter` chains working. Lock contention
     /// is a non-issue — chain lookups happen on user-visible events
     /// (breakpoint hits, step responses), not in hot loops.
-    addr2_ctx: once_cell::sync::OnceCell<
-        std::sync::Mutex<addr2line::Context<EndianArcSlice>>,
-    >,
+    addr2_ctx: once_cell::sync::OnceCell<std::sync::Mutex<addr2line::Context<EndianArcSlice>>>,
     /// macOS Mach-O `__unwind_info` section bytes. Empty on Linux /
     /// ELF or when the binary has no compact-unwind section. Parsed
     /// lazily on each query (zero-copy parser; the per-query cost is
@@ -325,7 +323,9 @@ impl DebugInformation {
                 let fp = regs.value(FP)?;
                 fp.saturating_add(16)
             }
-            OpcodeArm64::Frameless { stack_size_in_bytes } => {
+            OpcodeArm64::Frameless {
+                stack_size_in_bytes,
+            } => {
                 let sp = regs.value(SP)?;
                 sp.saturating_add(stack_size_in_bytes as u64)
             }
@@ -455,8 +455,7 @@ impl DebugInformation {
                 );
                 // Return an addr2line context over an empty Dwarf
                 // so callers get empty chains instead of crashes.
-                addr2line::Context::from_dwarf(empty_dwarf())
-                    .expect("empty Dwarf always builds")
+                addr2line::Context::from_dwarf(empty_dwarf()).expect("empty Dwarf always builds")
             });
             std::sync::Mutex::new(ctx)
         })
@@ -773,8 +772,7 @@ impl DebugInformation {
                         // locals' DWARF expressions don't apply.
                         let physical_match =
                             self.candidate_in_subprogram_range(suitable_place.address, info);
-                        let canonical = decl_file_match
-                            && physical_match.unwrap_or(true);
+                        let canonical = decl_file_match && physical_match.unwrap_or(true);
                         if record_diagnostics {
                             diagnostics.candidates.push(LineCandidate {
                                 address: suitable_place.address,
@@ -1296,10 +1294,7 @@ fn subprogram_decl_file_matches(
 /// its `DW_AT_decl_file` index resolved against the subprogram's CU
 /// file table. `None` when the DIE carries no decl_file, or when the
 /// file index points outside the CU's file table.
-fn subprogram_decl_file(
-    func: FatDieRef<'_, Function>,
-    info: &FunctionInfo,
-) -> Option<PathBuf> {
+fn subprogram_decl_file(func: FatDieRef<'_, Function>, info: &FunctionInfo) -> Option<PathBuf> {
     let (decl_file_idx, _) = info.decl_file_line?;
     let unit = func.unit();
     unit.files().get(decl_file_idx as usize).cloned()

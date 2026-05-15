@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::debugger::Debugger;
-use crate::ui::structured::error::BsError;
 use crate::ui::structured::envelope::ListResponse;
+use crate::ui::structured::error::BsError;
 use crate::ui::structured::{ResponseBudget, StructuredCommand};
 
 use super::ThreadDto;

@@ -151,8 +151,12 @@ impl StructuredCommand for WatchSet {
             .strip_prefix("0x")
             .or_else(|| self.address.strip_prefix("0X"))
             .unwrap_or(&self.address);
-        let raw = u64::from_str_radix(trimmed, 16)
-            .map_err(|_| BsError::new(ErrorCode::BadAddress, format!("invalid hex address: {}", self.address)))?;
+        let raw = u64::from_str_radix(trimmed, 16).map_err(|_| {
+            BsError::new(
+                ErrorCode::BadAddress,
+                format!("invalid hex address: {}", self.address),
+            )
+        })?;
         let addr: RelocatedAddress = raw.into();
         let view = dbg.set_watchpoint_on_memory(
             addr,
@@ -200,9 +204,16 @@ impl StructuredCommand for WatchRemove {
             }
             (Some(n), None) => dbg.remove_watchpoint_by_number(n)?,
             (None, Some(addr)) => {
-                let trimmed = addr.strip_prefix("0x").or_else(|| addr.strip_prefix("0X")).unwrap_or(&addr);
-                let raw = u64::from_str_radix(trimmed, 16)
-                    .map_err(|_| BsError::new(ErrorCode::BadAddress, format!("invalid hex address: {addr}")))?;
+                let trimmed = addr
+                    .strip_prefix("0x")
+                    .or_else(|| addr.strip_prefix("0X"))
+                    .unwrap_or(&addr);
+                let raw = u64::from_str_radix(trimmed, 16).map_err(|_| {
+                    BsError::new(
+                        ErrorCode::BadAddress,
+                        format!("invalid hex address: {addr}"),
+                    )
+                })?;
                 dbg.remove_watchpoint_by_addr(raw.into())?
             }
         };

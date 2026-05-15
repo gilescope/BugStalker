@@ -381,7 +381,8 @@ impl Debugger {
             if !diag.candidates.is_empty() {
                 diagnostics.push(diag);
             }
-            let owned: Vec<PlaceDescriptorOwned> = places.into_iter().map(|p| p.to_owned()).collect();
+            let owned: Vec<PlaceDescriptorOwned> =
+                places.into_iter().map(|p| p.to_owned()).collect();
             per_dwarf_places.push((*dwarf, owned));
         }
 

@@ -40,7 +40,10 @@ impl StructuredCommand for FrameInfo {
             num: info.num,
             function: info.frame.func_name.clone(),
             address: format!("0x{:x}", info.frame.ip.as_u64()),
-            function_start: info.frame.fn_start_ip.map(|a| format!("0x{:x}", a.as_u64())),
+            function_start: info
+                .frame
+                .fn_start_ip
+                .map(|a| format!("0x{:x}", a.as_u64())),
             base_addr: format!("0x{:x}", info.base_addr.as_u64()),
             cfa: format!("0x{:x}", info.cfa.as_u64()),
             return_addr: info.return_addr.map(|a| format!("0x{:x}", a.as_u64())),

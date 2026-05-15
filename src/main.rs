@@ -21,12 +21,7 @@ use std::sync::Mutex;
 /// `bs --version` is enough to tell a stale `~/.cargo/bin/bs` (or a
 /// pre-fix tarball install) from a fresh local build — no mtime
 /// archaeology required.
-const BS_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (",
-    env!("BS_BUILD_STAMP"),
-    ")"
-);
+const BS_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BS_BUILD_STAMP"), ")");
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version = BS_VERSION, about, long_about = None)]

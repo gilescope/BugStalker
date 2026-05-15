@@ -38,10 +38,7 @@ pub enum Event {
         inline_chain: Vec<InlineFrameDto>,
     },
     /// Debuggee stopped on an OS signal (SIGSEGV, SIGINT, etc.).
-    Signal {
-        signal: i32,
-        signal_name: String,
-    },
+    Signal { signal: i32, signal_name: String },
     /// Debuggee exited.
     Exit { code: i32 },
     /// Watchpoint activated.

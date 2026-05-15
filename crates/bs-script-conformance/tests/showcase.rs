@@ -6,9 +6,7 @@
 //! agent recipe it documents — set a breakpoint, run, inspect a
 //! variable. No JSON pointer extraction, no string transcript.
 
-use bs_script_conformance::structured::commands::r#break::{
-    BreakInfo, BreakSet, Location,
-};
+use bs_script_conformance::structured::commands::r#break::{BreakInfo, BreakSet, Location};
 use bs_script_conformance::structured::commands::print_var::Var;
 use bs_script_conformance::structured::commands::run::Run;
 use bs_script_conformance::structured::commands::{StopKind, StopReason};
