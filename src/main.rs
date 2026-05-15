@@ -137,10 +137,51 @@ impl From<&Args> for UIConfig {
     }
 }
 
+/// Print a one-line warning to stderr when bs starts on a macOS
+/// kernel known to force-reboot under bs's mach syscall traffic.
+/// Three byte-identical kernel panics captured on
+/// `xnu-12377.101.15 / 25E253` so far; see
+/// `doc/macos-26.4.1-panic-risk.md`. Suppress with
+/// `BS_DARWIN_PANIC_WARN=0` once you've internalised the risk.
+fn warn_macos_panic_risk_once() {
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::var_os("BS_DARWIN_PANIC_WARN").as_deref() == Some(std::ffi::OsStr::new("0")) {
+            return;
+        }
+        // Probe the running kernel build. `uname -v` looks like
+        //   "Darwin Kernel Version 25.4.0: Thu Mar 19 19:26:07 PDT 2026; root:xnu-12377.101.15~1/RELEASE_ARM64_T6031"
+        let kver = std::process::Command::new("uname")
+            .arg("-v")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let is_known_bad = kver.contains("xnu-12377.101.15");
+        if !is_known_bad {
+            return;
+        }
+        eprintln!(
+            "[bs] WARNING: macOS kernel xnu-12377.101.15 is known to \
+             force-reboot the host under bs's mach syscall load."
+        );
+        eprintln!(
+            "[bs]          Apple Feedback Assistant report filed \
+             2026-05-15; see doc/macos-26.4.1-panic-risk.md."
+        );
+        eprintln!(
+            "[bs]          Suppress this warning with \
+             BS_DARWIN_PANIC_WARN=0 once you've internalised the risk."
+        );
+    }
+}
+
 fn main() {
     let logger = env_logger::Logger::from_default_env();
     let filter = logger.filter();
     LOGGER_SWITCHER.switch(logger, filter);
+
+    warn_macos_panic_risk_once();
 
     let args = Args::parse();
     ui::config::set(UIConfig::from(&args));
