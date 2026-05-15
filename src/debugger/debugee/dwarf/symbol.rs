@@ -289,6 +289,140 @@ mod showcase_lookup_tests {
         eprintln!("[lookup] mangled_at({addr:#x}) = {got}");
     }
 
+    /// Strategy 1 end-to-end sim: locate the `Point as Greeter`
+    /// vtable in `__DATA_CONST,__const` by hunting for slot 3 (the
+    /// `greet` fn ptr), read the 16-byte vtable layout straight
+    /// from the binary's file contents, then for each non-zero slot
+    /// look the address up in `SymbolTab` and demangle through
+    /// `concrete_from_vtable_symbol`. This is exactly what bs does
+    /// at runtime — but on static bytes, so no debuggee, no
+    /// inferior, no kernel risk. If this passes, the resolver
+    /// chain works for the showcase fixture; if it fails, the bug
+    /// is between the renderer hook and what we sim here.
+    #[test]
+    fn strategy1_sim_resolves_point() {
+        use object::ObjectSection as _;
+        let path = binary_path();
+        if !path.exists() {
+            eprintln!("skipping — showcase debug binary not built at {path:?}");
+            return;
+        }
+        let data = fs::read(&path).expect("read showcase");
+        let obj = object::File::parse(&*data).expect("parse showcase");
+        let tab = SymbolTab::new(&obj).expect("symbol table");
+
+        // Find `greet`'s address.
+        let greet_addr: u64 = obj.symbols()
+            .filter_map(|s| s.name().ok().map(|n| (n, s.address())))
+            .find(|(n, _)| (n.contains("showcase..main..Point")
+                || n.contains("8showcase4mainNtB2_5Point"))
+                && n.contains("Greeter")
+                && n.contains("5greet"))
+            .map(|(_, a)| a)
+            .expect("greet symbol present");
+
+        // Find a vtable by scanning __DATA_CONST,__const for a u64
+        // equal to greet_addr (slot 3 of the vtable). The vtable
+        // base is 24 bytes earlier. The `object` crate exposes
+        // Mach-O sections by their bare `sectname` (with collisions
+        // across segments resolved by iteration order); the safer
+        // probe is to iterate all sections and filter by segment.
+        let section = obj.sections()
+            .find(|s| {
+                let seg = s.segment_name_bytes().ok().flatten();
+                let name = s.name_bytes().ok();
+                seg == Some(b"__DATA_CONST" as &[u8]) && name == Some(b"__const" as &[u8])
+            })
+            .expect("__DATA_CONST,__const section");
+        let bytes = section.data().expect("section data");
+        let base_addr = section.address();
+        let mut vtable_base: Option<u64> = None;
+        for off in (0..bytes.len().saturating_sub(8)).step_by(8) {
+            let v = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+            if v == greet_addr && off >= 24 {
+                vtable_base = Some(base_addr + (off - 24) as u64);
+                break;
+            }
+        }
+        let vtable_base = vtable_base.expect("greet appears in __const exactly once");
+        eprintln!("[sim] vtable base @ {vtable_base:#x}");
+
+        // Read 16 u64 slots starting at vtable_base from the file.
+        let vtable_off = (vtable_base - base_addr) as usize;
+        let slots: Vec<u64> = (0..16)
+            .filter_map(|i| {
+                let o = vtable_off + i * 8;
+                if o + 8 > bytes.len() {
+                    return None;
+                }
+                Some(u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap()))
+            })
+            .collect();
+        eprintln!("[sim] slots: {:?}", slots.iter().map(|s| format!("{s:#x}")).collect::<Vec<_>>());
+
+        // Replay Strategy 1 — return the first slot whose mangled
+        // name extracts a concrete type. (Pulling the helper out of
+        // parser.rs would make this cleaner; for now we re-implement
+        // the legacy + v0 surgery inline so this test stays in
+        // symbol.rs and avoids a public re-export of the parser
+        // internals.)
+        let mut resolved: Option<String> = None;
+        for slot in &slots {
+            if *slot == 0 {
+                continue;
+            }
+            let Some(raw) = tab.mangled_at(*slot) else {
+                continue;
+            };
+            // Apply the same Mach-O underscore peel we fixed in
+            // parser.rs.
+            let peeled = if raw.starts_with("__R") || raw.starts_with("__Z") {
+                &raw[1..]
+            } else {
+                raw
+            };
+            let parsed = match rust_mangle_tree::parse(peeled) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let s = match parsed {
+                rust_mangle_tree::Symbol::V0(path) => {
+                    // Walk for an impl_self_type.
+                    fn walk<'a>(p: &'a rust_mangle_tree::Path<'a>) -> Option<rust_mangle_tree::Type<'a>> {
+                        if let Some(t) = p.impl_self_type() { return Some(t.clone()); }
+                        match p {
+                            rust_mangle_tree::Path::Nested { parent, .. }
+                            | rust_mangle_tree::Path::Generic { parent, .. } => walk(parent),
+                            _ => None,
+                        }
+                    }
+                    walk(&path).and_then(|t| match t {
+                        rust_mangle_tree::Type::Path(p) => Some(p.to_string()),
+                        _ => None,
+                    })
+                }
+                rust_mangle_tree::Symbol::Legacy(_) => {
+                    let demangled = format!("{parsed:#}");
+                    (|| {
+                        let lt = demangled.find('<')?;
+                        let as_kw = demangled[lt..].find(" as ")?;
+                        Some(demangled[lt + 1..lt + as_kw].trim().to_string())
+                    })()
+                }
+                _ => None,
+            };
+            if let Some(name) = s {
+                resolved = Some(name);
+                break;
+            }
+        }
+        assert_eq!(
+            resolved.as_deref(),
+            Some("showcase::main::Point"),
+            "Strategy 1 simulation should reproduce the user's expected concrete type"
+        );
+    }
+
     #[test]
     fn vtable_base_has_no_symbol() {
         // The `<Point as Greeter>` vtable lives in `__DATA_CONST,__const`

@@ -17,8 +17,19 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+/// `--version` output. We carry the build stamp from `build.rs` so
+/// `bs --version` is enough to tell a stale `~/.cargo/bin/bs` (or a
+/// pre-fix tarball install) from a fresh local build — no mtime
+/// archaeology required.
+const BS_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("BS_BUILD_STAMP"),
+    ")"
+);
+
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = BS_VERSION, about, long_about = None)]
 pub struct Args {
     /// Start with terminal ui
     #[clap(long)]
