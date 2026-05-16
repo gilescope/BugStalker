@@ -928,6 +928,14 @@ fn test_variables_request() -> anyhow::Result<()> {
 /// Any DAP error / EOF during the walk is treated as bs crashing
 /// or hanging — the test fails with the captured error. When the
 /// underlying panic is fixed the walk completes and the test passes.
+///
+/// macOS-only: the original kill-on-debug was reproduced with the
+/// `wild` linker on `aarch64-apple-darwin`, and this test hard-codes
+/// that target triple to build showcase the same way the
+/// codelldb-fork extension does. Building for `aarch64-apple-darwin`
+/// from a Linux host fails with `error[E0463]: can't find crate for
+/// std` because that target's libstd isn't installed there.
+#[cfg(target_os = "macos")]
 #[test]
 #[serial]
 fn test_showcase_locals_no_crash() -> anyhow::Result<()> {
