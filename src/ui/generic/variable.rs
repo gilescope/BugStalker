@@ -74,11 +74,18 @@ fn render_value_inner(
 ) -> String {
     match value.value_layout() {
         Some(layout) => match layout {
-            ValueLayout::PreRendered(rendered_value) => match value {
-                Value::CEnum(_) => format!("{}::{}", value.r#type().name_fmt(), rendered_value),
-                _ if print_type => format!("{}({})", value.r#type().name_fmt(), rendered_value),
-                _ => format!("{rendered_value}"),
-            },
+            ValueLayout::PreRendered(rendered_value) => {
+                let type_name = value.r#type().name_fmt();
+                match value {
+                    Value::CEnum(_) => format!("{type_name}::{rendered_value}"),
+                    // The unit type renders its own value as "()", so the
+                    // generic `Type(value)` wrap below would produce the
+                    // nonsense `()(())`. Special-case: emit just "()".
+                    _ if type_name == "()" => "()".to_string(),
+                    _ if print_type => format!("{type_name}({rendered_value})"),
+                    _ => format!("{rendered_value}"),
+                }
+            }
             ValueLayout::Referential(addr) => {
                 if print_type {
                     format!(
@@ -150,6 +157,56 @@ fn render_value_inner(
             ValueLayout::Structure(members) => {
                 let type_name = value.r#type().name_fmt();
                 let spec = viz.and_then(|r| r.find(&type_name));
+
+                // Detect tuple shape: all member field names are
+                // `__0`, `__1`, … in order. Rust uses this naming
+                // for tuple structs (`Wrap(7, 8)`), tuple variants
+                // of enums (`Result::Ok(7)`), and bare tuples
+                // (`(1, "one")`). Render as positional in parens
+                // rather than struct-init braces. A user-supplied
+                // viz spec opts out (the spec author chose
+                // struct-style placeholders deliberately).
+                let is_tuple_shape = spec.is_none()
+                    && !members.is_empty()
+                    && members.iter().enumerate().all(|(i, m)| {
+                        m.field_name.as_deref() == Some(&format!("__{i}"))
+                    });
+                if is_tuple_shape {
+                    let inner: Vec<String> = members
+                        .iter()
+                        .map(|m| {
+                            // Only scalar leaves (PreRendered) drop
+                            // their type prefix — that's what makes
+                            // `Result::Ok(7)` read better than
+                            // `Result::Ok(i32(7))`. Anything else
+                            // keeps it so we preserve:
+                            //   * newtype wrappers: `Some(NonZero<u32>(42))`
+                            //   * pointer addresses with their type:
+                            //     `Some(&i32 [0x…])` not the bare
+                            //     `Some(0x…)`
+                            //   * type-name annotations like cycle
+                            //     markers (`[cycle to 0x…]`) and dyn
+                            //     concrete-type recovery (`[→ Type]`),
+                            //     both of which live in the type ident
+                            //     and would otherwise vanish.
+                            let keep_type = !matches!(
+                                m.value.value_layout(),
+                                Some(ValueLayout::PreRendered(_))
+                            );
+                            render_value_inner(&m.value, depth, keep_type, viz)
+                        })
+                        .collect();
+                    let body = format!("({})", inner.join(", "));
+                    return if print_type && !type_name.starts_with('(') {
+                        // Bare-tuple types are already parens-shaped
+                        // (`(i32, &str)`); doubling them up gives
+                        // `(i32, &str)(1, "one")`. Skip the prefix.
+                        format!("{type_name}{body}")
+                    } else {
+                        body
+                    };
+                }
+
                 let summary_str = spec.and_then(|s| {
                     s.summary
                         .as_deref()
@@ -219,37 +276,20 @@ fn render_value_inner(
 
                 format!("{render}\n{}}}", TAB.repeat(depth))
             }
-            ValueLayout::IndexedList(items) => {
-                let mut render = format!("{} {{", value.r#type().name_fmt());
-
-                let tabs = TAB.repeat(depth + 1);
-
-                for item in items {
-                    render = format!("{render}\n");
-                    render = format!(
-                        "{render}{tabs}{}: {}",
-                        item.index,
-                        render_value_inner(&item.value, depth + 1, false, viz)
-                    );
-                }
-
-                format!("{render}\n{}}}", TAB.repeat(depth))
-            }
-            ValueLayout::NonIndexedList(values) => {
-                let mut render = format!("{} {{", value.r#type().name_fmt());
-
-                let tabs = TAB.repeat(depth + 1);
-
-                for val in values {
-                    render = format!("{render}\n");
-                    render = format!(
-                        "{render}{tabs}{}",
-                        render_value_inner(val, depth + 1, false, viz)
-                    );
-                }
-
-                format!("{render}\n{}}}", TAB.repeat(depth))
-            }
+            ValueLayout::IndexedList(items) => render_linear_list(
+                value.r#type().name_fmt().to_string(),
+                items.iter().map(|i| &i.value),
+                depth,
+                print_type,
+                viz,
+            ),
+            ValueLayout::NonIndexedList(values) => render_linear_list(
+                value.r#type().name_fmt().to_string(),
+                values.iter(),
+                depth,
+                print_type,
+                viz,
+            ),
         },
         None => format!("{}(unknown)", value.r#type().name_fmt()),
     }
@@ -262,6 +302,30 @@ fn render_value_inner(
 /// `format` overrides from `spec`, so a placeholder `{flags}`
 /// for a field marked `format = "hex"` substitutes as
 /// `0xff00ff` rather than the raw decimal form.
+/// Render a linear collection (array, slice, Vec, set, …) as
+/// `TypeName [a, b, c]` — matching Rust's `Debug` shape for slices.
+/// Single-line; long lists wrap at the terminal naturally. Inner
+/// items render with `print_type=false` so we don't get noise like
+/// `Vec<i32> [i32(1), i32(2)]`.
+fn render_linear_list<'a>(
+    type_name: String,
+    items: impl IntoIterator<Item = &'a Value>,
+    depth: usize,
+    print_type: bool,
+    viz: Option<&VizRegistry>,
+) -> String {
+    let inner: Vec<String> = items
+        .into_iter()
+        .map(|v| render_value_inner(v, depth + 1, false, viz))
+        .collect();
+    let body = format!("[{}]", inner.join(", "));
+    if print_type {
+        format!("{type_name} {body}")
+    } else {
+        body
+    }
+}
+
 fn substitute_template(template: &str, members: &[Member], spec: &TypeViewSpec) -> String {
     substitute_template_with_fields(template, members, &spec.fields)
 }

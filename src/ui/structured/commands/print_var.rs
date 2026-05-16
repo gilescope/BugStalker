@@ -26,8 +26,9 @@ use crate::debugger::Debugger;
 use crate::debugger::variable::dqe::{Dqe, Selector};
 use crate::debugger::variable::execute::QueryResult;
 use crate::debugger::variable::render::RenderValue;
+use crate::debugger::viz::VizRegistry;
 use crate::ui::command::parser::expression;
-use crate::ui::generic::variable::render_value;
+use crate::ui::generic::variable::render_value_with_viz;
 use crate::ui::structured::envelope::ListResponse;
 use crate::ui::structured::error::{BsError, ErrorCode};
 use crate::ui::structured::{ResponseBudget, StructuredCommand};
@@ -61,13 +62,13 @@ pub struct VarResult {
     pub value_text: String,
 }
 
-impl<'a> From<&QueryResult<'a>> for VarResult {
-    fn from(qr: &QueryResult<'a>) -> Self {
+impl VarResult {
+    fn from_query(qr: &QueryResult<'_>, viz: Option<&VizRegistry>) -> Self {
         let value = qr.value();
         Self {
             name: qr.identity().name.clone(),
             r#type: value.r#type().name_fmt().to_string(),
-            value_text: render_value(value),
+            value_text: render_value_with_viz(value, viz),
         }
     }
 }
@@ -111,7 +112,11 @@ impl StructuredCommand for Var {
     ) -> Result<Self::Response, BsError> {
         let dqe = build_dqe(self.name.as_deref(), self.expression.as_deref())?;
         let qrs = dbg.read_variable(dqe)?;
-        let items: Vec<VarResult> = qrs.iter().map(VarResult::from).collect();
+        let viz = dbg.view_registry();
+        let items: Vec<VarResult> = qrs
+            .iter()
+            .map(|qr| VarResult::from_query(qr, Some(viz)))
+            .collect();
         Ok(ListResponse::from_iter(items, budget.item_cap()))
     }
 }
@@ -128,7 +133,11 @@ impl StructuredCommand for Arg {
     ) -> Result<Self::Response, BsError> {
         let dqe = build_dqe(self.name.as_deref(), self.expression.as_deref())?;
         let qrs = dbg.read_argument(dqe)?;
-        let items: Vec<VarResult> = qrs.iter().map(VarResult::from).collect();
+        let viz = dbg.view_registry();
+        let items: Vec<VarResult> = qrs
+            .iter()
+            .map(|qr| VarResult::from_query(qr, Some(viz)))
+            .collect();
         Ok(ListResponse::from_iter(items, budget.item_cap()))
     }
 }
