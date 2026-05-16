@@ -55,6 +55,35 @@ pub struct Args {
     #[arg(default_value_t = false)]
     script: bool,
 
+    /// Test-runner mode: read the given .json5 script, dispatch every
+    /// request through the same engine `--script` uses, accumulate
+    /// `assert.*` results into TAP 14 on stdout, and exit `0` if every
+    /// assertion passed (else `1`). See `doc/scripting/usage.md`.
+    #[clap(long, value_name = "SCRIPT")]
+    test: Option<PathBuf>,
+
+    /// Combined with `--test`: rewrite mismatched `expect:` blocks in
+    /// the script in place using the current responses. Idempotent.
+    /// `0x…` addresses are auto-masked into `$regex` placeholders.
+    #[clap(long, requires = "test")]
+    #[arg(default_value_t = false)]
+    bless: bool,
+
+    /// With `--bless` or `--record`: skip the address auto-mask
+    /// step. Use when you want a recorded test to assert on a
+    /// literal `0x…` value.
+    #[clap(long)]
+    #[arg(default_value_t = false)]
+    no_masks: bool,
+
+    /// Recorder mode: take a JSON-RPC stream on stdin (same wire
+    /// format as `--script`), tee every request into the given file
+    /// as a runnable test script. Read-only inspections (`var`,
+    /// `arg`, `frame.info`) auto-promote to `assert.*` blocks pinned
+    /// against the observed response.
+    #[clap(long, value_name = "OUT")]
+    record: Option<PathBuf>,
+
     /// Pure metadata mode: write the JSON Schema catalogue of every
     /// scripting method to stdout and exit. Pair with `bs --script` to
     /// drive the debugger from an agent.
@@ -216,6 +245,43 @@ fn main() {
         bugstalker::ui::script::run_script(debugee_src(), args.oracle.clone())
             .unwrap_or_exit(ErrorKind::Io, "script");
         return;
+    }
+
+    // --record drives a JSON-RPC session and writes a runnable test
+    // script as we go. Same wire format as --script for the inputs
+    // and outputs.
+    if let Some(out_path) = args.record.clone() {
+        bugstalker::ui::script::run_record(
+            &out_path,
+            debugee_src(),
+            args.oracle.clone(),
+            !args.no_masks,
+        )
+        .unwrap_or_exit(ErrorKind::Io, "record");
+        return;
+    }
+
+    // --test reads a script file, accumulates assertions into TAP, and
+    // exits with 0 on all-pass / 1 on any failure or bail-out. Same
+    // dispatcher as --script underneath. `--bless` rewrites mismatched
+    // expect blocks instead of failing.
+    if let Some(script_path) = args.test.clone() {
+        let opts = if args.bless {
+            bugstalker::ui::script::RunOptions {
+                bless: true,
+                address_masking: !args.no_masks,
+            }
+        } else {
+            bugstalker::ui::script::RunOptions::default()
+        };
+        let code = bugstalker::ui::script::run_test_with(
+            &script_path,
+            debugee_src(),
+            args.oracle.clone(),
+            opts,
+        )
+        .unwrap_or_exit(ErrorKind::Io, "test");
+        exit(code);
     }
 
     // Determine interface mode

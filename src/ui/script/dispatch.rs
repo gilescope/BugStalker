@@ -63,4 +63,10 @@ dispatch_table![
     commands::r#break::BreakRemove,
     commands::watch::WatchSet,
     commands::watch::WatchRemove,
+    // Assertions — used by `bs --test`.
+    commands::assert::AssertVar,
+    commands::assert::AssertArg,
+    commands::assert::AssertFrame,
+    commands::assert::AssertOk,
+    commands::assert::AssertFail,
 ];

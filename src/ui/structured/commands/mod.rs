@@ -5,6 +5,7 @@
 //! `StructuredCommand` impl. The catalogue is assembled in
 //! `crate::ui::script::dispatch`.
 
+pub mod assert;
 pub mod backtrace;
 pub mod r#break;
 pub mod r#continue;
