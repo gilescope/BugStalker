@@ -847,7 +847,7 @@ pub fn render_value_to_string_with_viz(
             if let debugger::variable::value::Value::RustEnum(re) = v
                 && let Some(spec) = viz.and_then(|r| {
                     let outer = RenderValue::r#type(v).name_fmt();
-                    r.find(&outer)
+                    r.find(outer)
                 })
             {
                 let active_variant_name = re.value.as_ref().and_then(|m| m.field_name.as_deref());
@@ -958,37 +958,37 @@ pub fn render_value_to_string_with_viz(
         }
         Some(debugger::variable::render::ValueLayout::Structure(members)) => {
             let type_name = RenderValue::r#type(v).name_fmt();
-            if let Some(spec) = viz.and_then(|r| r.find(&type_name)) {
-                if let Some(tmpl) = spec.summary.as_deref() {
-                    return debugger::viz::substitute_template(tmpl, members, |m| {
-                        // Honour per-field format overrides
-                        // inside the template too, mirroring the
-                        // TUI/console path. The DAP renderer
-                        // doesn't have a `format_scalar` of its
-                        // own — for now reach into the TUI helper
-                        // via a thin re-export, since the formats
-                        // are pure functions of (Value, Format).
-                        let fmt = m
-                            .field_name
-                            .as_deref()
-                            .and_then(|name| spec.fields.iter().find(|f| f.name == name))
-                            .map(|f| f.format)
-                            .filter(|f| *f != bs_viz_spec::Format::Default);
-                        if let Some(fmt) = fmt {
-                            if let Some(s) =
-                                crate::ui::generic::variable::format_scalar_for_dap(&m.value, fmt)
-                            {
-                                return s;
-                            }
-                            if let Some(s) =
-                                crate::ui::generic::variable::format_bytes_for_dap(&m.value, fmt)
-                            {
-                                return s;
-                            }
+            if let Some(spec) = viz.and_then(|r| r.find(type_name))
+                && let Some(tmpl) = spec.summary.as_deref()
+            {
+                return debugger::viz::substitute_template(tmpl, members, |m| {
+                    // Honour per-field format overrides
+                    // inside the template too, mirroring the
+                    // TUI/console path. The DAP renderer
+                    // doesn't have a `format_scalar` of its
+                    // own — for now reach into the TUI helper
+                    // via a thin re-export, since the formats
+                    // are pure functions of (Value, Format).
+                    let fmt = m
+                        .field_name
+                        .as_deref()
+                        .and_then(|name| spec.fields.iter().find(|f| f.name == name))
+                        .map(|f| f.format)
+                        .filter(|f| *f != bs_viz_spec::Format::Default);
+                    if let Some(fmt) = fmt {
+                        if let Some(s) =
+                            crate::ui::generic::variable::format_scalar_for_dap(&m.value, fmt)
+                        {
+                            return s;
                         }
-                        render_value_to_string_with_viz(&m.value, viz)
-                    });
-                }
+                        if let Some(s) =
+                            crate::ui::generic::variable::format_bytes_for_dap(&m.value, fmt)
+                        {
+                            return s;
+                        }
+                    }
+                    render_value_to_string_with_viz(&m.value, viz)
+                });
             }
             if is_tuple_structure(members) {
                 // Render tuples inline with the bracket shape Rust

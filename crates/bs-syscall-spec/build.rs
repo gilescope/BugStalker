@@ -117,15 +117,15 @@ fn parse_table(raw: &str, path: &std::path::Path) -> Result<Vec<Entry>, String> 
                 path.display(),
             ));
         }
-        if let Some(prev) = last_nr {
-            if nr <= prev {
-                return Err(format!(
-                    "{}:{line_no}: row `{trimmed}` is out of order \
-                     (nr {nr} not strictly greater than previous {prev}); \
-                     keep the table sorted by number",
-                    path.display(),
-                ));
-            }
+        if let Some(prev) = last_nr
+            && nr <= prev
+        {
+            return Err(format!(
+                "{}:{line_no}: row `{trimmed}` is out of order \
+                 (nr {nr} not strictly greater than previous {prev}); \
+                 keep the table sorted by number",
+                path.display(),
+            ));
         }
         last_nr = Some(nr);
         entries.push(Entry {

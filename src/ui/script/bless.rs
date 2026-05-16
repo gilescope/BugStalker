@@ -203,7 +203,7 @@ fn render_into(v: &Value, base_indent: usize, depth_indent: usize, out: &mut Str
 }
 
 fn inline_array(items: &[Value]) -> String {
-    let parts: Vec<String> = items.iter().map(|v| inline_value(v)).collect();
+    let parts: Vec<String> = items.iter().map(inline_value).collect();
     format!("[{}]", parts.join(", "))
 }
 

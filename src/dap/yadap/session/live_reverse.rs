@@ -134,7 +134,7 @@ impl super::DebugSession {
             .into_iter()
             .map(|thread| thread.thread.pid)
             .collect::<Vec<_>>();
-        if !pids.iter().any(|pid| *pid == focused_pid) {
+        if !pids.contains(&focused_pid) {
             pids.push(focused_pid);
         }
         pids.sort_by_key(|pid| pid.as_raw());

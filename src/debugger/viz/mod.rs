@@ -222,10 +222,7 @@ impl VizRegistry {
         // closure capturing `disabled` (a `RwLockReadGuard`)
         // can't return a borrow of `self.by_name` past its own
         // scope.
-        let (resolved_key, resolved_spec): (&str, &TypeViewSpec) = match self.resolve(query) {
-            Some(pair) => pair,
-            None => return None,
-        };
+        let (resolved_key, resolved_spec): (&str, &TypeViewSpec) = self.resolve(query)?;
         if self.disabled.read().ok()?.contains(resolved_key) {
             return None;
         }

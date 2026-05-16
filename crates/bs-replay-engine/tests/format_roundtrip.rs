@@ -508,7 +508,7 @@ fn instruction_trap_event_roundtrip_per_kind() {
         .write_event(Event::InstructionTrap {
             pc: 0x4000_1010,
             kind: InstructionTrapKind::Rdrand,
-            result: vec![0x123456_789a, 1],
+            result: vec![0x0012_3456_789a, 1],
         })
         .unwrap();
     // CPUID: eax/ebx/ecx/edx.

@@ -26,6 +26,12 @@
 //! `version::tests`) ensures a future trace written by a newer
 //! BugStalker fails fast against an older one.
 
+// `rkyv::Archive` derives sibling `Archived*` enums/structs whose
+// fields don't inherit our doc comments, which trips
+// `#![warn(missing_docs)]`. Suppress at the module level rather than
+// dotting `#[allow]` on every Archive-deriving type.
+#![allow(missing_docs)]
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// One recorded event. Public-API stability is **not** promised at

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! Property tests for the format layer.
 //!
+// The proptest closures destructure long tuple types inline; introducing
+// a `type` alias for each makes the test harder to read than the
+// inline form. The complexity is bounded to test code.
+#![allow(clippy::type_complexity)]
 //! Phase 8 § "Property testing" lists this as the Phase 5 property:
 //! "record→replay never produces a different PC trace from the
 //! recorded one (the property is determinism itself)". At the

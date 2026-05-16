@@ -292,17 +292,17 @@ pub fn validate_with(dir: impl AsRef<Path>, opts: &ValidationOptions<'_>) -> Val
 
     // ---- Replay-time host checks (only when the manifest parsed) ----
     if let Some(m) = manifest.as_ref() {
-        if let Some(expected) = opts.expected_build_id {
-            if m.build_id != expected {
-                report.push(
-                    Severity::Error,
-                    DiagKind::BuildIdMismatch,
-                    format!(
-                        "manifest build_id {recorded} disagrees with expected {expected}",
-                        recorded = m.build_id,
-                    ),
-                );
-            }
+        if let Some(expected) = opts.expected_build_id
+            && m.build_id != expected
+        {
+            report.push(
+                Severity::Error,
+                DiagKind::BuildIdMismatch,
+                format!(
+                    "manifest build_id {recorded} disagrees with expected {expected}",
+                    recorded = m.build_id,
+                ),
+            );
         }
         if let Some(host) = opts.host_features {
             let missing = m.missing_host_features(host);
@@ -467,10 +467,10 @@ fn enumerate_segments(dir: &Path) -> std::io::Result<Vec<u64>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        if let Some(name) = entry.file_name().to_str() {
-            if let Some(idx) = parse_segment_filename(name) {
-                out.push(idx);
-            }
+        if let Some(name) = entry.file_name().to_str()
+            && let Some(idx) = parse_segment_filename(name)
+        {
+            out.push(idx);
         }
     }
     out.sort_unstable();

@@ -181,19 +181,19 @@ pub fn capture_pre_syscall(frame: CallFrame, reader: &dyn MemoryReader) -> Captu
     let tier = match classify(frame.nr) {
         Tier::Curated(spec) => {
             for (idx, p) in spec.params.iter().enumerate() {
-                if let ParamKind::InBuf { len_param } = p.kind {
-                    if let Some(len) = resolve_buf_len(
+                if let ParamKind::InBuf { len_param } = p.kind
+                    && let Some(len) = resolve_buf_len(
                         spec, &frame, /*ret=*/ 0, len_param, /*pre=*/ true,
-                    ) {
-                        push_buf_region(
-                            &mut regions,
-                            idx,
-                            frame.args[idx],
-                            len.min(BUFFER_CAP),
-                            CapturedKind::InBuf,
-                            reader,
-                        );
-                    }
+                    )
+                {
+                    push_buf_region(
+                        &mut regions,
+                        idx,
+                        frame.args[idx],
+                        len.min(BUFFER_CAP),
+                        CapturedKind::InBuf,
+                        reader,
+                    );
                 }
                 if matches!(p.kind, ParamKind::InCStr) {
                     push_cstr_region(&mut regions, idx, frame.args[idx], reader);
@@ -232,19 +232,18 @@ pub fn capture_post_syscall(
     let tier = match classify(frame.nr) {
         Tier::Curated(spec) => {
             for (idx, p) in spec.params.iter().enumerate() {
-                if let ParamKind::OutBuf { len_param } = p.kind {
-                    if let Some(len) =
+                if let ParamKind::OutBuf { len_param } = p.kind
+                    && let Some(len) =
                         resolve_buf_len(spec, &frame, result, len_param, /*pre=*/ false)
-                    {
-                        push_buf_region(
-                            &mut regions,
-                            idx,
-                            frame.args[idx],
-                            len.min(BUFFER_CAP),
-                            CapturedKind::OutBuf,
-                            reader,
-                        );
-                    }
+                {
+                    push_buf_region(
+                        &mut regions,
+                        idx,
+                        frame.args[idx],
+                        len.min(BUFFER_CAP),
+                        CapturedKind::OutBuf,
+                        reader,
+                    );
                 }
             }
             CaptureTier::Curated

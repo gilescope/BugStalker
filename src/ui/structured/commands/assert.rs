@@ -446,9 +446,7 @@ fn match_operator(op: &str, arg: &Value, actual: &Value, path: &str) -> Option<M
                 _ => return fail("$any_of: argument must be an array of patterns"),
             };
             for alt in alternatives {
-                if match_value(alt, actual, "").is_none() {
-                    return None;
-                }
+                match_value(alt, actual, "")?;
             }
             fail("$any_of: no alternative matched")
         }

@@ -333,11 +333,6 @@ impl<'a> DwarfUnwinder<'a> {
         Self { debugee }
     }
 
-    /// Unwind call stack.
-    ///
-    /// # Arguments
-    ///
-    /// * pid: thread for unwinding
     /// AArch64 frame-pointer walk. Used as a fallback when DWARF
     /// unwinding can't make progress because frame 0 is in an
     /// untracked dylib (libsystem on darwin, libc on linux). Walks
@@ -349,6 +344,10 @@ impl<'a> DwarfUnwinder<'a> {
     ///
     /// The walk is bounded by `MAX_UNWIND_DEPTH` and a visited-fp
     /// loop guard.
+    ///
+    /// # Arguments
+    ///
+    /// * pid: thread for unwinding
     #[cfg(target_arch = "aarch64")]
     fn fp_walk_into_dwarf(
         &self,

@@ -204,6 +204,7 @@ impl TraceeCtl {
         self.threads_state.get(&pid)
     }
 
+    #[allow(dead_code)] // kept for symmetry with the &-getters; in-tree uses may follow
     pub(crate) fn tracee_mut(&mut self, pid: Pid) -> Option<&mut Tracee> {
         self.threads_state.get_mut(&pid)
     }
@@ -212,6 +213,7 @@ impl TraceeCtl {
         self.threads_state.get(&pid).unwrap()
     }
 
+    #[allow(dead_code)] // kept for symmetry with the &-getters; in-tree uses may follow
     pub(crate) fn tracee_ensure_mut(&mut self, pid: Pid) -> &mut Tracee {
         self.tracee_mut(pid).unwrap()
     }

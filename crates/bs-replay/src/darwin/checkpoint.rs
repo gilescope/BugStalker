@@ -300,9 +300,9 @@ pub fn enumerate_regions(task: task_t) -> Result<Vec<MachRegion>, MachError> {
             return Err(MachError::Region { kern_return: kr });
         }
         let prot = info.protection as u32;
-        let private = info.share_mode == SM_PRIVATE as u8;
+        let private = info.share_mode == SM_PRIVATE;
         let shared_with_other_tasks =
-            info.share_mode == SM_SHARED as u8 || info.share_mode == SM_TRUESHARED as u8;
+            info.share_mode == SM_SHARED || info.share_mode == SM_TRUESHARED;
         out.push(MachRegion {
             start: addr,
             size,
@@ -310,7 +310,7 @@ pub fn enumerate_regions(task: task_t) -> Result<Vec<MachRegion>, MachError> {
             private,
             shared_with_other_tasks,
         });
-        addr = addr.checked_add(size).unwrap_or(u64::MAX);
+        addr = addr.saturating_add(size);
         if addr == u64::MAX {
             break;
         }

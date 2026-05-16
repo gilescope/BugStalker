@@ -1525,7 +1525,7 @@ impl DebugInformationBuilder {
         let section_addr = |names: &[&str]| -> Option<u64> {
             file.sections().find_map(|section| {
                 let n = section.name().ok()?;
-                if names.iter().any(|w| *w == n) {
+                if names.contains(&n) {
                     Some(section.address())
                 } else {
                     None

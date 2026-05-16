@@ -637,7 +637,7 @@ impl Command {
             .to_slice()
             .map(|s: &str| s.to_string());
         let apply_patch = op_w_arg(APPLY_PATCH_COMMAND)
-            .ignore_then(apply_patch_path.clone())
+            .ignore_then(apply_patch_path)
             .then(whitespace().ignore_then(hex()).or_not())
             .map(|(path, base)| {
                 Command::ApplyPatch(apply_patch::Command::ApplyPatch {

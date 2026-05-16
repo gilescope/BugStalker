@@ -954,7 +954,7 @@ impl Tracer {
         use std::collections::HashSet;
 
         let state = self.darwin_state.as_mut().expect("supervision must exist");
-        let live = darwin_mach::task_threads_vec(state.task).map_err(|e| Error::from(e))?;
+        let live = darwin_mach::task_threads_vec(state.task).map_err(Error::from)?;
 
         let mut seen_tids: HashSet<u64> = HashSet::new();
         let mut faulting_pid: Option<nix::unistd::Pid> = None;
@@ -1116,8 +1116,9 @@ impl Tracer {
                 // SAFETY: PT_CONTINUE takes `(req, pid, addr, data)`;
                 // addr==1 means "continue from current PC", data==0
                 // is "deliver no signal".
-                let pt_rc =
-                    unsafe { libc::ptrace(libc::PT_CONTINUE, pid.as_raw(), 1 as *mut _, 0) };
+                let pt_rc = unsafe {
+                    libc::ptrace(libc::PT_CONTINUE, pid.as_raw(), std::ptr::dangling_mut(), 0)
+                };
                 if pt_rc < 0 {
                     let err = nix::errno::Errno::last();
                     if err != nix::errno::Errno::ESRCH {

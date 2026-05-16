@@ -111,40 +111,38 @@ fn render_value_inner(
                 // chose (`ok`, `warn`, `err`, ...); presentation
                 // is the IDE's call. Wrapping it in `[...]` is
                 // BugStalker's lowest-common-denominator default.
-                if let Value::RustEnum(re) = value {
-                    if let Some(spec) = viz.and_then(|r| {
+                if let Value::RustEnum(re) = value
+                    && let Some(spec) = viz.and_then(|r| {
                         let outer = value.r#type().name_fmt();
-                        r.find(&outer)
-                    }) {
-                        let active_variant_name =
-                            re.value.as_ref().and_then(|m| m.field_name.as_deref());
-                        let variant_spec = active_variant_name
-                            .and_then(|n| spec.variants.iter().find(|v| v.name == n));
-                        let tmpl = variant_spec
-                            .and_then(|v| v.summary.as_deref())
-                            .or(spec.summary.as_deref());
-                        if let (Some(tmpl), Value::Struct(variant)) = (tmpl, val) {
-                            // Variant-scoped fields override
-                            // type-level ones for placeholder
-                            // resolution. We synthesise a temp
-                            // spec view via `substitute_with_fields`
-                            // so renames / formats from the
-                            // variant entry apply.
-                            let outer_type = value.r#type().name_fmt();
-                            let summary = match variant_spec {
-                                Some(v) => substitute_template_with_fields(
-                                    tmpl,
-                                    &variant.members,
-                                    &v.fields,
-                                ),
-                                None => substitute_template(tmpl, &variant.members, spec),
-                            };
-                            let tag_prefix = variant_spec
-                                .and_then(|v| v.tag.as_deref())
-                                .map(|t| format!(" [{t}]"))
-                                .unwrap_or_default();
-                            return format!("{outer_type}{tag_prefix} {summary}");
-                        }
+                        r.find(outer)
+                    })
+                {
+                    let active_variant_name =
+                        re.value.as_ref().and_then(|m| m.field_name.as_deref());
+                    let variant_spec = active_variant_name
+                        .and_then(|n| spec.variants.iter().find(|v| v.name == n));
+                    let tmpl = variant_spec
+                        .and_then(|v| v.summary.as_deref())
+                        .or(spec.summary.as_deref());
+                    if let (Some(tmpl), Value::Struct(variant)) = (tmpl, val) {
+                        // Variant-scoped fields override
+                        // type-level ones for placeholder
+                        // resolution. We synthesise a temp
+                        // spec view via `substitute_with_fields`
+                        // so renames / formats from the
+                        // variant entry apply.
+                        let outer_type = value.r#type().name_fmt();
+                        let summary = match variant_spec {
+                            Some(v) => {
+                                substitute_template_with_fields(tmpl, &variant.members, &v.fields)
+                            }
+                            None => substitute_template(tmpl, &variant.members, spec),
+                        };
+                        let tag_prefix = variant_spec
+                            .and_then(|v| v.tag.as_deref())
+                            .map(|t| format!(" [{t}]"))
+                            .unwrap_or_default();
+                        return format!("{outer_type}{tag_prefix} {summary}");
                     }
                 }
                 format!(
@@ -156,7 +154,7 @@ fn render_value_inner(
             #[allow(clippy::useless_format)]
             ValueLayout::Structure(members) => {
                 let type_name = value.r#type().name_fmt();
-                let spec = viz.and_then(|r| r.find(&type_name));
+                let spec = viz.and_then(|r| r.find(type_name));
 
                 // Detect tuple shape: all member field names are
                 // `__0`, `__1`, … in order. Rust uses this naming

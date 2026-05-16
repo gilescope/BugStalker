@@ -77,7 +77,6 @@ use nix::sys::signal;
 use nix::sys::signal::{SIGKILL, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
-use object::Object;
 use os_pipe::PipeWriter;
 use regex::Regex;
 #[cfg(target_os = "linux")]
@@ -1489,7 +1488,7 @@ impl Debugger {
         // (architecture-typed), via DWARF's numeric register id.
         let read_unwound = |reg: Register| -> Option<u64> {
             let dwarf_reg = reg.dwarf_register()?;
-            unwound.value(dwarf_reg.into()).ok()
+            unwound.value(dwarf_reg).ok()
         };
 
         let mut map = raw;

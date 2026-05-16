@@ -14,11 +14,12 @@
 //! one-error-variant for "could not poke the inferior" because it
 //! preserves the meaning at the API surface even though Mach isn't
 //! ptrace).
-
-#![cfg(target_os = "macos")]
+//
+// `mod.rs` already gates the inclusion of this file with
+// `#[cfg(target_os = "macos")]`, so there's no inner `#![cfg(...)]`
+// here.
 
 use crate::debugger::Error;
-use crate::debugger::Error::Ptrace;
 use mach2::exception_types::{
     EXC_MASK_BAD_ACCESS, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE, EXCEPTION_DEFAULT,
     MACH_EXCEPTION_CODES, exception_mask_t,
@@ -492,17 +493,19 @@ pub fn vm_write_word(task: task_t, addr: usize, value: usize) -> Result<(), Erro
     Ok(())
 }
 
-/// Query a VM region for its `(protection, max_protection)` mask
-/// pair. The Mach kernel reports both: `protection` is the *current*
-/// permission, `max_protection` is the upper bound the page can ever
-/// be raised to without re-mapping.
-///
-/// The caller wants `max_protection` for restoration decisions —
-/// `protection` lies for some shared pages (notably the dyld shared
-/// cache reports `R` only even though the page is genuinely
-/// executable). `max_protection` reflects what the page is *for*:
-/// `R+X` for text loaded from disk, `R+W` for an anonymous
-/// `mmap(PROT_READ | PROT_WRITE)`, etc.
+// Background note (used to attach to a `region_protection` helper
+// that's since been inlined). Kept here because the rationale is
+// still load-bearing for callers that pick `max_protection`:
+//
+// The Mach kernel reports both `protection` and `max_protection`.
+// `protection` is the *current* permission; `max_protection` is the
+// upper bound the page can ever be raised to without re-mapping.
+//
+// Restoration decisions want `max_protection` — `protection` lies
+// for some shared pages (the dyld shared cache reports `R` only
+// even though the page is genuinely executable). `max_protection`
+// reflects what the page is *for*: `R+X` for text loaded from
+// disk, `R+W` for an anonymous `mmap(PROT_READ | PROT_WRITE)`, etc.
 
 /// Invalidate the inferior's instruction-cache lines covering
 /// `[addr, addr+len)` so the BRK we just wrote via `mach_vm_write`
@@ -1272,7 +1275,7 @@ fn task_dyld_all_image_infos_addr(task: task_t) -> Result<u64, MachError> {
         )
     };
     check(kr)?;
-    Ok(info.all_image_info_addr as u64)
+    Ok(info.all_image_info_addr)
 }
 
 /// Read `n` bytes at `addr` and decode them as `T`. Used to slurp
@@ -1364,7 +1367,7 @@ impl ExceptionPort {
         //                       at the fault rather than letting the
         //                       process die silently
         let mask: exception_mask_t = EXC_MASK_BREAKPOINT | EXC_MASK_SOFTWARE | EXC_MASK_BAD_ACCESS;
-        let behavior: u32 = (EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES) as u32;
+        let behavior: u32 = EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES;
         // SAFETY: task and port are valid mach_port_t values.
         let kr = unsafe {
             task_set_exception_ports(task, mask, self.port, behavior as i32, THREAD_STATE_NONE)

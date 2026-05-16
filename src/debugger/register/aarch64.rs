@@ -536,10 +536,10 @@ pub mod debug_impl {
             let threads = darwin_mach::task_threads_vec(task)?;
             let mut first_err: Option<Error> = None;
             for thread in threads {
-                if let Err(e) = darwin_mach::thread_set_arm_debug_state64(thread, &self.raw) {
-                    if first_err.is_none() {
-                        first_err = Some(Error::from(e));
-                    }
+                if let Err(e) = darwin_mach::thread_set_arm_debug_state64(thread, &self.raw)
+                    && first_err.is_none()
+                {
+                    first_err = Some(Error::from(e));
                 }
             }
             if let Some(e) = first_err {

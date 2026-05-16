@@ -63,15 +63,15 @@ impl<'a> EventCursor<'a> {
                     return;
                 }
             };
-            if let Some(r) = ranges.iter().find(|r| r.segment_index == *seg_idx) {
-                if r.contains(event_index) {
-                    let new_offset = (event_index - r.first_event_index) as usize;
-                    if let Some((_, _, off)) = &mut self.current {
-                        *off = new_offset;
-                    }
-                    self.next_event_index = event_index;
-                    return;
+            if let Some(r) = ranges.iter().find(|r| r.segment_index == *seg_idx)
+                && r.contains(event_index)
+            {
+                let new_offset = (event_index - r.first_event_index) as usize;
+                if let Some((_, _, off)) = &mut self.current {
+                    *off = new_offset;
                 }
+                self.next_event_index = event_index;
+                return;
             }
         }
         self.current = None;
@@ -80,15 +80,16 @@ impl<'a> EventCursor<'a> {
 
     /// Decode the next event in record order, or `Ok(None)` if the
     /// cursor has run past the end of the trace.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Event>, TraceReadError> {
         // Fast path: still inside the loaded segment.
-        if let Some((_, seg, off)) = &mut self.current {
-            if *off < seg.event_count()? {
-                let ev = seg.event_at(*off)?;
-                *off += 1;
-                self.next_event_index += 1;
-                return Ok(Some(ev));
-            }
+        if let Some((_, seg, off)) = &mut self.current
+            && *off < seg.event_count()?
+        {
+            let ev = seg.event_at(*off)?;
+            *off += 1;
+            self.next_event_index += 1;
+            return Ok(Some(ev));
         }
         // Need to load the segment that holds `next_event_index`.
         let routed = self.reader.segment_for_event(self.next_event_index)?;
