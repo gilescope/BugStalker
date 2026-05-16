@@ -199,8 +199,12 @@ impl DebugInformation {
         debug_assert!(tpl.split("::").count() > 0);
         let needle = tpl.split("::").last().expect("at least one exists");
         self.pub_names.as_ref().map(|pub_names| {
-            let found = pub_names.predictive_search(needle);
-            !found.is_empty()
+            // trie-rs 0.4: predictive_search returns an iterator; we
+            // only need to know whether any match exists.
+            pub_names
+                .predictive_search::<Vec<u8>, _>(needle)
+                .next()
+                .is_some()
         })
     }
 
