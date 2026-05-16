@@ -3052,7 +3052,13 @@ fn test_niche_option_recovery() {
 #[test]
 #[serial]
 fn test_dyn_trait_detection() {
-    use bugstalker::debugger::variable::render::ValueLayout;
+    // Phase 3 Feature A batch A8 — `value_layout()` for trait
+    // objects used to return `PreRendered(<multi-line summary>)`.
+    // That summary is now built by the ui renderer
+    // (`render_value`) because it needs the depth context that
+    // `value_layout` can't carry. So this test now drives the
+    // public renderer instead of inspecting the layout enum.
+    use bugstalker::ui::generic::variable::render_value;
 
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
@@ -3075,10 +3081,7 @@ fn test_dyn_trait_detection() {
             .iter()
             .find(|v| v.identity().to_string().contains(name))
             .unwrap_or_else(|| panic!("{name} not in locals"));
-        match v.value().value_layout().expect("layout") {
-            ValueLayout::PreRendered(s) => s.into_owned(),
-            other => panic!("{name}: expected PreRendered (trait-object summary), got {other:?}"),
-        }
+        render_value(v.value())
     };
 
     // `Box<dyn Error>` renders as the wrapping struct's two-pointer
