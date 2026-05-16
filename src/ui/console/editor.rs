@@ -245,8 +245,7 @@ impl Completer for CommandCompleter {
                     return Ok(pairs_from_variants(self.vars.iter(), line, maybe_var, ""));
                 }
 
-                let variants: Vec<Vec<u8>> =
-                    self.var_hints.predictive_search(maybe_var).collect();
+                let variants: Vec<Vec<u8>> = self.var_hints.predictive_search(maybe_var).collect();
                 if !variants.is_empty() {
                     let variants_iter = variants.iter().map(|var| {
                         std::str::from_utf8(var.as_slice()).expect("invalid utf-8 string")
@@ -259,8 +258,7 @@ impl Completer for CommandCompleter {
                     return Ok(pairs_from_variants(self.args.iter(), line, maybe_arg, ""));
                 }
 
-                let variants: Vec<Vec<u8>> =
-                    self.arg_hints.predictive_search(maybe_arg).collect();
+                let variants: Vec<Vec<u8>> = self.arg_hints.predictive_search(maybe_arg).collect();
                 if !variants.is_empty() {
                     let variants_iter = variants.iter().map(|var| {
                         std::str::from_utf8(var.as_slice()).expect("invalid utf-8 string")

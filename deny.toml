@@ -21,7 +21,25 @@ feature-depth = 1
 [advisories]
 version = 2
 yanked = "warn"
-ignore = []
+# Four "unmaintained" advisories survive even after a fresh
+# `cargo update`. Each is transitive via a TUI/syntax-highlighting
+# dep we don't control, with no semver-compatible upstream fix:
+#
+# * RUSTSEC-2025-0141 — bincode 1.x via syntect 5.3 (latest; pinned).
+# * RUSTSEC-2024-0320 — yaml-rust via syntect 5.3.
+# * RUSTSEC-2024-0436 — paste via ratatui 0.29 ← tuirealm 3.3.
+# * RUSTSEC-2023-0051 — dlopen_derive via thread_db (our pinned fork).
+#
+# Revisit each when:
+#   - syntect ships a release dropping bincode 1 / yaml-rust,
+#   - tuirealm 4.x lands (drops paste via ratatui 0.30+),
+#   - thread_db upstreams aarch64 support so we can drop the fork.
+ignore = [
+    "RUSTSEC-2025-0141",  # bincode 1.x unmaintained (transitive via syntect)
+    "RUSTSEC-2024-0320",  # yaml-rust unmaintained (transitive via syntect)
+    "RUSTSEC-2024-0436",  # paste unmaintained (transitive via ratatui/tuirealm)
+    "RUSTSEC-2023-0051",  # dlopen_derive unmaintained (transitive via thread_db)
+]
 
 [licenses]
 version = 2
