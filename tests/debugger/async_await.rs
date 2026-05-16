@@ -210,7 +210,12 @@ fn test_await_trace_join() {
         .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
-    debugger.set_breakpoint_at_line("main.rs", 11).unwrap();
+    // Break inside `marker()`, called from `branch_a` between two
+    // sleeps. At that point branch_a is on-CPU while branch_b/c
+    // are still mid-poll on longer sleeps — all three `MaybeDone`
+    // slots are in their `Future(_)` variant and reachable from
+    // the joiner's state machine.
+    debugger.set_breakpoint_at_line("main.rs", 15).unwrap();
     debugger.start_debugee().unwrap();
 
     let bt = debugger.async_backtrace().unwrap();

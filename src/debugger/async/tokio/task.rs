@@ -202,6 +202,15 @@ fn collect_coroutine_seeds(
                 // "real coroutine".
                 if AsyncFnFuture::try_from(re).is_ok() {
                     found.push(re.clone());
+                } else if let Some(active) = re.value.as_ref()
+                    && let Value::Struct(inner) = &active.value
+                {
+                    // Non-coroutine enum (e.g. tokio's `MaybeDone`,
+                    // `Option`, `Result`) — recurse into the active
+                    // variant's payload so branches buried under
+                    // join!-style wrappers stay reachable.
+                    let nested = collect_coroutine_seeds(inner, depth - 1);
+                    found.extend(nested);
                 }
             }
             Value::Struct(inner) => {
