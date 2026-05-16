@@ -116,6 +116,22 @@ fn main() {
     let dyn_ref: &dyn Greeter = &point;
     let dyn_box: Box<dyn Greeter> = Box::new(Point { x: 0.0, y: 0.0 });
 
+    // 11b. multi-bound trait object — `dyn Trait + Send + Sync`.
+    //      Auto-trait markers (Send, Sync) carry no vtable entries,
+    //      so the fat-pointer layout is identical to a plain
+    //      `dyn Error`. The bound list is purely a type-system
+    //      constraint, which the debugger should still surface.
+    use std::error::Error;
+    #[derive(Debug)]
+    struct ShowcaseErr(&'static str);
+    impl std::fmt::Display for ShowcaseErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl Error for ShowcaseErr {}
+    let multi_bound: Box<dyn Error + Send + Sync> = Box::new(ShowcaseErr("boom"));
+
     // 12. closures — capturing both Copy and non-Copy state
     let captured_copy = 10;
     let captured_string = String::from("state");
@@ -141,4 +157,15 @@ fn main() {
     println!(
         "done. {dir:?} {shape_circle:?} {shape_square:?} {shape_empty:?} {point:?} squares={squares:?}"
     );
+
+    // 17. demonstrate the panic auto-trap. Pass `--panic` to see
+    //     BugStalker stop at `core::panicking::panic_fmt` with the
+    //     full backtrace through here. Without the flag, the program
+    //     exits cleanly — the exit auto-trap stops there instead.
+    if std::env::args().any(|a| a == "--panic") {
+        let cause = multi_bound;
+        panic!("showcase panic — cause was {cause}");
+    }
+    // Reference multi_bound so it survives DCE when --panic is absent.
+    std::hint::black_box(&multi_bound);
 }
