@@ -784,16 +784,16 @@ impl Value {
                 // field map — should fall through to the underlying
                 // struct so callers can navigate by DWARF field
                 // name (e.g. tokio's `AtomicU64 { v: UnsafeCell { value } }`).
-                let from_specialized = match &specialized {
+                let from_specialized = matches!(
+                    &specialized,
                     Some(SpecializedValue::HashMap(_))
-                    | Some(SpecializedValue::BTreeMap(_))
-                    | Some(SpecializedValue::Vector(_))
-                    | Some(SpecializedValue::VecDeque(_))
-                    | Some(SpecializedValue::Tls(_))
-                    | Some(SpecializedValue::Cell(_))
-                    | Some(SpecializedValue::RefCell(_)) => true,
-                    _ => false,
-                };
+                        | Some(SpecializedValue::BTreeMap(_))
+                        | Some(SpecializedValue::Vector(_))
+                        | Some(SpecializedValue::VecDeque(_))
+                        | Some(SpecializedValue::Tls(_))
+                        | Some(SpecializedValue::Cell(_))
+                        | Some(SpecializedValue::RefCell(_))
+                );
                 if !from_specialized {
                     return original.field(field_name);
                 }
