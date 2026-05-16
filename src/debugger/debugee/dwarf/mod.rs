@@ -655,12 +655,19 @@ impl DebugInformation {
         // `panic_unwind/src/lib.rs` (another unit's file table) into
         // the result set, because both files match the "lib.rs"
         // suffix query and the loop would then look for any line ≥ 3
-        // in panic_unwind's table. We cap the per-pair expansion at
-        // `line + 1` to mirror master's bounded `[line, line+1]`
-        // heuristic — enough to skip past a single doc-comment line,
-        // not so far it drifts into the next function or an unrelated
-        // stdlib file.
-        const LINE_EXPANSION_LIMIT: u64 = 1;
+        // in panic_unwind's table.
+        //
+        // Cap the per-pair expansion at `line + 16` lines. That's
+        // wide enough to skip past a multi-line doc comment block
+        // to the next statement (the `bs_viz_spec` DAP regression
+        // tests rely on a five-line slide from a `//` comment to a
+        // `Format::from_tag` call, and similar test fixtures elsewhere
+        // sit a few lines further), but narrow enough that a stray
+        // basename query like `lib.rs:3` doesn't drag in the first
+        // statement of an unrelated stdlib `lib.rs` (panic_unwind's
+        // earliest is_stmt is around line 97 in the linux toolchain
+        // and well outside the window).
+        const LINE_EXPANSION_LIMIT: u64 = 16;
         for (unit_idx, file_lines) in &files {
             let unit = self.unit_ensure(*unit_idx);
             let mut pair_needle: Option<u64> = None;

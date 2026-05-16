@@ -303,24 +303,30 @@ ci-source:
     COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml Makefile ./
     COPY --dir src tests crates benches examples ./
 
-# Mirrors CI's `test` job. Parameterised by `RUSTC` so the same
+# Mirrors CI's `test` job. Parameterised by `RUSTC_VER` so the same
 # target covers the 1.91 … 1.95 matrix. The MSRV + LRV layers are
 # already cached by `+ci-toolchain`; this target only installs the
-# extra rustc when `$RUSTC` differs from 1.95.
+# extra rustc when the value isn't already in the base.
+#
+# **Why `RUSTC_VER` and not `RUSTC`**: cargo reads the `RUSTC`
+# environment variable as the *path to the rustc binary*. Earthly
+# RUN exports ARGs as env vars, so an `ARG RUSTC=1.95.0` would tell
+# cargo to invoke a binary literally named `1.95.0` for `rustc -vV`
+# and fail with "could not execute process `1.95.0 -vV`".
 ci-test:
-    ARG RUSTC=1.95.0
+    ARG RUSTC_VER=1.95.0
     FROM +ci-source
-    IF [ "$RUSTC" != "1.89.0" ] && [ "$RUSTC" != "1.95.0" ]
-        RUN rustup toolchain install "$RUSTC" --profile minimal
+    IF [ "$RUSTC_VER" != "1.89.0" ] && [ "$RUSTC_VER" != "1.95.0" ]
+        RUN rustup toolchain install "$RUSTC_VER" --profile minimal
     END
     RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --mount=type=cache,target=/bs/examples/target,sharing=locked \
         cd examples && \
-        cargo "+$RUSTC" build -p calc_lib && \
-        cargo "+$RUSTC" build && \
+        cargo "+$RUSTC_VER" build -p calc_lib && \
+        cargo "+$RUSTC_VER" build && \
         mkdir -p /bs/examples/_built && \
         cp -r target/debug /bs/examples/_built/debug
-    RUN strings examples/_built/debug/calc | grep "^rustc version" | grep "$RUSTC"
+    RUN strings examples/_built/debug/calc | grep "^rustc version" | grep "$RUSTC_VER"
     RUN rm -rf examples/target && mkdir -p examples/target && \
         mv examples/_built/debug examples/target/debug
     RUN --privileged \
@@ -331,11 +337,11 @@ ci-test:
 # 5-version matrix — the same shape CI runs. Earthly runs the BUILDs
 # in parallel; each slot inherits the shared `+ci-source` layer.
 ci-test-matrix:
-    BUILD +ci-test --RUSTC=1.91.0
-    BUILD +ci-test --RUSTC=1.92.0
-    BUILD +ci-test --RUSTC=1.93.0
-    BUILD +ci-test --RUSTC=1.94.0
-    BUILD +ci-test --RUSTC=1.95.0
+    BUILD +ci-test --RUSTC_VER=1.91.0
+    BUILD +ci-test --RUSTC_VER=1.92.0
+    BUILD +ci-test --RUSTC_VER=1.93.0
+    BUILD +ci-test --RUSTC_VER=1.94.0
+    BUILD +ci-test --RUSTC_VER=1.95.0
 
 # Mirrors CI's `integration-test` job (the python unittest suite).
 # Reuses `+ci-source` so the toolchain + source layers are shared
