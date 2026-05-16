@@ -619,16 +619,37 @@ fn render_trait_object_multiline(
     if let Some(align) = view.align {
         let _ = writeln!(out, "    align: {align},");
     }
+    // Phase 3 Feature A batch A9 — group methods by trait. Order
+    // of insertion is preserved (the first time a trait appears in
+    // the vtable wins its slot in the output), so the user sees
+    // the supertrait inheritance chain in vtable order. Methods
+    // with no recognised trait (the `(other)` bucket) land last.
     let total = view.methods.len();
     let shown = total.min(MAX_RENDER_METHODS);
+    let mut grouped: Vec<(String, Vec<&crate::debugger::variable::value::VtableSlot>)> = Vec::new();
     for slot in &view.methods[..shown] {
-        let loc = slot
-            .source_location
-            .as_deref()
-            .map(|l| format!(" ({l})"))
-            .unwrap_or_default();
-        let display = clean_method_display(&slot.display);
-        let _ = writeln!(out, "    {}: → {display}{loc},", slot.name);
+        let key = slot
+            .trait_name
+            .clone()
+            .unwrap_or_else(|| "(other)".to_string());
+        if let Some(bucket) = grouped.iter_mut().find(|(k, _)| k == &key) {
+            bucket.1.push(slot);
+        } else {
+            grouped.push((key, vec![slot]));
+        }
+    }
+    for (trait_name, slots) in &grouped {
+        let _ = writeln!(out, "    {trait_name}: {{");
+        for slot in slots {
+            let loc = slot
+                .source_location
+                .as_deref()
+                .map(|l| format!(" ({l})"))
+                .unwrap_or_default();
+            let display = clean_method_display(&slot.display);
+            let _ = writeln!(out, "      {}: → {display}{loc},", slot.name);
+        }
+        let _ = writeln!(out, "    }},");
     }
     if total > shown {
         let _ = writeln!(out, "    … ({} more methods)", total - shown);

@@ -229,6 +229,17 @@ pub struct VtableView {
 pub struct VtableSlot {
     /// Runtime address of the function this slot points at.
     pub addr: u64,
+    /// Phase 3 Feature A batch A9 — the trait this slot belongs
+    /// to. Parsed from the demangled symbol: `<X as Trait>::method`
+    /// yields `Trait`; default-impl `Path::Trait::method` yields
+    /// `Trait`. `None` for the drop slot and for symbols whose
+    /// shape we can't classify.
+    ///
+    /// The renderer groups methods by this so the inheritance
+    /// hierarchy (`dyn Error` ⇒ `Debug { fmt }`, `Display { fmt }`,
+    /// `Error { source, … }`) is visible without the user having
+    /// to read the `<X as Y>` symbol form.
+    pub trait_name: Option<String>,
     /// Short label — the trait method's name, or "drop".
     pub name: String,
     /// Full demangled symbol — `<Concrete as Trait>::method` for a

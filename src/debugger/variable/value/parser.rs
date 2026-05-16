@@ -1607,6 +1607,7 @@ fn resolve_trait_object_view_from_lookups<'a>(
             view.drop = Some(VtableSlot {
                 addr: drop_addr,
                 name: "drop".to_string(),
+                trait_name: None,
                 display: demangled,
                 source_location: source_at(drop_addr),
             });
@@ -1674,9 +1675,11 @@ fn resolve_trait_object_view_from_lookups<'a>(
             }
         }
         let short = method_short_name(&demangled).unwrap_or_else(|| demangled.clone());
+        let trait_name = extract_trait_name(&demangled);
         view.methods.push(VtableSlot {
             addr,
             name: short,
+            trait_name,
             display: demangled,
             source_location: source_at(addr),
         });
@@ -1867,6 +1870,68 @@ fn parse_dyn_bounds(type_name: &str) -> Option<((usize, usize), Vec<String>)> {
         .collect();
 
     Some((main_span, auto_traits))
+}
+
+/// Pull the trait name out of a demangled vtable method symbol so
+/// the renderer can group methods by trait (`Debug { fmt }`,
+/// `Error { source, … }`). Two recognised shapes:
+///
+/// * `<Concrete as Trait>::method` — primary form for any method
+///   the concrete type implements (override or required). The
+///   trait name is whatever sits between ` as ` and `>` at angle
+///   depth 0.
+/// * `Path::Trait::method` — default-impl form used when the
+///   concrete doesn't override. The trait is the next-to-last
+///   `::` segment.
+///
+/// Returns `None` for shapes we don't recognise — the renderer
+/// buckets these under `(other)`.
+fn extract_trait_name(demangled: &str) -> Option<String> {
+    // Pattern 1: `<X as Trait>::method`.
+    if let Some(angle_start) = demangled.find('<') {
+        let after_lt = &demangled[angle_start + 1..];
+        if let Some(as_at) = after_lt.find(" as ") {
+            let after_as = &after_lt[as_at + 4..];
+            // Find matching `>` at depth 0 (the `<` we just stepped
+            // past).
+            let bytes = after_as.as_bytes();
+            let mut depth: i32 = 0;
+            for (i, &c) in bytes.iter().enumerate() {
+                match c {
+                    b'<' => depth += 1,
+                    b'>' => {
+                        if depth == 0 {
+                            let raw = after_as[..i].trim();
+                            return Some(raw.rsplit("::").next().unwrap_or(raw).to_string());
+                        }
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    // Pattern 2: `Path::Trait::method`. Take the third-from-last
+    // segment via two rsplits. We need at least two `::` for this
+    // to be unambiguous.
+    let mut parts = demangled.rsplitn(3, "::");
+    let _method = parts.next()?;
+    let trait_seg = parts.next()?;
+    if parts.next().is_none() {
+        // Only one `::` total → just a `Type::method` pair, no
+        // namespace. Could still be a trait method, but without
+        // more context we can't tell — keep behaviour conservative.
+        return None;
+    }
+    // The trait segment may itself be a path component; take its
+    // last identifier (the actual trait name).
+    Some(
+        trait_seg
+            .rsplit("::")
+            .next()
+            .unwrap_or(trait_seg)
+            .to_string(),
+    )
 }
 
 /// Pull the trailing method name out of a demangled symbol like
@@ -2517,5 +2582,66 @@ mod dyn_resolver_tests {
     fn dyn_bounds_non_trait_object_returns_none() {
         assert!(parse_dyn_bounds("Vec<u8>").is_none());
         assert!(parse_dyn_bounds("Point").is_none());
+    }
+
+    // ---- extract_trait_name: method → declaring-trait grouping ----
+
+    use super::extract_trait_name;
+
+    /// Primary form: `<X as Trait>::method` → `Trait`. Full paths
+    /// on either side get short-named.
+    #[test]
+    fn trait_name_from_impl_form() {
+        assert_eq!(
+            extract_trait_name("<showcase::main::ShowcaseErr as core::fmt::Debug>::fmt").as_deref(),
+            Some("Debug")
+        );
+        assert_eq!(
+            extract_trait_name("<showcase::main::Point as showcase::main::Greeter>::greet")
+                .as_deref(),
+            Some("Greeter")
+        );
+    }
+
+    /// Default-impl form: `path::Trait::method` → `Trait`. The
+    /// concrete type doesn't override, so rustc points the slot at
+    /// the default impl on the trait itself.
+    #[test]
+    fn trait_name_from_default_impl_form() {
+        assert_eq!(
+            extract_trait_name("core::error::Error::source").as_deref(),
+            Some("Error")
+        );
+        assert_eq!(
+            extract_trait_name("core::iter::Iterator::size_hint").as_deref(),
+            Some("Iterator")
+        );
+    }
+
+    /// Trait with its own generics — `<X as Iterator<Item = u32>>::
+    /// next`. The `<u32>` substring inside the trait's bound list
+    /// must not confuse the `>`-matching for the outer `<X as Y>`.
+    #[test]
+    fn trait_name_with_generic_in_trait_args() {
+        assert_eq!(
+            extract_trait_name("<some::Iter as core::iter::Iterator<Item = u32>>::next").as_deref(),
+            Some("Iterator<Item = u32>")
+        );
+    }
+
+    /// `Type::method` with no namespace — too little context, we
+    /// can't tell whether `Type` is the trait or the concrete. Stay
+    /// conservative and return None; the renderer groups under
+    /// `(other)`.
+    #[test]
+    fn trait_name_bare_pair_returns_none() {
+        assert!(extract_trait_name("Foo::bar").is_none());
+    }
+
+    /// A symbol with no `::` at all — definitely not a method
+    /// shape. None.
+    #[test]
+    fn trait_name_no_separators_returns_none() {
+        assert!(extract_trait_name("main").is_none());
     }
 }
