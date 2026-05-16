@@ -142,6 +142,12 @@ fn main() {
         Box::new(Point { x: 30.0, y: 40.0 }),
     ];
 
+    // 11d. `dyn Iterator<Item=u32>` — a many-method trait. Exercises
+    //      the vtable view's per-trait method truncation (Iterator
+    //      carries 70+ provided methods; we render the first 8 and
+    //      print `… (N more methods)` for the rest).
+    let dyn_iter: Box<dyn Iterator<Item = u32>> = Box::new((1u32..=5).filter(|x| x % 2 == 0));
+
     // 12. closures — capturing both Copy and non-Copy state
     let captured_copy = 10;
     let captured_string = String::from("state");

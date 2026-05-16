@@ -468,6 +468,20 @@ pub fn render_trait_object_at_depth(
     s: &crate::debugger::variable::value::StructValue,
     depth: usize,
 ) -> String {
+    render_trait_object_at_depth_with(s, depth, None)
+}
+
+/// Like [`render_trait_object_at_depth`] but lets the caller force
+/// the type ident the renderer uses for the leading line. Needed
+/// for transparent wrappers like `Pin<P>`: the peeled inner struct
+/// `s` has the Box's type ident (`Box<dyn Trait>`) but the user
+/// expects the outer `Pin<Box<dyn Trait>>` annotation. Pass the
+/// outer name through here.
+pub fn render_trait_object_at_depth_with(
+    s: &crate::debugger::variable::value::StructValue,
+    depth: usize,
+    type_override: Option<&str>,
+) -> String {
     use crate::debugger::variable::value::Value;
     let mut data_ptr: Option<*const ()> = None;
     let mut vtable_ptr: Option<*const ()> = None;
@@ -480,7 +494,31 @@ pub fn render_trait_object_at_depth(
             }
         }
     }
-    let raw_trait_name = s.type_ident.name().unwrap_or("dyn Trait");
+    // When a caller passes a type-override (Pin-peeling and
+    // friends), we want the outer wrapper's ident but still need
+    // the inner struct's `[→ Concrete]` annotation — that's where
+    // the dyn-resolver wrote the concrete-type recovery hint.
+    // Splice the annotation out of the inner ident and onto the
+    // outer name.
+    let raw_trait_name_owned: String;
+    let raw_trait_name: &str = match type_override {
+        Some(over) => {
+            let inner = s.type_ident.name().unwrap_or("");
+            let annotation = inner.find("[→ ").and_then(|start| {
+                inner[start..]
+                    .find(']')
+                    .map(|end| &inner[start..start + end + 1])
+            });
+            match annotation {
+                Some(ann) => {
+                    raw_trait_name_owned = format!("{over} {ann}");
+                    &raw_trait_name_owned
+                }
+                None => over,
+            }
+        }
+        None => s.type_ident.name().unwrap_or("dyn Trait"),
+    };
     // Strip `alloc::boxed::`, `core::marker::`, `, alloc::alloc::
     // Global>` etc. from the type-ident so the dyn line reads like
     // source. The JSON `type` field still carries the full path for

@@ -79,10 +79,40 @@ fn render_value_inner(
     // the depth-aware trait-object renderer instead. It carries
     // its own type-prefix decision so the `print_type` argument is
     // baked into the format and we return directly.
-    if let Value::Struct(s) = value
+    //
+    // Pin<P> peels to its pinnee at the specialization layer, so
+    // `Pin<Box<dyn Trait>>` reaches us as a `Specialized::Pin`
+    // wrapping the Box's fat-pointer struct. Peel that one layer
+    // here so trait-object detection still fires — pass the outer
+    // value's type ident (`Pin<Box<dyn Trait>>`) through as an
+    // override so the render keeps the Pin annotation visible.
+    let peeled_struct = match value {
+        Value::Struct(s) => Some((s, false)),
+        Value::Specialized {
+            value: Some(crate::debugger::variable::value::SpecializedValue::Pin(inner)),
+            ..
+        } => match inner.as_ref() {
+            Value::Struct(s) => Some((s, true)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((s, peeled_pin)) = peeled_struct
         && s.is_trait_object()
     {
-        return crate::debugger::variable::render::render_trait_object_at_depth(s, depth);
+        let type_override: Option<String> = if peeled_pin {
+            // Use the OUTER Pin<...>'s type ident so the render
+            // surfaces the pin annotation. Inner Box's type is what
+            // s.type_ident.name() would yield by default.
+            Some(value.r#type().name_fmt().to_string())
+        } else {
+            None
+        };
+        return crate::debugger::variable::render::render_trait_object_at_depth_with(
+            s,
+            depth,
+            type_override.as_deref(),
+        );
     }
     match value.value_layout() {
         Some(layout) => match layout {

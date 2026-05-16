@@ -93,6 +93,17 @@ fn dyn_vtable_nested() {
     run("tests/scripts/dyn_vtable_nested.json5", SHOWCASE_DEBUGGEE)
 }
 
+// Phase 3 Feature A batch A10 — corner cases beyond the basic
+// [&dyn / Box<dyn>] pair: Pin<Box<dyn Future>> exercises the
+// Pin-peeling path through the specialization layer;
+// Box<dyn Iterator<Item=u32>> exercises the `<Concrete as Trait>`
+// override + `Trait::default_impl` mix in the trait-grouped
+// render.
+#[test]
+fn dyn_vtable_corners() {
+    run("tests/scripts/dyn_vtable_corners.json5", SHOWCASE_DEBUGGEE)
+}
+
 fn run(script: &str, debuggee: &str) {
     require_path(BS_BINARY, "build bs first: `cargo build --bin bs`");
     require_path(

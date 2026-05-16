@@ -1,0 +1,47 @@
+// Locks in two dyn corners beyond the basic [&dyn / Box<dyn>] cases:
+//
+//   * `pinned` — `Pin<Box<dyn Future<Output=u32>>>`. The Pin
+//     specialization peels the wrapper at parse time; the renderer
+//     re-applies the outer Pin<…> ident so the user keeps seeing
+//     they're looking at a pinned reference. Future's vtable
+//     concrete is an opaque `{{closure}}` (the async coroutine);
+//     value-inline doesn't fire for closures.
+//   * `dyn_iter` — `Box<dyn Iterator<Item=u32>>`. Iterator's dyn
+//     vtable is small (most methods are `where Self: Sized` and
+//     therefore not dyn-compatible) but exercises both the
+//     `<Concrete as Trait>::override` shape (next, size_hint) and
+//     the `Iterator::default_impl` shape (advance_by, nth) for
+//     trait-grouping detection.
+
+{ jsonrpc: "2.0", id: 1, method: "break.set", params: { at: "main.rs:173" } }
+{ jsonrpc: "2.0", id: 2, method: "run" }
+{ jsonrpc: "2.0", id: 3, method: "assert.var", params: { name: "pinned",
+expect: {
+  items: [
+    {
+      name: "pinned",
+      type: "Pin<alloc::boxed::Box<dyn core::future::future::Future<Output=u32>, alloc::alloc::Global>>",
+      value_text: {
+        $regex: "^Pin<Box<dyn Future<Output=u32>, _>> \\[→ \\{\\{closure\\}\\}\\] \\{\n  data: 0x[0-9a-fA-F]+,\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: → drop_in_place<\\{\\{closure\\}\\}> \\(mod\\.rs:799\\),\n    size: 1,\n    align: 1,\n    main: \\{\n      \\{\\{closure\\}\\}: → main::\\{\\{closure\\}\\} \\(main\\.rs:170\\),\n    \\},\n  \\},\n\\}$"
+      }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ jsonrpc: "2.0", id: 4, method: "assert.var", params: { name: "dyn_iter",
+expect: {
+  items: [
+    {
+      name: "dyn_iter",
+      type: "alloc::boxed::Box<dyn core::iter::traits::iterator::Iterator<Item=u32>, alloc::alloc::Global> [→ core::iter::adapters::filter::Filter<I,P>]",
+      value_text: {
+        $regex: "^Box<dyn Iterator<Item=u32>, _> \\[→ Filter<I,P>\\] \\{\n  data: 0x[0-9a-fA-F]+,\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 12,\n    align: 4,\n    Iterator: \\{\n      next: → <Filter<I,P> as Iterator>::next \\(filter\\.rs:97\\),\n      size_hint: → <Filter<I,P> as Iterator>::size_hint \\(filter\\.rs:118\\),\n      advance_by: → Iterator::advance_by \\(iterator\\.rs:296\\),\n      nth: → Iterator::nth \\(iterator\\.rs:373\\),\n    \\},\n  \\},\n\\}$"
+      }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
