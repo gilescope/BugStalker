@@ -720,7 +720,7 @@ fn render_concrete_compact(
     if depth > MAX_DEPTH {
         return "…".to_string();
     }
-    let type_name = strip_type_namespace(&value.r#type().name_fmt().to_string());
+    let type_name = strip_type_namespace(value.r#type().name_fmt());
     match value.value_layout() {
         Some(ValueLayout::PreRendered(s)) => s.into_owned(),
         Some(ValueLayout::Referential(addr)) => format!("{type_name} [{addr:p}]"),
@@ -918,10 +918,12 @@ pub fn clean_method_display(s: &str) -> String {
 /// be leading bytes in well-formed UTF-8) also return 1 so we make
 /// forward progress.
 fn utf8_char_len(b: u8) -> usize {
-    if b < 0x80 {
+    // ASCII (b < 0x80) and stray continuation bytes (0x80..0xc0)
+    // both return 1: continuation-as-leading is malformed UTF-8 and
+    // we degrade gracefully by skipping one byte to keep forward
+    // progress. Multibyte leads use their canonical lengths.
+    if b < 0xc0 {
         1
-    } else if b < 0xc0 {
-        1 // stray continuation byte — degrade gracefully
     } else if b < 0xe0 {
         2
     } else if b < 0xf0 {

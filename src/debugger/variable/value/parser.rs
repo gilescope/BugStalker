@@ -516,7 +516,7 @@ impl ValueParser {
                     // get surfaced on the view and rendered as a
                     // separate `[+ Send + Sync]` annotation.
                     let (cleaned, auto_traits) = match parse_dyn_bounds(&original) {
-                        Some(((main_start, main_end), autos)) if !autos.is_empty() => {
+                        Some(((_main_start, main_end), autos)) if !autos.is_empty() => {
                             // Find where the auto-trait suffix ends —
                             // the bound list ends at the same `>`/`)`/`,`
                             // the parser stopped at. We splice
@@ -1748,8 +1748,8 @@ fn strip_vestigial_dyn_parens(s: &str) -> String {
             let mut depth: i32 = 0;
             let mut close = None;
             let mut has_plus = false;
-            for j in (i + 1)..bytes.len() {
-                match bytes[j] {
+            for (j, &b) in bytes.iter().enumerate().skip(i + 1) {
+                match b {
                     b'<' | b'(' => depth += 1,
                     b'>' => depth -= 1,
                     b')' => {
@@ -1809,8 +1809,7 @@ fn parse_dyn_bounds(type_name: &str) -> Option<((usize, usize), Vec<String>)> {
     let bytes = type_name.as_bytes();
     let mut depth: i32 = 0;
     let mut bound_list_end = type_name.len();
-    for i in bound_list_start..type_name.len() {
-        let c = bytes[i];
+    for (i, &c) in bytes.iter().enumerate().skip(bound_list_start) {
         match c {
             b'<' | b'(' => depth += 1,
             b'>' | b')' => {
@@ -1917,12 +1916,7 @@ fn extract_trait_name(demangled: &str) -> Option<String> {
     let mut parts = demangled.rsplitn(3, "::");
     let _method = parts.next()?;
     let trait_seg = parts.next()?;
-    if parts.next().is_none() {
-        // Only one `::` total → just a `Type::method` pair, no
-        // namespace. Could still be a trait method, but without
-        // more context we can't tell — keep behaviour conservative.
-        return None;
-    }
+    parts.next()?;
     // The trait segment may itself be a path component; take its
     // last identifier (the actual trait name).
     Some(
