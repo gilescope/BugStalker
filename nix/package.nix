@@ -14,7 +14,15 @@ rustPlatform.buildRustPackage {
     path = ../.;
   };
 
-  cargoLock.lockFile = ../Cargo.lock;
+  cargoLock = {
+    lockFile = ../Cargo.lock;
+    # `thread_db` is fetched by git rev (see Cargo.toml — pinned to a fork
+    # at c36ca728 until aarch64 support is upstreamed). Nix needs the
+    # vendored hash explicitly because it can't derive it from Cargo.lock.
+    outputHashes = {
+      "thread_db-0.1.4" = "sha256-OFKJ9OEo99RAzQHJR4YR3oVGL7Q1uv+ee/9TmkmjqWA=";
+    };
+  };
 
   nativeBuildInputs = [ pkg-config ];
 
