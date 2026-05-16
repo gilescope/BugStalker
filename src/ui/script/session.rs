@@ -10,6 +10,7 @@ use std::thread;
 use os_pipe::PipeReader;
 
 use crate::debugger::{Debugger, DebuggerBuilder};
+use crate::ui::structured::event::{Event, OutputStream};
 use crate::ui::structured::{ResponseBudget, schema};
 use crate::ui::supervisor::DebugeeSource;
 
@@ -35,11 +36,12 @@ pub fn run_script(source: DebugeeSource<'_>, oracles: Vec<String>) -> anyhow::Re
     let (err_reader, err_writer) = os_pipe::pipe()?;
     // Inferior stdout/stderr are routed into pipes that we MUST drain —
     // dropping the read end immediately would make the inferior SIGPIPE
-    // on its first write. v1 quietly discards the bytes; v2 will surface
-    // them as `output` events so agents can see what the debuggee
-    // printed.
-    spawn_drain(out_reader);
-    spawn_drain(err_reader);
+    // on its first write. Each line becomes an `output` event on the
+    // JSON-RPC notification stream so script agents can assert on
+    // what the debuggee printed (the EnC demo's "I patched compute,
+    // now show me it prints 15" needs this to verify end-to-end).
+    spawn_output_forwarder(out_reader, OutputStream::Stdout, sink.clone());
+    spawn_output_forwarder(err_reader, OutputStream::Stderr, sink.clone());
 
     let child = source.create_child(out_writer, err_writer)?;
     let oracle_objs = crate::ui::supervisor::resolve_oracles(&oracles);
@@ -89,18 +91,46 @@ pub fn run_script(source: DebugeeSource<'_>, oracles: Vec<String>) -> anyhow::Re
     Ok(())
 }
 
-/// Drain a pipe to /dev/null in a background thread. Holds the read end
-/// open for the lifetime of the thread, which is the lifetime of the
-/// pipe writer the inferior holds; SIGPIPE is suppressed because there
-/// is always a reader.
-fn spawn_drain(mut reader: PipeReader) {
+/// Forward a pipe's bytes to JSON-RPC `output` events, one event
+/// per `\n`-terminated line. Holds the read end open for the
+/// thread's lifetime so the inferior never sees SIGPIPE.
+///
+/// Line-buffered: a partial trailing chunk is held back until the
+/// next newline or EOF. The byte stream is decoded as UTF-8 with
+/// `from_utf8_lossy` so a binary blob doesn't kill the forwarder
+/// — bad bytes land as the `U+FFFD` replacement character. Most
+/// debuggees print UTF-8 text.
+fn spawn_output_forwarder(mut reader: PipeReader, stream: OutputStream, sink: OutputSink) {
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let mut leftover: Vec<u8> = Vec::new();
         loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => continue,
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            leftover.extend_from_slice(&buf[..n]);
+            // Emit each complete line; keep any trailing partial
+            // line in `leftover` for the next read.
+            while let Some(nl) = leftover.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = leftover.drain(..=nl).collect();
+                // Strip the trailing `\n` (and optional `\r` for
+                // CRLF) so the event payload is the line content.
+                let mut end = line.len() - 1; // past the `\n`
+                if end > 0 && line[end - 1] == b'\r' {
+                    end -= 1;
+                }
+                let text = String::from_utf8_lossy(&line[..end]).into_owned();
+                sink.emit_event(Event::Output { stream, data: text });
             }
+        }
+        // EOF: flush any non-newline-terminated tail. Debuggees
+        // that exit without a final `\n` (e.g. crashed mid-print)
+        // shouldn't have their last words swallowed.
+        if !leftover.is_empty() {
+            let text = String::from_utf8_lossy(&leftover).into_owned();
+            sink.emit_event(Event::Output { stream, data: text });
         }
     });
 }

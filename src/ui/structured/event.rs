@@ -59,6 +59,32 @@ pub enum Event {
     },
     /// Debuggee process installed (initial start or restart).
     ProcessInstalled { pid: i32 },
+    /// Inferior wrote to its stdout or stderr. One event per line —
+    /// the pipe reader splits on `\n` so partial lines aren't
+    /// surfaced until the inferior flushes. Trailing newline is
+    /// stripped from `data` (the boundary is already encoded by
+    /// the per-event split).
+    ///
+    /// Use case: a `bs --script` agent that ran `cargo build` /
+    /// `printf` / `dbg!()` in the inferior wants to assert on the
+    /// emitted text. Pre-v2 this was discarded; now the script
+    /// runner sees every line interleaved with the response
+    /// stream.
+    Output {
+        /// `"stdout"` or `"stderr"`. The wire form uses lower-case
+        /// strings so JSON-RPC clients can dispatch on the field
+        /// without learning a Rust enum.
+        stream: OutputStream,
+        /// One line of output, newline stripped.
+        data: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
