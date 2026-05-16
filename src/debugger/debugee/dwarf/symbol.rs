@@ -101,6 +101,21 @@ impl SymbolTab {
             let mut sorted_text: Vec<(u64, String)> = Vec::new();
             for symbol in sym_table.symbols() {
                 let raw = symbol.name().unwrap_or_default();
+                // ARM/AArch64 ELF emits "mapping symbols" alongside
+                // real symbols: `$a` (A32 code), `$t` (T32 / thumb),
+                // `$x` (A64 code), `$d` (data). They sit at the same
+                // address as real Rust function symbols, and if they
+                // happen to land last in this loop they overwrite the
+                // real entry in `by_address` — vtable resolution then
+                // sees `"$x"` instead of `<Concrete as Trait>::fmt`
+                // and can't recover the concrete type. They carry no
+                // information useful to a debugger; drop them.
+                //
+                // RISC-V uses `$riscv` for an analogous purpose; play
+                // it safe and drop anything `$`-prefixed.
+                if raw.starts_with('$') {
+                    continue;
+                }
                 // Mach-O nlist names carry a leading underscore that
                 // ELF doesn't — `__R...` for a Rust v0 symbol, `__ZN`
                 // for legacy. `rust-mangle-tree` expects the stripped
