@@ -596,14 +596,15 @@ impl Debugger {
     /// the user with no breakpoints at all.
     pub fn enable_breakpoints_at(&self, addrs: &[RelocatedAddress]) {
         for bp in self.breakpoints.active_breakpoints() {
-            if addrs.contains(&bp.addr) && !bp.is_enabled() {
-                if let Err(e) = bp.enable() {
-                    log::warn!(
-                        target: "breakpoint",
-                        "failed to re-enable breakpoint at {}: {e}",
-                        bp.addr,
-                    );
-                }
+            if addrs.contains(&bp.addr)
+                && !bp.is_enabled()
+                && let Err(e) = bp.enable()
+            {
+                log::warn!(
+                    target: "breakpoint",
+                    "failed to re-enable breakpoint at {}: {e}",
+                    bp.addr,
+                );
             }
         }
     }

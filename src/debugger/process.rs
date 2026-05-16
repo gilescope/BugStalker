@@ -443,8 +443,8 @@ impl<S: State> Child<S> {
                 path.as_ptr(),
                 &actions,
                 &attr,
-                argv_ptrs.as_ptr() as *const *mut _,
-                envp_ptrs.as_ptr() as *const *mut _,
+                argv_ptrs.as_ptr(),
+                envp_ptrs.as_ptr(),
             )
         };
 
