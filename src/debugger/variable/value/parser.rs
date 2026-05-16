@@ -1175,6 +1175,32 @@ impl ValueParser {
                 }
             )
         {
+            // Phantom-sibling filter. Rustc 1.92+ emits the std
+            // `thread_local!` macro expansion with two parallel
+            // `Storage<T, F>` instantiations under the same closure
+            // hierarchy — `Storage<T, !>` is the live lazy TLS, and
+            // `Storage<T, ()>` is a phantom sibling that some other
+            // code path in `std::sys::thread_local::native` refers to
+            // structurally but never actually instantiates at
+            // runtime. On Linux x86_64 the phantom's `state` byte
+            // happens to read 0 (Uninitialized) so the state-byte
+            // check below filters it out for free; on Linux aarch64
+            // the phantom DIE is degenerate (no `state` member at
+            // all), the state check returns `None`, and the value
+            // falls through to the peel+wrap fallback — surfacing a
+            // duplicate `__RUST_STD_INTERNAL_VAL` to the caller and
+            // breaking `read_var_dqe!` slice-pattern matches.
+            //
+            // Always drop the `, ()>` variant up front. The `!` /
+            // single-arg `Storage<T>` / `EagerStorage<T>` shapes
+            // continue down the existing path.
+            #[cfg(not(target_os = "macos"))]
+            if let Value::Struct(s) = &parsed
+                && let Some(n) = s.type_ident.name()
+                && n.ends_with(", ()>")
+            {
+                return None;
+            }
             // Darwin uninit detection. dsymutil keeps the
             // `Storage<T, D>::state` field intact even though it
             // strips the `LazyStorage::Alive` discriminant on the
