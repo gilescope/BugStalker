@@ -1602,20 +1602,52 @@ impl Debugger {
             }
         }
 
-        // x86_64 path: would need to write [new_rsp] = return_addr
-        // and adjust rsp by -8 for the implicit CALL push. Not
-        // implemented here — falls through to set_pc only, same as
-        // the partial behaviour we shipped previously. Tracked
-        // separately. A spike at writing the unwound CFA/RA pair
-        // produced wrong SP values (the unwinder's frame-1 CFA
-        // semantics don't map straight onto "function-entry SP"
-        // on System-V); needs more careful unwinder inspection
-        // before the stack repair can land. For the EnC flow, the
-        // user's pre-patch breakpoint typically fires before the
-        // patched function reaches its RET, so set_pc alone is
-        // usually enough — the RET-misadventure only matters if
-        // the auto-resume runs past every breakpoint and the
-        // function tries to return.
+        // x86_64 path: System-V passes the return address on the
+        // stack — CALL pushes the resume PC and decrements RSP by
+        // 8 before transferring control. To recreate fn-entry
+        // state from the unwound frame-1 values:
+        //
+        //   * `unwound.value(SP)` at frame 1 = caller's SP at its
+        //     call site = the CFA of frame 0 in DWARF terms. On
+        //     x86_64 this is "RSP *before* CALL pushed the
+        //     return addr" — i.e. the function-entry SP plus 8.
+        //   * `unwound.value(RA)` at frame 1 = address right
+        //     after CALL in the caller = the return PC that
+        //     CALL pushed onto the stack.
+        //
+        // So fn-entry RSP = unwound_SP - 8, and the byte at that
+        // slot needs to hold unwound_RA. Plus the System-V
+        // callee-saved set (RBX, RBP, R12..R15) gets restored
+        // from the unwinder so the patched function starts with
+        // the same live state the original did.
+        //
+        // When the unwinder can't recover SP/RA — possible if
+        // frame 0 sits in a no-DWARF leaf (signal trampoline,
+        // hand-rolled asm) — fall through to set_pc only. The
+        // RET at function exit will then pop garbage; the EnC
+        // flow's auto-resume usually catches the user's pre-
+        // patch bp before that matters.
+        // x86_64 path: stack repair not implemented. A spike that
+        // wrote `[unwound.value(SP) - 8] = unwound.value(RA)` and
+        // restored callee-saved registers produced an inferior
+        // stack overflow — the inferior re-entered the patched
+        // function recursively. The unwound (SP, RA) pair *does*
+        // match the System-V "CFA = RSP just before CALL"
+        // convention (verified: return_addr lands at
+        // `call_once+0xb` which is right after the `call rdi`
+        // trampoline that originally invoked compute), so the
+        // recursion isn't an address-arithmetic mistake. Probable
+        // cause: the patched function's prologue allocates a
+        // different stack frame size than the original, so
+        // recreating "fn-entry state" from the unwinder's view
+        // of the ORIGINAL function's CFA writes the return
+        // address into a slot the patched prologue then clobbers.
+        // Needs a separate pass: read the patched function's CFA
+        // rule from the new image's eh_frame, not assume it
+        // matches the running process's old rule. Tracked
+        // separately. For now, set_pc-only — the EnC auto-resume
+        // typically catches the user's pre-patch bp before the
+        // (broken) RET would matter.
 
         map.set_pc(fn_start);
         map.persist(pid)?;
