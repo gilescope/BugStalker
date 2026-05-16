@@ -9,6 +9,15 @@ common:
     FROM --platform=$BS_PLATFORM rust:1.89-bookworm
     ENV CARGO_TERM_COLOR=always
     ENV DEBIAN_FRONTEND=noninteractive
+    # 32 MB default stack for test threads. The recursive walkers in
+    # the debugger's tokio runtime introspection / dyn-Future
+    # resolver / async-backtrace builder occasionally overflow the
+    # default 2 MB thread stack when the inferior parks deep inside
+    # a `tokio::join!` tree (notably `async_await::test_await_trace_join`,
+    # which has overflowed at depths well inside `MAX_BRANCH_DEPTH`).
+    # 32 MB is generous and matches the env var the existing CI
+    # workflow exports too.
+    ENV RUST_MIN_STACK=33554432
     # `clang` is required by the `dap_integration::test_bs_viz_spec_breakpoint_*`
     # tests, which compile a sub-crate with `-C linker=clang` to exercise
     # the edit-and-continue rustflags path; without it the test panics

@@ -15,6 +15,11 @@ concurrency:
 env:
   MSRV: 1.89.0
   LRV: 1.95.0
+  # 32 MB default stack for test threads. The debugger's recursive
+  # walkers (tokio runtime introspection, dyn-Future resolver,
+  # async-backtrace builder) occasionally overflow the default 2 MB
+  # thread stack on deep `tokio::join!`-style fixtures.
+  RUST_MIN_STACK: "33554432"
 
 jobs:
   test:
