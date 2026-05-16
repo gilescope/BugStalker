@@ -185,7 +185,7 @@ pub fn scan_vdso_exports(
     range: &ProcMapping,
     bytes: &[u8],
 ) -> Result<Vec<VdsoSymbol>, VdsoScanError> {
-    use object::read::elf::{ElfFile64, FileHeader};
+    use object::read::elf::ElfFile64;
     use object::{Object, ObjectSymbol};
 
     let elf: ElfFile64<object::Endianness> =
@@ -211,7 +211,7 @@ pub fn scan_vdso_exports(
             Ok(n) => n,
             Err(_) => continue,
         };
-        if !VDSO_TARGET_SYMBOLS.iter().any(|t| *t == name) {
+        if !VDSO_TARGET_SYMBOLS.contains(&name) {
             continue;
         }
         let address = load_base + sym.address();
@@ -395,12 +395,15 @@ pub fn peekdata(pid: i32, addr: u64) -> io::Result<u64> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 unsafe fn errno_location() -> *mut libc::c_int {
-    libc::__errno_location()
+    // SAFETY: forwarding to a libc thread-local accessor; the caller
+    // already promises to use the returned pointer correctly.
+    unsafe { libc::__errno_location() }
 }
 
 #[cfg(target_vendor = "apple")]
 unsafe fn errno_location() -> *mut libc::c_int {
-    libc::__error()
+    // SAFETY: same contract as the Linux branch.
+    unsafe { libc::__error() }
 }
 
 /// Write `bytes` into the tracee at `addr`, in 8-byte chunks.

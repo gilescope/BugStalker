@@ -20,7 +20,7 @@
 //!    d. Send fd to parent via `sendmsg(SCM_RIGHTS)`.
 //!    e. Close the fd in the child (the parent now owns it).
 //!    f. `raise(SIGSTOP)` — synchronisation barrier; the parent
-//!       sets ptrace options on the next stop and CONTs us.
+//!    sets ptrace options on the next stop and CONTs us.
 //!    g. `execve(argv[0], argv, envp)`.
 //! 3. Parent:
 //!    a. `recvmsg(SCM_RIGHTS)` — receives the listener.
@@ -28,7 +28,7 @@
 //!    c. `PTRACE_SETOPTIONS` with TRACESYSGOOD | TRACESYSCALL.
 //!    d. `PTRACE_CONT` — child proceeds to execve.
 //!    e. Returns [`RecordChild { pid, listener }`] ready for
-//!       [`record_syscall_with_exit`](super::exit_stop::record_syscall_with_exit).
+//!    [`record_syscall_with_exit`](super::exit_stop::record_syscall_with_exit).
 //!
 //! ## Drop semantics
 //!

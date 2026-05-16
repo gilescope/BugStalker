@@ -121,8 +121,7 @@ pub fn apply_in_child(actions: &[FileAction]) -> io::Result<()> {
                 };
                 // SAFETY: open(/dev/null, flags) — async-signal-
                 // safe. NUL-terminated string literal.
-                let opened =
-                    unsafe { libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, flags) };
+                let opened = unsafe { libc::open(c"/dev/null".as_ptr(), flags) };
                 if opened < 0 {
                     return Err(io::Error::last_os_error());
                 }

@@ -176,10 +176,10 @@ fn is_capturable(r: &MemoryRegion) -> bool {
     if !r.perms.write || !r.perms.private {
         return false;
     }
-    if let Some(name) = &r.pathname {
-        if matches!(name.as_str(), "[vvar]" | "[vdso]" | "[vsyscall]") {
-            return false;
-        }
+    if let Some(name) = &r.pathname
+        && matches!(name.as_str(), "[vvar]" | "[vdso]" | "[vsyscall]")
+    {
+        return false;
     }
     true
 }

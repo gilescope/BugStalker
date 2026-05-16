@@ -1690,6 +1690,10 @@ impl<'a> VariableParserExtension<'a> {
             .members
             .iter()
             .find(|m| m.field_name.as_deref() == Some("inner"));
+        // Mutated only inside the cfg(target_os = "macos") branch
+        // below; `mut` is unused on other targets, so silence the
+        // lint there.
+        #[allow(unused_mut)]
         let mut locked = inner_member
             .and_then(|m| {
                 m.value.bfs_iterator().find_map(|(_, child)| match child {

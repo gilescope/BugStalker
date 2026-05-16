@@ -7,8 +7,9 @@
 //! until the trace is exhausted or the tracee exits.
 //!
 //! Linux only.
-
-#![cfg(target_os = "linux")]
+//
+// `lib.rs` already gates this module with `#[cfg(target_os = "linux")]`,
+// so there's no inner `#![cfg(...)]` here.
 
 use std::ffi::CString;
 use std::path::Path;
@@ -28,7 +29,7 @@ use bs_replay_engine::record::linux::ptrace_driver::{
 use bs_replay_engine::record::linux::signals::ptrace_setsiginfo;
 use bs_replay_engine::record::syscall_capture::MemoryReader;
 use bs_replay_engine::replay::linux::replay_child::{
-    ReplayChild, ReplaySpawnError, ReplaySpawnOptions, spawn_replay_child, spawn_replay_child_with,
+    ReplaySpawnError, ReplaySpawnOptions, spawn_replay_child, spawn_replay_child_with,
 };
 use bs_replay_engine::replay::linux::shim::{
     MemoryWriter, ProcMemWriter, ReplayError as ReplayShimError, apply_recorded_event,
@@ -287,9 +288,8 @@ pub fn replay_program(
             Ok(n) => n,
             Err(e) => {
                 // Reap and stamp exit status.
-                report.exit = Some(reap_exit(pid).unwrap_or_else(|| {
-                    ReplayExit::Exited(0) // best-effort default
-                }));
+                // best-effort default if `reap_exit` can't observe an exit
+                report.exit = Some(reap_exit(pid).unwrap_or(ReplayExit::Exited(0)));
                 tracing::debug!("replay_program: recv_notif ended ({e})");
                 break 'replay;
             }
@@ -632,6 +632,7 @@ pub(crate) enum DriveOutcome {
 /// events along the way get PC-not-precise-but-content-precise
 /// delivery via PTRACE_SETSIGINFO; instruction-trap events
 /// stay skipped (replay landing in step 97).
+#[allow(dead_code)] // helper kept for callers added in subsequent steps
 fn walk_to_next_syscall(
     cursor: &mut bs_replay_engine::format::EventCursor<'_>,
     report: &mut ReplayReport,
@@ -639,6 +640,7 @@ fn walk_to_next_syscall(
     walk_to_next_syscall_with(cursor, report, None)
 }
 
+#[allow(dead_code)] // helper kept for callers added in subsequent steps
 fn walk_to_next_syscall_with(
     cursor: &mut bs_replay_engine::format::EventCursor<'_>,
     report: &mut ReplayReport,

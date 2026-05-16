@@ -20,6 +20,7 @@
 #![cfg(target_os = "linux")]
 
 use std::io;
+#[cfg(target_arch = "aarch64")]
 use std::mem;
 
 /// Linux aarch64 `struct user_pt_regs`. From the kernel's
@@ -27,7 +28,7 @@ use std::mem;
 /// 272 bytes total. Layout is stable since the architecture
 /// shipped.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[allow(missing_docs)]
 pub struct UserRegsAarch64 {
     /// x0..x30 — general-purpose register file. x8 is the
@@ -41,18 +42,8 @@ pub struct UserRegsAarch64 {
     pub pstate: u64,
 }
 
-impl Default for UserRegsAarch64 {
-    fn default() -> Self {
-        Self {
-            regs: [0u64; 31],
-            sp: 0,
-            pc: 0,
-            pstate: 0,
-        }
-    }
-}
-
 /// `NT_PRSTATUS` regset ID — same value across all archs.
+#[cfg(target_arch = "aarch64")]
 const NT_PRSTATUS: i32 = 1;
 
 /// `PTRACE_GETREGSET` wrapper for aarch64 NT_PRSTATUS.
@@ -105,10 +96,14 @@ pub fn set_regs_aarch64(pid: i32, regs: &UserRegsAarch64) -> io::Result<()> {
 // Off-arch builds get stubs so callers can compile a unified
 // dispatch. The stubs return ENOSYS so any caller that reaches
 // them on the wrong arch surfaces a clean diagnostic.
+/// Off-arch stub for `get_regs_aarch64` so dispatch sites compile on
+/// non-aarch64 targets. Always returns `ENOSYS`.
 #[cfg(not(target_arch = "aarch64"))]
 pub fn get_regs_aarch64(_pid: i32) -> io::Result<UserRegsAarch64> {
     Err(io::Error::from_raw_os_error(libc::ENOSYS))
 }
+/// Off-arch stub for `set_regs_aarch64` so dispatch sites compile on
+/// non-aarch64 targets. Always returns `ENOSYS`.
 #[cfg(not(target_arch = "aarch64"))]
 pub fn set_regs_aarch64(_pid: i32, _regs: &UserRegsAarch64) -> io::Result<()> {
     Err(io::Error::from_raw_os_error(libc::ENOSYS))

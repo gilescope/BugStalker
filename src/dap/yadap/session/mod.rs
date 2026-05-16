@@ -58,6 +58,7 @@ pub struct DebugSession {
     last_stop: Option<control::LastStop>,
     module_info: Option<init::ModuleInfo>,
     replay_session: Option<ReverseDebugger>,
+    #[allow(dead_code)] // populated/used on Linux only; reserved on macOS
     live_reverse: live_reverse::LiveReverseHistory,
     canceled_request_ids: HashSet<i64>,
     canceled_progress_ids: HashSet<String>,
@@ -134,6 +135,10 @@ impl DebugSession {
             last_stop: None,
             module_info: None,
             replay_session: None,
+            // `LiveReverseHistory` is a unit struct on non-macOS,
+            // so clippy nags about `::default()` there; the macOS
+            // build has fields and needs the derive.
+            #[allow(clippy::default_constructed_unit_structs)]
             live_reverse: live_reverse::LiveReverseHistory::default(),
             canceled_request_ids: HashSet::new(),
             canceled_progress_ids: HashSet::new(),

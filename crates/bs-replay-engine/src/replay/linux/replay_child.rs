@@ -32,11 +32,11 @@
 //!    b. [`install_trap_all_listener`] → listener fd.
 //!    c. `sendmsg(SCM_RIGHTS)` the fd to the parent.
 //!    d. `execve(prog, argv, envp)` — the kernel will trap every
-//!       subsequent syscall via NOTIF.
+//!    subsequent syscall via NOTIF.
 //! 4. Parent:
 //!    a. `recvmsg(SCM_RIGHTS)` — receives the listener.
 //!    b. Returns [`ReplayChild { pid, listener }`] ready for
-//!       the replay supervisor's recv_notif loop.
+//!    the replay supervisor's recv_notif loop.
 //!
 //! No `PTRACE_TRACEME`, no SIGSTOP barrier, no `PTRACE_SETOPTIONS`
 //! — just the listener handover. The kernel does the rest.
@@ -159,10 +159,10 @@ impl ReplayChild {
 
 impl Drop for ReplayChild {
     fn drop(&mut self) {
-        if !self.cleaned_up {
-            if let Err(e) = self.do_shutdown() {
-                tracing::warn!("ReplayChild::drop: cleanup(pid={}) failed: {e}", self.pid,);
-            }
+        if !self.cleaned_up
+            && let Err(e) = self.do_shutdown()
+        {
+            tracing::warn!("ReplayChild::drop: cleanup(pid={}) failed: {e}", self.pid,);
         }
     }
 }

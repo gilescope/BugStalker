@@ -1512,7 +1512,7 @@ impl DebugInformationBuilder {
             RunTimeEndian::Big
         };
 
-        let mut eh_frame = EhFrame::load(|id| -> Result<EndianArcSlice, Error> {
+        let eh_frame = EhFrame::load(|id| -> Result<EndianArcSlice, Error> {
             loader::load_section(id, file, endian)
         })?;
         #[cfg(target_arch = "aarch64")]
@@ -1602,7 +1602,7 @@ impl DebugInformationBuilder {
 
         let dwarf = loader::load_par(debug_info_file, endian)?;
         let debug_frame = if debug_info_file.section_by_name(".debug_frame").is_some() {
-            let mut df = DebugFrame::load(|id| -> Result<EndianArcSlice, Error> {
+            let df = DebugFrame::load(|id| -> Result<EndianArcSlice, Error> {
                 loader::load_section(id, debug_info_file, endian)
             })?;
             #[cfg(target_arch = "aarch64")]

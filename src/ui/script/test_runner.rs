@@ -94,8 +94,10 @@ pub fn run_test_with(
     // trail, which suits a streaming runner.
     writeln!(out, "TAP version 14")?;
 
-    let mut state = RunnerState::default();
-    state.bless = opts.bless;
+    let mut state = RunnerState {
+        bless: opts.bless,
+        ..RunnerState::default()
+    };
 
     loop {
         match reader.read() {

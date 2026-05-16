@@ -51,7 +51,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use crate::format::event::Event;
 use crate::format::trace_writer::{TraceWriteError, TraceWriter};
 use crate::record::syscall_capture::{
-    self, CallFrame, CapturedSyscall, MemoryReader, capture_pre_syscall,
+    CallFrame, CapturedSyscall, MemoryReader, capture_pre_syscall,
 };
 
 /// Documented sentinel `Event::Syscall.result` value the

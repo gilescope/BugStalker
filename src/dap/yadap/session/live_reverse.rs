@@ -179,6 +179,11 @@ impl super::DebugSession {
         req: &DapRequest,
         thread_id: i64,
     ) -> anyhow::Result<()> {
+        // On non-macOS the `return` is "needless" (no code follows
+        // in the expanded body) but on macOS the next cfg-block is
+        // the real implementation; the early-return form keeps both
+        // sides readable.
+        #[allow(clippy::needless_return)]
         #[cfg(not(target_os = "macos"))]
         {
             let _ = thread_id;

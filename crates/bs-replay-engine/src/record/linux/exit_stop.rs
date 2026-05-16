@@ -300,9 +300,9 @@ pub fn ptrace_cont(pid: i32, sig: i32) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Fuse a pre-syscall capture with a post-syscall one into a
-/// single observation. The pre half supplies args + InBuf +
-/// InCStr regions; the post half supplies the result + OutBuf
-/// + catch-all post-state regions. Plan §3B contract: one
+/// single observation. The pre half supplies args plus InBuf and
+/// InCStr regions; the post half supplies the result plus OutBuf
+/// and catch-all post-state regions. Plan §3B contract: one
 /// `Event::Syscall` per syscall, carrying both halves.
 pub fn merge_pre_post(pre: &CapturedSyscall, post: &CapturedSyscall) -> CapturedSyscall {
     // Sanity — pre and post must agree on nr + args; if they

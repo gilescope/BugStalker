@@ -32,10 +32,10 @@ pub fn list_open_fds(pid: i32) -> io::Result<Vec<u32>> {
     let mut out = Vec::new();
     for entry in fs::read_dir(&path)? {
         let entry = entry?;
-        if let Some(name) = entry.file_name().to_str() {
-            if let Ok(n) = name.parse::<u32>() {
-                out.push(n);
-            }
+        if let Some(name) = entry.file_name().to_str()
+            && let Ok(n) = name.parse::<u32>()
+        {
+            out.push(n);
         }
     }
     out.sort_unstable();

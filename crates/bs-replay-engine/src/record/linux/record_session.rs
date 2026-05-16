@@ -282,13 +282,13 @@ impl RecordedChild {
 
 impl Drop for RecordedChild {
     fn drop(&mut self) {
-        if !self.detached {
-            if let Err(e) = self.do_detach() {
-                tracing::warn!(
-                    "RecordedChild::drop: PTRACE_DETACH(pid={}) failed: {e}",
-                    self.pid,
-                );
-            }
+        if !self.detached
+            && let Err(e) = self.do_detach()
+        {
+            tracing::warn!(
+                "RecordedChild::drop: PTRACE_DETACH(pid={}) failed: {e}",
+                self.pid,
+            );
         }
         let mut status = 0;
         unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) };
@@ -392,15 +392,11 @@ fn child_main(
     }
     // PR_SET_TSC must be set in the tracee thread. Apply
     // before execve so it survives into the new image.
-    if flags.trap_tsc {
-        if super::instrs::set_tsc_trap_for_self().is_err() {
-            return Err(75);
-        }
+    if flags.trap_tsc && super::instrs::set_tsc_trap_for_self().is_err() {
+        return Err(75);
     }
-    if flags.disable_cpuid {
-        if super::instrs::set_cpuid_disabled_for_self().is_err() {
-            return Err(76);
-        }
+    if flags.disable_cpuid && super::instrs::set_cpuid_disabled_for_self().is_err() {
+        return Err(76);
     }
     // execve. PTRACE_TRACEME makes the kernel raise SIGTRAP at
     // the first user-space instruction after execve, which the

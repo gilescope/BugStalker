@@ -144,6 +144,10 @@ pub fn render_json5_value(v: &Value, base_indent: usize) -> String {
     out
 }
 
+// `base_indent` flows through unchanged so per-line "back to the
+// start of the value" rendering can hook in later; clippy flags it
+// as unused-in-recursion until then.
+#[allow(clippy::only_used_in_recursion)]
 fn render_into(v: &Value, base_indent: usize, depth_indent: usize, out: &mut String) {
     match v {
         Value::Null => out.push_str("null"),
@@ -248,6 +252,7 @@ fn render_string(s: &str) -> String {
 }
 
 /// Column (zero-based) of the byte at `pos` within its line.
+#[allow(dead_code)] // helper kept for follow-up bless features
 fn indent_of_value(source: &str, pos: usize) -> usize {
     let line_start = source[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
     pos.saturating_sub(line_start)

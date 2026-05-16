@@ -15,8 +15,9 @@
 //! The result is a `CaptureReport` summarising the size of what
 //! was written. A future DAP `bs/replayCapture` handler is a thin
 //! wrapper around this function.
-
-#![cfg(target_os = "linux")]
+//
+// `lib.rs` already gates this module with `#[cfg(target_os = "linux")]`,
+// so there's no inner `#![cfg(...)]` here.
 
 use std::path::Path;
 

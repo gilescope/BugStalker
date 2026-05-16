@@ -77,6 +77,11 @@ use nix::sys::signal;
 use nix::sys::signal::{SIGKILL, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
+// `Object` is consumed for trait-method dispatch (e.g. `object.entry()`).
+// On macOS the cfg-gated call sites can elide all uses of it; rather
+// than litter call-site cfgs, allow the unused-import lint here.
+#[allow(unused_imports)]
+use object::Object;
 use os_pipe::PipeWriter;
 use regex::Regex;
 #[cfg(target_os = "linux")]
@@ -1486,6 +1491,9 @@ impl Debugger {
 
         // Helper: read a value from the unwound map by Register
         // (architecture-typed), via DWARF's numeric register id.
+        // Kept named (rather than `_`-prefixed) so the cfg-gated
+        // architectures that *do* use it below find it.
+        #[allow(unused_variables)]
         let read_unwound = |reg: Register| -> Option<u64> {
             let dwarf_reg = reg.dwarf_register()?;
             unwound.value(dwarf_reg).ok()

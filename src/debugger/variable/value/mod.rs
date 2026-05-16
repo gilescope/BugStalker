@@ -411,6 +411,12 @@ pub struct CModifiedValue {
 }
 
 /// Program typed value representation.
+// `StructValue` and `ArrayValue` carry substantially more state than
+// the simpler scalar variants. `Box`-ing them just to shave the enum
+// size would impose a heap allocation on every variable construction
+// and break borrow patterns through the rendering code, so the size
+// difference is accepted deliberately.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq)]
 pub enum Value {
     Scalar(ScalarValue),

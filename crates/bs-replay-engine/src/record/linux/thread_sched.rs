@@ -51,7 +51,7 @@ pub struct SingleCpuPin {
 }
 
 /// CPU mask snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AffinityMask {
     /// CPU ids that were enabled. Sorted ascending, deduped.
     pub cpus: Vec<u32>,
@@ -71,12 +71,6 @@ impl AffinityMask {
     }
 }
 
-impl Default for AffinityMask {
-    fn default() -> Self {
-        Self { cpus: Vec::new() }
-    }
-}
-
 /// Read the current affinity mask of the calling process.
 pub fn current_affinity_for_self() -> io::Result<AffinityMask> {
     // SAFETY: zero-init is the documented sentinel; the kernel
@@ -88,7 +82,7 @@ pub fn current_affinity_for_self() -> io::Result<AffinityMask> {
     }
     let mut cpus = Vec::new();
     // `CPU_SETSIZE` is 1024 on glibc; the loop's bounded.
-    for cpu in 0..libc::CPU_SETSIZE as i32 {
+    for cpu in 0..libc::CPU_SETSIZE {
         // SAFETY: CPU_ISSET is read-only on the mask, well-
         // defined for any non-negative cpu id.
         if unsafe { libc::CPU_ISSET(cpu as usize, &set) } {
@@ -109,7 +103,7 @@ pub fn current_affinity_for_self() -> io::Result<AffinityMask> {
 /// the syscall so the diagnostic is more helpful than `EINVAL`.
 pub fn pin_to_single_cpu_for_self(cpu: u32) -> Result<SingleCpuPin, AffinityError> {
     let previous = current_affinity_for_self().map_err(AffinityError::ReadCurrent)?;
-    if !previous.cpus.iter().any(|c| *c == cpu) {
+    if !previous.cpus.contains(&cpu) {
         return Err(AffinityError::CpuNotInCurrentMask {
             requested: cpu,
             available: previous.cpus.clone(),

@@ -46,7 +46,7 @@ use crate::record::linux::ptrace_driver::{
     RESULT_NOT_CAPTURED_YET, RecorderError, SeccompNotif, frame_from_notif, recv_notif,
     respond_intercept,
 };
-use crate::record::syscall_capture::{self, CapturedSyscall, MemoryReader};
+use crate::record::syscall_capture::{self, CapturedSyscall};
 
 /// Inverse of [`MemoryReader`] — write recorded bytes back into
 /// the tracee's address space at replay time. Linux impl wraps

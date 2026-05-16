@@ -211,6 +211,7 @@ impl VizRegistry {
     ///    * **Reverse** (`key.ends_with(query)`): registered
     ///      `viz_demo::Person`, queried `Person` — covers
     ///      tests / debug-CLI lookups that pass the local name.
+    ///
     ///    Both branches require a `::` separator at the join
     ///    so `MyPerson` doesn't match `Person`. Ambiguous
     ///    matches (>1 hit) bail to `None` so we never apply the
