@@ -1304,8 +1304,17 @@ fn peel_tls_storage_wrappers(mut val: Value) -> Value {
                 if !STRUCT_WRAPPERS.iter().any(|w| name.starts_with(w)) {
                     return Value::Struct(s);
                 }
+                // std::sys::thread_local::native::Storage<T> has been
+                // observed with both `value` (older rustc) and `val`
+                // (rustc 1.94+) names for its T-holding field. Try
+                // both so peel keeps descending across rustc minor
+                // versions.
                 let s_clone = s.clone();
-                match s.field("value").or_else(|| s_clone.clone().field("__0")) {
+                match s
+                    .field("value")
+                    .or_else(|| s_clone.clone().field("val"))
+                    .or_else(|| s_clone.clone().field("__0"))
+                {
                     Some(v) => val = v,
                     None => return Value::Struct(s_clone),
                 }
