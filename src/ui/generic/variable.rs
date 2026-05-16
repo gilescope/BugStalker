@@ -76,12 +76,32 @@ fn render_value_inner(
         Some(layout) => match layout {
             ValueLayout::PreRendered(rendered_value) => {
                 let type_name = value.r#type().name_fmt();
+                let type_str = type_name.to_string();
                 match value {
                     Value::CEnum(_) => format!("{type_name}::{rendered_value}"),
                     // The unit type renders its own value as "()", so the
                     // generic `Type(value)` wrap below would produce the
                     // nonsense `()(())`. Special-case: emit just "()".
                     _ if type_name == "()" => "()".to_string(),
+                    // The body already opens with the type name (e.g.
+                    // the dyn-vtable multi-line render starts with
+                    // `Type [→ Concrete] { … }`, or a viz spec hand-
+                    // wrote `Person { name … }`). Don't wrap it again
+                    // — that produces `Type(Type { … })`. Suffix
+                    // tolerance: allow whitespace, `{`, `(`, or `<`
+                    // immediately after so we don't false-positive on
+                    // `TypeFoo` matching `Type`.
+                    _ if print_type
+                        && rendered_value.starts_with(&type_str)
+                        && rendered_value
+                            .as_bytes()
+                            .get(type_str.len())
+                            .is_none_or(|b| {
+                                matches!(*b, b' ' | b'\n' | b'{' | b'(' | b'<' | b'[')
+                            }) =>
+                    {
+                        rendered_value.into_owned()
+                    }
                     _ if print_type => format!("{type_name}({rendered_value})"),
                     _ => format!("{rendered_value}"),
                 }

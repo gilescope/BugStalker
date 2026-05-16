@@ -364,6 +364,7 @@ mod tests {
             ],
             type_params: Default::default(),
             raw_address: None,
+            vtable_view: None,
         }
     }
 
@@ -377,6 +378,7 @@ mod tests {
             }],
             type_params: Default::default(),
             raw_address: None,
+            vtable_view: None,
         }
     }
 
@@ -407,6 +409,7 @@ mod tests {
             members: vec![],
             type_params: Default::default(),
             raw_address: None,
+            vtable_view: None,
         };
         assert!(find_trait_object_concrete(&Value::Struct(s), 4).is_none());
     }

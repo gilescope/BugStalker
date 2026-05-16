@@ -721,6 +721,7 @@ impl<'a> VariableParserExtension<'a> {
                 type_params: type_params.clone(),
                 // set to `None` because the address operator unavailable for spec vars
                 raw_address: None,
+                vtable_view: None,
             },
             elided,
         })
@@ -1288,6 +1289,7 @@ impl<'a> VariableParserExtension<'a> {
                 type_params: type_params.clone(),
                 // set to `None` because the address operator unavailable for spec vars
                 raw_address: None,
+                vtable_view: None,
             },
             // VecDeque path: capacity-bound applied via guard_cap; the
             // `len` here is already accurate (no separate truncation
@@ -1362,6 +1364,7 @@ impl<'a> VariableParserExtension<'a> {
             type_params: Default::default(),
             // set to `None` because the address operator unavailable for spec vars
             raw_address: None,
+            vtable_view: None,
         }))
     }
 

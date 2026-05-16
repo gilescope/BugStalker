@@ -145,6 +145,7 @@ mod test {
                     ],
                     type_params: Default::default(),
                     raw_address: None,
+                    vtable_view: None,
                 }),
                 expected_order: vec![
                     FieldOrIndex::Root,
@@ -206,6 +207,7 @@ mod test {
                                 ],
                                 type_params: Default::default(),
                                 raw_address: None,
+                                vtable_view: None,
                             }),
                         },
                         Member {
@@ -223,6 +225,7 @@ mod test {
                     ],
                     type_params: Default::default(),
                     raw_address: None,
+                    vtable_view: None,
                 }),
                 expected_order: vec![
                     FieldOrIndex::Root,

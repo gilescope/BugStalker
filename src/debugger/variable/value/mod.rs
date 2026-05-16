@@ -174,6 +174,56 @@ pub struct StructValue {
     /// Map of type parameters of a structure type.
     pub type_params: IndexMap<String, Option<TypeId>>,
     pub raw_address: Option<usize>,
+    /// Phase 3 Feature A batch A4 — populated by the dyn-resolver
+    /// when this struct *is* the fat-pointer pair for a `dyn Trait`
+    /// and we managed to read the vtable's slots. The renderer uses
+    /// it to surface drop / size / align / methods as a typed
+    /// record. `None` when detection misfires or every probe missed.
+    pub vtable_view: Option<VtableView>,
+}
+
+/// Resolved contents of a `dyn Trait` vtable. Built at parse time
+/// by walking the inferior's vtable memory and looking each slot up
+/// in the symbol table; consumed at render time. Slot indices
+/// follow rustc's layout — `[drop, size, align, methods…]` — so the
+/// renderer can present them with the right labels regardless of
+/// how many trait methods came after.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct VtableView {
+    /// Runtime address of the vtable itself (post-ASLR/PIE).
+    pub vtable_addr: u64,
+    /// Slot 0 — `core::ptr::drop_in_place::<Concrete>`. `None` when
+    /// the concrete type is `!Drop` (slot is a null pointer) or the
+    /// drop fn's symbol couldn't be resolved.
+    pub drop: Option<VtableSlot>,
+    /// Slot 1 — `size_of::<Concrete>()`. Read as a raw u64.
+    pub size: Option<u64>,
+    /// Slot 2 — `align_of::<Concrete>()`. Read as a raw u64.
+    pub align: Option<u64>,
+    /// Slots 3+ — trait method pointers in declaration order. Empty
+    /// when the trait has no methods (`dyn Send`, `dyn Sync`, …) or
+    /// every probe was unresolvable.
+    pub methods: Vec<VtableSlot>,
+    /// Total slots inspected (for "+N more" elision when the slot
+    /// count exceeds the renderer's display cap).
+    pub probed_slots: usize,
+}
+
+/// One vtable slot the resolver was able to identify by symbol.
+/// Methods carry `name` = the trait method ("greet"); the drop
+/// slot carries `name` = "drop".
+#[derive(Clone, PartialEq, Debug)]
+pub struct VtableSlot {
+    /// Runtime address of the function this slot points at.
+    pub addr: u64,
+    /// Short label — the trait method's name, or "drop".
+    pub name: String,
+    /// Full demangled symbol — `<Concrete as Trait>::method` for a
+    /// method, `core::ptr::drop_in_place::<Concrete>` for the drop
+    /// slot. Surfaced verbatim in the renderer.
+    pub display: String,
+    /// `file.rs:line` if `addr2line` had a hit; `None` otherwise.
+    pub source_location: Option<String>,
 }
 
 impl StructValue {
@@ -1247,6 +1297,7 @@ mod test {
                 ],
                 type_params: IndexMap::default(),
                 raw_address: None,
+                vtable_view: None,
             },
             elided: None,
         }
@@ -1415,6 +1466,7 @@ mod test {
                             }],
                             type_params: Default::default(),
                             raw_address: None,
+                            vtable_view: None,
                         }),
                     })),
                     raw_address: None,
@@ -1765,6 +1817,7 @@ mod test {
                     ],
                     type_params: Default::default(),
                     raw_address: None,
+                    vtable_view: None,
                 }),
                 eq_literals: vec![
                     Literal::AssocArray(HashMap::from([
@@ -1864,6 +1917,7 @@ mod test {
                     ],
                     type_params: Default::default(),
                     raw_address: None,
+                    vtable_view: None,
                 }),
                 eq_literals: vec![
                     Literal::Array(Box::new([

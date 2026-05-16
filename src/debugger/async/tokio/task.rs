@@ -498,6 +498,7 @@ mod tests {
                     members: vec![],
                     type_params: Default::default(),
                     raw_address: None,
+                    vtable_view: None,
                 }),
             })),
             raw_address: None,
@@ -512,6 +513,7 @@ mod tests {
             members,
             type_params: Default::default(),
             raw_address: None,
+            vtable_view: None,
         }
     }
 
@@ -554,6 +556,7 @@ mod tests {
                     members: vec![],
                     type_params: Default::default(),
                     raw_address: None,
+                    vtable_view: None,
                 }),
             })),
             raw_address: None,

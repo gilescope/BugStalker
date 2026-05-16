@@ -470,6 +470,16 @@ fn render_trait_object_summary(s: &crate::debugger::variable::value::StructValue
     }
     let trait_name = s.type_ident.name().unwrap_or("dyn Trait");
     let resolved = trait_name.contains("[→ ");
+
+    // Phase 3 Feature A batch A4 — when the resolver populated a
+    // structured `vtable_view`, render the multi-line typed-record
+    // form. Single-line `[→ Concrete]` fallback survives for the
+    // strategy-2-only case (read failed; we have a concrete name
+    // but no slot data).
+    if let (Some(d), Some(v), Some(view), true) = (data_ptr, vtable_ptr, &s.vtable_view, resolved) {
+        return render_trait_object_multiline(trait_name, d, v, view);
+    }
+
     match (data_ptr, vtable_ptr, resolved) {
         (Some(d), Some(v), true) => {
             format!("{trait_name} {{ data: {d:p}, vtable: {v:p} }}")
@@ -479,6 +489,65 @@ fn render_trait_object_summary(s: &crate::debugger::variable::value::StructValue
         ),
         _ => format!("{trait_name}  [trait object — pointer fields missing]"),
     }
+}
+
+/// Render the resolved vtable as a typed record. Each method slot
+/// shows: short name, the demangled `<Concrete as Trait>::method`
+/// symbol (so the user sees the *exact* function `.method()` calls
+/// will dispatch to), and a `(file.rs:line)` hint when DWARF had it.
+///
+/// Long method lists (`dyn Iterator` etc.) are truncated to the
+/// first `MAX_RENDER_METHODS`; the truncation marker prints the
+/// remaining count so a curious user knows there's more to see.
+fn render_trait_object_multiline(
+    trait_name: &str,
+    data_ptr: *const (),
+    vtable_ptr: *const (),
+    view: &crate::debugger::variable::value::VtableView,
+) -> String {
+    use std::fmt::Write;
+    const MAX_RENDER_METHODS: usize = 8;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{trait_name} {{");
+    let _ = writeln!(out, "  data: {data_ptr:p},");
+    let _ = writeln!(out, "  vtable: {vtable_ptr:p} {{");
+    if let Some(drop) = &view.drop {
+        let loc = drop
+            .source_location
+            .as_deref()
+            .map(|l| format!(" ({l})"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "    drop: → {}{loc},", drop.display);
+    } else {
+        // Null drop slot is the canonical signal for `!Drop` types.
+        // Surface it explicitly — a missing line here would read as
+        // "we couldn't resolve drop" which has very different
+        // implications.
+        let _ = writeln!(out, "    drop: <no Drop impl>,");
+    }
+    if let Some(size) = view.size {
+        let _ = writeln!(out, "    size: {size},");
+    }
+    if let Some(align) = view.align {
+        let _ = writeln!(out, "    align: {align},");
+    }
+    let total = view.methods.len();
+    let shown = total.min(MAX_RENDER_METHODS);
+    for slot in &view.methods[..shown] {
+        let loc = slot
+            .source_location
+            .as_deref()
+            .map(|l| format!(" ({l})"))
+            .unwrap_or_default();
+        let _ = writeln!(out, "    {}: → {}{loc},", slot.name, slot.display);
+    }
+    if total > shown {
+        let _ = writeln!(out, "    … ({} more methods)", total - shown);
+    }
+    let _ = writeln!(out, "  }},");
+    out.push('}');
+    out
 }
 
 /// Phase 1 S5 — `SystemTime` rendered as ISO-8601 / RFC3339 UTC.
