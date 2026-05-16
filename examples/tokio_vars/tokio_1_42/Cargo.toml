@@ -6,3 +6,5 @@ publish = false
 
 [dependencies]
 tokio = { package = "tokio", version = "=1.42.0", features = ["full"] }
+
+[workspace]

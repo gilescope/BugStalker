@@ -1,6 +1,10 @@
 [workspace]
 members = [".", "crates/*"]
 # examples/ is its own workspace (separate Cargo.lock); never pull it in.
+# Note: nested `examples/tokio_tcp/tokio_1_4X` and
+# `examples/tokio_vars/tokio_1_4X` packages each carry their own empty
+# `[workspace]` table so cargo stops walking up; adding them here doesn't
+# help because the exclude check matches against this root's own dir tree.
 exclude = ["examples", "examples/target", "fuzz"]
 resolver = "2"
 
