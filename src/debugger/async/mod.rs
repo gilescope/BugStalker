@@ -172,17 +172,17 @@ impl Debugger {
             if let Some(Some(w)) = worker {
                 // if this is an async worker we need to extract whole future list once
                 if tasks.is_empty() {
-                    // See worker.rs: tokio's thread_local!-generated
-                    // CONTEXT static expands to two matches in 1.40+;
-                    // pick the one with the `scheduler` field.
-                    let context_initialized = analyze_context
-                        .debugger()
-                        .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))?
-                        .into_iter()
-                        .find(|c| c.value().clone().field("scheduler").is_some())
-                        .ok_or(Error::Async(AsyncError::IncorrectAssumption(
-                            "CONTEXT not found",
-                        )))?;
+                    // See worker.rs::find_runtime_context for the
+                    // multi-candidate selection logic — different
+                    // platforms surface up to three CONTEXT DIEs and
+                    // only one carries a real `raw_address`.
+                    let context_initialized =
+                        crate::debugger::r#async::tokio::worker::find_runtime_context(
+                            analyze_context.debugger(),
+                        )
+                        .ok_or(Error::Async(
+                            AsyncError::IncorrectAssumption("CONTEXT not found"),
+                        ))?;
 
                     let owned = OwnedList::try_extract(&analyze_context, context_initialized)?;
                     let dbg = analyze_context.debugger();

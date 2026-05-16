@@ -99,6 +99,56 @@ impl LocalQueue {
     }
 }
 
+/// Pick the right `tokio::runtime::context::CONTEXT` candidate.
+///
+/// `thread_local! { static CONTEXT … }` expands to two static items
+/// in tokio 1.40+ (init-closure VAL + cached-value VAL); both
+/// surface as "CONTEXT" via name-based DQE, but only one carries
+/// the runtime context (it has a `scheduler` field).
+///
+/// On Linux aarch64 (rustc 1.95) there's a further wrinkle: rustc
+/// emits a *third* candidate — a direct `Context`-typed DIE that
+/// shadows the storage. It exposes `.scheduler` but has no
+/// in-memory address (it's the const-evaluator's compile-time
+/// result, not a real variable), so navigating through it produces
+/// pointers with `value: None` and the `scheduler.inner.deref()`
+/// chain fails downstream — leaving every tokio test in the
+/// async-backtrace suite without a worker.
+///
+/// Prefer the candidate whose inner `Context` carries a real
+/// `raw_address`. Fall back to the original `.find()` behaviour
+/// when no candidate carries one (older rustc / Darwin), so
+/// pre-existing platforms keep working.
+pub(crate) fn find_runtime_context<'a>(
+    debugger: &'a crate::debugger::Debugger,
+) -> Option<QueryResult<'a>> {
+    fn ctx_raw_address(qr: &QueryResult<'_>) -> Option<usize> {
+        match qr.value() {
+            Value::Specialized {
+                value: Some(crate::debugger::variable::value::SpecializedValue::Tls(tls)),
+                ..
+            } => tls.inner_value.as_ref().and_then(|v| match v.as_ref() {
+                Value::Struct(s) => s.raw_address,
+                _ => None,
+            }),
+            Value::Struct(s) => s.raw_address,
+            _ => None,
+        }
+    }
+
+    let candidates: Vec<QueryResult<'a>> = debugger
+        .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))
+        .ok()?
+        .into_iter()
+        .filter(|c| c.value().clone().field("scheduler").is_some())
+        .collect();
+
+    if let Some(i) = candidates.iter().position(|c| ctx_raw_address(c).is_some()) {
+        return candidates.into_iter().nth(i);
+    }
+    candidates.into_iter().next()
+}
+
 /// Async worker known states.
 pub(super) enum WorkerState {
     RunTask(usize),
@@ -121,16 +171,7 @@ impl WorkerInternal {
     /// * `thread`: thread information
     pub(super) fn analyze(ctx: &mut TokioAnalyzeContext, thread: &ThreadSnapshot) -> Option<Self> {
         let debugger = ctx.debugger_mut();
-        // `thread_local! { static CONTEXT … }` expands to two static
-        // items in tokio 1.40+ (init-closure VAL + cached-value VAL),
-        // both surface as "CONTEXT" via name-based DQE. Pick the one
-        // carrying the runtime context (it has a `scheduler` field;
-        // the other doesn't).
-        let context = debugger
-            .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))
-            .ok()?
-            .into_iter()
-            .find(|c| c.value().clone().field("scheduler").is_some())?;
+        let context = find_runtime_context(debugger)?;
 
         let backtrace = thread.bt.as_ref()?;
 
@@ -331,14 +372,9 @@ pub fn try_as_worker(
     };
     let task_bt_standby = active_task_from_frame();
 
-    let context_initialized = context
-        .debugger()
-        .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))?
-        .into_iter()
-        .find(|c| c.value().clone().field("scheduler").is_some())
-        .ok_or(Error::Async(AsyncError::IncorrectAssumption(
-            "CONTEXT not found",
-        )))?;
+    let context_initialized = find_runtime_context(context.debugger()).ok_or(Error::Async(
+        AsyncError::IncorrectAssumption("CONTEXT not found"),
+    ))?;
 
     let current_task_id = context_initialized
         .value()
