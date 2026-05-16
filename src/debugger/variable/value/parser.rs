@@ -1255,13 +1255,55 @@ fn resolve_trait_object_concrete_type(
 
     let debugee = pcx.evcx.evaluator.debugee();
     let dwarf = debugee.debug_info(pcx.evcx.ecx.location().pc).ok()?;
+    let pid = pcx.evcx.ecx.pid_on_focus();
 
+    // The symbol table is keyed by *image-relative* addresses (file
+    // offsets / `st_value`), but `vtable_addr` and the per-slot fn
+    // pointers we read from the inferior are *runtime* addresses
+    // post-ASLR/PIE relocation. Translate via the debugee's mapping
+    // table before any `mangled_symbol_at` lookup — same
+    // `RelocatedAddress → GlobalAddress` flow `address::into_global`
+    // uses for PC translation elsewhere.
+    let to_global = |runtime: u64| -> Option<u64> {
+        let reloc = crate::debugger::address::RelocatedAddress::from(runtime);
+        reloc.into_global(debugee).ok().map(u64::from)
+    };
+    let read_memory =
+        |addr: u64, len: usize| crate::debugger::read_memory_by_pid(pid, addr as usize, len).ok();
+    let mangled_at = |global: u64| dwarf.mangled_symbol_at(global);
+
+    resolve_trait_object_from_lookups(vtable_addr, &to_global, &read_memory, &mangled_at)
+}
+
+/// Pure core of the vtable → concrete-type resolver. Takes the
+/// vtable runtime address and three injectable lookups so it can be
+/// unit-tested without a live debuggee.
+///
+/// `to_global` translates a runtime (post-ASLR/PIE) address into the
+/// image-relative offset the symbol table is keyed by. Returning
+/// `None` means "this address isn't mapped into any module we know
+/// about" — caller skips the lookup.
+///
+/// `read_memory` reads bytes from the inferior. We use it to slurp
+/// the first N pointer-sized vtable slots in one syscall.
+///
+/// `mangled_at` is the address-keyed symbol lookup. It must accept
+/// image-relative addresses (the symbol table's native domain) — the
+/// caller is responsible for translation. Returning a `&str` borrows
+/// from the symbol-table's storage.
+fn resolve_trait_object_from_lookups<'a>(
+    vtable_addr: u64,
+    to_global: &dyn Fn(u64) -> Option<u64>,
+    read_memory: &dyn Fn(u64, usize) -> Option<Vec<u8>>,
+    mangled_at: &dyn Fn(u64) -> Option<&'a str>,
+) -> Option<String> {
     // Strategy 2: symbol at the vtable address itself. Works on
-    // ELF / linux where rustc exports `<Concrete as Trait>::{vtable}`
-    // as a real symbol; misses on Mach-O / darwin where adhoc-built
-    // binaries place vtables in anonymous `__DATA_CONST,__const`
-    // and don't export individual symbols.
-    if let Some(mangled) = dwarf.mangled_symbol_at(vtable_addr)
+    // v0-mangled builds where rustc exports `<Concrete as Trait>::
+    // {vtable}` as a real symbol; misses on legacy-mangled builds
+    // (no vtable-shaped symbol emitted) and on Mach-O where the
+    // linker may place the vtable in an anonymous block.
+    if let Some(vt_global) = to_global(vtable_addr)
+        && let Some(mangled) = mangled_at(vt_global)
         && let Some(name) = concrete_from_vtable_symbol(mangled)
     {
         return Some(name);
@@ -1281,18 +1323,20 @@ fn resolve_trait_object_concrete_type(
     // plus inheritance; 16 covers `Error`, `Display`, `Debug`, and
     // most of the stdlib traits we care about today.
     const MAX_PROBE_SLOTS: usize = 16;
-    let probe = crate::debugger::read_memory_by_pid(
-        pcx.evcx.ecx.pid_on_focus(),
-        vtable_addr as usize,
-        MAX_PROBE_SLOTS * std::mem::size_of::<u64>(),
-    )
-    .ok()?;
+    let probe = read_memory(vtable_addr, MAX_PROBE_SLOTS * std::mem::size_of::<u64>())?;
     for chunk in probe.chunks_exact(std::mem::size_of::<u64>()) {
         let slot = u64::from_le_bytes(chunk.try_into().ok()?);
         if slot == 0 {
             continue;
         }
-        let Some(mangled) = dwarf.mangled_symbol_at(slot) else {
+        // Translate runtime slot → image-relative before the lookup;
+        // if the slot points into a region we have no mapping for
+        // (e.g. a stale/garbage word in size/align slots) skip it
+        // rather than treating it as a function symbol.
+        let Some(slot_global) = to_global(slot) else {
+            continue;
+        };
+        let Some(mangled) = mangled_at(slot_global) else {
             continue;
         };
         // Two extraction strategies for whichever shape the symbol
@@ -1500,5 +1544,222 @@ mod dyn_resolver_tests {
             concrete_from_vtable_symbol(mangled).as_deref(),
             Some("showcase::main::Point")
         );
+    }
+
+    // ---- resolve_trait_object_from_lookups: end-to-end stub tests ----
+    //
+    // These tests simulate the live-debuggee flow with three stub
+    // closures (address translation, memory read, symbol lookup).
+    // They guard against the specific class of bug we just fixed —
+    // forgetting to translate a runtime address through `to_global`
+    // before hitting the (image-relative) symbol table — plus the
+    // adjacent failure modes (null drop slot, garbage size/align
+    // slots, exhausted probe budget).
+
+    use super::resolve_trait_object_from_lookups;
+    use std::cell::RefCell;
+
+    /// Simulated PIE/ASLR slide. Runtime addresses we hand to the
+    /// resolver are `image_offset + ARTIFICIAL_SLIDE`; the stub
+    /// `to_global` subtracts it, mirroring what
+    /// `RelocatedAddress::into_global` does on a real debuggee.
+    const ARTIFICIAL_SLIDE: u64 = 0x5555_5555_4000;
+
+    /// Image-relative addresses of the two symbols our stub table
+    /// holds. Chosen to look like real `.text` offsets (well above
+    /// the slide isn't necessary — these are *image-relative*).
+    const POINT_GREET_GLOBAL: u64 = 0x1c2d0;
+    const DROP_IN_PLACE_MYERROR_GLOBAL: u64 = 0xf170;
+
+    /// v0-mangled `<Point as Greeter>::greet`, no leading underscore
+    /// (the symbol table's `mangled_at` returns the raw nlist form
+    /// post-strip already, see `SymbolTab::mangled_at` callers).
+    const POINT_GREET_MANGLED: &str =
+        "_RNvXNvCsdCBZUK1EFOO_8showcase4mainNtB2_5PointNtB2_7Greeter5greet";
+    const DROP_IN_PLACE_MYERROR_MANGLED: &str =
+        "_ZN4core3ptr59drop_in_place$LT$vars..phase3_dyn_trait..MyError$GT$17h0000000000000000E";
+
+    /// Build a stub vtable in a Vec<u8> with the layout rustc emits:
+    /// `[drop, size, align, m1, m2, …]`. Each slot is a runtime
+    /// address (`image_offset + slide`). Caller passes the slots they
+    /// want; we serialise them little-endian.
+    fn vtable_bytes(slots: &[u64]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(slots.len() * 8);
+        for s in slots {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// `to_global` stub. Subtracts the artificial slide. Returns
+    /// `None` for the impossible-mapping case (used by the "unmapped
+    /// slot" test).
+    fn slide_translator(runtime: u64) -> Option<u64> {
+        runtime.checked_sub(ARTIFICIAL_SLIDE)
+    }
+
+    /// Captures the lookup-key history so tests can assert *which*
+    /// addresses the resolver hit the symbol table with.
+    struct LookupRecorder {
+        table: Vec<(u64, &'static str)>,
+        seen: RefCell<Vec<u64>>,
+    }
+    impl LookupRecorder {
+        fn new(table: Vec<(u64, &'static str)>) -> Self {
+            Self {
+                table,
+                seen: RefCell::new(Vec::new()),
+            }
+        }
+        fn lookup(&self, addr: u64) -> Option<&str> {
+            self.seen.borrow_mut().push(addr);
+            self.table
+                .iter()
+                .find_map(|(a, s)| (*a == addr).then_some(*s))
+        }
+    }
+
+    /// The regression test. **This is the exact bug from commit
+    /// 0e9abbe's follow-up:** pre-fix, the resolver passed runtime
+    /// addresses straight into the image-relative symbol table and
+    /// every lookup missed. Here we build a vtable whose slot-3
+    /// runtime address slides to a real entry in the symbol table —
+    /// if the resolver forgets to translate, the test fails.
+    #[test]
+    fn slot_walk_finds_concrete_type_after_address_translation() {
+        // Slot-3 holds <Point as Greeter>::greet at the runtime PC
+        // (image-relative + slide). Slots 0–2 (drop / size / align)
+        // are zero so the early continue exercises that branch.
+        let slot3_runtime = POINT_GREET_GLOBAL + ARTIFICIAL_SLIDE;
+        let vt = vtable_bytes(&[0, 0, 0, slot3_runtime]);
+        let recorder = LookupRecorder::new(vec![(POINT_GREET_GLOBAL, POINT_GREET_MANGLED)]);
+
+        let resolved = resolve_trait_object_from_lookups(
+            0xDEAD_BEEF, // vtable address: untranslatable + not in table — strategy 2 misses.
+            &|r| slide_translator(r),
+            &|_, n| Some(vt[..n.min(vt.len())].to_vec()),
+            &|a| recorder.lookup(a),
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("showcase::main::Point"),
+            "slot-walking must translate runtime → image-relative before symbol lookup",
+        );
+        // Every non-zero slot we probed must have been translated:
+        // the recorder should only ever see *image-relative* keys.
+        let seen = recorder.seen.borrow();
+        for key in seen.iter() {
+            assert!(
+                *key < ARTIFICIAL_SLIDE,
+                "lookup key {key:#x} >= slide {ARTIFICIAL_SLIDE:#x} — caller forgot to translate",
+            );
+        }
+    }
+
+    /// Strategy 1's drop-fn fallback: `core::ptr::drop_in_place::
+    /// <MyError>` at slot 0 is the only carrier of the concrete type
+    /// when the trait has no methods we recognise. Confirms the
+    /// second extractor (`concrete_from_drop_in_place_symbol`) is
+    /// reached after the vtable-slot probe.
+    #[test]
+    fn slot_walk_falls_back_to_drop_in_place() {
+        let drop_runtime = DROP_IN_PLACE_MYERROR_GLOBAL + ARTIFICIAL_SLIDE;
+        // Slot 0 = drop. Slots 1, 2 (size/align) are 0 so the slot
+        // walker continues past them.
+        let vt = vtable_bytes(&[drop_runtime, 0, 0]);
+        let recorder = LookupRecorder::new(vec![(
+            DROP_IN_PLACE_MYERROR_GLOBAL,
+            DROP_IN_PLACE_MYERROR_MANGLED,
+        )]);
+
+        let resolved = resolve_trait_object_from_lookups(
+            0,
+            &|r| slide_translator(r),
+            &|_, n| Some(vt[..n.min(vt.len())].to_vec()),
+            &|a| recorder.lookup(a),
+        );
+        assert_eq!(
+            resolved.as_deref(),
+            Some("vars::phase3_dyn_trait::MyError"),
+            "drop-fn fallback must surface the concrete type when no method symbols match",
+        );
+    }
+
+    /// Strategy 2 hits when the symbol table has an entry at the
+    /// vtable address itself (v0-mangled builds with exported vtable
+    /// symbols). Slot walking must never run.
+    #[test]
+    fn strategy_2_uses_vtable_address_directly() {
+        // Hand-rolled v0 vtable symbol: `<Point as Greeter>::{vtable}`.
+        // The walk_for_impl spine yields the same TraitImpl as the
+        // method symbol, so re-using POINT_GREET_MANGLED here is OK —
+        // both demangle to the same self-type.
+        const VTABLE_GLOBAL: u64 = 0x7DEF8;
+        let vt_runtime = VTABLE_GLOBAL + ARTIFICIAL_SLIDE;
+        let recorder = LookupRecorder::new(vec![(VTABLE_GLOBAL, POINT_GREET_MANGLED)]);
+
+        let resolved = resolve_trait_object_from_lookups(
+            vt_runtime,
+            &|r| slide_translator(r),
+            &|_, _| panic!("strategy 2 must not need to read memory when the vtable address has a symbol"),
+            &|a| recorder.lookup(a),
+        );
+        assert_eq!(resolved.as_deref(), Some("showcase::main::Point"));
+        // Strategy 2 lookup happens against the *translated* vtable
+        // address — same image-relative invariant as strategy 1.
+        let seen = recorder.seen.borrow();
+        assert_eq!(seen.as_slice(), &[VTABLE_GLOBAL]);
+    }
+
+    /// If `to_global` returns `None` (slot points into a region we
+    /// have no mapping for — uninitialised memory, a foreign dylib
+    /// without debug info), the resolver must skip that slot rather
+    /// than treating the raw runtime word as an image-relative key.
+    #[test]
+    fn unmapped_slot_does_not_poison_table_lookup() {
+        let drop_runtime = DROP_IN_PLACE_MYERROR_GLOBAL + ARTIFICIAL_SLIDE;
+        // Slot 0 = garbage (no mapping). Slot 1 = drop (valid).
+        // Slots 2+ = 0. Without skip-on-None the resolver would feed
+        // raw garbage into the symbol table and might collide.
+        let vt = vtable_bytes(&[0x1234_5678_DEAD_BEEF, drop_runtime, 0]);
+        let recorder = LookupRecorder::new(vec![(
+            DROP_IN_PLACE_MYERROR_GLOBAL,
+            DROP_IN_PLACE_MYERROR_MANGLED,
+        )]);
+
+        let resolved = resolve_trait_object_from_lookups(
+            0,
+            &|r| r.checked_sub(ARTIFICIAL_SLIDE).filter(|g| *g < 0x10_0000),
+            &|_, n| Some(vt[..n.min(vt.len())].to_vec()),
+            &|a| recorder.lookup(a),
+        );
+        assert_eq!(resolved.as_deref(), Some("vars::phase3_dyn_trait::MyError"));
+        // The garbage slot must never have reached the lookup —
+        // its runtime value minus the slide either underflows or
+        // falls outside our synthetic `<0x10_0000` window, and the
+        // recorder records *only* lookups that ran.
+        let seen = recorder.seen.borrow();
+        assert!(
+            !seen.contains(&0x1234_5678_DEAD_BEEF),
+            "raw garbage slot {:#x} must not be used as a symbol-table key",
+            0x1234_5678_DEAD_BEEFu64,
+        );
+    }
+
+    /// Tail case: the vtable holds 16 nonsense slots, none of which
+    /// resolve. The resolver must terminate (not loop, not panic)
+    /// and return `None` so the renderer falls back to the
+    /// "concrete type unavailable" hint.
+    #[test]
+    fn no_resolvable_slot_returns_none() {
+        let vt = vtable_bytes(&[ARTIFICIAL_SLIDE + 0x9999; 16]);
+        let recorder = LookupRecorder::new(vec![]); // empty table
+        let resolved = resolve_trait_object_from_lookups(
+            0,
+            &|r| slide_translator(r),
+            &|_, n| Some(vt[..n.min(vt.len())].to_vec()),
+            &|a| recorder.lookup(a),
+        );
+        assert!(resolved.is_none());
     }
 }

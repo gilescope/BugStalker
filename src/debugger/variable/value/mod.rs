@@ -178,27 +178,28 @@ pub struct StructValue {
 
 impl StructValue {
     /// Phase 3 Feature A — `true` when this struct is the
-    /// fat-pointer representation of a `dyn Trait`. Detected at
-    /// render time from the type name plus the canonical
-    /// `pointer`/`vtable` member shape rustc emits. Cheap inspection
-    /// — no extra storage, no plumbing through every constructor.
+    /// fat-pointer representation of a `dyn Trait`.
+    ///
+    /// **Layout-driven detection.** The fat pointer rustc emits for
+    /// `dyn Trait` (and `dyn Trait + Send + …`) is invariably a
+    /// 2-member struct with one pointer-named field (`pointer` /
+    /// `data_ptr`) and a `vtable` (or `v_table` / `vtbl`) sibling.
+    /// We match on layout because the type name — which may contain
+    /// `"dyn "` purely as a generic argument — is unreliable: e.g.
+    /// `UnsafeCell<Option<…Box<dyn Any + Send>>>` *mentions* `dyn`
+    /// but its own layout is a single `value:` field. Pre-fix that
+    /// wrapper got classified as a trait object and the renderer
+    /// emitted `[trait object — pointer fields missing]`.
     pub fn is_trait_object(&self) -> bool {
-        let name_match = self.type_ident.name().is_some_and(|n| n.contains("dyn "));
-        if name_match {
-            return true;
+        if self.members.len() != 2 {
+            return false;
         }
-        if self.members.len() == 2 {
-            let m0 = self.members[0].field_name.as_deref();
-            let m1 = self.members[1].field_name.as_deref();
-            return matches!(
-                (m0, m1),
-                (Some("pointer"), Some("vtable"))
-                    | (Some("data_ptr"), Some("vtable"))
-                    | (Some("vtable"), Some("pointer"))
-                    | (Some("vtable"), Some("data_ptr"))
-            );
-        }
-        false
+        let m0 = self.members[0].field_name.as_deref();
+        let m1 = self.members[1].field_name.as_deref();
+        const DATA: [Option<&str>; 3] =
+            [Some("pointer"), Some("data_ptr"), Some("data")];
+        const VT: [Option<&str>; 3] = [Some("vtable"), Some("v_table"), Some("vtbl")];
+        DATA.contains(&m0) && VT.contains(&m1) || VT.contains(&m0) && DATA.contains(&m1)
     }
 }
 
