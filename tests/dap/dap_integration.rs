@@ -90,6 +90,20 @@ macro_rules! require_frame {
     }};
 }
 
+/// `handle_variables` in the DAP layer formats each variable's name as
+/// `"<name> : <type>"` so IDEs that don't honour the DAP `type` field
+/// inline still render the type next to the value (see
+/// `src/dap/yadap/session/data.rs`). Tests that look up variables by
+/// name should use this matcher instead of an exact equality check so
+/// they stay robust to a type that may or may not be present (e.g. a
+/// raw lambda capture has no name, and locals always do).
+fn var_name_matches(v: &Value, want: &str) -> bool {
+    let Some(name) = v["name"].as_str() else {
+        return false;
+    };
+    name == want || name.starts_with(&format!("{want} : "))
+}
+
 fn initialize(session: &mut DapSession) -> anyhow::Result<()> {
     let seq = session
         .client
@@ -1110,7 +1124,7 @@ fn test_set_variable_request() -> anyhow::Result<()> {
     ensure_response!(session, &vars_response, "variables", vars_seq, true);
     let container = vars_response["body"]["variables"]
         .as_array()
-        .and_then(|vars| vars.iter().find(|v| v["name"] == "container"))
+        .and_then(|vars| vars.iter().find(|v| var_name_matches(v, "container")))
         .cloned()
         .unwrap();
     let container_ref = container["variablesReference"].as_i64().unwrap_or(0);
@@ -1122,7 +1136,7 @@ fn test_set_variable_request() -> anyhow::Result<()> {
     ensure_response!(session, &point_response, "variables", point_seq, true);
     let point = point_response["body"]["variables"]
         .as_array()
-        .and_then(|vars| vars.iter().find(|v| v["name"] == "point"))
+        .and_then(|vars| vars.iter().find(|v| var_name_matches(v, "point")))
         .cloned()
         .unwrap();
     let point_ref = point["variablesReference"].as_i64().unwrap_or(0);
