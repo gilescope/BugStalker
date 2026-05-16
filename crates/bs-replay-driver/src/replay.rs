@@ -11,6 +11,18 @@
 // `lib.rs` already gates this module with `#[cfg(target_os = "linux")]`,
 // so there's no inner `#![cfg(...)]` here.
 
+// Many helpers in this module are only consumed by the x86_64
+// instruction-trap path (iced-x86 disassembly, ptrace single-step,
+// `UserRegsX86_64`, …). On aarch64 they end up unused until the
+// instr-trap port lands. cfg-gating every single import / helper
+// would drown the file in `#[cfg(target_arch = "x86_64")]` lines;
+// allow the dead-code/unused-imports lints at file scope on
+// non-x86_64 instead, with this note explaining why.
+#![cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(unused_imports, dead_code, unused_variables)
+)]
+
 use std::ffi::CString;
 use std::path::Path;
 
