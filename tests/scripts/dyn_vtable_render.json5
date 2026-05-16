@@ -23,7 +23,7 @@ expect: {
       name: "dyn_ref",
       type: "&dyn showcase::main::Greeter [→ showcase::main::Point]",
       value_text: {
-        $regex: "^\\&dyn showcase::main::Greeter \\[→ showcase::main::Point\\] \\{\n  data: 0x[0-9a-fA-F]+,\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    greet: → <showcase::main::Point as showcase::main::Greeter>::greet \\(main\\.rs:112\\),\n  \\},\n\\}$"
+        $regex: "^\\&dyn showcase::main::Greeter \\[→ showcase::main::Point\\] \\{\n  data: 0x[0-9a-fA-F]+ → Point \\{ x: 1, y: 2\\.5 \\},\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    greet: → <showcase::main::Point as showcase::main::Greeter>::greet \\(main\\.rs:112\\),\n  \\},\n\\}$"
       }
     }
   ],
@@ -38,7 +38,7 @@ expect: {
       name: "dyn_box",
       type: "alloc::boxed::Box<dyn showcase::main::Greeter, alloc::alloc::Global> [→ showcase::main::Point]",
       value_text: {
-        $regex: "^alloc::boxed::Box<dyn showcase::main::Greeter, alloc::alloc::Global> \\[→ showcase::main::Point\\] \\{\n  data: 0x[0-9a-fA-F]+,\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    greet: → <showcase::main::Point as showcase::main::Greeter>::greet \\(main\\.rs:112\\),\n  \\},\n\\}$"
+        $regex: "^alloc::boxed::Box<dyn showcase::main::Greeter, alloc::alloc::Global> \\[→ showcase::main::Point\\] \\{\n  data: 0x[0-9a-fA-F]+ → Point \\{ x: 0, y: 0 \\},\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    greet: → <showcase::main::Point as showcase::main::Greeter>::greet \\(main\\.rs:112\\),\n  \\},\n\\}$"
       }
     }
   ],
@@ -53,7 +53,7 @@ expect: {
       name: "multi_bound",
       type: "alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync), alloc::alloc::Global> [→ showcase::main::ShowcaseErr]",
       value_text: {
-        $regex: "^alloc::boxed::Box<\\(dyn core::error::Error \\+ core::marker::Send \\+ core::marker::Sync\\), alloc::alloc::Global> \\[→ showcase::main::ShowcaseErr\\] \\{\n  data: 0x[0-9a-fA-F]+,\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    fmt: → <showcase::main::ShowcaseErr as core::fmt::Debug>::fmt \\(main\\.rs:125\\),\n    fmt: → <showcase::main::ShowcaseErr as core::fmt::Display>::fmt \\(main\\.rs:128\\),\n    source: → core::error::Error::source \\(error\\.rs:105\\),\n    type_id: → core::error::Error::type_id \\(error\\.rs:116\\),\n    description: → core::error::Error::description \\(error\\.rs:131\\),\n    cause: → core::error::Error::cause \\(error\\.rs:141\\),\n    provide: → core::error::Error::provide \\(error\\.rs:204\\),\n  \\},\n\\}$"
+        $regex: "^alloc::boxed::Box<\\(dyn core::error::Error \\+ core::marker::Send \\+ core::marker::Sync\\), alloc::alloc::Global> \\[→ showcase::main::ShowcaseErr\\] \\{\n  data: 0x[0-9a-fA-F]+ → ShowcaseErr\\(\"boom\"\\),\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    fmt: → <showcase::main::ShowcaseErr as core::fmt::Debug>::fmt \\(main\\.rs:125\\),\n    fmt: → <showcase::main::ShowcaseErr as core::fmt::Display>::fmt \\(main\\.rs:128\\),\n    source: → core::error::Error::source \\(error\\.rs:105\\),\n    type_id: → core::error::Error::type_id \\(error\\.rs:116\\),\n    description: → core::error::Error::description \\(error\\.rs:131\\),\n    cause: → core::error::Error::cause \\(error\\.rs:141\\),\n    provide: → core::error::Error::provide \\(error\\.rs:204\\),\n  \\},\n\\}$"
       }
     }
   ],

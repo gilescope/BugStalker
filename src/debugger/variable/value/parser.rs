@@ -510,7 +510,31 @@ impl ValueParser {
                     struct_var
                         .type_ident
                         .set_name(format!("{original} [→ {}]", info.concrete));
-                    struct_var.vtable_view = Some(info.view);
+                    let mut view = info.view;
+                    // Phase 3 Feature A batch A5 — when we can resolve
+                    // the data pointer through the concrete type, the
+                    // dyn becomes transparent: the renderer surfaces
+                    // the actual value next to the vtable. Two ways
+                    // to find the concrete type's `TypeId`:
+                    //
+                    //   1. Already present in this variable's type
+                    //      graph — happens when the binary's DWARF
+                    //      cross-references the impl from the dyn
+                    //      site (the Box/&dyn parsing path may pull
+                    //      it in).
+                    //   2. Look it up in the binary's full DWARF via
+                    //      `find_type_die_ref`. Always available;
+                    //      builds a fresh `ComplexType` rooted at
+                    //      that DIE and re-parses.
+                    //
+                    // Skip silently when both miss — the methods +
+                    // size + align still render below.
+                    if let Some(data_addr) = data_pointer_runtime(&struct_var) {
+                        view.concrete_value =
+                            try_parse_concrete_value(pcx, &info.concrete, data_addr, &view)
+                                .map(Box::new);
+                    }
+                    struct_var.vtable_view = Some(view);
                 }
 
                 let parser_ext = VariableParserExtension::new(self);
@@ -1217,6 +1241,129 @@ fn peel_tls_storage_wrappers(mut val: Value) -> Value {
 fn scalar_from_bytes<T: Copy>(bytes: &Bytes) -> T {
     let ptr = bytes.as_ptr();
     unsafe { std::ptr::read_unaligned::<T>(ptr as *const T) }
+}
+
+/// Pull the runtime data pointer off a dyn fat-pointer struct. The
+/// dyn-resolver already ran `is_trait_object()` so the struct is the
+/// canonical `{ pointer/data_ptr, vtable }` shape — we just grab the
+/// non-vtable pointer's value.
+fn data_pointer_runtime(struct_var: &StructValue) -> Option<u64> {
+    struct_var.members.iter().find_map(|m| {
+        if matches!(
+            m.field_name.as_deref(),
+            Some("pointer") | Some("data_ptr") | Some("data")
+        ) && let Value::Pointer(p) = &m.value
+        {
+            return p.value.map(|raw| raw as u64);
+        }
+        None
+    })
+}
+
+/// Re-parse the inferior memory at `data_addr` through the concrete
+/// type named in `concrete`. Returns `None` quietly when:
+///
+///   * we can't find a DIE for `concrete` in the binary's DWARF, or
+///   * the size in the vtable view doesn't match what the type's
+///     own DWARF says (mismatch suggests we resolved the wrong
+///     concrete — better to render nothing than mislead), or
+///   * the read or parse fails for any other reason.
+///
+/// The concrete is re-parsed in a fresh `ParseContext` whose
+/// `type_graph` is a `ComplexType` rooted at the concrete's DIE —
+/// the outer dyn's type graph doesn't contain the concrete (rustc
+/// only emits the dyn fat-pointer types for the `dyn Trait` site),
+/// so we have to build one ourselves.
+fn try_parse_concrete_value(
+    pcx: &ParseContext,
+    concrete: &str,
+    data_addr: u64,
+    view: &VtableView,
+) -> Option<Value> {
+    use crate::debugger::debugee::dwarf::r#type::TypeParser;
+    use crate::debugger::debugee::dwarf::unit::die_ref::FatDieRef;
+
+    let debugee = pcx.evcx.evaluator.debugee();
+    let dwarf = debugee.debug_info(pcx.evcx.ecx.location().pc).ok()?;
+
+    // The resolver yields fully-qualified names ("crate::module::
+    // Type"); `find_type_die_ref_all` walks every unit and returns
+    // candidates by short name. We filter by full path so a `Point`
+    // in two crates doesn't grab the wrong one. Short name = last
+    // `::`-segment; full path comes from joining the DIE's namespace
+    // chain — we compare via `TypeIdentity::display`.
+    let short = concrete.rsplit("::").next().unwrap_or(concrete);
+    let candidates = dwarf.find_type_die_ref_all(short);
+    // `DebugInformation::find_unit` is keyed for "find the unit
+    // *containing* this PC" — it returns `None` when the offset
+    // matches a unit's start exactly, which is exactly what we get
+    // back from `find_type_die_ref_all`. Resolve via a linear scan
+    // over `unit_count` matching by `.offset()`.
+    let unit_count = dwarf.unit_count();
+    let mut matched: Option<crate::debugger::debugee::dwarf::r#type::ComplexType> = None;
+    for (debug_info_off, unit_off) in candidates {
+        let mut unit_idx = None;
+        for i in 0..unit_count {
+            if dwarf.unit_ensure(i).offset() == Some(debug_info_off) {
+                unit_idx = Some(i);
+                break;
+            }
+        }
+        let Some(unit_idx) = unit_idx else { continue };
+        let die_ref: FatDieRef<'_> = FatDieRef::new_no_hint(dwarf, unit_idx, unit_off);
+        let root_id = crate::debugger::debugee::dwarf::unit::DieAddr::Unit(unit_off);
+        let candidate = TypeParser::new().parse(die_ref, root_id);
+        let full = candidate.identity(root_id).to_string();
+        if full == concrete {
+            matched = Some(candidate);
+            break;
+        }
+    }
+    let concrete_type = matched?;
+
+    // Cross-check the vtable's size slot against the concrete's
+    // DWARF-emitted size. A mismatch means we resolved the wrong
+    // concrete — better to skip the inline value than mislead.
+    let concrete_root = concrete_type.root();
+    let dwarf_size = concrete_type
+        .type_size_in_bytes(pcx.evcx, concrete_root)
+        .unwrap_or(0);
+    if let Some(expected) = view.size
+        && dwarf_size != expected
+    {
+        log::debug!(
+            target: "dyn-resolver",
+            "concrete-value size mismatch for {concrete}: dwarf={dwarf_size} vtable={expected}; \
+             skipping inline value render"
+        );
+        return None;
+    }
+    if dwarf_size == 0 {
+        return None;
+    }
+
+    // Read the inferior memory at the data pointer and parse it as
+    // the concrete type. Fresh `ParseContext` because `pcx`'s
+    // `type_graph` is the outer dyn's graph; we need the concrete's.
+    let pid = pcx.evcx.ecx.pid_on_focus();
+    let raw_data =
+        crate::debugger::read_memory_by_pid(pid, data_addr as usize, dwarf_size as usize).ok()?;
+    let data = ObjectBinaryRepr {
+        raw_data: Bytes::from(raw_data),
+        address: Some(data_addr as usize),
+        size: dwarf_size as usize,
+    };
+    let concrete_pcx = ParseContext {
+        evcx: pcx.evcx,
+        type_graph: &concrete_type,
+        // Fresh visited-set: the concrete lives in a separate
+        // allocation tree from the outer dyn, so prior visits don't
+        // apply. Recursion depth carries over so a deeply-nested
+        // dyn-of-dyn still hits the cap.
+        visited_allocations: Default::default(),
+        recursion_depth: pcx.recursion_depth.clone(),
+    };
+    ValueParser::new().parse_inner(&concrete_pcx, Some(data), concrete_root)
 }
 
 /// Phase 3 Feature A — vtable → concrete-type **and** structured

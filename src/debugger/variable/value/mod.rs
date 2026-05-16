@@ -207,6 +207,12 @@ pub struct VtableView {
     /// Total slots inspected (for "+N more" elision when the slot
     /// count exceeds the renderer's display cap).
     pub probed_slots: usize,
+    /// Phase 3 Feature A batch A5 — the concrete pointee, parsed
+    /// through its DWARF type. `Some` only when we found the
+    /// concrete's DIE *and* successfully parsed the inferior memory
+    /// at `data_ptr`. The renderer surfaces this inline so a dyn
+    /// stops being opaque.
+    pub concrete_value: Option<Box<Value>>,
 }
 
 /// One vtable slot the resolver was able to identify by symbol.

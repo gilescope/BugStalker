@@ -499,6 +499,17 @@ fn render_trait_object_summary(s: &crate::debugger::variable::value::StructValue
 /// Long method lists (`dyn Iterator` etc.) are truncated to the
 /// first `MAX_RENDER_METHODS`; the truncation marker prints the
 /// remaining count so a curious user knows there's more to see.
+///
+/// When the resolver succeeded in re-parsing the data pointer
+/// through the concrete type (`view.concrete_value` is `Some`),
+/// the value renders inline on the `data:` line:
+///
+/// ```text
+///   data: 0x55555… → Point { x: 0.0, y: 0.0 }
+/// ```
+///
+/// — turning the dyn from "opaque pointer + methods" into a
+/// transparent view of what the pointee actually is.
 fn render_trait_object_multiline(
     trait_name: &str,
     data_ptr: *const (),
@@ -510,7 +521,20 @@ fn render_trait_object_multiline(
 
     let mut out = String::new();
     let _ = writeln!(out, "{trait_name} {{");
-    let _ = writeln!(out, "  data: {data_ptr:p},");
+    if let Some(concrete) = view.concrete_value.as_deref() {
+        // Compact one-line render of the concrete value so it sits
+        // next to `data:` without exploding the vtable view's line
+        // count. The full ui renderer (with viz hooks) lives up the
+        // module tree in `ui::generic::variable`; we can't reach it
+        // from here without a cycle. The mini-renderer below covers
+        // the cases we care about (scalars, simple structs, ptrs,
+        // tuple-shape structs, enums) and degrades to a bare type
+        // name for anything more exotic.
+        let rendered = render_concrete_compact(concrete, 0);
+        let _ = writeln!(out, "  data: {data_ptr:p} → {rendered},");
+    } else {
+        let _ = writeln!(out, "  data: {data_ptr:p},");
+    }
     let _ = writeln!(out, "  vtable: {vtable_ptr:p} {{");
     if let Some(drop) = &view.drop {
         let loc = drop
@@ -548,6 +572,97 @@ fn render_trait_object_multiline(
     let _ = writeln!(out, "  }},");
     out.push('}');
     out
+}
+
+/// Minimal compact recursive renderer for the dyn-resolver's
+/// `concrete_value`. Scoped to the cases that fall out of a
+/// dyn-pointee: scalars, simple structs, tuple-shaped structs,
+/// pointers, enum variants. Anything more exotic (HashMap, Vec
+/// elision markers, etc.) falls back to the bare type name —
+/// users still see `data: 0x… → ConcreteType` which is more useful
+/// than `data: 0x…`.
+///
+/// Not a re-implementation of `ui::generic::variable::render_value_inner`
+/// — that one lives up the module tree and we can't reach it from
+/// `debugger` without a layering cycle. Kept short on purpose; if
+/// users start wanting richer dyn-pointee renders, the right move
+/// is to lift the trait-object render into `ui` rather than grow
+/// this helper.
+fn render_concrete_compact(
+    value: &crate::debugger::variable::value::Value,
+    depth: usize,
+) -> String {
+    const MAX_DEPTH: usize = 4;
+    const MAX_MEMBERS_INLINE: usize = 6;
+    if depth > MAX_DEPTH {
+        return "…".to_string();
+    }
+    let type_name = value.r#type().name_fmt().to_string();
+    match value.value_layout() {
+        Some(ValueLayout::PreRendered(s)) => s.into_owned(),
+        Some(ValueLayout::Referential(addr)) => format!("{type_name} [{addr:p}]"),
+        Some(ValueLayout::Wrapped(inner)) => render_concrete_compact(inner, depth + 1),
+        Some(ValueLayout::Structure(members)) => {
+            // Tuple-shape detection: `__0`, `__1`, … . Render
+            // positionally `Type(a, b)` rather than struct-style.
+            let is_tuple = !members.is_empty()
+                && members
+                    .iter()
+                    .enumerate()
+                    .all(|(i, m)| m.field_name.as_deref() == Some(&format!("__{i}")));
+            let shown = members.len().min(MAX_MEMBERS_INLINE);
+            let elided = members.len().saturating_sub(shown);
+            let parts: Vec<String> = members[..shown]
+                .iter()
+                .map(|m| {
+                    let inner = render_concrete_compact(&m.value, depth + 1);
+                    if is_tuple {
+                        inner
+                    } else {
+                        match m.field_name.as_deref() {
+                            Some(name) => format!("{name}: {inner}"),
+                            None => inner,
+                        }
+                    }
+                })
+                .collect();
+            let mut body = parts.join(", ");
+            if elided > 0 {
+                body.push_str(&format!(", … ({elided} more)"));
+            }
+            if is_tuple {
+                if type_name.starts_with('(') {
+                    format!("({body})")
+                } else {
+                    format!("{type_name}({body})")
+                }
+            } else {
+                format!("{type_name} {{ {body} }}")
+            }
+        }
+        Some(ValueLayout::IndexedList(items)) => {
+            let shown = items.len().min(MAX_MEMBERS_INLINE);
+            let elided = items.len().saturating_sub(shown);
+            let parts: Vec<String> = items[..shown]
+                .iter()
+                .map(|it| render_concrete_compact(&it.value, depth + 1))
+                .collect();
+            let mut body = parts.join(", ");
+            if elided > 0 {
+                body.push_str(&format!(", … ({elided} more)"));
+            }
+            format!("{type_name} [{body}]")
+        }
+        _ => {
+            // RustEnum carries the active variant via `Wrapped`; the
+            // generic match arm above already handled that. Anything
+            // else (Map, NonIndexedList, Subroutine) falls through
+            // to a bare type name — the dyn user case rarely hits
+            // these as a concrete pointee.
+            let _ = value;
+            type_name
+        }
+    }
 }
 
 /// Phase 1 S5 — `SystemTime` rendered as ISO-8601 / RFC3339 UTC.
