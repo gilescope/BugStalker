@@ -649,169 +649,180 @@ impl DebugInformation {
         let mut result: Vec<PlaceDescriptor> = vec![];
         let mut inline_fallback: Vec<PlaceDescriptor> = vec![];
 
-        let mut next_statement_line: Option<u64> = None;
+        // Compute the needle line per (unit, file_lines) pair, not
+        // globally across all units. Globally would let a hit at line 3
+        // in `my_lib/src/lib.rs` (one unit) pull a hit at line 97 in
+        // `panic_unwind/src/lib.rs` (another unit's file table) into
+        // the result set, because both files match the "lib.rs"
+        // suffix query and the loop would then look for any line ≥ 3
+        // in panic_unwind's table. We cap the per-pair expansion at
+        // `line + 1` to mirror master's bounded `[line, line+1]`
+        // heuristic — enough to skip past a single doc-comment line,
+        // not so far it drifts into the next function or an unrelated
+        // stdlib file.
+        const LINE_EXPANSION_LIMIT: u64 = 1;
         for (unit_idx, file_lines) in &files {
             let unit = self.unit_ensure(*unit_idx);
+            let mut pair_needle: Option<u64> = None;
             for &line_idx in file_lines {
                 let line_row = unit.line(line_idx);
-                if line_row.is_stmt() && line_row.line >= line {
-                    next_statement_line = Some(match next_statement_line {
+                if line_row.is_stmt()
+                    && line_row.line >= line
+                    && line_row.line <= line + LINE_EXPANSION_LIMIT
+                {
+                    pair_needle = Some(match pair_needle {
                         Some(current) => current.min(line_row.line),
                         None => line_row.line,
                     });
                 }
             }
-        }
+            let Some(needle_line) = pair_needle else {
+                continue;
+            };
 
-        if let Some(needle_line) = next_statement_line {
-            for (unit_idx, file_lines) in &files {
-                let unit = self.unit_ensure(*unit_idx);
+            let mut suitable_places_in_unit = vec![];
 
-                let mut suitable_places_in_unit = vec![];
+            let mut i = 0;
+            while i < file_lines.len() {
+                let mut line_idx = file_lines[i];
+                let next_line_row = unit.line(line_idx);
 
-                let mut i = 0;
-                while i < file_lines.len() {
-                    let mut line_idx = file_lines[i];
-                    let next_line_row = unit.line(line_idx);
-
-                    if suitable_places_in_unit.is_empty() {
-                        // no places found at this point,
-                        // try to find the closest place to a target line
-                        if next_line_row.line != needle_line || !next_line_row.is_stmt() {
-                            i += 1;
-                            continue;
-                        }
-
-                        // now check that there is no prolog end in neighborhood line rows,
-                        // if there is one then take it.
-                        // This sets priority of line rows with PE over other
-                        // line rows at this line as a breakpoint candidate
-                        let mut ahead_idx = i + 1;
-                        loop {
-                            let Some(&ahead_line_idx) = file_lines.get(ahead_idx) else {
-                                break;
-                            };
-
-                            let line_row = unit.line(ahead_line_idx);
-                            if line_row.line != next_line_row.line || !line_row.is_stmt() {
-                                break;
-                            }
-
-                            if line_row.prolog_end() {
-                                line_idx = ahead_line_idx;
-                                i = ahead_idx;
-                                break;
-                            }
-                            ahead_idx += 1;
-                        }
-
-                        if let Some(place) = unit.find_place_by_idx(line_idx) {
-                            suitable_places_in_unit.push(place);
-                        }
-                    } else {
-                        // At least one line is found,
-                        // now try to find lines with the same col and row
-                        // as in found place in source code.
-                        // This covers a case when compiler
-                        // generates multiple representations of a single line, for example, when
-                        // source code line in a part of a template function.
-                        let line = suitable_places_in_unit[0].line_number;
-                        let col = suitable_places_in_unit[0].column_number;
-                        let pe = suitable_places_in_unit[0].prolog_end;
-                        let eb = suitable_places_in_unit[0].epilog_begin;
-                        let es = suitable_places_in_unit[0].end_sequence;
-
-                        if next_line_row.line != line
-                            || next_line_row.column != col
-                            || next_line_row.prolog_end() != pe
-                            || next_line_row.epilog_begin() != eb
-                            || next_line_row.end_sequence() != es
-                            || !next_line_row.is_stmt()
-                        {
-                            i += 1;
-                            continue;
-                        }
-
-                        if let Some(place) = unit.find_place_by_idx(line_idx) {
-                            suitable_places_in_unit.push(place);
-                        }
+                if suitable_places_in_unit.is_empty() {
+                    // no places found at this point,
+                    // try to find the closest place to a target line
+                    if next_line_row.line != needle_line || !next_line_row.is_stmt() {
+                        i += 1;
+                        continue;
                     }
 
-                    i += 1;
+                    // now check that there is no prolog end in neighborhood line rows,
+                    // if there is one then take it.
+                    // This sets priority of line rows with PE over other
+                    // line rows at this line as a breakpoint candidate
+                    let mut ahead_idx = i + 1;
+                    loop {
+                        let Some(&ahead_line_idx) = file_lines.get(ahead_idx) else {
+                            break;
+                        };
+
+                        let line_row = unit.line(ahead_line_idx);
+                        if line_row.line != next_line_row.line || !line_row.is_stmt() {
+                            break;
+                        }
+
+                        if line_row.prolog_end() {
+                            line_idx = ahead_line_idx;
+                            i = ahead_idx;
+                            break;
+                        }
+                        ahead_idx += 1;
+                    }
+
+                    if let Some(place) = unit.find_place_by_idx(line_idx) {
+                        suitable_places_in_unit.push(place);
+                    }
+                } else {
+                    // At least one line is found,
+                    // now try to find lines with the same col and row
+                    // as in found place in source code.
+                    // This covers a case when compiler
+                    // generates multiple representations of a single line, for example, when
+                    // source code line in a part of a template function.
+                    let line = suitable_places_in_unit[0].line_number;
+                    let col = suitable_places_in_unit[0].column_number;
+                    let pe = suitable_places_in_unit[0].prolog_end;
+                    let eb = suitable_places_in_unit[0].epilog_begin;
+                    let es = suitable_places_in_unit[0].end_sequence;
+
+                    if next_line_row.line != line
+                        || next_line_row.column != col
+                        || next_line_row.prolog_end() != pe
+                        || next_line_row.epilog_begin() != eb
+                        || next_line_row.end_sequence() != es
+                        || !next_line_row.is_stmt()
+                    {
+                        i += 1;
+                        continue;
+                    }
+
+                    if let Some(place) = unit.find_place_by_idx(line_idx) {
+                        suitable_places_in_unit.push(place);
+                    }
                 }
 
-                for suitable_place in suitable_places_in_unit {
-                    // only one place for a single unique subprogram is allowed
-                    // to apply this rule as a filter for all places
-                    if let Some((func, info)) = self.find_function_by_pc(suitable_place.address)? {
-                        let key = Key {
-                            name: info.name.clone(),
-                            range: func.ranges(),
-                        };
-                        if unique_subprograms.contains(&key) {
-                            if record_diagnostics {
-                                diagnostics.candidates.push(LineCandidate {
-                                    address: suitable_place.address,
-                                    function: info.full_name(),
-                                    decl_file: subprogram_decl_file(func, info),
-                                    status: CandidateStatus::DuplicateSubprogram,
-                                });
-                            }
-                            continue;
-                        }
-                        unique_subprograms.insert(key);
+                i += 1;
+            }
 
-                        let decl_file = subprogram_decl_file(func, info);
-                        let decl_file_match = subprogram_decl_file_matches(func, info, file_tpl);
-                        // Stronger physical-function check: the line
-                        // entry's PC must be in the SAME
-                        // compact-unwind function as the DWARF
-                        // subprogram's *real* entry (per nm). This
-                        // catches the case where DWARF claims a wide
-                        // subprogram range that overlaps with foreign
-                        // physical functions (LTO / cold-block split
-                        // / generic instantiation interleave); the
-                        // candidate PC is in main per DWARF but
-                        // physically in HashMap::insert, where main's
-                        // locals' DWARF expressions don't apply.
-                        let physical_match =
-                            self.candidate_in_subprogram_range(suitable_place.address, info);
-                        let canonical = decl_file_match && physical_match.unwrap_or(true);
+            for suitable_place in suitable_places_in_unit {
+                // only one place for a single unique subprogram is allowed
+                // to apply this rule as a filter for all places
+                if let Some((func, info)) = self.find_function_by_pc(suitable_place.address)? {
+                    let key = Key {
+                        name: info.name.clone(),
+                        range: func.ranges(),
+                    };
+                    if unique_subprograms.contains(&key) {
                         if record_diagnostics {
                             diagnostics.candidates.push(LineCandidate {
                                 address: suitable_place.address,
                                 function: info.full_name(),
-                                decl_file,
-                                status: if canonical {
-                                    CandidateStatus::Selected
-                                } else {
-                                    CandidateStatus::InlineCopy
-                                },
+                                decl_file: subprogram_decl_file(func, info),
+                                status: CandidateStatus::DuplicateSubprogram,
                             });
                         }
-                        if canonical {
-                            result.push(suitable_place);
-                        } else {
-                            inline_fallback.push(suitable_place);
-                        }
-                    } else {
-                        // No enclosing subprogram — keep it as a canonical
-                        // match. Synthetic / orphaned addresses are rare
-                        // enough that we don't bucket them as inline-only.
-                        if record_diagnostics {
-                            diagnostics.candidates.push(LineCandidate {
-                                address: suitable_place.address,
-                                function: None,
-                                decl_file: None,
-                                status: CandidateStatus::Selected,
-                            });
-                        }
-                        result.push(suitable_place);
+                        continue;
                     }
+                    unique_subprograms.insert(key);
+
+                    let decl_file = subprogram_decl_file(func, info);
+                    let decl_file_match = subprogram_decl_file_matches(func, info, file_tpl);
+                    // Stronger physical-function check: the line
+                    // entry's PC must be in the SAME
+                    // compact-unwind function as the DWARF
+                    // subprogram's *real* entry (per nm). This
+                    // catches the case where DWARF claims a wide
+                    // subprogram range that overlaps with foreign
+                    // physical functions (LTO / cold-block split
+                    // / generic instantiation interleave); the
+                    // candidate PC is in main per DWARF but
+                    // physically in HashMap::insert, where main's
+                    // locals' DWARF expressions don't apply.
+                    let physical_match =
+                        self.candidate_in_subprogram_range(suitable_place.address, info);
+                    let canonical = decl_file_match && physical_match.unwrap_or(true);
+                    if record_diagnostics {
+                        diagnostics.candidates.push(LineCandidate {
+                            address: suitable_place.address,
+                            function: info.full_name(),
+                            decl_file,
+                            status: if canonical {
+                                CandidateStatus::Selected
+                            } else {
+                                CandidateStatus::InlineCopy
+                            },
+                        });
+                    }
+                    if canonical {
+                        result.push(suitable_place);
+                    } else {
+                        inline_fallback.push(suitable_place);
+                    }
+                } else {
+                    // No enclosing subprogram — keep it as a canonical
+                    // match. Synthetic / orphaned addresses are rare
+                    // enough that we don't bucket them as inline-only.
+                    if record_diagnostics {
+                        diagnostics.candidates.push(LineCandidate {
+                            address: suitable_place.address,
+                            function: None,
+                            decl_file: None,
+                            status: CandidateStatus::Selected,
+                        });
+                    }
+                    result.push(suitable_place);
                 }
             }
         }
-
         // When canonical entries exist, return only those — they are
         // the addresses where the source line was actually compiled.
         // Otherwise fall back to the inline copies so the user still
