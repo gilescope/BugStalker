@@ -3,6 +3,15 @@ on: [push, pull_request]
 
 name: CI
 
+# Cancel any in-flight CI run on the same PR / branch when a new
+# commit arrives. The group key is the PR number when the trigger
+# is a `pull_request`; otherwise it's the ref name (so pushes to
+# `master` only cancel earlier pushes to `master`, not parallel
+# PR runs whose `head_ref` happens to share a name).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   MSRV: 1.89.0
   LRV: 1.95.0
