@@ -69,4 +69,7 @@ dispatch_table![
     commands::assert::AssertFrame,
     commands::assert::AssertOk,
     commands::assert::AssertFail,
+    // AOT edit-and-continue: apply a wild --emit-patch output to the
+    // running debuggee.
+    commands::apply_patch::PatchApply,
 ];
