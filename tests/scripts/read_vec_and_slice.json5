@@ -9,7 +9,7 @@ expect: {
     {
       name: "vec1",
       type: "Vec<i32, alloc::alloc::Global>",
-      value_text: "Vec<i32, alloc::alloc::Global> [1, 2, 3]"
+      value_text: "Vec<i32, _> [1, 2, 3]"
     }
   ],
   total: 1,
@@ -22,7 +22,7 @@ expect: {
     {
       name: "vec2",
       type: "Vec<vars::vec_and_slice_types::Foo, alloc::alloc::Global>",
-      value_text: "Vec<vars::vec_and_slice_types::Foo, alloc::alloc::Global> [{\n        foo: i32(1)\n    }, {\n        foo: i32(2)\n    }]"
+      value_text: "Vec<Foo, _> [{\n        foo: i32(1)\n    }, {\n        foo: i32(2)\n    }]"
     }
   ],
   total: 1,
@@ -35,7 +35,7 @@ expect: {
     {
       name: "vec3",
       type: "Vec<alloc::vec::Vec<i32, alloc::alloc::Global>, alloc::alloc::Global>",
-      value_text: "Vec<alloc::vec::Vec<i32, alloc::alloc::Global>, alloc::alloc::Global> [[1, 2, 3], [1, 2, 3]]"
+      value_text: "Vec<Vec<i32, _>, _> [[1, 2, 3], [1, 2, 3]]"
     }
   ],
   total: 1,

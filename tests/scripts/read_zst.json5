@@ -35,7 +35,7 @@ expect: {
     {
       name: "vec_zst",
       type: "Vec<(), alloc::alloc::Global>",
-      value_text: "Vec<(), alloc::alloc::Global> [(), (), ()]"
+      value_text: "Vec<(), _> [(), (), ()]"
     }
   ],
   total: 1,
@@ -87,7 +87,7 @@ expect: {
     {
       name: "vecdeque_zst",
       type: "VecDeque<(), alloc::alloc::Global>",
-      value_text: "VecDeque<(), alloc::alloc::Global> [(), (), (), (), ()]"
+      value_text: "VecDeque<(), _> [(), (), (), (), ()]"
     }
   ],
   total: 1,
@@ -100,7 +100,7 @@ expect: {
     {
       name: "hash_map_zst_key",
       type: "HashMap<(), i32, std::hash::random::RandomState>",
-      value_text: "HashMap<(), i32, std::hash::random::RandomState> {\n    (): i32(1)\n}"
+      value_text: "HashMap<(), i32, _> {\n    (): i32(1)\n}"
     }
   ],
   total: 1,
@@ -113,7 +113,7 @@ expect: {
     {
       name: "hash_map_zst_val",
       type: "HashMap<i32, (), std::hash::random::RandomState>",
-      value_text: "HashMap<i32, (), std::hash::random::RandomState> {\n    i32(1): ()\n}"
+      value_text: "HashMap<i32, (), _> {\n    i32(1): ()\n}"
     }
   ],
   total: 1,
@@ -126,7 +126,7 @@ expect: {
     {
       name: "hash_map_zst",
       type: "HashMap<(), (), std::hash::random::RandomState>",
-      value_text: "HashMap<(), (), std::hash::random::RandomState> {\n    (): ()\n}"
+      value_text: "HashMap<(), (), _> {\n    (): ()\n}"
     }
   ],
   total: 1,
@@ -139,7 +139,7 @@ expect: {
     {
       name: "hash_set_zst",
       type: "HashSet<(), std::hash::random::RandomState>",
-      value_text: "HashSet<(), std::hash::random::RandomState> [()]"
+      value_text: "HashSet<(), _> [()]"
     }
   ],
   total: 1,
@@ -152,7 +152,7 @@ expect: {
     {
       name: "btree_map_zst_key",
       type: "BTreeMap<(), i32, alloc::alloc::Global>",
-      value_text: "BTreeMap<(), i32, alloc::alloc::Global> {\n    (): i32(1)\n}"
+      value_text: "BTreeMap<(), i32, _> {\n    (): i32(1)\n}"
     }
   ],
   total: 1,
@@ -165,7 +165,7 @@ expect: {
     {
       name: "btree_map_zst_val",
       type: "BTreeMap<i32, (), alloc::alloc::Global>",
-      value_text: "BTreeMap<i32, (), alloc::alloc::Global> {\n    i32(1): ()\n    2: ()\n}"
+      value_text: "BTreeMap<i32, (), _> {\n    i32(1): ()\n    2: ()\n}"
     }
   ],
   total: 1,
@@ -178,7 +178,7 @@ expect: {
     {
       name: "btree_map_zst",
       type: "BTreeMap<(), (), alloc::alloc::Global>",
-      value_text: "BTreeMap<(), (), alloc::alloc::Global> {\n    (): ()\n}"
+      value_text: "BTreeMap<(), (), _> {\n    (): ()\n}"
     }
   ],
   total: 1,
@@ -191,7 +191,7 @@ expect: {
     {
       name: "btree_set_zst",
       type: "BTreeSet<(), alloc::alloc::Global>",
-      value_text: "BTreeSet<(), alloc::alloc::Global> [()]"
+      value_text: "BTreeSet<(), _> [()]"
     }
   ],
   total: 1,

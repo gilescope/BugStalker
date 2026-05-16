@@ -96,7 +96,7 @@ expect: {
     {
       name: "box_d",
       type: "alloc::boxed::Box<i32, alloc::alloc::Global>",
-      value_text: "alloc::boxed::Box<i32, alloc::alloc::Global>::i32(2)"
+      value_text: "Box<i32, _>::i32(2)"
     }
   ],
   total: 1,
@@ -124,9 +124,7 @@ expect: {
     {
       name: "ref_f",
       type: "&vars::references::Foo",
-      value_text: {
-        $regex: "^\\&vars::references::Foo \\[0x[0-9a-fA-F]+\\]$"
-      }
+      value_text: { $regex: "^\\&Foo \\[0x[0-9a-fA-F]+\\]$" }
     }
   ],
   total: 1,

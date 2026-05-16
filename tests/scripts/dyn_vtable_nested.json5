@@ -13,7 +13,7 @@ expect: {
     {
       name: "dyn_vec",
       type: "Vec<alloc::boxed::Box<dyn showcase::main::Greeter, alloc::alloc::Global>, alloc::alloc::Global>",
-      value_text: "Vec<alloc::boxed::Box<dyn showcase::main::Greeter, alloc::alloc::Global>, alloc::alloc::Global> [Box<dyn Greeter, _> [→ Point] (Point { x: 10, y: 20 }) {1 method}, Box<dyn Greeter, _> [→ Point] (Point { x: 30, y: 40 }) {1 method}]"
+      value_text: "Vec<Box<dyn Greeter, _>, _> [Box<dyn Greeter, _> [→ Point] (Point { x: 10, y: 20 }) {1 method}, Box<dyn Greeter, _> [→ Point] (Point { x: 30, y: 40 }) {1 method}]"
     }
   ],
   total: 1,

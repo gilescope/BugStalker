@@ -11,6 +11,19 @@ use syntect::util::as_24_bit_terminal_escaped;
 
 const TAB: &str = "    ";
 
+/// Strip module-path noise from a value's type ident for *display*.
+/// `alloc::boxed::Box<core::option::Option<u8>>` becomes
+/// `Box<Option<u8>>`. Compiler-inserted defaults like the `Global`
+/// allocator collapse to `_` — visible but not noise.
+///
+/// Use this everywhere the rendered output will be shown to the
+/// user. Do NOT use it for viz-registry lookups: the registry is
+/// keyed by the fully-qualified path, and short-name lookup would
+/// alias `Foo` in two different crates.
+fn display_type_name(value: &Value) -> String {
+    crate::debugger::variable::render::strip_type_namespace(&value.r#type().name_fmt())
+}
+
 pub fn render_variable(var: &QueryResult, prerender: Option<&str>) -> anyhow::Result<String> {
     render_variable_with_viz(var, prerender, None)
 }
@@ -104,6 +117,8 @@ fn render_value_inner(
             // Use the OUTER Pin<...>'s type ident so the render
             // surfaces the pin annotation. Inner Box's type is what
             // s.type_ident.name() would yield by default.
+            // (render_trait_object_at_depth_with strips paths
+            // internally; we pass the raw name through here.)
             Some(value.r#type().name_fmt().to_string())
         } else {
             None
@@ -117,8 +132,8 @@ fn render_value_inner(
     match value.value_layout() {
         Some(layout) => match layout {
             ValueLayout::PreRendered(rendered_value) => {
-                let type_name = value.r#type().name_fmt();
-                let type_str = type_name.to_string();
+                let type_str = display_type_name(value);
+                let type_name: &str = &type_str;
                 match value {
                     Value::CEnum(_) => format!("{type_name}::{rendered_value}"),
                     // The unit type renders its own value as "()", so the
@@ -152,7 +167,7 @@ fn render_value_inner(
                 if print_type {
                     format!(
                         "{} [{}]",
-                        value.r#type().name_fmt(),
+                        display_type_name(value),
                         RelocatedAddress::from(addr as usize)
                     )
                 } else {
@@ -173,50 +188,58 @@ fn render_value_inner(
                 // chose (`ok`, `warn`, `err`, ...); presentation
                 // is the IDE's call. Wrapping it in `[...]` is
                 // BugStalker's lowest-common-denominator default.
-                if let Value::RustEnum(re) = value
-                    && let Some(spec) = viz.and_then(|r| {
+                if let Value::RustEnum(re) = value {
+                    if let Some(spec) = viz.and_then(|r| {
                         let outer = value.r#type().name_fmt();
-                        r.find(outer)
-                    })
-                {
-                    let active_variant_name =
-                        re.value.as_ref().and_then(|m| m.field_name.as_deref());
-                    let variant_spec = active_variant_name
-                        .and_then(|n| spec.variants.iter().find(|v| v.name == n));
-                    let tmpl = variant_spec
-                        .and_then(|v| v.summary.as_deref())
-                        .or(spec.summary.as_deref());
-                    if let (Some(tmpl), Value::Struct(variant)) = (tmpl, val) {
-                        // Variant-scoped fields override
-                        // type-level ones for placeholder
-                        // resolution. We synthesise a temp
-                        // spec view via `substitute_with_fields`
-                        // so renames / formats from the
-                        // variant entry apply.
-                        let outer_type = value.r#type().name_fmt();
-                        let summary = match variant_spec {
-                            Some(v) => {
-                                substitute_template_with_fields(tmpl, &variant.members, &v.fields)
-                            }
-                            None => substitute_template(tmpl, &variant.members, spec),
-                        };
-                        let tag_prefix = variant_spec
-                            .and_then(|v| v.tag.as_deref())
-                            .map(|t| format!(" [{t}]"))
-                            .unwrap_or_default();
-                        return format!("{outer_type}{tag_prefix} {summary}");
+                        r.find(&outer)
+                    }) {
+                        let active_variant_name =
+                            re.value.as_ref().and_then(|m| m.field_name.as_deref());
+                        let variant_spec = active_variant_name
+                            .and_then(|n| spec.variants.iter().find(|v| v.name == n));
+                        let tmpl = variant_spec
+                            .and_then(|v| v.summary.as_deref())
+                            .or(spec.summary.as_deref());
+                        if let (Some(tmpl), Value::Struct(variant)) = (tmpl, val) {
+                            // Variant-scoped fields override
+                            // type-level ones for placeholder
+                            // resolution. We synthesise a temp
+                            // spec view via `substitute_with_fields`
+                            // so renames / formats from the
+                            // variant entry apply.
+                            let outer_type = display_type_name(value);
+                            let summary = match variant_spec {
+                                Some(v) => substitute_template_with_fields(
+                                    tmpl,
+                                    &variant.members,
+                                    &v.fields,
+                                ),
+                                None => substitute_template(tmpl, &variant.members, spec),
+                            };
+                            let tag_prefix = variant_spec
+                                .and_then(|v| v.tag.as_deref())
+                                .map(|t| format!(" [{t}]"))
+                                .unwrap_or_default();
+                            return format!("{outer_type}{tag_prefix} {summary}");
+                        }
                     }
                 }
                 format!(
                     "{}::{}",
-                    value.r#type().name_fmt(),
+                    display_type_name(value),
                     render_value_inner(val, depth, true, viz)
                 )
             }
             #[allow(clippy::useless_format)]
             ValueLayout::Structure(members) => {
-                let type_name = value.r#type().name_fmt();
-                let spec = viz.and_then(|r| r.find(type_name));
+                // Viz registry is keyed by fully-qualified path —
+                // look up against the raw name. For display we use
+                // the short form so `Box<Option<u8>>` reads better
+                // than `alloc::boxed::Box<core::option::Option<u8>>`.
+                let raw_type_name = value.r#type().name_fmt();
+                let spec = viz.and_then(|r| r.find(&raw_type_name));
+                let type_name = display_type_name(value);
+                let type_name: &str = &type_name;
 
                 // Detect tuple shape: all member field names are
                 // `__0`, `__1`, … in order. Rust uses this naming
@@ -314,7 +337,7 @@ fn render_value_inner(
                 format!("{render}\n{}}}", TAB.repeat(depth))
             }
             ValueLayout::Map(kv_children) => {
-                let mut render = format!("{} {{", value.r#type().name_fmt());
+                let mut render = format!("{} {{", display_type_name(value));
 
                 let tabs = TAB.repeat(depth + 1);
 
@@ -338,21 +361,21 @@ fn render_value_inner(
                 format!("{render}\n{}}}", TAB.repeat(depth))
             }
             ValueLayout::IndexedList(items) => render_linear_list(
-                value.r#type().name_fmt().to_string(),
+                display_type_name(value),
                 items.iter().map(|i| &i.value),
                 depth,
                 print_type,
                 viz,
             ),
             ValueLayout::NonIndexedList(values) => render_linear_list(
-                value.r#type().name_fmt().to_string(),
+                display_type_name(value),
                 values.iter(),
                 depth,
                 print_type,
                 viz,
             ),
         },
-        None => format!("{}(unknown)", value.r#type().name_fmt()),
+        None => format!("{}(unknown)", display_type_name(value)),
     }
 }
 
