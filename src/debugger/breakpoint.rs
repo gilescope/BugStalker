@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 use crate::debugger::Debugger;
 use crate::debugger::address::{Address, RelocatedAddress};
+use log::debug;
 use crate::debugger::debugee::Debugee;
 use crate::debugger::debugee::dwarf::DebugInformation;
 use crate::debugger::debugee::dwarf::unit::PlaceDescriptorOwned;
@@ -488,6 +489,97 @@ impl Debugger {
         self.breakpoints
             .deferred_breakpoints
             .push(DeferredBreakpoint::at_line(file, line));
+    }
+
+    /// Install auto-trap breakpoints — one at the panic-runtime entry,
+    /// one at libc's exit handler — so the user gets a final chance to
+    /// inspect locals / take a backtrace before the world goes away.
+    ///
+    /// Both traps are best-effort: a symbol the linker stripped or a
+    /// runtime that doesn't use the canonical names (no_std, custom
+    /// libc, …) is skipped silently. They install as ordinary
+    /// breakpoints so the user can `break.remove` them by number if
+    /// they're in the way.
+    ///
+    /// Returns `(panic_traps_set, exit_traps_set)`.
+    pub fn install_auto_traps(&mut self) -> (usize, usize) {
+        // Candidate symbols — broad on purpose; the same Rust binary
+        // may carry any subset depending on toolchain version, panic
+        // strategy, and whether the unwind runtime is statically
+        // linked. We try them all, deduplicating in practice because
+        // `set_breakpoint_at_fn` only fires once per resolved place.
+        const PANIC_FNS: &[&str] = &[
+            // Rust 1.83+ panic handler (the runtime hook entry).
+            "std::panicking::rust_panic_with_hook",
+            // Older Rust handler.
+            "std::panicking::begin_panic_handler",
+            // Formatted-arg panic entry from core::panicking.
+            "core::panicking::panic_fmt",
+            // The catch-all `_Unwind_RaiseException` rust-shim.
+            "rust_panic",
+        ];
+        const EXIT_FNS: &[&str] = &[
+            // Rust-side explicit exit.
+            "std::process::exit",
+            // libc's exit (runs atexit handlers, then _exit).
+            "exit",
+            // glibc-internal exit entry, sometimes the only one visible.
+            "__GI_exit",
+        ];
+
+        let mut panic_traps = 0usize;
+        for name in PANIC_FNS {
+            if self.set_breakpoint_at_fn(name).is_ok() {
+                panic_traps += 1;
+                debug!(target: "auto-trap", "installed panic trap at `{name}`");
+            }
+        }
+        let mut exit_traps = 0usize;
+        for name in EXIT_FNS {
+            if self.set_breakpoint_at_fn(name).is_ok() {
+                exit_traps += 1;
+                debug!(target: "auto-trap", "installed exit trap at `{name}`");
+            }
+        }
+
+        // Libc's `exit` lives in `libc.so.6` and is reachable via the
+        // dynamic-linker symbol table, but it usually carries no DWARF
+        // — `set_breakpoint_at_fn` won't find it. Walk every loaded
+        // module's symbol table directly. We set the breakpoint at
+        // the raw address (no `place` info) — when the trap fires the
+        // bt walks up into the caller's DWARF as usual, so the user
+        // still sees a useful stack.
+        const LIBC_EXIT_FNS: &[&str] = &["exit", "_exit", "__GI_exit", "__libc_exit"];
+        let modules: Vec<_> = self
+            .debugee
+            .debug_info_all()
+            .into_iter()
+            .map(|d| (d.pathname().to_path_buf(), d as *const _ as usize))
+            .collect();
+        let _ = modules; // we only re-fetch fresh refs in the loop body
+        // Iterate by name to avoid hanging onto borrows of `self.debugee`
+        // across `self.breakpoints.add_and_enable`.
+        let info_count = self.debugee.debug_info_all().len();
+        for idx in 0..info_count {
+            for name in LIBC_EXIT_FNS {
+                let (runtime, pathname) = {
+                    let infos = self.debugee.debug_info_all();
+                    let Some(info) = infos.get(idx) else { continue };
+                    let Some(global) = info.symbol_address(name) else { continue };
+                    let Ok(runtime) = global.relocate_to_segment(&self.debugee, info) else {
+                        continue;
+                    };
+                    (runtime, info.pathname().to_path_buf())
+                };
+                let bp = Breakpoint::new(pathname, runtime, self.process.pid(), None);
+                if self.breakpoints.add_and_enable(bp).is_ok() {
+                    exit_traps += 1;
+                    debug!(target: "auto-trap", "installed libc exit trap at `{name}` @ {runtime}");
+                    break; // first match in this module wins
+                }
+            }
+        }
+        (panic_traps, exit_traps)
     }
 
     /// Refresh deferred breakpoints. Trying to set breakpoint if success - remove

@@ -748,6 +748,17 @@ impl Debugger {
                                     }
                                 }
 
+                                // Auto-traps: stop the debuggee one last
+                                // time before a panic unwinds away the
+                                // stack, and again just before the
+                                // process exits — that's the user's
+                                // chance to inspect locals + backtrace
+                                // before the world goes away. Symbols
+                                // that aren't present in this binary
+                                // (e.g. `_exit` in a no_std build) get
+                                // skipped silently.
+                                self.install_auto_traps();
+
                                 // ignore possible signals and watchpoints
                                 while self.step_over_breakpoint()?.is_some() {}
                                 continue;
