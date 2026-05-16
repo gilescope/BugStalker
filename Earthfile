@@ -9,9 +9,14 @@ common:
     FROM --platform=$BS_PLATFORM rust:1.89-bookworm
     ENV CARGO_TERM_COLOR=always
     ENV DEBIAN_FRONTEND=noninteractive
+    # `clang` is required by the `dap_integration::test_bs_viz_spec_breakpoint_*`
+    # tests, which compile a sub-crate with `-C linker=clang` to exercise
+    # the edit-and-continue rustflags path; without it the test panics
+    # with "failed to build … bs-viz-spec test binary".
     RUN apt-get update && \
         apt-get install -y --no-install-recommends \
             build-essential \
+            clang \
             pkg-config \
             libc6-dbg \
             python3 \
