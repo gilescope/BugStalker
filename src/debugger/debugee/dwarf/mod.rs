@@ -861,7 +861,44 @@ impl DebugInformation {
                     }
                 }
             }
+            // Same exact-match preference rule as for canonical hits
+            // (see below): if any inline-fallback candidate is an exact
+            // match for the user's requested line, drop the slides so a
+            // stray expansion in an unrelated unit doesn't trigger a
+            // spurious bp at, say, the function epilogue.
+            if inline_fallback.iter().any(|p| p.line_number == line) {
+                inline_fallback.retain(|p| p.line_number == line);
+            }
             return Ok((inline_fallback, diagnostics));
+        }
+
+        // Expansion-match suppression. The per-unit needle (line 670)
+        // lets a unit whose file table doesn't carry the user's
+        // requested line still contribute a place from a later line
+        // (up to +16). That's what lets `break.set main.rs:N` slide
+        // forward through a doc-comment block. But it also means that
+        // when one CU has line N exactly (e.g. the async-fn poll body
+        // of `new_ticker_task`) and *another* CU only carries a later
+        // line (the sync future-constructor stub, whose only line
+        // entry in its file table is the function's closing brace),
+        // we'd install bps at both — the spurious one being on the
+        // synchronous shim main runs before the runtime ever polls.
+        // When an exact match exists, the slide candidates are
+        // necessarily wrong, so drop them.
+        if result.iter().any(|p| p.line_number == line) {
+            let kept_addrs: HashSet<GlobalAddress> = result
+                .iter()
+                .filter(|p| p.line_number == line)
+                .map(|p| p.address)
+                .collect();
+            result.retain(|p| p.line_number == line);
+            if record_diagnostics {
+                for c in diagnostics.candidates.iter_mut() {
+                    if c.status == CandidateStatus::Selected && !kept_addrs.contains(&c.address) {
+                        c.status = CandidateStatus::DuplicateSubprogram;
+                    }
+                }
+            }
         }
 
         Ok((result, diagnostics))
