@@ -20,6 +20,7 @@
 //! shape blob).
 
 use std::io;
+#[cfg(target_arch = "x86_64")]
 use std::mem;
 
 use nix::unistd::Pid;
