@@ -564,6 +564,50 @@ impl Debugger {
         &self.viz
     }
 
+    /// Disable every currently-enabled breakpoint and return the
+    /// list of their runtime addresses so the caller can restore
+    /// them later via [`enable_breakpoints_at`]. Used by the
+    /// edit-and-continue flow: while wild's patch overwrites text
+    /// bytes, any `INT3` (0xCC) bytes the debugger has injected
+    /// would cause the patch's pre-image drift check to fail —
+    /// we drop them, apply the patch against the clean original
+    /// bytes, then re-arm.
+    ///
+    /// Idempotent — calling twice with no intervening
+    /// [`enable_breakpoints_at`] returns an empty list the second
+    /// time.
+    pub fn disable_all_breakpoints(&self) -> Vec<RelocatedAddress> {
+        let mut addrs = Vec::new();
+        for bp in self.breakpoints.active_breakpoints() {
+            if bp.is_enabled() {
+                addrs.push(bp.addr);
+                let _ = bp.disable();
+            }
+        }
+        addrs
+    }
+
+    /// Re-enable breakpoints at each of the given runtime
+    /// addresses. Addresses not present in the registry are
+    /// silently skipped (a breakpoint may have been removed
+    /// between the disable + re-enable). Errors on a single bp's
+    /// `enable()` are logged but don't abort the whole batch —
+    /// best-effort restore so a partial failure doesn't leave
+    /// the user with no breakpoints at all.
+    pub fn enable_breakpoints_at(&self, addrs: &[RelocatedAddress]) {
+        for bp in self.breakpoints.active_breakpoints() {
+            if addrs.contains(&bp.addr) && !bp.is_enabled() {
+                if let Err(e) = bp.enable() {
+                    log::warn!(
+                        target: "breakpoint",
+                        "failed to re-enable breakpoint at {}: {e}",
+                        bp.addr,
+                    );
+                }
+            }
+        }
+    }
+
     /// Return installed oracle, or `None` if oracle not found or not installed.
     ///
     /// # Arguments
@@ -1562,7 +1606,16 @@ impl Debugger {
         // and adjust rsp by -8 for the implicit CALL push. Not
         // implemented here — falls through to set_pc only, same as
         // the partial behaviour we shipped previously. Tracked
-        // separately.
+        // separately. A spike at writing the unwound CFA/RA pair
+        // produced wrong SP values (the unwinder's frame-1 CFA
+        // semantics don't map straight onto "function-entry SP"
+        // on System-V); needs more careful unwinder inspection
+        // before the stack repair can land. For the EnC flow, the
+        // user's pre-patch breakpoint typically fires before the
+        // patched function reaches its RET, so set_pc alone is
+        // usually enough — the RET-misadventure only matters if
+        // the auto-resume runs past every breakpoint and the
+        // function tries to return.
 
         map.set_pc(fn_start);
         map.persist(pid)?;
