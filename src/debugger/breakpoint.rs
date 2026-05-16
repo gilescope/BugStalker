@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 use crate::debugger::Debugger;
 use crate::debugger::address::{Address, RelocatedAddress};
-use log::debug;
 use crate::debugger::debugee::Debugee;
 use crate::debugger::debugee::dwarf::DebugInformation;
 use crate::debugger::debugee::dwarf::unit::PlaceDescriptorOwned;
 use crate::debugger::error::Error;
 use crate::debugger::error::Error::{NoDebugInformation, NoSuitablePlace, PlaceNotFound};
+use log::debug;
 #[cfg(target_os = "linux")]
 use nix::libc::c_void;
 #[cfg(target_os = "linux")]
@@ -565,7 +565,9 @@ impl Debugger {
                 let (runtime, pathname) = {
                     let infos = self.debugee.debug_info_all();
                     let Some(info) = infos.get(idx) else { continue };
-                    let Some(global) = info.symbol_address(name) else { continue };
+                    let Some(global) = info.symbol_address(name) else {
+                        continue;
+                    };
                     let Ok(runtime) = global.relocate_to_segment(&self.debugee, info) else {
                         continue;
                     };

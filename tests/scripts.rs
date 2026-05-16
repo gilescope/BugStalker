@@ -19,24 +19,69 @@ const VARS_DEBUGGEE: &str = "./examples/target/debug/vars";
 // (~20+), swap to a build.rs glob. For now the explicit list keeps the
 // `cargo test` filter syntax (`-- read_enum`) working without macros.
 
-#[test] fn read_struct()         { run("tests/scripts/read_struct.json5",         VARS_DEBUGGEE) }
-#[test] fn read_scalars()        { run("tests/scripts/read_scalars.json5",        VARS_DEBUGGEE) }
-#[test] fn read_array()          { run("tests/scripts/read_array.json5",          VARS_DEBUGGEE) }
-#[test] fn read_enum()           { run("tests/scripts/read_enum.json5",           VARS_DEBUGGEE) }
-#[test] fn read_pointers()       { run("tests/scripts/read_pointers.json5",       VARS_DEBUGGEE) }
-#[test] fn read_deref_pointers() { run("tests/scripts/read_deref_pointers.json5", VARS_DEBUGGEE) }
-#[test] fn read_type_alias()     { run("tests/scripts/read_type_alias.json5",     VARS_DEBUGGEE) }
-#[test] fn read_strings()        { run("tests/scripts/read_strings.json5",        VARS_DEBUGGEE) }
-#[test] fn read_arguments()      { run("tests/scripts/read_arguments.json5",      VARS_DEBUGGEE) }
-#[test] fn read_vec_and_slice()  { run("tests/scripts/read_vec_and_slice.json5",  VARS_DEBUGGEE) }
-#[test] fn read_zst()            { run("tests/scripts/read_zst.json5",            VARS_DEBUGGEE) }
-#[test] fn read_statics()        { run("tests/scripts/read_statics.json5",        VARS_DEBUGGEE) }
-#[test] fn read_time()           { run("tests/scripts/read_time.json5",           VARS_DEBUGGEE) }
-#[test] fn read_address_op()     { run("tests/scripts/read_address_op.json5",     VARS_DEBUGGEE) }
+#[test]
+fn read_struct() {
+    run("tests/scripts/read_struct.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_scalars() {
+    run("tests/scripts/read_scalars.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_array() {
+    run("tests/scripts/read_array.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_enum() {
+    run("tests/scripts/read_enum.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_pointers() {
+    run("tests/scripts/read_pointers.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_deref_pointers() {
+    run("tests/scripts/read_deref_pointers.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_type_alias() {
+    run("tests/scripts/read_type_alias.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_strings() {
+    run("tests/scripts/read_strings.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_arguments() {
+    run("tests/scripts/read_arguments.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_vec_and_slice() {
+    run("tests/scripts/read_vec_and_slice.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_zst() {
+    run("tests/scripts/read_zst.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_statics() {
+    run("tests/scripts/read_statics.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_time() {
+    run("tests/scripts/read_time.json5", VARS_DEBUGGEE)
+}
+#[test]
+fn read_address_op() {
+    run("tests/scripts/read_address_op.json5", VARS_DEBUGGEE)
+}
 
 fn run(script: &str, debuggee: &str) {
     require_path(BS_BINARY, "build bs first: `cargo build --bin bs`");
-    require_path(debuggee, "build the debuggee first; see tests/scripts/README.md");
+    require_path(
+        debuggee,
+        "build the debuggee first; see tests/scripts/README.md",
+    );
 
     let output = Command::new(BS_BINARY)
         .arg("--test")

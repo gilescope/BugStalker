@@ -1701,7 +1701,11 @@ mod dyn_resolver_tests {
         let resolved = resolve_trait_object_from_lookups(
             vt_runtime,
             &|r| slide_translator(r),
-            &|_, _| panic!("strategy 2 must not need to read memory when the vtable address has a symbol"),
+            &|_, _| {
+                panic!(
+                    "strategy 2 must not need to read memory when the vtable address has a symbol"
+                )
+            },
             &|a| recorder.lookup(a),
         );
         assert_eq!(resolved.as_deref(), Some("showcase::main::Point"));

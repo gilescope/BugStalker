@@ -94,8 +94,7 @@ pub struct AssertVar {
 
 impl StructuredCommand for AssertVar {
     const METHOD: &'static str = "assert.var";
-    const SUMMARY: &'static str =
-        "Read a variable and assert its response shape matches `expect`. \
+    const SUMMARY: &'static str = "Read a variable and assert its response shape matches `expect`. \
          Used by `bs --test` and `bs --record`.";
     type Response = AssertResult;
 
@@ -125,7 +124,8 @@ pub struct AssertArg {
 
 impl StructuredCommand for AssertArg {
     const METHOD: &'static str = "assert.arg";
-    const SUMMARY: &'static str = "Read an argument and assert its response shape matches `expect`.";
+    const SUMMARY: &'static str =
+        "Read an argument and assert its response shape matches `expect`.";
     type Response = AssertResult;
 
     fn execute(self, dbg: &mut Debugger, budget: &ResponseBudget) -> Result<AssertResult, BsError> {
@@ -176,10 +176,15 @@ pub struct AssertOk {
 
 impl StructuredCommand for AssertOk {
     const METHOD: &'static str = "assert.ok";
-    const SUMMARY: &'static str = "Always-passing assertion. Use to mark a reached-this-point checkpoint.";
+    const SUMMARY: &'static str =
+        "Always-passing assertion. Use to mark a reached-this-point checkpoint.";
     type Response = AssertResult;
 
-    fn execute(self, _dbg: &mut Debugger, _budget: &ResponseBudget) -> Result<AssertResult, BsError> {
+    fn execute(
+        self,
+        _dbg: &mut Debugger,
+        _budget: &ResponseBudget,
+    ) -> Result<AssertResult, BsError> {
         Ok(AssertResult {
             passed: true,
             hint: Some(self.hint),
@@ -203,7 +208,11 @@ impl StructuredCommand for AssertFail {
     const SUMMARY: &'static str = "Always-failing assertion. Use to mark an unreachable arm.";
     type Response = AssertResult;
 
-    fn execute(self, _dbg: &mut Debugger, _budget: &ResponseBudget) -> Result<AssertResult, BsError> {
+    fn execute(
+        self,
+        _dbg: &mut Debugger,
+        _budget: &ResponseBudget,
+    ) -> Result<AssertResult, BsError> {
         Ok(AssertResult {
             passed: false,
             hint: self.hint,
@@ -515,20 +524,13 @@ mod matcher_tests {
             .is_none()
         );
         assert!(
-            match_value(
-                &json!({ "$ends_with": "(7)" }),
-                &json!("Result::Ok(7)"),
-                ""
-            )
-            .is_none()
+            match_value(&json!({ "$ends_with": "(7)" }), &json!("Result::Ok(7)"), "").is_none()
         );
     }
 
     #[test]
     fn op_exists_true_false() {
-        assert!(
-            match_value(&json!({ "$exists": true }), &json!("anything"), "").is_none()
-        );
+        assert!(match_value(&json!({ "$exists": true }), &json!("anything"), "").is_none());
         assert!(match_value(&json!({ "$exists": true }), &json!(null), "").is_some());
         assert!(match_value(&json!({ "$exists": false }), &json!(null), "").is_none());
     }
@@ -547,7 +549,10 @@ mod matcher_tests {
         // object. Without this, callers would write ambiguous patterns.
         let expected = json!({ "$regex": "x", "trailing": 1 });
         let m = match_value(&expected, &json!("x"), "").unwrap();
-        assert!(m.reason.contains("operator object must contain exactly one"));
+        assert!(
+            m.reason
+                .contains("operator object must contain exactly one")
+        );
     }
 
     #[test]

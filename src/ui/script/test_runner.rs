@@ -114,16 +114,15 @@ pub fn run_test_with(
 
                 match (method.starts_with("assert."), result) {
                     (true, Ok(value)) => state.record_assert(&mut out, &method, value)?,
-                    (true, Err(err)) => state.record_assert_error(&mut out, &method, &err.message)?,
+                    (true, Err(err)) => {
+                        state.record_assert_error(&mut out, &method, &err.message)?
+                    }
                     (false, Ok(_)) => { /* silent — driver step */ }
                     (false, Err(err)) => {
                         // A non-assert error aborts: the script's
                         // premise is broken (no breakpoint, can't run,
                         // …). Bail-out with the message.
-                        state.bail_out(
-                            &mut out,
-                            &format!("{} failed: {}", method, err.message),
-                        )?;
+                        state.bail_out(&mut out, &format!("{} failed: {}", method, err.message))?;
                         break;
                     }
                 }
@@ -221,8 +220,16 @@ impl RunnerState {
                 writeln!(out, "  ---")?;
                 writeln!(out, "  message: {}", quote_yaml(&m.reason))?;
                 writeln!(out, "  path: {}", quote_yaml(&m.path))?;
-                writeln!(out, "  expected: {}", serde_json::to_string(&m.expected).unwrap_or_default())?;
-                writeln!(out, "  got: {}", serde_json::to_string(&m.got).unwrap_or_default())?;
+                writeln!(
+                    out,
+                    "  expected: {}",
+                    serde_json::to_string(&m.expected).unwrap_or_default()
+                )?;
+                writeln!(
+                    out,
+                    "  got: {}",
+                    serde_json::to_string(&m.got).unwrap_or_default()
+                )?;
                 writeln!(out, "  ...")?;
             }
         }
@@ -266,7 +273,10 @@ fn quote_yaml(s: &str) -> String {
         || s.contains(['"', '\\', '\n', ':'])
         || s.starts_with(['&', '*', '#', '?', '|', '<', '>', '=', '!', '%', '@', '`'])
     {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+        let escaped = s
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
         format!("\"{escaped}\"")
     } else {
         s.to_string()

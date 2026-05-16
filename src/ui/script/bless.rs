@@ -230,8 +230,11 @@ fn inline_value(v: &Value) -> String {
 /// else falls back to a quoted form.
 fn render_key(k: &str) -> String {
     let is_ident = !k.is_empty()
-        && k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
-        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        && k.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+        && k.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
     if is_ident {
         k.to_string()
     } else {
@@ -509,7 +512,9 @@ fn field_string_value(chunk: &str, key: &str) -> Option<String> {
 /// relative to the chunk.
 fn field_object_value_span(chunk: &str, key: &str) -> Option<(usize, usize)> {
     let trimmed = chunk.trim();
-    let leading = chunk.len() - trimmed.len() - (chunk.len() - trimmed.len() - (chunk.len() - trimmed.trim_start().len()));
+    let leading = chunk.len()
+        - trimmed.len()
+        - (chunk.len() - trimmed.len() - (chunk.len() - trimmed.trim_start().len()));
     let _ = leading; // intentionally unused; we use `chunk.find('{')` below
     let open = chunk.find('{')?;
     let inner_start = open + 1;
@@ -527,8 +532,12 @@ fn value_end(bytes: &[u8], start: usize) -> usize {
         return start;
     }
     match bytes[start] {
-        b'{' => match_brace(bytes, start, b'{', b'}').map(|e| e + 1).unwrap_or(bytes.len()),
-        b'[' => match_brace(bytes, start, b'[', b']').map(|e| e + 1).unwrap_or(bytes.len()),
+        b'{' => match_brace(bytes, start, b'{', b'}')
+            .map(|e| e + 1)
+            .unwrap_or(bytes.len()),
+        b'[' => match_brace(bytes, start, b'[', b']')
+            .map(|e| e + 1)
+            .unwrap_or(bytes.len()),
         b'"' | b'\'' => skip_string(bytes, start),
         _ => {
             let mut i = start;
@@ -590,7 +599,10 @@ mod tests {
     #[test]
     fn finds_method_value() {
         let chunk = "{ method: \"assert.var\", params: {} }";
-        assert_eq!(field_string_value(chunk, "method").as_deref(), Some("assert.var"));
+        assert_eq!(
+            field_string_value(chunk, "method").as_deref(),
+            Some("assert.var")
+        );
     }
 
     #[test]
@@ -662,10 +674,7 @@ mod tests {
         // `regex::escape` is conservative — `&`, `[`, `]` all get
         // backslashed even though `&` isn't a metachar. That's still
         // a correct regex, just a touch noisier than necessary.
-        assert_eq!(
-            v,
-            json!({ "$regex": r"^\&i32 \[0x[0-9a-fA-F]+\]$" })
-        );
+        assert_eq!(v, json!({ "$regex": r"^\&i32 \[0x[0-9a-fA-F]+\]$" }));
     }
 
     #[test]

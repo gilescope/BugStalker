@@ -196,8 +196,7 @@ impl StructValue {
         }
         let m0 = self.members[0].field_name.as_deref();
         let m1 = self.members[1].field_name.as_deref();
-        const DATA: [Option<&str>; 3] =
-            [Some("pointer"), Some("data_ptr"), Some("data")];
+        const DATA: [Option<&str>; 3] = [Some("pointer"), Some("data_ptr"), Some("data")];
         const VT: [Option<&str>; 3] = [Some("vtable"), Some("v_table"), Some("vtbl")];
         DATA.contains(&m0) && VT.contains(&m1) || VT.contains(&m0) && DATA.contains(&m1)
     }

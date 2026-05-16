@@ -168,9 +168,10 @@ fn render_value_inner(
                 // struct-style placeholders deliberately).
                 let is_tuple_shape = spec.is_none()
                     && !members.is_empty()
-                    && members.iter().enumerate().all(|(i, m)| {
-                        m.field_name.as_deref() == Some(&format!("__{i}"))
-                    });
+                    && members
+                        .iter()
+                        .enumerate()
+                        .all(|(i, m)| m.field_name.as_deref() == Some(&format!("__{i}")));
                 if is_tuple_shape {
                     let inner: Vec<String> = members
                         .iter()
