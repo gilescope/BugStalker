@@ -546,6 +546,14 @@ impl ValueParser {
                             let mut cleaned = String::with_capacity(original.len());
                             cleaned.push_str(&original[..main_end]);
                             cleaned.push_str(&original[main_end + suffix_end..]);
+                            // Rustc wraps `dyn X + Y + Z` in parens
+                            // (`Box<(dyn X + Y + Z), Global>`) when
+                            // there's more than one bound. After we
+                            // splice out the auto-trait suffix, the
+                            // parens are vestigial — `(dyn X)` reads
+                            // worse than `dyn X`. Strip them when the
+                            // paren wraps exactly our main bound.
+                            let cleaned = strip_vestigial_dyn_parens(&cleaned);
                             (cleaned, autos)
                         }
                         _ => (original.clone(), Vec::new()),
@@ -1713,6 +1721,58 @@ fn demangle_to_string(mangled: &str) -> Option<String> {
         rust_mangle_tree::Symbol::Legacy(p) => Some(format!("{p:#}")),
         rust_mangle_tree::Symbol::NotRust(_) => None,
     }
+}
+
+/// Strip rustc-emitted parens around a single-bound `dyn Trait` in
+/// a type-ident string. Rustc writes `Box<(dyn X + Y + Z), Global>`
+/// when there's more than one bound; after the auto-trait splicer
+/// reduces it to `Box<(dyn X), Global>` the parens are vestigial.
+/// This pass walks the string, finds `(dyn …)` substrings whose
+/// interior carries no `+` at depth 0, and unwraps them.
+///
+/// Idempotent — running twice on the same input is a no-op.
+fn strip_vestigial_dyn_parens(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Detect `(dyn `.
+        if bytes[i] == b'(' && s[i..].starts_with("(dyn ") {
+            // Walk forward looking for the matching `)` at our
+            // depth, tracking `<>` / `()` nesting. If we find a
+            // `+` at depth 0 before the matching `)`, this is a
+            // genuine multi-bound dyn — leave the parens alone.
+            let mut depth: i32 = 0;
+            let mut close = None;
+            let mut has_plus = false;
+            for j in (i + 1)..bytes.len() {
+                match bytes[j] {
+                    b'<' | b'(' => depth += 1,
+                    b'>' => depth -= 1,
+                    b')' => {
+                        if depth == 0 {
+                            close = Some(j);
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    b'+' if depth == 0 => has_plus = true,
+                    _ => {}
+                }
+            }
+            if let Some(close) = close
+                && !has_plus
+            {
+                // Unwrap: push the contents, skip past the `)`.
+                out.push_str(&s[i + 1..close]);
+                i = close + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Parse a `dyn Trait + Send + Sync` bound list out of a

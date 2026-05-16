@@ -630,50 +630,10 @@ fn attach_array_length(
     format!("[{inner}; {len}]")
 }
 
-pub fn strip_type_namespace(type_name: &str) -> String {
-    let bytes = type_name.as_bytes();
-    let mut out = String::with_capacity(type_name.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b.is_ascii_alphabetic() || b == b'_' {
-            // Walk a chain of identifier segments separated by `::`.
-            // After the loop, `last_segment_start..i` is the final
-            // segment of whatever path we saw; that's what we emit.
-            let mut last_segment_start = i;
-            while i < bytes.len() {
-                let c = bytes[i];
-                if c.is_ascii_alphanumeric() || c == b'_' {
-                    i += 1;
-                } else if c == b':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
-                    i += 2;
-                    last_segment_start = i;
-                } else {
-                    break;
-                }
-            }
-            let segment = &type_name[last_segment_start..i];
-            // Default generic args (`Global` allocator, `RandomState`
-            // hasher) clutter the display; nobody writes
-            // `Vec<u8, Global>` or `HashMap<K, V, RandomState>` in
-            // source — they're inserted by the compiler to fill
-            // defaulted type parameters. Rewrite to `_` so the
-            // displayed type reads `Vec<u8, _>` /
-            // `HashMap<K, V, _>` — equivalent to source-level
-            // omission, but visibly present so the reader knows a
-            // type parameter was elided.
-            if segment == "Global" || segment == "RandomState" {
-                out.push('_');
-            } else {
-                out.push_str(segment);
-            }
-        } else {
-            out.push(b as char);
-            i += 1;
-        }
-    }
-    out
-}
+// `strip_type_namespace` lives in `debugger::variable::render` so
+// both the DAP layer and the dyn renderer can call it. Re-exported
+// here so existing call sites keep working with no churn.
+pub use crate::debugger::variable::render::strip_type_namespace;
 
 /// Cap on the inline string length for collection previews. Beyond
 /// this, the value column collapses to `(len=N) [...]` rather than
@@ -1469,129 +1429,8 @@ mod collection_preview_tests {
     }
 }
 
-#[cfg(test)]
-mod strip_type_namespace_tests {
-    use super::strip_type_namespace;
-
-    #[test]
-    fn primitive_passes_through() {
-        assert_eq!(strip_type_namespace("i32"), "i32");
-        assert_eq!(strip_type_namespace("bool"), "bool");
-        assert_eq!(strip_type_namespace("()"), "()");
-    }
-
-    #[test]
-    fn reference_passes_through() {
-        assert_eq!(strip_type_namespace("&str"), "&str");
-        assert_eq!(strip_type_namespace("&mut i32"), "&mut i32");
-    }
-
-    #[test]
-    fn single_namespace_segment_dropped() {
-        assert_eq!(strip_type_namespace("alloc::string::String"), "String");
-        assert_eq!(strip_type_namespace("core::option::Option"), "Option");
-    }
-
-    #[test]
-    fn generic_args_are_stripped_too() {
-        assert_eq!(
-            strip_type_namespace("std::collections::HashMap<alloc::string::String, i32>"),
-            "HashMap<String, i32>"
-        );
-    }
-
-    #[test]
-    fn nested_generics_strip_recursively() {
-        assert_eq!(
-            strip_type_namespace("core::option::Option<core::result::Result<i32, std::io::Error>>"),
-            "Option<Result<i32, Error>>"
-        );
-    }
-
-    #[test]
-    fn slice_and_array_punctuation_preserved() {
-        assert_eq!(strip_type_namespace("&[std::path::PathBuf]"), "&[PathBuf]");
-        assert_eq!(
-            strip_type_namespace("[std::path::PathBuf; 4]"),
-            "[PathBuf; 4]"
-        );
-    }
-
-    #[test]
-    fn tuple_passes_through() {
-        assert_eq!(
-            strip_type_namespace("(i32, alloc::string::String, &str)"),
-            "(i32, String, &str)"
-        );
-    }
-
-    #[test]
-    fn vec_of_hashmap() {
-        assert_eq!(
-            strip_type_namespace(
-                "alloc::vec::Vec<std::collections::HashMap<alloc::string::String, i32>>"
-            ),
-            "Vec<HashMap<String, i32>>"
-        );
-    }
-
-    #[test]
-    fn already_short_path_unchanged() {
-        // A type already in its bare form must round-trip.
-        assert_eq!(strip_type_namespace("Vec<i32>"), "Vec<i32>");
-    }
-
-    #[test]
-    fn empty_string_passes_through() {
-        assert_eq!(strip_type_namespace(""), "");
-    }
-
-    #[test]
-    fn global_default_allocator_becomes_underscore() {
-        assert_eq!(
-            strip_type_namespace("alloc::vec::Vec<u8, alloc::alloc::Global>"),
-            "Vec<u8, _>"
-        );
-        assert_eq!(strip_type_namespace("Box<i32, Global>"), "Box<i32, _>");
-    }
-
-    #[test]
-    fn random_state_default_hasher_becomes_underscore() {
-        assert_eq!(
-            strip_type_namespace(
-                "std::collections::HashMap<alloc::string::String, i32, std::collections::hash_map::RandomState>"
-            ),
-            "HashMap<String, i32, _>"
-        );
-    }
-
-    #[test]
-    fn elision_works_through_nesting() {
-        // Compiler-inserted defaults nested inside generic args
-        // (here: Vec inside HashMap's value type, each with their
-        // own elided defaults).
-        assert_eq!(
-            strip_type_namespace(
-                "std::collections::HashMap<\
-                    alloc::string::String, \
-                    alloc::vec::Vec<i32, alloc::alloc::Global>, \
-                    std::collections::hash_map::RandomState>"
-            ),
-            "HashMap<String, Vec<i32, _>, _>"
-        );
-    }
-
-    #[test]
-    fn user_type_named_global_is_not_touched() {
-        // Edge case: a user-defined namespace whose final segment
-        // is `Global` would currently also be elided. Documented
-        // behaviour — same as how clippy's `unused_braces` lint
-        // can't always tell synthetic-default from user-explicit;
-        // the test pins the current behaviour so anyone changing
-        // it knows what they're trading off.
-        assert_eq!(strip_type_namespace("my_crate::Global"), "_");
-    }
-}
+// `strip_type_namespace_tests` moved to
+// `debugger::variable::render` alongside the function itself.
 
 #[cfg(test)]
 mod deref_prefix_tests {

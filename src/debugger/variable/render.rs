@@ -480,7 +480,13 @@ pub fn render_trait_object_at_depth(
             }
         }
     }
-    let trait_name = s.type_ident.name().unwrap_or("dyn Trait");
+    let raw_trait_name = s.type_ident.name().unwrap_or("dyn Trait");
+    // Strip `alloc::boxed::`, `core::marker::`, `, alloc::alloc::
+    // Global>` etc. from the type-ident so the dyn line reads like
+    // source. The JSON `type` field still carries the full path for
+    // programmatic clients — this is purely a render-time cleanup.
+    let cleaned = strip_type_namespace(raw_trait_name);
+    let trait_name: &str = &cleaned;
     let resolved = trait_name.contains("[→ ");
     let view = s.vtable_view.as_ref();
 
@@ -598,7 +604,8 @@ fn render_trait_object_multiline(
             .as_deref()
             .map(|l| format!(" ({l})"))
             .unwrap_or_default();
-        let _ = writeln!(out, "    drop: → {}{loc},", drop.display);
+        let display = clean_method_display(&drop.display);
+        let _ = writeln!(out, "    drop: → {display}{loc},");
     } else {
         // Null drop slot is the canonical signal for `!Drop` types.
         // Surface it explicitly — a missing line here would read as
@@ -620,7 +627,8 @@ fn render_trait_object_multiline(
             .as_deref()
             .map(|l| format!(" ({l})"))
             .unwrap_or_default();
-        let _ = writeln!(out, "    {}: → {}{loc},", slot.name, slot.display);
+        let display = clean_method_display(&slot.display);
+        let _ = writeln!(out, "    {}: → {display}{loc},", slot.name);
     }
     if total > shown {
         let _ = writeln!(out, "    … ({} more methods)", total - shown);
@@ -653,7 +661,7 @@ fn render_concrete_compact(
     if depth > MAX_DEPTH {
         return "…".to_string();
     }
-    let type_name = value.r#type().name_fmt().to_string();
+    let type_name = strip_type_namespace(&value.r#type().name_fmt().to_string());
     match value.value_layout() {
         Some(ValueLayout::PreRendered(s)) => s.into_owned(),
         Some(ValueLayout::Referential(addr)) => format!("{type_name} [{addr:p}]"),
@@ -718,6 +726,269 @@ fn render_concrete_compact(
             let _ = value;
             type_name
         }
+    }
+}
+
+/// Strip module-path noise from a displayed type name. Walks the
+/// string, finds chains of `ident::ident::…::Ident`, and keeps only
+/// the last segment of each chain. Punctuation (`<>`, `&`, `[]`,
+/// `,`, ` `) passes through unchanged so the surrounding shape
+/// stays intact.
+///
+/// Compiler-inserted default type parameters (`Global` allocator,
+/// `RandomState` hasher) collapse to `_` rather than disappear —
+/// equivalent to source-level omission, but visibly present so the
+/// reader knows a type parameter was elided.
+///
+/// Lives in `debugger::variable::render` (not in any single UI
+/// layer) so both the DAP `data` builder and the dyn-resolver's
+/// render path can call the same function. Idempotent — running it
+/// twice on the same input yields the same output, so callers
+/// don't need to track which strings have already been cleaned.
+pub fn strip_type_namespace(type_name: &str) -> String {
+    let bytes = type_name.as_bytes();
+    let mut out = String::with_capacity(type_name.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphabetic() || b == b'_' {
+            // Walk a chain of identifier segments separated by `::`.
+            // After the loop, `last_segment_start..i` is the final
+            // segment of whatever path we saw; that's what we emit.
+            let mut last_segment_start = i;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c.is_ascii_alphanumeric() || c == b'_' {
+                    i += 1;
+                } else if c == b':' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                    i += 2;
+                    last_segment_start = i;
+                } else {
+                    break;
+                }
+            }
+            let segment = &type_name[last_segment_start..i];
+            // Default generic args (`Global` allocator, `RandomState`
+            // hasher) clutter the display; nobody writes
+            // `Vec<u8, Global>` or `HashMap<K, V, RandomState>` in
+            // source — they're inserted by the compiler to fill
+            // defaulted type parameters. Rewrite to `_` so the
+            // displayed type reads `Vec<u8, _>` /
+            // `HashMap<K, V, _>` — equivalent to source-level
+            // omission, but visibly present so the reader knows a
+            // type parameter was elided.
+            if segment == "Global" || segment == "RandomState" {
+                out.push('_');
+            } else {
+                out.push_str(segment);
+            }
+        } else {
+            // Non-identifier byte. ASCII bytes (punctuation, space,
+            // `<`, `>`, `[`, `]`, `,`, `&`) pass through one at a
+            // time. Multi-byte UTF-8 sequences (e.g. our `→` arrow
+            // in `[→ Concrete]` markers) need to land as a complete
+            // codepoint — `out.push(b as char)` on the leading
+            // continuation byte would produce mojibake. Consume the
+            // whole UTF-8 sequence in one slice.
+            let char_len = utf8_char_len(b);
+            let end = (i + char_len).min(bytes.len());
+            out.push_str(&type_name[i..end]);
+            i = end;
+        }
+    }
+    out
+}
+
+/// Clean a method symbol's display string for the dyn renderer.
+///
+/// `strip_type_namespace` handles `<X as Y>::method` cleanly — the
+/// `<` / `>` / ` as ` punctuation breaks identifier chains so each
+/// `X` and `Y` collapses to its short form. But for default-impl
+/// symbols with no angle brackets (`core::error::Error::source` —
+/// the source method of Error, used when the concrete type doesn't
+/// override it), strip would walk through every `::`-separated
+/// segment and emit only the final `source`, dropping the trait
+/// context that the user actually wants.
+///
+/// Keep the trailing `Type::method` pair for those symbols so the
+/// reader still sees which trait the default impl lives on.
+pub fn clean_method_display(s: &str) -> String {
+    if s.contains('<') {
+        return strip_type_namespace(s);
+    }
+    // No angle brackets: a fully-qualified path. Keep the last two
+    // `::`-segments so a `core::error::Error::source` shape lands
+    // as `Error::source`.
+    let mut parts = s.rsplitn(3, "::");
+    let last = parts.next().unwrap_or("");
+    let second_last = parts.next();
+    match second_last {
+        Some(typ) => format!("{typ}::{last}"),
+        None => s.to_string(),
+    }
+}
+
+/// Length in bytes of the UTF-8 sequence whose leading byte is `b`.
+/// Pure ASCII bytes return 1; continuation bytes (which shouldn't
+/// be leading bytes in well-formed UTF-8) also return 1 so we make
+/// forward progress.
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xc0 {
+        1 // stray continuation byte — degrade gracefully
+    } else if b < 0xe0 {
+        2
+    } else if b < 0xf0 {
+        3
+    } else {
+        4
+    }
+}
+
+#[cfg(test)]
+mod strip_type_namespace_tests {
+    use super::strip_type_namespace;
+
+    #[test]
+    fn primitive_passes_through() {
+        assert_eq!(strip_type_namespace("i32"), "i32");
+        assert_eq!(strip_type_namespace("bool"), "bool");
+        assert_eq!(strip_type_namespace("()"), "()");
+    }
+
+    #[test]
+    fn reference_passes_through() {
+        assert_eq!(strip_type_namespace("&str"), "&str");
+        assert_eq!(strip_type_namespace("&mut i32"), "&mut i32");
+    }
+
+    #[test]
+    fn single_namespace_segment_dropped() {
+        assert_eq!(strip_type_namespace("alloc::string::String"), "String");
+        assert_eq!(strip_type_namespace("core::option::Option"), "Option");
+    }
+
+    #[test]
+    fn generic_args_are_stripped_too() {
+        assert_eq!(
+            strip_type_namespace("std::collections::HashMap<alloc::string::String, i32>"),
+            "HashMap<String, i32>"
+        );
+    }
+
+    #[test]
+    fn nested_generics_strip_recursively() {
+        assert_eq!(
+            strip_type_namespace("core::option::Option<core::result::Result<i32, std::io::Error>>"),
+            "Option<Result<i32, Error>>"
+        );
+    }
+
+    #[test]
+    fn slice_and_array_punctuation_preserved() {
+        assert_eq!(strip_type_namespace("&[std::path::PathBuf]"), "&[PathBuf]");
+        assert_eq!(
+            strip_type_namespace("[std::path::PathBuf; 4]"),
+            "[PathBuf; 4]"
+        );
+    }
+
+    #[test]
+    fn tuple_passes_through() {
+        assert_eq!(
+            strip_type_namespace("(i32, alloc::string::String, &str)"),
+            "(i32, String, &str)"
+        );
+    }
+
+    #[test]
+    fn vec_of_hashmap() {
+        assert_eq!(
+            strip_type_namespace(
+                "alloc::vec::Vec<std::collections::HashMap<alloc::string::String, i32>>"
+            ),
+            "Vec<HashMap<String, i32>>"
+        );
+    }
+
+    #[test]
+    fn already_short_path_unchanged() {
+        // A type already in its bare form must round-trip.
+        assert_eq!(strip_type_namespace("Vec<i32>"), "Vec<i32>");
+    }
+
+    #[test]
+    fn empty_string_passes_through() {
+        assert_eq!(strip_type_namespace(""), "");
+    }
+
+    #[test]
+    fn global_default_allocator_becomes_underscore() {
+        assert_eq!(
+            strip_type_namespace("alloc::vec::Vec<u8, alloc::alloc::Global>"),
+            "Vec<u8, _>"
+        );
+        assert_eq!(strip_type_namespace("Box<i32, Global>"), "Box<i32, _>");
+    }
+
+    #[test]
+    fn random_state_default_hasher_becomes_underscore() {
+        assert_eq!(
+            strip_type_namespace(
+                "std::collections::HashMap<alloc::string::String, i32, std::collections::hash_map::RandomState>"
+            ),
+            "HashMap<String, i32, _>"
+        );
+    }
+
+    #[test]
+    fn elision_works_through_nesting() {
+        // Compiler-inserted defaults nested inside generic args
+        // (here: Vec inside HashMap's value type, each with their
+        // own elided defaults).
+        assert_eq!(
+            strip_type_namespace(
+                "std::collections::HashMap<\
+                    alloc::string::String, \
+                    alloc::vec::Vec<i32, alloc::alloc::Global>, \
+                    std::collections::hash_map::RandomState>"
+            ),
+            "HashMap<String, Vec<i32, _>, _>"
+        );
+    }
+
+    #[test]
+    fn user_type_named_global_is_not_touched() {
+        // Edge case: a user-defined namespace whose final segment
+        // is `Global` would currently also be elided. Documented
+        // behaviour — same as how clippy's `unused_braces` lint
+        // can't always tell synthetic-default from user-explicit;
+        // the test pins the current behaviour so anyone changing
+        // it knows what they're trading off.
+        assert_eq!(strip_type_namespace("my_crate::Global"), "_");
+    }
+
+    #[test]
+    fn idempotent() {
+        // Running twice yields the same output — callers don't
+        // need to track which strings have already been cleaned.
+        let input = "alloc::boxed::Box<dyn core::error::Error, alloc::alloc::Global>";
+        let once = strip_type_namespace(input);
+        assert_eq!(strip_type_namespace(&once), once);
+    }
+
+    #[test]
+    fn multi_byte_utf8_passes_through() {
+        // The dyn renderer's `[→ Concrete]` annotation puts a
+        // non-ASCII arrow in the input. Pre-fix, the byte-by-byte
+        // pass-through dropped each UTF-8 continuation byte as a
+        // separate char and produced mojibake (`â`). Lock in that
+        // the arrow survives intact along with the path stripping.
+        assert_eq!(
+            strip_type_namespace("Box<dyn core::error::Error> [→ showcase::main::Foo]"),
+            "Box<dyn Error> [→ Foo]"
+        );
     }
 }
 
