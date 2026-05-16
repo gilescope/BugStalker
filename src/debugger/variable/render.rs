@@ -858,6 +858,32 @@ pub fn strip_type_namespace(type_name: &str) -> String {
     out
 }
 
+/// Pull the raw `String` / `&str` content out of a value for use
+/// in summary-template substitution. Templates want the bare
+/// content (`Person(Ada, age 36)`) rather than the
+/// inspect-default quoted form (`Person("Ada", age 36)`); the
+/// author wrote the template, they get to shape the punctuation.
+///
+/// Returns `None` for any other value type — callers fall back
+/// to whatever default rendering they were using.
+pub fn unwrap_string_for_template(
+    value: &crate::debugger::variable::value::Value,
+) -> Option<String> {
+    use crate::debugger::variable::value::{SpecializedValue, Value};
+    if let Value::Specialized {
+        value: Some(spec_val),
+        ..
+    } = value
+    {
+        match spec_val {
+            SpecializedValue::String(s) => return Some(s.value.clone()),
+            SpecializedValue::Str(s) => return Some(s.value.clone()),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Clean a method symbol's display string for the dyn renderer.
 ///
 /// `strip_type_namespace` handles `<X as Y>::method` cleanly — the

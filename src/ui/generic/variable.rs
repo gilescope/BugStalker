@@ -416,6 +416,15 @@ fn substitute_template_with_fields(
                 return s;
             }
         }
+        // String / &str members render as `"Ada"` (quoted) by
+        // default — that's right for top-level inspection but
+        // reads as noise inside a summary template (`Person("Ada",
+        // age 36)` vs. the more natural `Person(Ada, age 36)`).
+        // Unwrap the raw value so author-controlled templates can
+        // shape the output around the bare string.
+        if let Some(raw) = crate::debugger::variable::render::unwrap_string_for_template(&m.value) {
+            return raw;
+        }
         render_value_inner(&m.value, 0, false, None)
     })
 }
