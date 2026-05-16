@@ -1627,44 +1627,49 @@ impl Debugger {
         // RET at function exit will then pop garbage; the EnC
         // flow's auto-resume usually catches the user's pre-
         // patch bp before that matters.
-        // x86_64 path: stack repair is not landing — bisected to
-        // a deeper upstream issue. The unwinder returns the wrong
-        // return address for leaf functions on x86_64.
+        // x86_64 path: use frame 0's CFA (already computed by
+        // the FDE for the current PC) to derive fn-entry SP,
+        // then read the *actual* saved return address from
+        // inferior memory at that slot. The previous spike tried
+        // to use the unwinder's frame-1 RA, which is wrong for
+        // leaf functions (no prologue → no FDE rows → unwinder
+        // propagates a stale register through some unrelated
+        // function's first row). Reading [fn_entry_RSP] direct
+        // is correct regardless: at entry to ANY function the
+        // saved return PC sits at the current RSP, before the
+        // prologue runs.
         //
-        // Repro: pause inside a leaf fn `compute` (called
-        // directly from `main`). The actual saved return address
-        // on the stack at [RSP] is `main+0x47` (= the
-        // instruction right after main's `call compute`). Read
-        // it via `read_memory(rsp, 8)` and you see exactly that.
+        // The DWARF CFA at the current PC encodes "where the
+        // caller's RSP was just before the CALL", so:
+        //   fn_entry_RSP = CFA - 8     (CALL pushed 8 bytes)
+        //   [fn_entry_RSP] = the byte CALL pushed (saved return PC)
         //
-        // But `restore_registers_at_frame(.., 1)` followed by
-        // `unwound.value(Register::RA)` returns a completely
-        // different address that resolves to inside
-        // `core::ops::function::FnOnce::call_once + 0xb` —
-        // `call_once` isn't even on the call stack (compute was
-        // called directly, no trait-object dispatch).
+        // For leaf functions (compute), CFA = current_RSP + 8,
+        // so fn_entry_RSP = current_RSP — set_sp is a no-op.
+        // For functions with a prologue, CFA includes the
+        // prologue's allocation, so fn_entry_RSP = current_RSP
+        // + allocation — set_sp moves RSP back up to entry.
         //
-        // Likely cause: compute has no prologue (uses the
-        // System-V red zone), so rustc emits no FDE rows for the
-        // body — only the implicit `RSP + 8` / `[CFA-8]` defaults.
-        // The unwinder's `next` step lands frame 1's PC at *some*
-        // address by following these defaults, but the address it
-        // walks to isn't the actual caller for this stack. The
-        // resulting stack-repair writes the wrong return slot,
-        // the patched fn RETs into an unrelated function, and
-        // the inferior either crashes or recurses.
-        //
-        // This is a debugger-wide unwinder correctness issue, not
-        // an EnC-specific one (`backtrace()` would mis-report the
-        // caller for the same scenario). A proper fix requires
-        // walking the FDE return-address rule against the real
-        // saved bytes at [RSP], not propagating registers
-        // through the unwinder when the leaf has trivial
-        // unwind info. Tracked separately.
-        //
-        // For now, set_pc-only. The EnC auto-resume catches the
-        // user's pre-patch breakpoint before the (broken) RET
-        // matters, which is the contract.
+        // The byte at [fn_entry_RSP] is the actual return PC;
+        // it's already there (CALL wrote it). We don't need to
+        // re-write — just leave it and let the patched function's
+        // RET pop it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Re-evaluate frame 0 in the current ecx so we can
+            // read its CFA directly. This is the same evaluation
+            // the unwinder did above, but we use the CFA only —
+            // not the propagated registers.
+            let frame_0_cfa = self.frame_info().ok().map(|info| u64::from(info.cfa));
+            if let Some(cfa) = frame_0_cfa {
+                let fn_entry_rsp = cfa.wrapping_sub(8);
+                map.set_sp(fn_entry_rsp);
+                // The byte at [fn_entry_rsp] is whatever CALL
+                // pushed; the RET at the end of the patched
+                // function will pop it and resume in the caller.
+                // No write needed — it's already correct.
+            }
+        }
 
         map.set_pc(fn_start);
         map.persist(pid)?;
