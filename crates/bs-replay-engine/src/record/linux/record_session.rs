@@ -80,6 +80,7 @@ use crate::record::linux::exit_stop::{get_regs, set_regs};
 // Instruction trapping is x86-64 only — iced-x86 disassembly +
 // the InstrKind set are x86 ISA. aarch64 has analogues
 // (CNTVCT_EL0 trap, AT/MRS) that aren't ported yet.
+#[cfg(target_arch = "x86_64")]
 use crate::record::linux::exit_stop::result_register_x86_64;
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
@@ -130,6 +131,7 @@ fn read_regs(pid: i32) -> std::io::Result<Regs> {
     }
 }
 
+#[allow(dead_code)] // wired up by sub-phase 3D's instr-trap path
 fn write_regs(pid: i32, regs: &Regs) -> std::io::Result<()> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -197,6 +199,7 @@ fn pc_of(regs: &Regs) -> u64 {
     }
 }
 
+#[allow(dead_code)] // wired up by sub-phase 3D's instr-trap path
 fn set_pc(regs: &mut Regs, pc: u64) {
     #[cfg(target_arch = "x86_64")]
     {

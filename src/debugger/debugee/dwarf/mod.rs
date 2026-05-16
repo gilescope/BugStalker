@@ -1512,7 +1512,10 @@ impl DebugInformationBuilder {
             RunTimeEndian::Big
         };
 
-        let eh_frame = EhFrame::load(|id| -> Result<EndianArcSlice, Error> {
+        // `mut` is only needed for the aarch64 `set_vendor` call
+        // below; on x86_64 the cfg-block disappears.
+        #[allow(unused_mut)]
+        let mut eh_frame = EhFrame::load(|id| -> Result<EndianArcSlice, Error> {
             loader::load_section(id, file, endian)
         })?;
         #[cfg(target_arch = "aarch64")]
@@ -1602,7 +1605,8 @@ impl DebugInformationBuilder {
 
         let dwarf = loader::load_par(debug_info_file, endian)?;
         let debug_frame = if debug_info_file.section_by_name(".debug_frame").is_some() {
-            let df = DebugFrame::load(|id| -> Result<EndianArcSlice, Error> {
+            #[allow(unused_mut)]
+            let mut df = DebugFrame::load(|id| -> Result<EndianArcSlice, Error> {
                 loader::load_section(id, debug_info_file, endian)
             })?;
             #[cfg(target_arch = "aarch64")]

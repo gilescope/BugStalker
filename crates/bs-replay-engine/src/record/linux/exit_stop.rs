@@ -52,15 +52,22 @@
 #![cfg(target_os = "linux")]
 
 use std::io;
+#[cfg(target_arch = "x86_64")]
 use std::mem;
+#[cfg(target_arch = "x86_64")]
 use std::os::fd::BorrowedFd;
 
-use crate::format::trace_writer::{TraceWriteError, TraceWriter};
+use crate::format::trace_writer::TraceWriteError;
+#[cfg(target_arch = "x86_64")]
+use crate::format::trace_writer::TraceWriter;
+use crate::record::linux::ptrace_driver::{RecorderError, SeccompNotif, capture_from_notif};
+#[cfg(target_arch = "x86_64")]
 use crate::record::linux::ptrace_driver::{
-    RecorderError, SeccompNotif, capture_from_notif, event_for_capture, frame_from_notif,
-    recv_notif, respond_continue,
+    event_for_capture, frame_from_notif, recv_notif, respond_continue,
 };
-use crate::record::syscall_capture::{CapturedSyscall, MemoryReader, capture_post_syscall};
+#[cfg(target_arch = "x86_64")]
+use crate::record::syscall_capture::capture_post_syscall;
+use crate::record::syscall_capture::{CapturedSyscall, MemoryReader};
 
 // ---------------------------------------------------------------------------
 // User-mode register layout
@@ -380,6 +387,9 @@ pub fn record_syscall_with_exit(
 /// public [`capture_from_notif`] sets `result =
 /// RESULT_NOT_CAPTURED_YET`; here we want the bare pre half
 /// because [`merge_pre_post`] re-stamps the real result.
+// Used by the x86_64 record path only; the aarch64 path takes a
+// different shape and doesn't call this helper.
+#[cfg(target_arch = "x86_64")]
 fn capture_from_notif_raw(notif: &SeccompNotif, reader: &dyn MemoryReader) -> CapturedSyscall {
     // Re-use the public path but immediately overwrite the
     // sentinel. We don't add a new public function because the
