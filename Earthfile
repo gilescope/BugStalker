@@ -265,28 +265,54 @@ install-darwin:
 # ----------------------------------------------------------------------
 #
 # Each `+ci-*` target reproduces one job from `.github/workflows/ci.yml`
-# as closely as a container can. Use these to triage CI failures
-# locally without round-tripping through GitHub Actions.
+# as closely as a container can. Layout is tuned so the shared
+# layers (toolchain + components + source COPY) are cached once and
+# reused across every job. Two reusable base targets carry that
+# weight:
+#
+#   +ci-toolchain — extends `+common`, installs MSRV (1.89) and LRV
+#                   (1.95) plus rustfmt + clippy. Shared by every
+#                   container-capable `+ci-*` job.
+#
+#   +ci-source    — extends `+ci-toolchain` and copies the workspace
+#                   manifest, `src`, `tests`, `crates`, `benches`,
+#                   `examples`, `Makefile`. Source edits invalidate
+#                   one layer here, not N copies across N targets.
 #
 # Single-job:   earthly -P +ci-lint
 # Whole suite:  earthly -P +ci-all
-# arm64 too:    earthly -P --BS_PLATFORM=linux/arm64 +ci-all
+# x86:          earthly -P --BS_PLATFORM=linux/amd64 +ci-all
+#               (arm64 is the file-level default)
 # macOS smoke:  earthly +ci-test-macos     (LOCALLY — needs a macOS host)
 # Nix check:    earthly +ci-nix            (LOCALLY — needs host `nix`)
 
-# Mirrors CI's `test` job. Parameterised by `RUSTC` so the same target
-# covers the 1.91 … 1.95 matrix.
-#   - installs RUSTC + MSRV
-#   - builds the example debuggees with RUSTC
-#   - greps the `rustc version` string out of `calc` as a sanity check
-#   - runs `cargo test` against the bs library
+# Shared toolchain layer: MSRV + LRV + components needed by lint /
+# deny. The 5-version test matrix layers its own RUSTC on top of
+# this rather than reinstalling 1.89 / 1.95 each slot.
+ci-toolchain:
+    FROM +common
+    RUN rustup toolchain install 1.89.0 --profile minimal \
+            --component rustfmt --component clippy && \
+        rustup toolchain install 1.95.0 --profile minimal
+
+# Source layer reused by every container-capable `+ci-*` job. Adds
+# `Makefile` + `examples/` on top of what `+source` carries, since
+# the integration-test and lint jobs both lean on `make` targets.
+ci-source:
+    FROM +ci-toolchain
+    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml Makefile ./
+    COPY --dir src tests crates benches examples ./
+
+# Mirrors CI's `test` job. Parameterised by `RUSTC` so the same
+# target covers the 1.91 … 1.95 matrix. The MSRV + LRV layers are
+# already cached by `+ci-toolchain`; this target only installs the
+# extra rustc when `$RUSTC` differs from 1.95.
 ci-test:
     ARG RUSTC=1.95.0
-    FROM +common
-    RUN rustup toolchain install "$RUSTC" --profile minimal && \
-        rustup toolchain install 1.89.0 --profile minimal
-    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml ./
-    COPY --dir src tests crates benches examples ./
+    FROM +ci-source
+    IF [ "$RUSTC" != "1.89.0" ] && [ "$RUSTC" != "1.95.0" ]
+        RUN rustup toolchain install "$RUSTC" --profile minimal
+    END
     RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --mount=type=cache,target=/bs/examples/target,sharing=locked \
         cd examples && \
@@ -302,7 +328,8 @@ ci-test:
         --mount=type=cache,target=/bs/target,sharing=locked \
         cargo test
 
-# 5-version matrix — the same shape CI runs.
+# 5-version matrix — the same shape CI runs. Earthly runs the BUILDs
+# in parallel; each slot inherits the shared `+ci-source` layer.
 ci-test-matrix:
     BUILD +ci-test --RUSTC=1.91.0
     BUILD +ci-test --RUSTC=1.92.0
@@ -311,20 +338,16 @@ ci-test-matrix:
     BUILD +ci-test --RUSTC=1.95.0
 
 # Mirrors CI's `integration-test` job (the python unittest suite).
-# Builds bs in release mode, builds the examples with LRV, then runs
-# `make int-test-rel`.
+# Reuses `+ci-source` so the toolchain + source layers are shared
+# with everything else.
 ci-integration-test:
-    FROM +common
-    # `int-test-rel` invokes `sudo python3 -m unittest`; sudo isn't
-    # in `rust:1.89-bookworm` and Earthly's container UID is root
+    FROM +ci-source
+    # `int-test-rel` invokes `sudo python3 …`; sudo isn't in
+    # `rust:1.89-bookworm` and the Earthly container runs as root
     # anyway, so wire `sudo` to a no-op alias.
     RUN echo '#!/bin/sh' > /usr/local/bin/sudo && \
         echo 'exec "$@"' >> /usr/local/bin/sudo && \
         chmod +x /usr/local/bin/sudo
-    RUN rustup toolchain install 1.95.0 --profile minimal && \
-        rustup toolchain install 1.89.0 --profile minimal
-    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml Makefile ./
-    COPY --dir src tests crates benches examples ./
     COPY requirements.txt ./
     RUN pip3 install --break-system-packages -r requirements.txt
     RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -343,13 +366,10 @@ ci-integration-test:
 
 # Mirrors CI's `lint` job: cargo build (workspace + examples), MSRV
 # string check, fmt --check, clippy -D warnings, all on MSRV.
+# Toolchain + components already in `+ci-source`.
 ci-lint:
-    FROM +common
-    RUN rustup toolchain install 1.89.0 --profile minimal \
-            --component rustfmt --component clippy && \
-        rustup override set 1.89.0
-    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml Makefile ./
-    COPY --dir src tests crates benches examples ./
+    FROM +ci-source
+    RUN rustup override set 1.89.0
     RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --mount=type=cache,target=/bs/target,sharing=locked \
         --mount=type=cache,target=/bs/examples/target,sharing=locked \
@@ -360,14 +380,19 @@ ci-lint:
         --mount=type=cache,target=/bs/target,sharing=locked \
         cargo clippy -- -D warnings
 
-# Mirrors CI's `deny` job. Runs the full set of cargo-deny checks
-# the EmbarkStudios action runs in CI: licenses, bans, sources,
+# Mirrors CI's `deny` job — the full set of cargo-deny checks the
+# EmbarkStudios action runs in CI: licenses, bans, sources,
 # advisories — all with `--all-features` so transitive deps gated
-# by features are still scanned.
-ci-deny:
-    FROM +common
+# by features are still scanned. `cargo install cargo-deny` is
+# pinned to a separate layer so the install caches independently
+# of source edits.
+ci-deny-tool:
+    FROM +ci-toolchain
     RUN --mount=type=cache,target=/usr/local/cargo/registry \
         cargo install cargo-deny --locked
+
+ci-deny:
+    FROM +ci-deny-tool
     COPY Cargo.toml Cargo.lock deny.toml ./
     COPY --dir src tests crates examples ./
     RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -376,14 +401,12 @@ ci-deny:
 
 # Mirrors CI's `test-arm64` job. Same as `ci-test` plus the
 # explicit `--features int_test --test debugger` and `--test dap`
-# passes. Always uses LRV (1.95). On a multi-arch host, target the
-# arm64 platform explicitly: `--BS_PLATFORM=linux/arm64`.
+# passes. The base Earthfile defaults `BS_PLATFORM=linux/arm64`,
+# so plain `earthly +ci-test-arm64` already targets arm64; the
+# target only differs from `+ci-test --RUSTC=1.95.0` in the extra
+# debugger/DAP integration passes.
 ci-test-arm64:
-    FROM +common
-    RUN rustup toolchain install 1.95.0 --profile minimal && \
-        rustup toolchain install 1.89.0 --profile minimal
-    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml ./
-    COPY --dir src tests crates benches examples ./
+    FROM +ci-source
     RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --mount=type=cache,target=/bs/examples/target,sharing=locked \
         cd examples && \
@@ -406,7 +429,10 @@ ci-test-arm64:
         --mount=type=cache,target=/bs/target,sharing=locked \
         cargo test --features int_test --test dap
 
-# Same shape as `ci-lint`; arch hint is from --BS_PLATFORM.
+# `+ci-lint-arm64` is what `+ci-lint` already does when the global
+# `BS_PLATFORM` is `linux/arm64` (the file-level default). Kept as
+# a documented alias so the CI job-name → Earthfile-target mapping
+# stays 1:1.
 ci-lint-arm64:
     BUILD +ci-lint
 
