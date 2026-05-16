@@ -441,21 +441,33 @@ pub fn render_bytes(bytes: &[u8], mode: ByteRenderMode, truncated: bool) -> Stri
     }
 }
 
-/// Phase 3 Feature A — `dyn Trait` summary line. The detector
-/// recognises the fat-pointer trait-object layout; the parser-side
-/// resolver (see `parser::resolve_trait_object_concrete_type`) tries
-/// to recover the concrete type behind the vtable and splices the
-/// recovered name into `type_ident` as `… [→ Concrete]`. This
-/// renderer consumes both states:
+/// Phase 3 Feature A — depth-aware `dyn Trait` render. Driven from
+/// the ui renderer because it threads the current nesting depth;
+/// `value_layout()` (no depth context) just exposes the Structure
+/// members so non-renderer callers see the bare fat pointer.
 ///
-/// * **Resolved:** the type name carries `[→ Concrete]` already, so
-///   we render `<full-name> { data: 0x…, vtable: 0x… }` without a
-///   pending marker.
-/// * **Unresolved:** rustc didn't export a vtable symbol, the
-///   binary is stripped, or every method probe missed. We append a
-///   `[concrete type unavailable; …]` hint so the user knows we
-///   detected the trait object even though we can't show the inner.
-fn render_trait_object_summary(s: &crate::debugger::variable::value::StructValue) -> String {
+/// Three formats keyed by depth:
+///
+/// * `depth == 0` — top-level inspection. Full multi-line view:
+///   data pointer with inline concrete value, vtable record with
+///   drop / size / align / per-method demangled symbols + source
+///   locations.
+/// * `depth == 1` — one item inside a container. One-liner that
+///   keeps the punchline (`Trait [→ Concrete] (concrete-value)
+///   {N methods}`) but drops addresses and method bodies — the
+///   user clicked into a `Vec<Box<dyn …>>`, they want each entry
+///   to fit on a line.
+/// * `depth >= 2` — deeper. Just the trait + concrete annotation
+///   (`Trait [→ Concrete]`). Anyone curious can re-query the inner
+///   path directly.
+///
+/// `depth_override` lets callers force the multi-line render even
+/// when they're nominally at depth N; current sole user is the
+/// `var` command at top level (always passes `depth=0`).
+pub fn render_trait_object_at_depth(
+    s: &crate::debugger::variable::value::StructValue,
+    depth: usize,
+) -> String {
     use crate::debugger::variable::value::Value;
     let mut data_ptr: Option<*const ()> = None;
     let mut vtable_ptr: Option<*const ()> = None;
@@ -470,16 +482,50 @@ fn render_trait_object_summary(s: &crate::debugger::variable::value::StructValue
     }
     let trait_name = s.type_ident.name().unwrap_or("dyn Trait");
     let resolved = trait_name.contains("[→ ");
+    let view = s.vtable_view.as_ref();
 
-    // Phase 3 Feature A batch A4 — when the resolver populated a
-    // structured `vtable_view`, render the multi-line typed-record
-    // form. Single-line `[→ Concrete]` fallback survives for the
-    // strategy-2-only case (read failed; we have a concrete name
-    // but no slot data).
-    if let (Some(d), Some(v), Some(view), true) = (data_ptr, vtable_ptr, &s.vtable_view, resolved) {
+    // Depth 0 — the user wants everything. Same multi-line view
+    // as before the depth refactor.
+    if depth == 0
+        && let (Some(d), Some(v), Some(view), true) = (data_ptr, vtable_ptr, view, resolved)
+    {
         return render_trait_object_multiline(trait_name, d, v, view);
     }
 
+    // Depth 1 — one-line with the concrete-value punchline. Show
+    // the inline value and a method-count tail; drop addresses
+    // and per-method bodies.
+    if depth == 1
+        && resolved
+        && let Some(view) = view
+    {
+        let mut out = trait_name.to_string();
+        if let Some(concrete) = view.concrete_value.as_deref() {
+            let rendered = render_concrete_compact(concrete, 0);
+            out.push_str(&format!(" ({rendered})"));
+        }
+        let method_count = view.methods.len();
+        if method_count > 0 {
+            let plural = if method_count == 1 {
+                "method"
+            } else {
+                "methods"
+            };
+            out.push_str(&format!(" {{{method_count} {plural}}}"));
+        }
+        return out;
+    }
+
+    // Depth 2+ — just the type-with-concrete annotation. Anyone
+    // who wants more drills in with `var <path>`.
+    if depth >= 2 && resolved {
+        return trait_name.to_string();
+    }
+
+    // Fallback paths — unresolved concrete or strategy-2-only.
+    // Preserves the pre-depth-aware format so callers that hit
+    // these (stripped binaries, legacy mangling) see the same
+    // hint they used to.
     match (data_ptr, vtable_ptr, resolved) {
         (Some(d), Some(v), true) => {
             format!("{trait_name} {{ data: {d:p}, vtable: {v:p} }}")
@@ -861,15 +907,16 @@ impl RenderValue for Value {
                 ValueLayout::PreRendered(Cow::Owned(scalar.value.as_ref()?.to_string()))
             }
             Value::Struct(r#struct) => {
-                // Phase 3 Feature A — annotate `dyn Trait` fat-pointer
-                // structs so the user knows the renderer recognised
-                // the trait-object layout. Concrete-type recovery
-                // (vtable → symbol → demangle → TypeId) is a follow-
-                // up batch; this hop is detection + tagging only.
-                if r#struct.is_trait_object() {
-                    let body = render_trait_object_summary(r#struct);
-                    return Some(ValueLayout::PreRendered(Cow::Owned(body)));
-                }
+                // Trait-object special-case used to land here as
+                // `PreRendered(<multi-line string>)`. That worked but
+                // `value_layout()` has no depth context, so a nested
+                // dyn (inside `Vec<Box<dyn …>>`) couldn't collapse.
+                // The trait-object render path now lives in the ui
+                // renderer (`ui::generic::variable::render_value_inner`)
+                // which DOES carry depth. Here we just expose the
+                // members; the ui dispatch detects `is_trait_object()`
+                // and branches before the generic Structure path
+                // recurses into pointer/vtable fields.
                 ValueLayout::Structure(r#struct.members.as_ref())
             }
             Value::Array(array) => ValueLayout::IndexedList(array.items.as_deref()?),

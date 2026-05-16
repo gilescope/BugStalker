@@ -72,6 +72,18 @@ fn render_value_inner(
     print_type: bool,
     viz: Option<&VizRegistry>,
 ) -> String {
+    // Trait-object special-case: `value_layout()` exposes the bare
+    // fat-pointer Structure (members are `pointer` + `vtable`),
+    // which the generic Structure path below would render as
+    // `Type { pointer: 0x…, vtable: 0x… }` — useless. Dispatch to
+    // the depth-aware trait-object renderer instead. It carries
+    // its own type-prefix decision so the `print_type` argument is
+    // baked into the format and we return directly.
+    if let Value::Struct(s) = value
+        && s.is_trait_object()
+    {
+        return crate::debugger::variable::render::render_trait_object_at_depth(s, depth);
+    }
     match value.value_layout() {
         Some(layout) => match layout {
             ValueLayout::PreRendered(rendered_value) => {

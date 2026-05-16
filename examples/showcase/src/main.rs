@@ -132,6 +132,16 @@ fn main() {
     impl Error for ShowcaseErr {}
     let multi_bound: Box<dyn Error + Send + Sync> = Box::new(ShowcaseErr("boom"));
 
+    // 11c. nested trait objects — `Vec<Box<dyn Greeter>>`. Exercises
+    //      the depth-aware dyn renderer: at depth 0 each entry would
+    //      explode into ~8 lines; the renderer collapses inner-level
+    //      dyn to `Trait [→ Concrete] (concrete-value) {N methods}`
+    //      so the container reads as a compact list.
+    let dyn_vec: Vec<Box<dyn Greeter>> = vec![
+        Box::new(Point { x: 10.0, y: 20.0 }),
+        Box::new(Point { x: 30.0, y: 40.0 }),
+    ];
+
     // 12. closures — capturing both Copy and non-Copy state
     let captured_copy = 10;
     let captured_string = String::from("state");

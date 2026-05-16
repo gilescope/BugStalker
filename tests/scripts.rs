@@ -14,6 +14,7 @@ use std::process::Command;
 
 const BS_BINARY: &str = "./target/debug/bs";
 const VARS_DEBUGGEE: &str = "./examples/target/debug/vars";
+const SHOWCASE_DEBUGGEE: &str = "./examples/target/debug/showcase";
 
 // One `#[test]` per script. When the count outgrows hand-rolling
 // (~20+), swap to a build.rs glob. For now the explicit list keeps the
@@ -74,6 +75,22 @@ fn read_time() {
 #[test]
 fn read_address_op() {
     run("tests/scripts/read_address_op.json5", VARS_DEBUGGEE)
+}
+
+// Phase 3 Feature A batch A4 — locks in the dyn-vtable-as-typed-
+// record render against the showcase fixtures. ASLR-dependent
+// addresses are masked in the script's `$regex` expects.
+#[test]
+fn dyn_vtable_render() {
+    run("tests/scripts/dyn_vtable_render.json5", SHOWCASE_DEBUGGEE)
+}
+
+// Phase 3 Feature A batch A6 — depth-aware collapse on nested dyn.
+// `Vec<Box<dyn Greeter>>` at depth 0 puts each entry at depth 1,
+// where the multi-line vtable view collapses to a one-liner.
+#[test]
+fn dyn_vtable_nested() {
+    run("tests/scripts/dyn_vtable_nested.json5", SHOWCASE_DEBUGGEE)
 }
 
 fn run(script: &str, debuggee: &str) {
