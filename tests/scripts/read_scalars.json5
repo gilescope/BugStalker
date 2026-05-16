@@ -1,0 +1,153 @@
+// Migrated from tests/integration/test_variables.py::test_read_scalar_variables.
+// Reads all rust scalar primitives at the bottom of vars::scalars().
+// Bless: bs --test --bless tests/scripts/read_scalars.json5 ./examples/target/debug/vars
+
+{ method: "break.set", params: { at: "vars.rs:30" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "int8",         hint: "i8",
+expect: {
+  items: [{ name: "int8", type: "i8", value_text: "i8(1)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "int16",        hint: "i16",
+expect: {
+  items: [{ name: "int16", type: "i16", value_text: "i16(-1)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "int32",        hint: "i32",
+expect: {
+  items: [{ name: "int32", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "int64",        hint: "i64",
+expect: {
+  items: [{ name: "int64", type: "i64", value_text: "i64(-2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "int128",       hint: "i128",
+expect: {
+  items: [{ name: "int128", type: "i128", value_text: "i128(3)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "isize",        hint: "isize",
+expect: {
+  items: [{ name: "isize", type: "isize", value_text: "isize(-3)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "uint8",        hint: "u8",
+expect: {
+  items: [{ name: "uint8", type: "u8", value_text: "u8(1)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "uint16",       hint: "u16",
+expect: {
+  items: [{ name: "uint16", type: "u16", value_text: "u16(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "uint32",       hint: "u32",
+expect: {
+  items: [{ name: "uint32", type: "u32", value_text: "u32(3)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "uint64",       hint: "u64",
+expect: {
+  items: [{ name: "uint64", type: "u64", value_text: "u64(4)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "uint128",      hint: "u128",
+expect: {
+  items: [{ name: "uint128", type: "u128", value_text: "u128(5)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "usize",        hint: "usize",
+expect: {
+  items: [{ name: "usize", type: "usize", value_text: "usize(6)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "f32",          hint: "f32",
+expect: {
+  items: [{ name: "f32", type: "f32", value_text: "f32(1.1)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "f64",          hint: "f64",
+expect: {
+  items: [{ name: "f64", type: "f64", value_text: "f64(1.2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "boolean_true", hint: "bool=true",
+expect: {
+  items: [
+    {
+      name: "boolean_true",
+      type: "bool",
+      value_text: "bool(true)"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "boolean_false",hint: "bool=false",
+expect: {
+  items: [
+    {
+      name: "boolean_false",
+      type: "bool",
+      value_text: "bool(false)"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "char_ascii",   hint: "char ASCII",
+expect: {
+  items: [
+    { name: "char_ascii", type: "char", value_text: "char(a)" }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "char_non_ascii", hint: "char non-ASCII",
+expect: {
+  items: [
+    {
+      name: "char_non_ascii",
+      type: "char",
+      value_text: "char(😊)"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

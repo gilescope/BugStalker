@@ -1,0 +1,200 @@
+// Migrated from tests/integration/test_variables.py::test_zst_types.
+
+{ method: "break.set", params: { at: "vars.rs:496" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "ptr_zst",        hint: "&()",
+expect: {
+  items: [
+    {
+      name: "ptr_zst",
+      type: "&()",
+      value_text: { $regex: "^\\&\\(\\) \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "array_zst",      hint: "[()]",
+expect: {
+  items: [
+    {
+      name: "array_zst",
+      type: "[()]",
+      value_text: "[()] [(), ()]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "vec_zst",        hint: "Vec<()>",
+expect: {
+  items: [
+    {
+      name: "vec_zst",
+      type: "Vec<(), alloc::alloc::Global>",
+      value_text: "Vec<(), alloc::alloc::Global> [(), (), ()]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "slice_zst",      hint: "&[(); 4]",
+expect: {
+  items: [
+    {
+      name: "slice_zst",
+      type: "&[(); 4]",
+      value_text: { $regex: "^\\&\\[\\(\\); 4\\] \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "struct_zst",     hint: "StructZst",
+expect: {
+  items: [
+    {
+      name: "struct_zst",
+      type: "StructZst",
+      value_text: "StructZst(())"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "enum_zst",       hint: "Option<()>::Some",
+expect: {
+  items: [
+    {
+      name: "enum_zst",
+      type: "Option<()>",
+      value_text: "Option<()>::Some(())"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "vecdeque_zst",   hint: "VecDeque<()>",
+expect: {
+  items: [
+    {
+      name: "vecdeque_zst",
+      type: "VecDeque<(), alloc::alloc::Global>",
+      value_text: "VecDeque<(), alloc::alloc::Global> [(), (), (), (), ()]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "hash_map_zst_key", hint: "HashMap<(), i32>",
+expect: {
+  items: [
+    {
+      name: "hash_map_zst_key",
+      type: "HashMap<(), i32, std::hash::random::RandomState>",
+      value_text: "HashMap<(), i32, std::hash::random::RandomState> {\n    (): i32(1)\n}"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "hash_map_zst_val", hint: "HashMap<i32, ()>",
+expect: {
+  items: [
+    {
+      name: "hash_map_zst_val",
+      type: "HashMap<i32, (), std::hash::random::RandomState>",
+      value_text: "HashMap<i32, (), std::hash::random::RandomState> {\n    i32(1): ()\n}"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "hash_map_zst",     hint: "HashMap<(), ()>",
+expect: {
+  items: [
+    {
+      name: "hash_map_zst",
+      type: "HashMap<(), (), std::hash::random::RandomState>",
+      value_text: "HashMap<(), (), std::hash::random::RandomState> {\n    (): ()\n}"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "hash_set_zst",     hint: "HashSet<()>",
+expect: {
+  items: [
+    {
+      name: "hash_set_zst",
+      type: "HashSet<(), std::hash::random::RandomState>",
+      value_text: "HashSet<(), std::hash::random::RandomState> [()]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "btree_map_zst_key", hint: "BTreeMap<(), i32>",
+expect: {
+  items: [
+    {
+      name: "btree_map_zst_key",
+      type: "BTreeMap<(), i32, alloc::alloc::Global>",
+      value_text: "BTreeMap<(), i32, alloc::alloc::Global> {\n    (): i32(1)\n}"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "btree_map_zst_val", hint: "BTreeMap<i32, ()>",
+expect: {
+  items: [
+    {
+      name: "btree_map_zst_val",
+      type: "BTreeMap<i32, (), alloc::alloc::Global>",
+      value_text: "BTreeMap<i32, (), alloc::alloc::Global> {\n    i32(1): ()\n    2: ()\n}"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "btree_map_zst",     hint: "BTreeMap<(), ()>",
+expect: {
+  items: [
+    {
+      name: "btree_map_zst",
+      type: "BTreeMap<(), (), alloc::alloc::Global>",
+      value_text: "BTreeMap<(), (), alloc::alloc::Global> {\n    (): ()\n}"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "btree_set_zst",     hint: "BTreeSet<()>",
+expect: {
+  items: [
+    {
+      name: "btree_set_zst",
+      type: "BTreeSet<(), alloc::alloc::Global>",
+      value_text: "BTreeSet<(), alloc::alloc::Global> [()]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

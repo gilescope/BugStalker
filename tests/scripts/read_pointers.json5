@@ -1,0 +1,135 @@
+// Migrated from tests/integration/test_variables.py::test_read_pointers.
+// Address-shaped fields get auto-masked to $regex placeholders on bless.
+
+{ method: "break.set", params: { at: "vars.rs:119" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "a",         hint: "i32 source",
+expect: {
+  items: [{ name: "a", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "ref_a",     hint: "&i32 reference",
+expect: {
+  items: [
+    {
+      name: "ref_a",
+      type: "&i32",
+      value_text: { $regex: "^\\&i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "ptr_a",     hint: "*const i32",
+expect: {
+  items: [
+    {
+      name: "ptr_a",
+      type: "*const i32",
+      value_text: { $regex: "^\\*const i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "ptr_ptr_a", hint: "**const i32",
+expect: {
+  items: [
+    {
+      name: "ptr_ptr_a",
+      type: "*const *const i32",
+      value_text: { $regex: "^\\*const \\*const i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "b",         hint: "i32 mutable source",
+expect: {
+  items: [{ name: "b", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "mut_ref_b", hint: "&mut i32",
+expect: {
+  items: [
+    {
+      name: "mut_ref_b",
+      type: "&mut i32",
+      value_text: { $regex: "^\\&mut i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "c",         hint: "i32 raw-target source",
+expect: {
+  items: [{ name: "c", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "mut_ptr_c", hint: "*mut i32",
+expect: {
+  items: [
+    {
+      name: "mut_ptr_c",
+      type: "*mut i32",
+      value_text: { $regex: "^\\*mut i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "box_d",     hint: "Box<i32>",
+expect: {
+  items: [
+    {
+      name: "box_d",
+      type: "alloc::boxed::Box<i32, alloc::alloc::Global>",
+      value_text: "alloc::boxed::Box<i32, alloc::alloc::Global>::i32(2)"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "f",         hint: "Foo struct",
+expect: {
+  items: [
+    {
+      name: "f",
+      type: "Foo",
+      value_text: {
+        $regex: "^Foo \\{\n    bar: i32\\(1\\)\n    baz: \\[i32\\] \\[1, 2\\]\n    foo: \\&i32 \\[0x[0-9a-fA-F]+\\]\n\\}$"
+      }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "ref_f",     hint: "&Foo",
+expect: {
+  items: [
+    {
+      name: "ref_f",
+      type: "&vars::references::Foo",
+      value_text: {
+        $regex: "^\\&vars::references::Foo \\[0x[0-9a-fA-F]+\\]$"
+      }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

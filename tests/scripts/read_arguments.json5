@@ -1,0 +1,80 @@
+// Migrated from tests/integration/test_variables.py::test_read_arguments.
+// Uses assert.arg (the arg-side twin of assert.var).
+
+{ method: "break.set", params: { at: "vars.rs:232" } }
+{ method: "run" }
+
+{ method: "assert.arg", params: { name: "by_val",  hint: "i32 by value",
+expect: {
+  items: [{ name: "by_val", type: "i32", value_text: "i32(1)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.arg", params: { name: "by_ref",  hint: "&i32",
+expect: {
+  items: [
+    {
+      name: "by_ref",
+      type: "&i32",
+      value_text: { $regex: "^\\&i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.arg", params: { name: "vec",     hint: "Vec<u8>",
+expect: {
+  items: [
+    {
+      name: "vec",
+      type: "Vec<u8, alloc::alloc::Global>",
+      value_text: "Vec<u8, alloc::alloc::Global> [3, 4, 5]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.arg", params: { name: "box_arr", hint: "Box<[u8]>",
+expect: {
+  items: [
+    {
+      name: "box_arr",
+      type: "alloc::boxed::Box<[u8], alloc::alloc::Global>",
+      value_text: {
+        $regex: "^alloc::boxed::Box<\\[u8\\], alloc::alloc::Global> \\{\n    data_ptr: \\*u8 \\[0x[0-9a-fA-F]+\\]\n    length: usize\\(3\\)\n\\}$"
+      }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.arg", params: {                  hint: "all arguments in one shot",
+expect: {
+  items: [
+    { name: "by_val", type: "i32", value_text: "i32(1)" },
+    {
+      name: "by_ref",
+      type: "&i32",
+      value_text: { $regex: "^\\&i32 \\[0x[0-9a-fA-F]+\\]$" }
+    },
+    {
+      name: "vec",
+      type: "Vec<u8, alloc::alloc::Global>",
+      value_text: "Vec<u8, alloc::alloc::Global> [3, 4, 5]"
+    },
+    {
+      name: "box_arr",
+      type: "alloc::boxed::Box<[u8], alloc::alloc::Global>",
+      value_text: {
+        $regex: "^alloc::boxed::Box<\\[u8\\], alloc::alloc::Global> \\{\n    data_ptr: \\*u8 \\[0x[0-9a-fA-F]+\\]\n    length: usize\\(3\\)\n\\}$"
+      }
+    }
+  ],
+  total: 4,
+  truncated: false
+}
+} }

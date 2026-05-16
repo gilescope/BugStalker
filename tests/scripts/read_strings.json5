@@ -1,0 +1,44 @@
+// Migrated from tests/integration/test_variables.py::test_read_strings.
+
+{ method: "break.set", params: { at: "vars.rs:159" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "s1", hint: "owned String",
+expect: {
+  items: [
+    {
+      name: "s1",
+      type: "String",
+      value_text: "String(\"hello world\")"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "s2", hint: "&str via String::as_str",
+expect: {
+  items: [
+    {
+      name: "s2",
+      type: "&str",
+      value_text: "&str(\"hello world\")"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "s3", hint: "&'static str",
+expect: {
+  items: [
+    {
+      name: "s3",
+      type: "&str",
+      value_text: "&str(\"hello world\")"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

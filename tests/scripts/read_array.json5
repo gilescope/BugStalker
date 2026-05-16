@@ -1,0 +1,31 @@
+// Migrated from tests/integration/test_variables.py::test_read_array.
+
+{ method: "break.set", params: { at: "vars.rs:61" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "arr_1", hint: "flat [i32; 5]",
+expect: {
+  items: [
+    {
+      name: "arr_1",
+      type: "[i32]",
+      value_text: "[i32] [1, -1, 2, -2, 3]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "arr_2", hint: "nested [[i32; 5]; 3]",
+expect: {
+  items: [
+    {
+      name: "arr_2",
+      type: "[[i32]]",
+      value_text: "[[i32]] [[1, -1, 2, -2, 3], [0, 1, 2, 3, 4], [0, -1, -2, -3, -4]]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

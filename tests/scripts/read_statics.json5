@@ -1,0 +1,25 @@
+// Migrated from tests/integration/test_variables.py::test_read_static_variables.
+
+{ method: "break.set", params: { at: "vars.rs:168" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "GLOB_1", hint: "&'static str global",
+expect: {
+  items: [
+    {
+      name: "GLOB_1",
+      type: "&str",
+      value_text: "&str(\"glob_1\")"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "GLOB_2", hint: "i32 global",
+expect: {
+  items: [{ name: "GLOB_2", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
