@@ -361,9 +361,9 @@ ci-integration-test:
         chmod +x /usr/local/bin/sudo
     COPY requirements.txt ./
     RUN pip3 install --break-system-packages -r requirements.txt
-    RUN --mount=type=cache,target=/usr/local/cargo/registry \
-        --mount=type=cache,target=/bs/target,sharing=locked \
-        make build-rel
+    # Build the examples once into a non-cache location so the
+    # integration suite — which spawns them as debuggees — can find
+    # them inside the layer FS after the cache mount detaches.
     RUN --mount=type=cache,target=/usr/local/cargo/registry \
         --mount=type=cache,target=/bs/examples/target,sharing=locked \
         make build-examples RUST_VERSION=1.95.0 && \
@@ -371,9 +371,17 @@ ci-integration-test:
         cp -r examples/target/debug /bs/examples/_built/debug
     RUN rm -rf examples/target && mkdir -p examples/target && \
         mv examples/_built/debug examples/target/debug
-    RUN strings ./target/release/bs | grep "rustc version" | grep "1.89.0" && \
-        strings ./examples/target/debug/calc | grep "^rustc version" | grep "1.95.0"
-    RUN --privileged make int-test-rel
+    # Build bs and run the integration suite in one RUN — `bs` is
+    # built into `target/release/` under the cache mount, and the
+    # python unittest layer runs from that same mount, so it sees
+    # the binary. The CI version-stamp check folds in here too.
+    RUN --privileged \
+        --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        make build-rel && \
+        strings ./target/release/bs | grep "rustc version" | grep "1.89.0" && \
+        strings ./examples/target/debug/calc | grep "^rustc version" | grep "1.95.0" && \
+        make int-test-rel
 
 # Mirrors CI's `lint` job: cargo build (workspace + examples), MSRV
 # string check, fmt --check, clippy -D warnings, all on MSRV.
