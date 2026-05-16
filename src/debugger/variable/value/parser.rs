@@ -507,10 +507,55 @@ impl ValueParser {
                         .name()
                         .unwrap_or("dyn Trait")
                         .to_string();
+
+                    // Phase 3 Feature A batch A7 — split `dyn Foo +
+                    // Send + Sync` into the main bound + an
+                    // auto-trait list. Reconstruct the type-ident
+                    // without the auto-trait portion so the main
+                    // trait name stays readable; the auto traits
+                    // get surfaced on the view and rendered as a
+                    // separate `[+ Send + Sync]` annotation.
+                    let (cleaned, auto_traits) = match parse_dyn_bounds(&original) {
+                        Some(((main_start, main_end), autos)) if !autos.is_empty() => {
+                            // Find where the auto-trait suffix ends —
+                            // the bound list ends at the same `>`/`)`/`,`
+                            // the parser stopped at. We splice
+                            // `[main_end..bound_list_end]` (which is
+                            // ` + Send + Sync`) out of the string.
+                            let after = &original[main_end..];
+                            let bytes = after.as_bytes();
+                            let mut depth: i32 = 0;
+                            let mut suffix_end = after.len();
+                            for (i, &c) in bytes.iter().enumerate() {
+                                match c {
+                                    b'<' | b'(' => depth += 1,
+                                    b'>' | b')' => {
+                                        if depth == 0 {
+                                            suffix_end = i;
+                                            break;
+                                        }
+                                        depth -= 1;
+                                    }
+                                    b',' if depth == 0 => {
+                                        suffix_end = i;
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            let mut cleaned = String::with_capacity(original.len());
+                            cleaned.push_str(&original[..main_end]);
+                            cleaned.push_str(&original[main_end + suffix_end..]);
+                            (cleaned, autos)
+                        }
+                        _ => (original.clone(), Vec::new()),
+                    };
+
                     struct_var
                         .type_ident
-                        .set_name(format!("{original} [→ {}]", info.concrete));
+                        .set_name(format!("{cleaned} [→ {}]", info.concrete));
                     let mut view = info.view;
+                    view.auto_traits = auto_traits;
                     // Phase 3 Feature A batch A5 — when we can resolve
                     // the data pointer through the concrete type, the
                     // dyn becomes transparent: the renderer surfaces
@@ -1670,6 +1715,100 @@ fn demangle_to_string(mangled: &str) -> Option<String> {
     }
 }
 
+/// Parse a `dyn Trait + Send + Sync` bound list out of a
+/// trait-object's type-ident name. Returns `(main_bound_span,
+/// auto_trait_short_names)` so the caller can splice the auto-trait
+/// portion out of the type-ident and surface it separately.
+///
+/// `main_bound_span` is the (start, end) of the *main* trait inside
+/// the input — caller uses it to reconstruct a type-ident with just
+/// the main bound (e.g. `Box<dyn core::error::Error, …>` from
+/// `Box<dyn core::error::Error + core::marker::Send + core::marker::Sync, …>`).
+///
+/// `auto_trait_short_names` is the short form (`Send`, not
+/// `core::marker::Send`) of every bound after the main one.
+///
+/// Returns `None` when:
+///   * the input has no `dyn ` token (not a trait-object ident), or
+///   * the bound list has only one entry (`dyn Greeter`) — no
+///     auto-traits to surface.
+fn parse_dyn_bounds(type_name: &str) -> Option<((usize, usize), Vec<String>)> {
+    // The dyn keyword. We don't anchor on `<` because the trait
+    // object may be at the top level (`&dyn Trait`) or nested
+    // inside generics (`Box<(dyn Trait + Send), …>`).
+    let dyn_at = type_name.find("dyn ")?;
+    let bound_list_start = dyn_at + 4;
+
+    // Bound list runs until: a closing `>` / `)` at depth 0, a
+    // comma at depth 0 (Box's second generic — Global), or end of
+    // string. Track angle-bracket + paren depth so `Iterator<Item
+    // = u32>` doesn't terminate early.
+    let bytes = type_name.as_bytes();
+    let mut depth: i32 = 0;
+    let mut bound_list_end = type_name.len();
+    for i in bound_list_start..type_name.len() {
+        let c = bytes[i];
+        match c {
+            b'<' | b'(' => depth += 1,
+            b'>' | b')' => {
+                if depth == 0 {
+                    bound_list_end = i;
+                    break;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => {
+                bound_list_end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Split on `+` at depth 0. Same depth machinery so `Iterator<
+    // Item = T>` doesn't split through its `<…>`.
+    let bound_list = &type_name[bound_list_start..bound_list_end];
+    let bytes = bound_list.as_bytes();
+    let mut bound_starts = vec![0usize];
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' | b'(' => depth += 1,
+            b'>' | b')' => depth -= 1,
+            b'+' if depth == 0 => bound_starts.push(i + 1),
+            _ => {}
+        }
+        i += 1;
+    }
+    if bound_starts.len() < 2 {
+        return None; // single-bound dyn — nothing to surface
+    }
+
+    // First slice = main bound. Compute its trimmed span inside
+    // the input string so the caller can splice cleanly.
+    let main_raw_end = bound_starts[1] - 1; // back off the `+`
+    let main_raw = &bound_list[..main_raw_end];
+    let main_trimmed = main_raw.trim_end();
+    let main_span = (bound_list_start, bound_list_start + main_trimmed.len());
+
+    let auto_traits: Vec<String> = bound_starts[1..]
+        .iter()
+        .enumerate()
+        .map(|(idx, start)| {
+            let end_with_plus = bound_starts
+                .get(idx + 2)
+                .copied()
+                .unwrap_or(bound_list.len() + 1);
+            let end = end_with_plus.saturating_sub(1).min(bound_list.len());
+            let raw = bound_list[*start..end].trim();
+            raw.rsplit("::").next().unwrap_or(raw).to_string()
+        })
+        .collect();
+
+    Some((main_span, auto_traits))
+}
+
 /// Pull the trailing method name out of a demangled symbol like
 /// `<Concrete as Trait>::greet` or `Concrete::greet`. Walks the
 /// last `::` that lives at angle-bracket depth 0 — naive `rsplit`
@@ -2265,5 +2404,58 @@ mod dyn_resolver_tests {
         // the test stub) — proves the walker stepped past the
         // null in the middle.
         assert_eq!(info.view.methods.len(), 2);
+    }
+
+    // ---- parse_dyn_bounds: auto-trait surfacing ----
+
+    use super::parse_dyn_bounds;
+
+    /// Single-bound dyn (no `+`): no auto traits to surface,
+    /// resolver returns `None` so the caller doesn't try to splice.
+    #[test]
+    fn dyn_bounds_single_returns_none() {
+        assert!(parse_dyn_bounds("&dyn showcase::main::Greeter").is_none());
+    }
+
+    /// Top-level `dyn Trait + Send + Sync`. The main bound's span
+    /// covers `core::error::Error`; the autos are short-named.
+    #[test]
+    fn dyn_bounds_multi_at_top_level() {
+        let input = "dyn core::error::Error + core::marker::Send + core::marker::Sync";
+        let (main, autos) = parse_dyn_bounds(input).expect("should parse");
+        assert_eq!(
+            &input[main.0..main.1],
+            "core::error::Error",
+            "main bound span must cover only the trait name",
+        );
+        assert_eq!(autos, vec!["Send".to_string(), "Sync".to_string()]);
+    }
+
+    /// Same shape but nested inside Box's generics — the bound
+    /// list terminates at the `,` that separates from `Global`.
+    #[test]
+    fn dyn_bounds_inside_box_generics() {
+        let input = "alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync), alloc::alloc::Global>";
+        let (main, autos) = parse_dyn_bounds(input).expect("should parse");
+        assert_eq!(&input[main.0..main.1], "core::error::Error");
+        assert_eq!(autos, vec!["Send".to_string(), "Sync".to_string()]);
+    }
+
+    /// Main bound carrying its own generic args (`Iterator<Item =
+    /// u32>`). The `<...>` portion must not be split on by the
+    /// bound-list parser's `+` walker.
+    #[test]
+    fn dyn_bounds_main_with_generics() {
+        let input = "dyn core::iter::Iterator<Item = u32> + core::marker::Send";
+        let (main, autos) = parse_dyn_bounds(input).expect("should parse");
+        assert_eq!(&input[main.0..main.1], "core::iter::Iterator<Item = u32>");
+        assert_eq!(autos, vec!["Send".to_string()]);
+    }
+
+    /// No `dyn ` token at all — not a trait-object ident.
+    #[test]
+    fn dyn_bounds_non_trait_object_returns_none() {
+        assert!(parse_dyn_bounds("Vec<u8>").is_none());
+        assert!(parse_dyn_bounds("Point").is_none());
     }
 }

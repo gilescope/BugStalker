@@ -51,9 +51,9 @@ expect: {
   items: [
     {
       name: "multi_bound",
-      type: "alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync), alloc::alloc::Global> [→ showcase::main::ShowcaseErr]",
+      type: "alloc::boxed::Box<(dyn core::error::Error), alloc::alloc::Global> [→ showcase::main::ShowcaseErr]",
       value_text: {
-        $regex: "^alloc::boxed::Box<\\(dyn core::error::Error \\+ core::marker::Send \\+ core::marker::Sync\\), alloc::alloc::Global> \\[→ showcase::main::ShowcaseErr\\] \\{\n  data: 0x[0-9a-fA-F]+ → ShowcaseErr\\(\"boom\"\\),\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    fmt: → <showcase::main::ShowcaseErr as core::fmt::Debug>::fmt \\(main\\.rs:125\\),\n    fmt: → <showcase::main::ShowcaseErr as core::fmt::Display>::fmt \\(main\\.rs:128\\),\n    source: → core::error::Error::source \\(error\\.rs:105\\),\n    type_id: → core::error::Error::type_id \\(error\\.rs:116\\),\n    description: → core::error::Error::description \\(error\\.rs:131\\),\n    cause: → core::error::Error::cause \\(error\\.rs:141\\),\n    provide: → core::error::Error::provide \\(error\\.rs:204\\),\n  \\},\n\\}$"
+        $regex: "^alloc::boxed::Box<\\(dyn core::error::Error\\), alloc::alloc::Global> \\[→ showcase::main::ShowcaseErr\\] \\[\\+ Send \\+ Sync\\] \\{\n  data: 0x[0-9a-fA-F]+ → ShowcaseErr\\(\"boom\"\\),\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    fmt: → <showcase::main::ShowcaseErr as core::fmt::Debug>::fmt \\(main\\.rs:125\\),\n    fmt: → <showcase::main::ShowcaseErr as core::fmt::Display>::fmt \\(main\\.rs:128\\),\n    source: → core::error::Error::source \\(error\\.rs:105\\),\n    type_id: → core::error::Error::type_id \\(error\\.rs:116\\),\n    description: → core::error::Error::description \\(error\\.rs:131\\),\n    cause: → core::error::Error::cause \\(error\\.rs:141\\),\n    provide: → core::error::Error::provide \\(error\\.rs:204\\),\n  \\},\n\\}$"
       }
     }
   ],

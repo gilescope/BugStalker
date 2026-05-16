@@ -213,6 +213,13 @@ pub struct VtableView {
     /// at `data_ptr`. The renderer surfaces this inline so a dyn
     /// stops being opaque.
     pub concrete_value: Option<Box<Value>>,
+    /// Phase 3 Feature A batch A7 — auto-trait markers carried in
+    /// the `dyn` bound list (`Send`, `Sync`, `Unpin`, etc.). Parsed
+    /// out of the type-ident at resolve time and rendered compactly
+    /// as `[+ Send + Sync]` so the main trait name stays readable.
+    /// Empty for single-bound dyns (`&dyn Greeter`). Names are
+    /// short form — `Send` rather than `core::marker::Send`.
+    pub auto_traits: Vec<String>,
 }
 
 /// One vtable slot the resolver was able to identify by symbol.

@@ -484,12 +484,21 @@ pub fn render_trait_object_at_depth(
     let resolved = trait_name.contains("[→ ");
     let view = s.vtable_view.as_ref();
 
+    // Auto-trait annotation — common to depths 0, 1, 2. Empty for
+    // single-bound dyn; renders as ` [+ Send + Sync]` otherwise.
+    // Goes after the `[→ Concrete]` annotation so the eye reads
+    // type → concrete → bounds left to right.
+    let auto_traits_suffix = view
+        .filter(|v| !v.auto_traits.is_empty())
+        .map(|v| format!(" [+ {}]", v.auto_traits.join(" + ")))
+        .unwrap_or_default();
+
     // Depth 0 — the user wants everything. Same multi-line view
     // as before the depth refactor.
     if depth == 0
         && let (Some(d), Some(v), Some(view), true) = (data_ptr, vtable_ptr, view, resolved)
     {
-        return render_trait_object_multiline(trait_name, d, v, view);
+        return render_trait_object_multiline(trait_name, &auto_traits_suffix, d, v, view);
     }
 
     // Depth 1 — one-line with the concrete-value punchline. Show
@@ -499,7 +508,7 @@ pub fn render_trait_object_at_depth(
         && resolved
         && let Some(view) = view
     {
-        let mut out = trait_name.to_string();
+        let mut out = format!("{trait_name}{auto_traits_suffix}");
         if let Some(concrete) = view.concrete_value.as_deref() {
             let rendered = render_concrete_compact(concrete, 0);
             out.push_str(&format!(" ({rendered})"));
@@ -519,7 +528,7 @@ pub fn render_trait_object_at_depth(
     // Depth 2+ — just the type-with-concrete annotation. Anyone
     // who wants more drills in with `var <path>`.
     if depth >= 2 && resolved {
-        return trait_name.to_string();
+        return format!("{trait_name}{auto_traits_suffix}");
     }
 
     // Fallback paths — unresolved concrete or strategy-2-only.
@@ -558,6 +567,7 @@ pub fn render_trait_object_at_depth(
 /// transparent view of what the pointee actually is.
 fn render_trait_object_multiline(
     trait_name: &str,
+    auto_traits_suffix: &str,
     data_ptr: *const (),
     vtable_ptr: *const (),
     view: &crate::debugger::variable::value::VtableView,
@@ -566,7 +576,7 @@ fn render_trait_object_multiline(
     const MAX_RENDER_METHODS: usize = 8;
 
     let mut out = String::new();
-    let _ = writeln!(out, "{trait_name} {{");
+    let _ = writeln!(out, "{trait_name}{auto_traits_suffix} {{");
     if let Some(concrete) = view.concrete_value.as_deref() {
         // Compact one-line render of the concrete value so it sits
         // next to `data:` without exploding the vtable view's line
