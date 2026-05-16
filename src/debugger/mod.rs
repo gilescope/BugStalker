@@ -1627,27 +1627,44 @@ impl Debugger {
         // RET at function exit will then pop garbage; the EnC
         // flow's auto-resume usually catches the user's pre-
         // patch bp before that matters.
-        // x86_64 path: stack repair not implemented. A spike that
-        // wrote `[unwound.value(SP) - 8] = unwound.value(RA)` and
-        // restored callee-saved registers produced an inferior
-        // stack overflow — the inferior re-entered the patched
-        // function recursively. The unwound (SP, RA) pair *does*
-        // match the System-V "CFA = RSP just before CALL"
-        // convention (verified: return_addr lands at
-        // `call_once+0xb` which is right after the `call rdi`
-        // trampoline that originally invoked compute), so the
-        // recursion isn't an address-arithmetic mistake. Probable
-        // cause: the patched function's prologue allocates a
-        // different stack frame size than the original, so
-        // recreating "fn-entry state" from the unwinder's view
-        // of the ORIGINAL function's CFA writes the return
-        // address into a slot the patched prologue then clobbers.
-        // Needs a separate pass: read the patched function's CFA
-        // rule from the new image's eh_frame, not assume it
-        // matches the running process's old rule. Tracked
-        // separately. For now, set_pc-only — the EnC auto-resume
-        // typically catches the user's pre-patch bp before the
-        // (broken) RET would matter.
+        // x86_64 path: stack repair is not landing — bisected to
+        // a deeper upstream issue. The unwinder returns the wrong
+        // return address for leaf functions on x86_64.
+        //
+        // Repro: pause inside a leaf fn `compute` (called
+        // directly from `main`). The actual saved return address
+        // on the stack at [RSP] is `main+0x47` (= the
+        // instruction right after main's `call compute`). Read
+        // it via `read_memory(rsp, 8)` and you see exactly that.
+        //
+        // But `restore_registers_at_frame(.., 1)` followed by
+        // `unwound.value(Register::RA)` returns a completely
+        // different address that resolves to inside
+        // `core::ops::function::FnOnce::call_once + 0xb` —
+        // `call_once` isn't even on the call stack (compute was
+        // called directly, no trait-object dispatch).
+        //
+        // Likely cause: compute has no prologue (uses the
+        // System-V red zone), so rustc emits no FDE rows for the
+        // body — only the implicit `RSP + 8` / `[CFA-8]` defaults.
+        // The unwinder's `next` step lands frame 1's PC at *some*
+        // address by following these defaults, but the address it
+        // walks to isn't the actual caller for this stack. The
+        // resulting stack-repair writes the wrong return slot,
+        // the patched fn RETs into an unrelated function, and
+        // the inferior either crashes or recurses.
+        //
+        // This is a debugger-wide unwinder correctness issue, not
+        // an EnC-specific one (`backtrace()` would mis-report the
+        // caller for the same scenario). A proper fix requires
+        // walking the FDE return-address rule against the real
+        // saved bytes at [RSP], not propagating registers
+        // through the unwinder when the leaf has trivial
+        // unwind info. Tracked separately.
+        //
+        // For now, set_pc-only. The EnC auto-resume catches the
+        // user's pre-patch breakpoint before the (broken) RET
+        // matters, which is the contract.
 
         map.set_pc(fn_start);
         map.persist(pid)?;
