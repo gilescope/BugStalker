@@ -773,44 +773,69 @@ impl Value {
             Value::Struct(structure) => structure.field(field_name),
             Value::RustEnum(r_enum) => r_enum.value.and_then(|v| v.value.field(field_name)),
             Value::Specialized {
-                value: specialized, ..
-            } => match specialized {
-                Some(SpecializedValue::HashMap(map)) | Some(SpecializedValue::BTreeMap(map)) => {
-                    map.kv_items.into_iter().find_map(|(key, value)| match key {
-                        Value::Specialized {
-                            value: specialized, ..
-                        } => match specialized {
-                            Some(SpecializedValue::String(string_key)) => {
-                                (string_key.value == field_name).then_some(value)
-                            }
-                            Some(SpecializedValue::Str(string_key)) => {
-                                (string_key.value == field_name).then_some(value)
-                            }
+                value: specialized,
+                original,
+            } => {
+                // Container-shaped specialisations have their own
+                // semantics for `.field()` (HashMap key lookup,
+                // Vector "buf" alias, Cell/RefCell pass-through, …).
+                // Anything else — notably `AtomicU*` / `AtomicI*` /
+                // bespoke pretty-printers that don't carry a real
+                // field map — should fall through to the underlying
+                // struct so callers can navigate by DWARF field
+                // name (e.g. tokio's `AtomicU64 { v: UnsafeCell { value } }`).
+                let from_specialized = match &specialized {
+                    Some(SpecializedValue::HashMap(_))
+                    | Some(SpecializedValue::BTreeMap(_))
+                    | Some(SpecializedValue::Vector(_))
+                    | Some(SpecializedValue::VecDeque(_))
+                    | Some(SpecializedValue::Tls(_))
+                    | Some(SpecializedValue::Cell(_))
+                    | Some(SpecializedValue::RefCell(_)) => true,
+                    _ => false,
+                };
+                if !from_specialized {
+                    return original.field(field_name);
+                }
+                match specialized {
+                    Some(SpecializedValue::HashMap(map))
+                    | Some(SpecializedValue::BTreeMap(map)) => {
+                        map.kv_items.into_iter().find_map(|(key, value)| match key {
+                            Value::Specialized {
+                                value: specialized, ..
+                            } => match specialized {
+                                Some(SpecializedValue::String(string_key)) => {
+                                    (string_key.value == field_name).then_some(value)
+                                }
+                                Some(SpecializedValue::Str(string_key)) => {
+                                    (string_key.value == field_name).then_some(value)
+                                }
+                                _ => None,
+                            },
                             _ => None,
-                        },
-                        _ => None,
-                    })
-                }
-                Some(SpecializedValue::Vector(vec_val))
-                | Some(SpecializedValue::VecDeque(vec_val)) => {
-                    if field_name == "buf" {
-                        vec_val
-                            .structure
-                            .members
-                            .first()
-                            .map(|member| member.value.clone())
-                    } else {
-                        None
+                        })
                     }
+                    Some(SpecializedValue::Vector(vec_val))
+                    | Some(SpecializedValue::VecDeque(vec_val)) => {
+                        if field_name == "buf" {
+                            vec_val
+                                .structure
+                                .members
+                                .first()
+                                .map(|member| member.value.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    Some(SpecializedValue::Tls(tls_var)) => tls_var
+                        .inner_value
+                        .and_then(|inner| inner.field(field_name)),
+                    Some(SpecializedValue::Cell(cell)) | Some(SpecializedValue::RefCell(cell)) => {
+                        cell.field(field_name)
+                    }
+                    _ => None,
                 }
-                Some(SpecializedValue::Tls(tls_var)) => tls_var
-                    .inner_value
-                    .and_then(|inner| inner.field(field_name)),
-                Some(SpecializedValue::Cell(cell)) | Some(SpecializedValue::RefCell(cell)) => {
-                    cell.field(field_name)
-                }
-                _ => None,
-            },
+            }
             _ => None,
         }
     }

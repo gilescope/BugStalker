@@ -172,15 +172,17 @@ impl Debugger {
             if let Some(Some(w)) = worker {
                 // if this is an async worker we need to extract whole future list once
                 if tasks.is_empty() {
-                    let mut context_initialized_var = analyze_context
+                    // See worker.rs: tokio's thread_local!-generated
+                    // CONTEXT static expands to two matches in 1.40+;
+                    // pick the one with the `scheduler` field.
+                    let context_initialized = analyze_context
                         .debugger()
-                        .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))?;
-                    let context_initialized =
-                        context_initialized_var
-                            .pop_if_single_el()
-                            .ok_or(Error::Async(AsyncError::IncorrectAssumption(
-                                "CONTEXT not found",
-                            )))?;
+                        .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))?
+                        .into_iter()
+                        .find(|c| c.value().clone().field("scheduler").is_some())
+                        .ok_or(Error::Async(AsyncError::IncorrectAssumption(
+                            "CONTEXT not found",
+                        )))?;
 
                     let owned = OwnedList::try_extract(&analyze_context, context_initialized)?;
                     let dbg = analyze_context.debugger();

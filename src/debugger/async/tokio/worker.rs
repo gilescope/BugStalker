@@ -121,10 +121,16 @@ impl WorkerInternal {
     /// * `thread`: thread information
     pub(super) fn analyze(ctx: &mut TokioAnalyzeContext, thread: &ThreadSnapshot) -> Option<Self> {
         let debugger = ctx.debugger_mut();
+        // `thread_local! { static CONTEXT … }` expands to two static
+        // items in tokio 1.40+ (init-closure VAL + cached-value VAL),
+        // both surface as "CONTEXT" via name-based DQE. Pick the one
+        // carrying the runtime context (it has a `scheduler` field;
+        // the other doesn't).
         let context = debugger
             .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))
             .ok()?
-            .pop_if_single_el()?;
+            .into_iter()
+            .find(|c| c.value().clone().field("scheduler").is_some())?;
 
         let backtrace = thread.bt.as_ref()?;
 
@@ -328,7 +334,8 @@ pub fn try_as_worker(
     let context_initialized = context
         .debugger()
         .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))?
-        .pop_if_single_el()
+        .into_iter()
+        .find(|c| c.value().clone().field("scheduler").is_some())
         .ok_or(Error::Async(AsyncError::IncorrectAssumption(
             "CONTEXT not found",
         )))?;
