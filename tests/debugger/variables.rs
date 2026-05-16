@@ -1421,31 +1421,33 @@ fn test_arguments() {
     });
 
     // Phase 1 S16: the Vec<u8> render goes through the byte-preview
-    // path. Bytes 3/4/5 are valid utf-8 (1-byte ASCII control chars),
-    // so the format is `b"<debug-escaped-string>"`. We check the
-    // shape (PreRendered + `b"` prefix) rather than the exact
-    // escape sequence to keep the test robust to Rust's debug-format
-    // tweaks.
+    // path *only when the bytes look like text* (printable ASCII +
+    // common whitespace; see `vec_bytes_are_stringy`). Bytes 3/4/5
+    // are valid utf-8 but not printable, so `b"\u{3}\u{4}\u{5}"`
+    // would be harder to read than the numeric form — the renderer
+    // deliberately falls through to `IndexedList`. Assert that's
+    // what we get; the renderer prints these as `Vec<u8> [3, 4, 5]`.
     use bugstalker::debugger::variable::render::ValueLayout;
     let layout = vec.value().value_layout().expect("Vec<u8> layout missing");
-    let rendered = match layout {
-        ValueLayout::PreRendered(s) => s.into_owned(),
-        other => panic!("expected byte-preview PreRendered, got {other:?}"),
-    };
-    assert!(
-        rendered.starts_with("b\""),
-        "byte-preview should start with `b\"`, got {rendered:?}"
-    );
-    // Rust's {:?} formatter escapes control bytes as `\u{N}`. Bytes
-    // 3, 4, 5 land as `\u{3}`, `\u{4}`, `\u{5}`. We assert each is
-    // present so a future formatter change (e.g. switching to
-    // `\xNN`) shows up as a failed assertion rather than a silent
-    // shape change.
-    for hex in ["\\u{3}", "\\u{4}", "\\u{5}"] {
-        assert!(
-            rendered.contains(hex),
-            "preview missing {hex}: {rendered:?}"
-        );
+    match layout {
+        ValueLayout::IndexedList(items) => {
+            let got: Vec<u64> = items
+                .iter()
+                .filter_map(|it| match &it.value {
+                    Value::Scalar(s) => match s.value {
+                        Some(SupportedScalar::U8(b)) => Some(b as u64),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![3, 4, 5],
+                "non-stringy Vec<u8> should render as numeric IndexedList"
+            );
+        }
+        other => panic!("expected numeric IndexedList for non-printable bytes, got {other:?}"),
     }
 
     assert_struct(
@@ -2401,12 +2403,15 @@ fn test_read_mutex_rwlock() {
     // locks would assert `true` here.
     assert_mutex_poisoned(pick("mtx").value(), false);
     assert_mutex_poisoned(pick("rwl").value(), false);
-    // Phase 1 S1 (locked): mtx and rwl are not held when the
-    // breakpoint fires (their `lock()`/`read()` calls happen
-    // afterwards). On macOS the futex backend isn't used so
-    // locked is always false there too.
-    assert_mutex_locked(pick("mtx").value(), false);
-    assert_mutex_locked(pick("rwl").value(), false);
+    // Phase 1 S1 (locked): the fixture *does* hold both locks at
+    // the breakpoint — `mtx.lock()` runs at vars.rs:734 and
+    // `rwl.read()` at vars.rs:735, both before the bp at 749. The
+    // probe correctly reports `locked = true`. On macOS the futex
+    // backend isn't used so the probe reports `false` there even
+    // when held; gate that platform out below if/when this test is
+    // re-enabled on darwin.
+    assert_mutex_locked(pick("mtx").value(), true);
+    assert_mutex_locked(pick("rwl").value(), true);
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);
