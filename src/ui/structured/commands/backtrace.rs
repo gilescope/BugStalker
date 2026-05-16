@@ -23,6 +23,9 @@ pub struct Backtrace {
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct Frame {
+    /// Zero-based frame index (innermost frame is `0`). Stable for
+    /// one stop; agents bind `frame N` to this number.
+    pub num: usize,
     pub function: Option<String>,
     pub address: String,
     pub function_start: Option<String>,
@@ -77,7 +80,9 @@ impl StructuredCommand for Backtrace {
                         .bt
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|f| Frame {
+                        .enumerate()
+                        .map(|(num, f)| Frame {
+                            num,
                             function: f.func_name,
                             address: hex(f.ip),
                             function_start: f.fn_start_ip.map(hex),
