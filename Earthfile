@@ -259,3 +259,182 @@ install-darwin:
         { echo "+install-darwin: cs.debugger entitlement missing after codesign"; exit 1; }
     RUN ln -sf bs "$HOME/.cargo/bin/bugstalker"
     RUN echo "+install-darwin: bs installed at \$HOME/.cargo/bin/bs (adhoc-signed with cs.debugger), bugstalker symlink in place"
+
+# ----------------------------------------------------------------------
+# CI-mirror targets
+# ----------------------------------------------------------------------
+#
+# Each `+ci-*` target reproduces one job from `.github/workflows/ci.yml`
+# as closely as a container can. Use these to triage CI failures
+# locally without round-tripping through GitHub Actions.
+#
+# Single-job:   earthly -P +ci-lint
+# Whole suite:  earthly -P +ci-all
+# arm64 too:    earthly -P --BS_PLATFORM=linux/arm64 +ci-all
+# macOS smoke:  earthly +ci-test-macos     (LOCALLY — needs a macOS host)
+# Nix check:    earthly +ci-nix            (LOCALLY — needs host `nix`)
+
+# Mirrors CI's `test` job. Parameterised by `RUSTC` so the same target
+# covers the 1.91 … 1.95 matrix.
+#   - installs RUSTC + MSRV
+#   - builds the example debuggees with RUSTC
+#   - greps the `rustc version` string out of `calc` as a sanity check
+#   - runs `cargo test` against the bs library
+ci-test:
+    ARG RUSTC=1.95.0
+    FROM +common
+    RUN rustup toolchain install "$RUSTC" --profile minimal && \
+        rustup toolchain install 1.89.0 --profile minimal
+    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml ./
+    COPY --dir src tests crates benches examples ./
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/examples/target,sharing=locked \
+        cd examples && \
+        cargo "+$RUSTC" build -p calc_lib && \
+        cargo "+$RUSTC" build && \
+        mkdir -p /bs/examples/_built && \
+        cp -r target/debug /bs/examples/_built/debug
+    RUN strings examples/_built/debug/calc | grep "^rustc version" | grep "$RUSTC"
+    RUN rm -rf examples/target && mkdir -p examples/target && \
+        mv examples/_built/debug examples/target/debug
+    RUN --privileged \
+        --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        cargo test
+
+# 5-version matrix — the same shape CI runs.
+ci-test-matrix:
+    BUILD +ci-test --RUSTC=1.91.0
+    BUILD +ci-test --RUSTC=1.92.0
+    BUILD +ci-test --RUSTC=1.93.0
+    BUILD +ci-test --RUSTC=1.94.0
+    BUILD +ci-test --RUSTC=1.95.0
+
+# Mirrors CI's `integration-test` job (the python unittest suite).
+# Builds bs in release mode, builds the examples with LRV, then runs
+# `make int-test-rel`.
+ci-integration-test:
+    FROM +common
+    # `int-test-rel` invokes `sudo python3 -m unittest`; sudo isn't
+    # in `rust:1.89-bookworm` and Earthly's container UID is root
+    # anyway, so wire `sudo` to a no-op alias.
+    RUN echo '#!/bin/sh' > /usr/local/bin/sudo && \
+        echo 'exec "$@"' >> /usr/local/bin/sudo && \
+        chmod +x /usr/local/bin/sudo
+    RUN rustup toolchain install 1.95.0 --profile minimal && \
+        rustup toolchain install 1.89.0 --profile minimal
+    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml Makefile ./
+    COPY --dir src tests crates benches examples ./
+    COPY requirements.txt ./
+    RUN pip3 install --break-system-packages -r requirements.txt
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        make build-rel
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/examples/target,sharing=locked \
+        make build-examples RUST_VERSION=1.95.0 && \
+        mkdir -p /bs/examples/_built && \
+        cp -r examples/target/debug /bs/examples/_built/debug
+    RUN rm -rf examples/target && mkdir -p examples/target && \
+        mv examples/_built/debug examples/target/debug
+    RUN strings ./target/release/bs | grep "rustc version" | grep "1.89.0" && \
+        strings ./examples/target/debug/calc | grep "^rustc version" | grep "1.95.0"
+    RUN --privileged make int-test-rel
+
+# Mirrors CI's `lint` job: cargo build (workspace + examples), MSRV
+# string check, fmt --check, clippy -D warnings, all on MSRV.
+ci-lint:
+    FROM +common
+    RUN rustup toolchain install 1.89.0 --profile minimal \
+            --component rustfmt --component clippy && \
+        rustup override set 1.89.0
+    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml Makefile ./
+    COPY --dir src tests crates benches examples ./
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        --mount=type=cache,target=/bs/examples/target,sharing=locked \
+        make build-all
+    RUN grep '^rust-version = .1\.89\.0.' Cargo.toml
+    RUN cargo fmt --all -- --check
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        cargo clippy -- -D warnings
+
+# Mirrors CI's `deny` job. Runs the full set of cargo-deny checks
+# the EmbarkStudios action runs in CI: licenses, bans, sources,
+# advisories — all with `--all-features` so transitive deps gated
+# by features are still scanned.
+ci-deny:
+    FROM +common
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        cargo install cargo-deny --locked
+    COPY Cargo.toml Cargo.lock deny.toml ./
+    COPY --dir src tests crates examples ./
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        cargo deny --all-features --manifest-path ./Cargo.toml \
+            check licenses bans sources advisories
+
+# Mirrors CI's `test-arm64` job. Same as `ci-test` plus the
+# explicit `--features int_test --test debugger` and `--test dap`
+# passes. Always uses LRV (1.95). On a multi-arch host, target the
+# arm64 platform explicitly: `--BS_PLATFORM=linux/arm64`.
+ci-test-arm64:
+    FROM +common
+    RUN rustup toolchain install 1.95.0 --profile minimal && \
+        rustup toolchain install 1.89.0 --profile minimal
+    COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml deny.toml ./
+    COPY --dir src tests crates benches examples ./
+    RUN --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/examples/target,sharing=locked \
+        cd examples && \
+        cargo +1.95.0 build -p calc_lib && \
+        cargo +1.95.0 build && \
+        mkdir -p /bs/examples/_built && \
+        cp -r target/debug /bs/examples/_built/debug
+    RUN rm -rf examples/target && mkdir -p examples/target && \
+        mv examples/_built/debug examples/target/debug
+    RUN --privileged \
+        --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        cargo test
+    RUN --privileged \
+        --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        cargo test --features int_test --test debugger -- --test-threads=1
+    RUN --privileged \
+        --mount=type=cache,target=/usr/local/cargo/registry \
+        --mount=type=cache,target=/bs/target,sharing=locked \
+        cargo test --features int_test --test dap
+
+# Same shape as `ci-lint`; arch hint is from --BS_PLATFORM.
+ci-lint-arm64:
+    BUILD +ci-lint
+
+# Mirrors CI's `nix` job. `nix flake check` needs a host nix install
+# and can't easily run inside an Earthly container, so this target
+# is LOCALLY.
+ci-nix:
+    LOCALLY
+    RUN command -v nix > /dev/null || { \
+        echo "+ci-nix: host \`nix\` not found; install Nix first"; exit 1; }
+    RUN nix flake check
+
+# Mirrors CI's `test-macos` smoke job: cargo check --workspace
+# --all-targets, then cargo test --workspace --lib. macOS only.
+ci-test-macos:
+    LOCALLY
+    RUN test "$(uname)" = Darwin || \
+        { echo "+ci-test-macos: macOS only (host is $(uname))"; exit 1; }
+    RUN rustup toolchain install 1.95.0 && rustup default 1.95.0
+    RUN cargo check --workspace --all-targets
+    RUN cargo test --workspace --lib
+
+# Full CI sweep: every container-capable job in parallel. `nix` and
+# `test-macos` are host-bound (LOCALLY) and are not BUILD-able from
+# inside another target; run them by hand from a darwin / nix host.
+ci-all:
+    BUILD +ci-test-matrix
+    BUILD +ci-integration-test
+    BUILD +ci-lint
+    BUILD +ci-deny
+    BUILD +ci-test-arm64
