@@ -345,6 +345,7 @@ impl ExplorationContext {
 pub struct DebuggerBuilder<H: EventHook + 'static = NopHook> {
     oracles: Vec<Arc<dyn Oracle>>,
     hooks: Option<H>,
+    auto_traps: bool,
 }
 
 impl<H: EventHook + 'static> DebuggerBuilder<H> {
@@ -353,7 +354,18 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
         Self {
             oracles: vec![],
             hooks: None,
+            auto_traps: true,
         }
+    }
+
+    /// Enable or disable the panic / process-exit auto-trap
+    /// breakpoints. Default: enabled. Test scenarios that drive
+    /// the inferior to completion (and expect it to *exit*) want
+    /// to disable these — otherwise the run stops at
+    /// `std::process::exit` instead of letting the OS reap the
+    /// process.
+    pub fn with_auto_traps(self, auto_traps: bool) -> Self {
+        Self { auto_traps, ..self }
     }
 
     /// Add oracles.
@@ -389,9 +401,9 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
     /// * `process`: debugee process
     pub fn build(self, process: Child<Installed>) -> Result<Debugger, Error> {
         if let Some(hooks) = self.hooks {
-            Debugger::new(process, hooks, self.oracles)
+            Debugger::new(process, hooks, self.oracles, self.auto_traps)
         } else {
-            Debugger::new(process, NopHook {}, self.oracles)
+            Debugger::new(process, NopHook {}, self.oracles, self.auto_traps)
         }
     }
 
@@ -431,6 +443,10 @@ pub struct Debugger {
     oracles: IndexMap<&'static str, (Arc<dyn Oracle>, bool)>,
     /// Detach flag to skip destructive cleanup on drop.
     detached: bool,
+    /// When false, the EntryPoint handler skips `install_auto_traps`.
+    /// Test scenarios that drive the inferior to completion need to
+    /// disable this so the run doesn't stop at `std::process::exit`.
+    auto_traps: bool,
     /// Phase 4 Tier-A — declarative visualiser registry,
     /// populated from the debuggee's `.bs_viz_spec` /
     /// `__bs_viz_spec` section at construction. Empty when the
@@ -445,6 +461,7 @@ impl Debugger {
         process: Child<Installed>,
         hooks: impl EventHook + 'static,
         oracles: impl IntoIterator<Item = Arc<dyn Oracle>>,
+        auto_traps: bool,
     ) -> Result<Self, Error> {
         let program_path = Path::new(process.program());
 
@@ -516,6 +533,7 @@ impl Debugger {
                 .map(|oracle| (oracle.name(), (oracle, false)))
                 .collect(),
             detached: false,
+            auto_traps,
             viz,
         })
     }
@@ -761,7 +779,15 @@ impl Debugger {
                                 // that aren't present in this binary
                                 // (e.g. `_exit` in a no_std build) get
                                 // skipped silently.
-                                self.install_auto_traps();
+                                //
+                                // Opt-out via `DebuggerBuilder::with_auto_traps(false)`:
+                                // some scenarios (notably the test
+                                // suite's "run to completion" tests)
+                                // need the inferior to actually exit
+                                // rather than stop at `process::exit`.
+                                if self.auto_traps {
+                                    self.install_auto_traps();
+                                }
 
                                 // ignore possible signals and watchpoints
                                 while self.step_over_breakpoint()?.is_some() {}
@@ -1762,13 +1788,28 @@ impl Drop for Debugger {
                 // All of these still mean "the inferior is gone",
                 // which is the only thing the surrounding test
                 // suite cares about.
-                debug_assert!(
-                    matches!(
-                        wait_result,
-                        WaitStatus::Signaled(_, _, _) | WaitStatus::Exited(_, _)
-                    ),
-                    "unexpected wait result for kill_pid={kill_pid}: {wait_result:?}"
-                );
+                // Drop cleanup is best-effort. If `waitpid` never
+                // returns a terminal status within the deadline (the
+                // process is wedged in uninterruptible sleep, the
+                // kernel is being slow to deliver our SIGKILL, …)
+                // we just log and move on — the surrounding `Drop`
+                // path is on a panic-unwinding stack, and a panic
+                // here turns into a non-unwinding abort that takes
+                // out the whole test process and masks every later
+                // test's result. assert_no_proc!() in the test will
+                // surface "still exists" as the primary failure
+                // instead.
+                if !matches!(
+                    wait_result,
+                    WaitStatus::Signaled(_, _, _) | WaitStatus::Exited(_, _)
+                ) {
+                    log::warn!(
+                        target: "debugger",
+                        "kill_pid={kill_pid} did not reach a terminal wait \
+                         status within deadline (last seen {wait_result:?}); \
+                         giving up — the OS will reap the inferior."
+                    );
+                }
             }
             ExecutionStatus::Exited => {}
         }

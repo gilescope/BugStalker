@@ -24,7 +24,9 @@ const VIZ_DEMO_APP: &str = "./examples/target/debug/viz_demo";
 fn debug_view_specs_loaded_from_demo_binary() {
     let process = prepare_debugee_process(VIZ_DEMO_APP, &[]);
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let debugger = builder.build(process).unwrap();
 
     // Ten derives in the demo binary: Person, Counter, Wrap,
@@ -166,7 +168,9 @@ fn debug_view_specs_loaded_from_demo_binary() {
 fn debug_view_summary_applied_at_render_time() {
     let process = prepare_debugee_process(VIZ_DEMO_APP, &[]);
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     // BP at the `black_box` line — every local in `main` is
@@ -494,7 +498,9 @@ fn debug_view_loader_recovers_dsym_for_split_debuginfo() {
     }
 
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     // The BP at `main.rs:139` only resolves if DWARF was loaded.

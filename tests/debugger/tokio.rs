@@ -9,7 +9,9 @@ use serial_test::serial;
 #[serial]
 fn test_async0() {
     let process = prepare_debugee_process(TOKIO_TICKER_APP, &[]);
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("main.rs", 6).unwrap();
@@ -31,7 +33,9 @@ fn test_async0() {
 #[serial]
 fn test_async_await_location_recovered() {
     let process = prepare_debugee_process(TOKIO_TICKER_APP, &[]);
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("main.rs", 6).unwrap();

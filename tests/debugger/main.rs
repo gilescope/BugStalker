@@ -332,7 +332,9 @@ fn test_debugger_graceful_shutdown() {
     let process = prepare_debugee_process(HW_APP, &[]);
     let pid = process.pid();
 
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
     debugger
         .set_breakpoint_at_line("hello_world.rs", 5)
@@ -349,7 +351,9 @@ fn test_debugger_graceful_shutdown_multithread() {
     let process = prepare_debugee_process(MT_APP, &[]);
     let pid = process.pid();
 
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
     debugger.set_breakpoint_at_line("mt.rs", 31).unwrap();
     debugger.start_debugee().unwrap();
@@ -365,7 +369,9 @@ fn test_frame_cfa() {
     let debugee_pid = process.pid();
 
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     debugger
         .set_breakpoint_at_line("hello_world.rs", 5)
@@ -398,7 +404,9 @@ fn test_registers() {
     let debugee_pid = process.pid();
 
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     debugger
         .set_breakpoint_at_line("hello_world.rs", 5)
@@ -432,7 +440,9 @@ fn test_debugger_disassembler() {
     let process = prepare_debugee_process(HW_APP, &[]);
     let pid = process.pid();
 
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
     debugger.set_breakpoint_at_fn("main").unwrap();
     debugger.start_debugee().unwrap();

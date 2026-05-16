@@ -79,7 +79,9 @@ fn test_unwind_restores_registers_for_caller_frame() {
     let process = prepare_debugee_process(CALLS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("calls.rs", 30).unwrap();
@@ -132,7 +134,9 @@ fn test_unwind_uses_debug_frame_when_eh_frame_missing() {
     let debugee_pid = process.pid();
 
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.start_debugee().unwrap();

@@ -104,11 +104,15 @@ impl EventHook for TestHooks {
 #[macro_export]
 macro_rules! assert_no_proc {
     ($pid:expr) => {
-        // Poll for up to 2 seconds — darwin's sysinfo reflects
-        // process state with more lag than linux. Earliest pass
-        // typically lands within 100 ms; a stuck inferior won't
-        // disappear in any duration.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // Poll for up to 10 seconds — earliest pass typically lands
+        // within 100 ms, but the multithreaded examples sleep for
+        // ~2–3 seconds *after* the breakpoint hit before main
+        // joins, so the inferior is genuinely still alive past the
+        // 2-second mark on slower CI runners. A stuck inferior
+        // won't disappear in any duration; 10 s is enough headroom
+        // to clear normal runtime + scheduler jitter without
+        // hanging the suite when something has really wedged.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let raw = $pid.as_raw() as u32;
         let mut found = true;
         while std::time::Instant::now() < deadline {

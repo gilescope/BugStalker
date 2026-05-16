@@ -42,7 +42,9 @@ fn root_async_fn(t: &TaskBacktrace) -> Option<&str> {
 #[serial]
 fn test_await_trace_simple() {
     let process = prepare_debugee_process(TOKIO_SIMPLE_AWAIT_APP, &[]);
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
     // Break inside `marker()` — a sync fn called from the loop body
@@ -84,7 +86,9 @@ fn test_await_trace_simple() {
 #[serial]
 fn test_await_trace_chained() {
     let process = prepare_debugee_process(TOKIO_CHAINED_AWAIT_APP, &[]);
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("main.rs", 11).unwrap();
@@ -132,7 +136,9 @@ fn test_await_trace_chained() {
 #[serial]
 fn test_await_trace_select() {
     let process = prepare_debugee_process(TOKIO_SELECT_APP, &[]);
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("main.rs", 11).unwrap();
@@ -199,7 +205,9 @@ fn test_await_trace_select() {
 #[serial]
 fn test_await_trace_join() {
     let process = prepare_debugee_process(TOKIO_JOIN_APP, &[]);
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("main.rs", 11).unwrap();
@@ -258,7 +266,9 @@ fn test_await_trace_join() {
 #[serial]
 fn test_await_trace_dyn_future() {
     let process = prepare_debugee_process(TOKIO_DYN_FUTURE_APP, &[]);
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("main.rs", 11).unwrap();

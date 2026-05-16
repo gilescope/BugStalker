@@ -116,7 +116,9 @@ fn fuzz_walk(app: &str, args: &[&'static str], local_seed: u64) {
 
     let process = prepare_debugee_process(app, args);
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     if debugger.set_breakpoint_at_fn("main").is_err() {

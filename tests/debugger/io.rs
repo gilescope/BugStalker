@@ -20,7 +20,9 @@ fn test_read_register_write() {
 
     let process = prepare_debugee_process(HW_APP, &[]);
     let debugee_pid = process.pid();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
     debugger
@@ -46,7 +48,9 @@ fn test_backtrace() {
     let process = prepare_debugee_process(HW_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger
@@ -86,7 +90,9 @@ fn test_read_value_u64() {
     let process = prepare_debugee_process(CALC_APP, &["1", "2", "3", "--description", "result"]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     debugger.set_breakpoint_at_line("main.rs", 15).unwrap();
 

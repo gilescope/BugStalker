@@ -58,7 +58,9 @@ fn test_watchpoint_works() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     debugger.set_breakpoint_at_line("vars.rs", 7).unwrap();
 
@@ -91,7 +93,9 @@ fn test_watchpoint_works_2() {
     let process = prepare_debugee_process(CALCULATIONS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut dbg = builder.build(process).unwrap();
     dbg.set_breakpoint_at_line("calculations.rs", 8).unwrap();
 
@@ -128,7 +132,9 @@ fn test_watchpoint_global_var() {
     let process = prepare_debugee_process(CALCULATIONS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut dbg = builder.build(process).unwrap();
     dbg.set_breakpoint_at_fn("main").unwrap();
 
@@ -160,7 +166,9 @@ fn test_max_watchpoint_count() {
     let process = prepare_debugee_process(CALCULATIONS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut dbg = builder.build(process).unwrap();
     dbg.set_breakpoint_at_line("calculations.rs", 22).unwrap();
 
@@ -207,7 +215,9 @@ fn test_watchpoint_remove_and_continue() {
     let process = prepare_debugee_process(CALCULATIONS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut dbg = builder.build(process).unwrap();
     dbg.set_breakpoint_at_line("calculations.rs", 22).unwrap();
 
@@ -242,7 +252,9 @@ fn test_watchpoint_global_var_multithread() {
     let process = prepare_debugee_process(CALCULATIONS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut dbg = builder.build(process).unwrap();
     dbg.set_breakpoint_at_fn("calculation_global_value_mt")
         .unwrap();
@@ -286,7 +298,9 @@ fn test_watchpoint_local_var_multithread() {
     let process = prepare_debugee_process(CALCULATIONS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut dbg = builder.build(process).unwrap();
     dbg.set_breakpoint_at_line("calculations.rs", 68).unwrap();
 
@@ -317,7 +331,9 @@ fn test_max_watchpoint_count_at_address() {
     let process = prepare_debugee_process(CALCULATIONS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut dbg = builder.build(process).unwrap();
     dbg.set_breakpoint_at_line("calculations.rs", 22).unwrap();
 
@@ -376,7 +392,9 @@ fn test_watchpoint_argument() {
     let process = prepare_debugee_process(CALCULATIONS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut dbg = builder.build(process).unwrap();
     dbg.set_breakpoint_at_fn("calculate_from_arg").unwrap();
 
