@@ -53,7 +53,13 @@ expect: {
       name: "multi_bound",
       type: "alloc::boxed::Box<dyn core::error::Error, alloc::alloc::Global> [→ showcase::main::ShowcaseErr]",
       value_text: {
-        $regex: "^Box<dyn Error, _> \\[→ ShowcaseErr\\] \\[\\+ Send \\+ Sync\\] \\{\n  data: 0x[0-9a-fA-F]+ → ShowcaseErr\\(\"boom\"\\),\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    Debug: \\{\n      fmt: → <ShowcaseErr as Debug>::fmt \\(main\\.rs:125\\),\n    \\},\n    Display: \\{\n      fmt: → <ShowcaseErr as Display>::fmt \\(main\\.rs:128\\),\n    \\},\n    Error: \\{\n      source: → Error::source \\(error\\.rs:105\\),\n      type_id: → Error::type_id \\(error\\.rs:116\\),\n      description: → Error::description \\(error\\.rs:131\\),\n      cause: → Error::cause \\(error\\.rs:141\\),\n      provide: → Error::provide \\(error\\.rs:204\\),\n    \\},\n  \\},\n\\}$"
+        // Source line numbers inside `core::error::Error`'s
+        // default-impl block shift between rustc minor releases —
+        // accept any line, not a fixed integer. (Reported error:111
+        // on rustc 1.95 vs error:105 on the rustc the test was
+        // pinned to.) The main.rs lines (125, 128) are in the
+        // showcase example fixture and stable.
+        $regex: "^Box<dyn Error, _> \\[→ ShowcaseErr\\] \\[\\+ Send \\+ Sync\\] \\{\n  data: 0x[0-9a-fA-F]+ → ShowcaseErr\\(\"boom\"\\),\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 16,\n    align: 8,\n    Debug: \\{\n      fmt: → <ShowcaseErr as Debug>::fmt \\(main\\.rs:125\\),\n    \\},\n    Display: \\{\n      fmt: → <ShowcaseErr as Display>::fmt \\(main\\.rs:128\\),\n    \\},\n    Error: \\{\n      source: → Error::source \\(error\\.rs:\\d+\\),\n      type_id: → Error::type_id \\(error\\.rs:\\d+\\),\n      description: → Error::description \\(error\\.rs:\\d+\\),\n      cause: → Error::cause \\(error\\.rs:\\d+\\),\n      provide: → Error::provide \\(error\\.rs:\\d+\\),\n    \\},\n  \\},\n\\}$"
       }
     }
   ],

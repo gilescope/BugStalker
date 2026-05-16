@@ -22,7 +22,11 @@ expect: {
       name: "pinned",
       type: "Pin<alloc::boxed::Box<dyn core::future::future::Future<Output=u32>, alloc::alloc::Global>>",
       value_text: {
-        $regex: "^Pin<Box<dyn Future<Output=u32>, _>> \\[→ \\{\\{closure\\}\\}\\] \\{\n  data: 0x[0-9a-fA-F]+,\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: → drop_in_place<\\{\\{closure\\}\\}> \\(mod\\.rs:799\\),\n    size: 1,\n    align: 1,\n    main: \\{\n      \\{\\{closure\\}\\}: → main::\\{\\{closure\\}\\} \\(main\\.rs:170\\),\n    \\},\n  \\},\n\\}$"
+        // Source line numbers inside `core::mem::drop_in_place` and
+        // other std internals shift between rustc minor releases —
+        // accept any line. The main.rs line (170) is in the fixture
+        // and stable.
+        $regex: "^Pin<Box<dyn Future<Output=u32>, _>> \\[→ \\{\\{closure\\}\\}\\] \\{\n  data: 0x[0-9a-fA-F]+,\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: → drop_in_place<\\{\\{closure\\}\\}> \\(mod\\.rs:\\d+\\),\n    size: 1,\n    align: 1,\n    main: \\{\n      \\{\\{closure\\}\\}: → main::\\{\\{closure\\}\\} \\(main\\.rs:170\\),\n    \\},\n  \\},\n\\}$"
       }
     }
   ],
@@ -37,7 +41,9 @@ expect: {
       name: "dyn_iter",
       type: "alloc::boxed::Box<dyn core::iter::traits::iterator::Iterator<Item=u32>, alloc::alloc::Global> [→ core::iter::adapters::filter::Filter<I,P>]",
       value_text: {
-        $regex: "^Box<dyn Iterator<Item=u32>, _> \\[→ Filter<I,P>\\] \\{\n  data: 0x[0-9a-fA-F]+,\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 12,\n    align: 4,\n    Iterator: \\{\n      next: → <Filter<I,P> as Iterator>::next \\(filter\\.rs:97\\),\n      size_hint: → <Filter<I,P> as Iterator>::size_hint \\(filter\\.rs:118\\),\n      advance_by: → Iterator::advance_by \\(iterator\\.rs:296\\),\n      nth: → Iterator::nth \\(iterator\\.rs:373\\),\n    \\},\n  \\},\n\\}$"
+        // Source line numbers inside std's iterator/filter modules
+        // shift between rustc minor releases — accept any line.
+        $regex: "^Box<dyn Iterator<Item=u32>, _> \\[→ Filter<I,P>\\] \\{\n  data: 0x[0-9a-fA-F]+,\n  vtable: 0x[0-9a-fA-F]+ \\{\n    drop: <no Drop impl>,\n    size: 12,\n    align: 4,\n    Iterator: \\{\n      next: → <Filter<I,P> as Iterator>::next \\(filter\\.rs:\\d+\\),\n      size_hint: → <Filter<I,P> as Iterator>::size_hint \\(filter\\.rs:\\d+\\),\n      advance_by: → Iterator::advance_by \\(iterator\\.rs:\\d+\\),\n      nth: → Iterator::nth \\(iterator\\.rs:\\d+\\),\n    \\},\n  \\},\n\\}$"
       }
     }
   ],
