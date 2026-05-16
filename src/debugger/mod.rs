@@ -1669,6 +1669,91 @@ impl Debugger {
                 // function will pop it and resume in the caller.
                 // No write needed — it's already correct.
             }
+
+            // Argument restoration. The patched function will re-
+            // run its prologue, which reads input args from the
+            // System-V int-arg registers (RDI, RSI, RDX, RCX, R8,
+            // R9 — first 6 integer/pointer args). If those
+            // registers have been clobbered between fn entry and
+            // the pause point, the restart would compute on
+            // garbage. We read each parameter's *current* value
+            // via its DWARF location list — which, at the current
+            // PC, resolves to the spill slot the prologue wrote
+            // to — and copy that back into the input register.
+            //
+            // The spill slots live in the function's local frame,
+            // BELOW the post-set_sp RSP (the prologue pushed RSP
+            // down before spilling), so they survive our SP reset
+            // intact. Tested with a non-leaf compute: paused at
+            // the multiply, EDI clobbered to a loop counter; the
+            // restore reads the spilled u32 and restarts compute
+            // with the original input.
+            //
+            // V1 limits: integer/pointer args only (no floats →
+            // XMM regs, no args by-value larger than 8 bytes).
+            // Args 7+ live on the stack pre-call and aren't
+            // touched here — the prologue reads them direct from
+            // [rbp+offset] which is still correct after our SP
+            // reset. Failures are silent — a missing location
+            // list or unsupported type leaves the corresponding
+            // register at whatever it currently holds.
+            const SYSV_INT_ARG_REGS: [Register; 6] = [
+                Register::Rdi,
+                Register::Rsi,
+                Register::Rdx,
+                Register::Rcx,
+                Register::R8,
+                Register::R9,
+            ];
+            if let Ok(dwarf) = self.debugee.debug_info(self.ecx().location().pc) {
+                let global_pc = self.ecx().location().global_pc;
+                if let Ok(Some((func_die, _))) = dwarf.find_function_by_pc(global_pc) {
+                    let params = func_die.parameters();
+                    for (i, param) in params.iter().enumerate() {
+                        if i >= SYSV_INT_ARG_REGS.len() {
+                            break;
+                        }
+                        let Some(ty) = param.r#type() else { continue };
+                        let Some(obj) = param.read_value(self.ecx(), &self.debugee, &ty) else {
+                            continue;
+                        };
+                        if obj.raw_data.is_empty() || obj.raw_data.len() > 8 {
+                            continue;
+                        }
+                        let mut buf = [0u8; 8];
+                        buf[..obj.raw_data.len()].copy_from_slice(&obj.raw_data);
+                        let value = u64::from_le_bytes(buf);
+                        map.update(SYSV_INT_ARG_REGS[i], value);
+                    }
+                }
+            }
+
+            // Callee-saved restoration. The patched function's
+            // prologue will save these registers (push rbp, save
+            // r12-r15 etc.) — they need to hold the CALLER's
+            // values at fn entry, not whatever the current body
+            // has clobbered them to. The DWARF unwinder for
+            // frame 0 already knows where each callee-saved was
+            // spilled by the prologue (via the FDE RegisterRule
+            // columns); we read those back from the stack and
+            // restore. Unlike the broken RA propagation, the
+            // saved-callee-register slots ARE in compute's own
+            // frame and the FDE rule reads them direct from
+            // [CFA + offset], so this is correct for both leaf
+            // and non-leaf cases (a leaf simply has no saved
+            // registers to read — the loop just does nothing).
+            for reg in [
+                Register::Rbx,
+                Register::Rbp,
+                Register::R12,
+                Register::R13,
+                Register::R14,
+                Register::R15,
+            ] {
+                if let Some(v) = read_unwound(reg) {
+                    map.update(reg, v);
+                }
+            }
         }
 
         map.set_pc(fn_start);
