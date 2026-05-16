@@ -1818,30 +1818,56 @@ impl<'a> VariableParserExtension<'a> {
 
     fn parse_maybe_uninit_inner(&self, val: Value) -> Result<Value, ParsingError> {
         // The Union has been parsed as a struct; find the `value`
-        // member (the `ManuallyDrop<T>` arm) and peel one more layer
-        // to get T. ManuallyDrop is `#[repr(transparent)]` and its
-        // single field is also called `value` in stable libcore.
+        // member (the `ManuallyDrop<T>` arm) and peel through every
+        // transparent wrapper to surface T directly.
+        //
+        // Wrapper chain seen in libcore over the years:
+        //
+        //   rustc ≤ 1.94: MaybeUninit<T> → value: ManuallyDrop<T>
+        //                                  → value: T
+        //   rustc ≥ 1.95: MaybeUninit<T> → value: ManuallyDrop<T>
+        //                                  → value: MaybeDangling<T>
+        //                                           → value: T
+        //
+        // Both ManuallyDrop and MaybeDangling are
+        // `#[repr(transparent)]` wrappers around a single inner
+        // `value` field. New wrappers could appear in future rustc
+        // versions, so peel structurally rather than by hard-coded
+        // type name: any struct with exactly one member named
+        // `value` is treated as a transparent wrapper. Bounded to
+        // 8 layers to avoid runaway peeling on a misshapen DIE.
         let outer = match val {
             Value::Struct(s) => s,
             _ => return Err(UnexpectedType("MaybeUninit outer is not a struct").into()),
         };
-        let value_member = outer
+        let mut current = outer
             .members
             .into_iter()
             .find(|m| m.field_name.as_deref() == Some("value"))
-            .ok_or(FieldNotFound("value"))?;
-        // ManuallyDrop is transparent — its inner field may or may
-        // not appear in DWARF. If we see an inner struct, peel it.
-        match value_member.value {
-            Value::Struct(inner) => {
-                if let Some(first) = inner.members.into_iter().next() {
-                    Ok(first.value)
-                } else {
-                    Err(IncompleteInterp("ManuallyDrop").into())
-                }
+            .ok_or(FieldNotFound("value"))?
+            .value;
+        for _ in 0..8 {
+            let s = match current {
+                Value::Struct(s) => s,
+                other => return Ok(other),
+            };
+            // Exactly one named-`value` member ⇒ keep peeling.
+            // Anything else (zero, many, or differently-named
+            // members) ⇒ this isn't a transparent wrapper, hand the
+            // struct back so the caller can decide what to do.
+            if s.members.len() == 1
+                && s.members
+                    .first()
+                    .and_then(|m| m.field_name.as_deref())
+                    .map(|n| n == "value" || n == "__0")
+                    == Some(true)
+            {
+                current = s.members.into_iter().next().unwrap().value;
+                continue;
             }
-            other => Ok(other),
+            return Ok(Value::Struct(s));
         }
+        Ok(current)
     }
 
     /// Phase 1 S13/S14 — `OsString` / `PathBuf` peeling. Both wrap a
