@@ -60,14 +60,15 @@ use std::os::fd::BorrowedFd;
 use crate::format::trace_writer::TraceWriteError;
 #[cfg(target_arch = "x86_64")]
 use crate::format::trace_writer::TraceWriter;
-use crate::record::linux::ptrace_driver::{RecorderError, SeccompNotif, capture_from_notif};
+use crate::record::linux::ptrace_driver::RecorderError;
 #[cfg(target_arch = "x86_64")]
 use crate::record::linux::ptrace_driver::{
-    event_for_capture, frame_from_notif, recv_notif, respond_continue,
+    SeccompNotif, capture_from_notif, event_for_capture, frame_from_notif, recv_notif,
+    respond_continue,
 };
+use crate::record::syscall_capture::CapturedSyscall;
 #[cfg(target_arch = "x86_64")]
-use crate::record::syscall_capture::capture_post_syscall;
-use crate::record::syscall_capture::{CapturedSyscall, MemoryReader};
+use crate::record::syscall_capture::{MemoryReader, capture_post_syscall};
 
 // ---------------------------------------------------------------------------
 // User-mode register layout
