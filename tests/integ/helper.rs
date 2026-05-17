@@ -41,6 +41,40 @@ pub struct Debugger {
 }
 
 impl Debugger {
+    /// Send a command line (cmd + `\n`) to bs, working around the
+    /// rustyline ingest race: the bs main loop runs rustyline in
+    /// raw mode and reads stdin one byte at a time. Empirically:
+    ///
+    ///   * a single `send_line` write delivers all bytes at once;
+    ///     rustyline drops most of them in its decode pipeline,
+    ///     keeping only the first.
+    ///   * sending one byte at a time with a 1 ms gap works on
+    ///     bare-metal Linux, but on the Earthly arm64/qemu-bookworm
+    ///     container the *first* byte still gets eaten if it lands
+    ///     before bs has finished printing its prompt (the ANSI
+    ///     `[?2026l` end-synchronized-output sequence in particular
+    ///     is emitted at the very end of the prompt; bs's stdin
+    ///     read doesn't start until after that).
+    ///   * a short *pre-send* sleep, then per-byte writes with a
+    ///     bigger inter-byte gap, lands the full line on both.
+    ///
+    /// 50 ms pre-pause + 5 ms inter-byte is well below human
+    /// perception but plenty of room for rustyline's rendering
+    /// pipeline; on healthy runs each command sees ~5 × `cmd.len()`
+    /// ms of latency, which is invisible.
+    fn send_command_line(&mut self, cmd: &str) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for b in cmd.bytes() {
+            self.session
+                .send([b])
+                .unwrap_or_else(|e| panic!("send({cmd:?}): {e}"));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        self.session
+            .send([b'\n'])
+            .unwrap_or_else(|e| panic!("send_newline({cmd:?}): {e}"));
+    }
+
     /// Spawn `bs -t none <debuggee_path>` and wait for the greet
     /// banner. Mirrors `Debugger.__init__(path=…)` in the Python
     /// helper.
@@ -88,24 +122,7 @@ impl Debugger {
     /// `Debugger.cmd(cmd, *should_see)` — send a line, then assert
     /// each `should_see` string appears in subsequent output.
     pub fn cmd(&mut self, cmd: &str, should_see: &[&str]) {
-        // Send one character at a time. `bs` uses `rustyline`,
-        // which reads stdin a byte at a time in raw mode and
-        // re-renders the line on every keystroke (cursor moves,
-        // syntax highlighting, etc.). A single `send_line` write
-        // races with the renderer — empirically, only the first
-        // byte of the command shows up in the expect buffer
-        // before rustyline starts dropping characters somewhere
-        // in its decode pipeline. Per-character writes with a
-        // 1 ms gap let rustyline keep up and the full line lands.
-        for b in cmd.bytes() {
-            self.session
-                .send([b])
-                .unwrap_or_else(|e| panic!("send({cmd:?}): {e}"));
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        self.session
-            .send([b'\n'])
-            .unwrap_or_else(|e| panic!("send_newline({cmd:?}): {e}"));
+        self.send_command_line(cmd);
         for needle in should_see {
             if let Err(e) = self.session.expect(*needle) {
                 // Drain everything available for ~2s so the
@@ -134,11 +151,7 @@ impl Debugger {
 
     /// `Debugger.cmd_re(cmd, *should_see_re)`.
     pub fn cmd_re(&mut self, cmd: &str, regexes: &[&str]) {
-        for b in cmd.bytes() {
-            self.session.send([b]).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        self.session.send([b'\n']).unwrap();
+        self.send_command_line(cmd);
         for re in regexes {
             if let Err(e) = self.session.expect(Regex(re)) {
                 let mut collected: Vec<u8> = Vec::new();
@@ -248,11 +261,14 @@ impl Debugger {
     /// `br` followed by a tab and expects the prompt to show the
     /// completion `break`.
     pub fn print(&mut self, text: &str, should_see: &[&str]) {
+        // Pre-pause + 5 ms inter-byte gap, matching `send_command_line`.
+        // Without it the first byte gets eaten on Earthly's container.
+        std::thread::sleep(std::time::Duration::from_millis(50));
         for b in text.bytes() {
             self.session
                 .send([b])
                 .unwrap_or_else(|e| panic!("send({text:?}): {e}"));
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         for needle in should_see {
             self.session
