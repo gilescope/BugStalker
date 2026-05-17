@@ -346,6 +346,7 @@ pub struct DebuggerBuilder<H: EventHook + 'static = NopHook> {
     oracles: Vec<Arc<dyn Oracle>>,
     hooks: Option<H>,
     auto_traps: bool,
+    force_restart: bool,
 }
 
 impl<H: EventHook + 'static> DebuggerBuilder<H> {
@@ -355,6 +356,7 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
             oracles: vec![],
             hooks: None,
             auto_traps: true,
+            force_restart: false,
         }
     }
 
@@ -366,6 +368,22 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
     /// process.
     pub fn with_auto_traps(self, auto_traps: bool) -> Self {
         Self { auto_traps, ..self }
+    }
+
+    /// Bypass the EnC restart safety check that refuses to
+    /// auto-restart functions whose body contains outbound CALL/BL
+    /// instructions. Default: false (refuse). Set to true if you
+    /// know the function is safe to restart from entry — e.g. you
+    /// have a Tier-2 fn-entry checkpoint to pair with the restart,
+    /// or you're testing a specific code path and accept the
+    /// possibility of garbage output. See
+    /// [`crate::debugger::error::Error::RestartRefusedInnerCalls`]
+    /// for the rationale.
+    pub fn with_force_restart(self, force_restart: bool) -> Self {
+        Self {
+            force_restart,
+            ..self
+        }
     }
 
     /// Add oracles.
@@ -401,9 +419,21 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
     /// * `process`: debugee process
     pub fn build(self, process: Child<Installed>) -> Result<Debugger, Error> {
         if let Some(hooks) = self.hooks {
-            Debugger::new(process, hooks, self.oracles, self.auto_traps)
+            Debugger::new(
+                process,
+                hooks,
+                self.oracles,
+                self.auto_traps,
+                self.force_restart,
+            )
         } else {
-            Debugger::new(process, NopHook {}, self.oracles, self.auto_traps)
+            Debugger::new(
+                process,
+                NopHook {},
+                self.oracles,
+                self.auto_traps,
+                self.force_restart,
+            )
         }
     }
 
@@ -447,6 +477,12 @@ pub struct Debugger {
     /// Test scenarios that drive the inferior to completion need to
     /// disable this so the run doesn't stop at `std::process::exit`.
     auto_traps: bool,
+    /// When true, `restart_top_frame` skips the safety check that
+    /// refuses functions with outbound CALL/BL instructions in their
+    /// body. Default: false. Set via
+    /// [`DebuggerBuilder::with_force_restart`]. See
+    /// [`Error::RestartRefusedInnerCalls`] for the rationale.
+    force_restart: bool,
     /// Phase 4 Tier-A — declarative visualiser registry,
     /// populated from the debuggee's `.bs_viz_spec` /
     /// `__bs_viz_spec` section at construction. Empty when the
@@ -462,6 +498,7 @@ impl Debugger {
         hooks: impl EventHook + 'static,
         oracles: impl IntoIterator<Item = Arc<dyn Oracle>>,
         auto_traps: bool,
+        force_restart: bool,
     ) -> Result<Self, Error> {
         let program_path = Path::new(process.program());
 
@@ -534,6 +571,7 @@ impl Debugger {
                 .collect(),
             detached: false,
             auto_traps,
+            force_restart,
             viz,
         })
     }
@@ -1545,6 +1583,58 @@ impl Debugger {
     pub fn restart_top_frame(&self, pid: Pid, fn_start: u64) -> Result<(), Error> {
         disable_when_not_stared!(self);
 
+        // EnC restart safety gate. The DWARF-only restart path
+        // restores the System-V int-arg registers and the callee-
+        // saved set from the unwound frame-1 view, plus the stack
+        // pointer from frame 0's CFA. That covers the *named*
+        // state DWARF describes, but not:
+        //   * caller-saved registers (RAX, RCX, RDX, RSI, R8..R11
+        //     and XMM0..7) that the function body happens to read
+        //     before writing,
+        //   * unnamed stack slots that hold iterator state
+        //     (`Iter::ptr/end`), drop flags, or temporary spills
+        //     for trait-object dispatch,
+        //   * floats passed in XMM registers (our parameter
+        //     restoration skips non-integer locations).
+        // Functions that only touch their named locals — leaves
+        // and simple non-leaves doing arithmetic over their
+        // arguments — restart safely. Functions whose body makes
+        // outbound calls (`compute` calling `Iterator::sum`,
+        // `slice::iter`, `precondition_check`, etc.) reliably
+        // don't, because those callees inherit state we couldn't
+        // reconstruct. The user-visible failure is plausible-
+        // looking garbage in the function's return value — worse
+        // than a clean refusal because nothing flags that the
+        // numbers are lies.
+        //
+        // Until Tier-2 fn-entry checkpoints land (see
+        // `doc/plans/phase-5-time-travel.md`), the honest move is
+        // to refuse the cases we can't safely handle. Override
+        // with `DebuggerBuilder::with_force_restart(true)` when
+        // you know the function is restart-safe (e.g. you've
+        // paired the restart with a writable-state checkpoint
+        // captured at fn entry).
+        if !self.force_restart {
+            let asm = self.disasm()?;
+            let (inner_calls, first_call) = count_inner_calls(&asm.instructions);
+            if inner_calls > 0 {
+                let function = asm
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("<at 0x{fn_start:x}>"));
+                let first_call_offset = first_call
+                    .map(|a| format!("first at 0x{:x}", u64::from(a)))
+                    .unwrap_or_else(|| "address unknown".to_string());
+                let plural = if inner_calls == 1 { "" } else { "s" };
+                return Err(Error::RestartRefusedInnerCalls {
+                    function,
+                    inner_calls,
+                    plural,
+                    first_call_offset,
+                });
+            }
+        }
+
         // Compute the caller's register state by unwinding one
         // frame. After this call `unwound` holds:
         //   SP = CFA of frame 0 = function-entry SP
@@ -2005,6 +2095,187 @@ impl Drop for Debugger {
             }
             ExecutionStatus::Exited => {}
         }
+    }
+}
+
+/// Scan a function's disassembly and count outbound CALL/BL
+/// instructions in its body. Returns `(count, first_address)` where
+/// `first_address` is the location of the first such instruction —
+/// used by `restart_top_frame` to surface a precise diagnostic.
+///
+/// Mnemonic recognition is capstone-output-shape sensitive:
+///
+/// * x86_64 (AT&T syntax, our default): `callq` for near-direct,
+///   `callq *…` for near-indirect, occasionally `calll` / `callw`.
+///   All start with `call`.
+/// * aarch64: `bl` (branch-with-link to immediate) and `blr`
+///   (branch-with-link to register). `b` / `br` are tail calls
+///   that don't push a return address — restart-safe by
+///   definition, so we don't count them.
+///
+/// We deliberately do *not* try to follow the calls, classify them
+/// as intrinsic vs. user, or filter "obviously safe" tail calls of
+/// `core::panic` etc. The point of the gate is correctness under
+/// uncertainty; refusing the long tail of edge cases is the
+/// expected behaviour until Tier-2 fn-entry checkpoints land.
+fn count_inner_calls(
+    instructions: &[debugee::disasm::Instruction],
+) -> (usize, Option<GlobalAddress>) {
+    let mut count = 0usize;
+    let mut first: Option<GlobalAddress> = None;
+    for instr in instructions {
+        let Some(mn) = instr.mnemonic.as_deref() else {
+            continue;
+        };
+        if is_call_mnemonic(mn) {
+            count += 1;
+            if first.is_none() {
+                first = Some(instr.address);
+            }
+        }
+    }
+    (count, first)
+}
+
+/// True if this capstone mnemonic represents an outbound call that
+/// pushes a return address (and therefore changes program state in
+/// a way that DWARF restart can't reconstruct).
+#[cfg(target_arch = "x86_64")]
+fn is_call_mnemonic(mn: &str) -> bool {
+    // capstone may emit "call", "callq", "calll", "callw" depending
+    // on operand size and syntax. Match the common prefix to cover
+    // them in one rule.
+    let lower = mn.trim().to_ascii_lowercase();
+    lower.starts_with("call")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn is_call_mnemonic(mn: &str) -> bool {
+    let lower = mn.trim().to_ascii_lowercase();
+    lower == "bl" || lower == "blr"
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn is_call_mnemonic(_mn: &str) -> bool {
+    // On unsupported archs we don't run restart_top_frame anyway;
+    // returning false keeps the safety gate from firing spuriously
+    // if the cfg gates above ever shift.
+    false
+}
+
+#[cfg(test)]
+mod restart_safety_tests {
+    use super::*;
+    use crate::debugger::address::GlobalAddress;
+    use crate::debugger::debugee::disasm::Instruction;
+
+    fn mk_instr(addr: u64, mn: &str) -> Instruction {
+        Instruction {
+            address: GlobalAddress::from(addr),
+            mnemonic: Some(mn.to_string()),
+            operands: None,
+        }
+    }
+
+    #[test]
+    fn empty_body_has_no_inner_calls() {
+        let (n, first) = count_inner_calls(&[]);
+        assert_eq!(n, 0);
+        assert!(first.is_none());
+    }
+
+    #[test]
+    fn leaf_arithmetic_has_no_inner_calls() {
+        let body = [
+            mk_instr(0x1000, "mov"),
+            mk_instr(0x1003, "add"),
+            mk_instr(0x1006, "ret"),
+        ];
+        let (n, first) = count_inner_calls(&body);
+        assert_eq!(n, 0);
+        assert!(first.is_none());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_callq_is_recognised() {
+        let body = [
+            mk_instr(0x1000, "mov"),
+            mk_instr(0x1003, "callq"),
+            mk_instr(0x1008, "ret"),
+        ];
+        let (n, first) = count_inner_calls(&body);
+        assert_eq!(n, 1);
+        assert_eq!(first.map(u64::from), Some(0x1003));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_multiple_call_variants_all_count() {
+        let body = [
+            mk_instr(0x1000, "call"),
+            mk_instr(0x1005, "callq"),
+            mk_instr(0x100a, "calll"),
+            mk_instr(0x100f, "callw"),
+        ];
+        let (n, first) = count_inner_calls(&body);
+        assert_eq!(n, 4);
+        assert_eq!(first.map(u64::from), Some(0x1000));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_jmp_is_not_a_call() {
+        // jmp is a tail-call jump that doesn't push a return
+        // address — restart-safe, so it must not trip the gate.
+        let body = [
+            mk_instr(0x1000, "mov"),
+            mk_instr(0x1003, "jmp"),
+            mk_instr(0x1008, "jne"),
+            mk_instr(0x100c, "jz"),
+        ];
+        let (n, _) = count_inner_calls(&body);
+        assert_eq!(n, 0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_bl_and_blr_count() {
+        let body = [
+            mk_instr(0x1000, "mov"),
+            mk_instr(0x1004, "bl"),
+            mk_instr(0x1008, "blr"),
+            mk_instr(0x100c, "ret"),
+        ];
+        let (n, first) = count_inner_calls(&body);
+        assert_eq!(n, 2);
+        assert_eq!(first.map(u64::from), Some(0x1004));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_b_and_br_do_not_count() {
+        // Plain branches are tail-calls that don't push LR —
+        // restart-safe, must not count.
+        let body = [
+            mk_instr(0x1000, "b"),
+            mk_instr(0x1004, "br"),
+            mk_instr(0x1008, "b.ne"),
+            mk_instr(0x100c, "ret"),
+        ];
+        let (n, _) = count_inner_calls(&body);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn missing_mnemonics_are_ignored() {
+        let body = [Instruction {
+            address: GlobalAddress::from(0x1000_u64),
+            mnemonic: None,
+            operands: None,
+        }];
+        let (n, _) = count_inner_calls(&body);
+        assert_eq!(n, 0);
     }
 }
 

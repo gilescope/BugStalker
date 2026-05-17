@@ -224,6 +224,35 @@ pub enum Error {
     Call(#[from] CallError),
     #[error(transparent)]
     FmtCall(#[from] FmtCallError),
+
+    // --------------------------------- EnC restart safety ----------------------------------------
+    /// Refused to auto-restart a function whose body makes outbound calls.
+    /// The DWARF-only restart path can't reconstruct the state held in
+    /// caller-saved registers and unnamed stack slots that those inner
+    /// calls depend on (iterator `Iter::ptr/end`, trait-object vtables,
+    /// XMM-passed floats). Restarting anyway produces plausible-looking
+    /// garbage. Override with [`crate::debugger::DebuggerBuilder::with_force_restart`].
+    #[error(
+        "refusing to auto-restart `{function}` from entry: the function body contains \
+         {inner_calls} outbound CALL{plural} ({first_call_offset}). State held in \
+         caller-saved registers and unnamed stack slots cannot be reconstructed from \
+         DWARF alone, so a restart would re-execute the body against stale memory and \
+         produce plausible-looking garbage. To force the restart anyway, build the \
+         debugger with `DebuggerBuilder::with_force_restart(true)` (Tier-2 \
+         writable-state restoration is the planned fix; see \
+         doc/plans/phase-5-time-travel.md)."
+    )]
+    RestartRefusedInnerCalls {
+        /// Human-readable function name (linkage or short).
+        function: String,
+        /// Count of CALL/BL instructions found in the body.
+        inner_calls: usize,
+        /// `"s"` when `inner_calls != 1`, empty otherwise — keeps the
+        /// message grammatical without separate format strings.
+        plural: &'static str,
+        /// Address of the first outbound call, for diagnostics.
+        first_call_offset: String,
+    },
 }
 
 impl Error {
@@ -301,6 +330,10 @@ impl Error {
             Error::Async(_) => false,
             Error::Call(_) => false,
             Error::FmtCall(_) => false,
+            // EnC restart refusal is a routing decision, not a
+            // process-fatal failure — the user can edit again, try
+            // a different patch, or `--force-restart` on opt-in.
+            Error::RestartRefusedInnerCalls { .. } => false,
 
             // currently fatal errors
             Error::DwarfParsing(_) => true,
