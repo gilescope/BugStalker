@@ -50,19 +50,14 @@ nt:
 nt-int:
 	$(NEXTEST) --workspace --features "int_test"
 
-int-test-external: build-test
-	sudo python3 -m unittest discover ./tests/integration/ -v -p "*external*"
-
-int-test-async: build-test
-	python3 -m unittest discover ./tests/integration/ -v -p "*async*"
-
+# Legacy Python integration tests were retired (see tests/integ/).
+# These targets are aliases to the Rust runner for muscle memory.
 int-test: build-test
-	sudo python3 -m unittest discover ./tests/integration/ -v
+	cargo test --test integ --features int_test -- --test-threads=1
 
 int-test-rel: build-test-rel
-	sudo python3 -m unittest discover ./tests/integration/ -v
+	cargo test --test integ --features int_test -- --test-threads=1
 
-# for local usage, note that test_external.py requires a root privileges
 test: build-all cargo-test int-test
 
 test-rel: build-all-rel cargo-test int-test-rel
@@ -95,4 +90,4 @@ clean-all:
 install:
 	cargo install --path .
 
-.PHONY: build build-rel build-test build-test-rel build-examples-for-func-test build-examples build-all build-all-rel cargo-test nt nt-int int-test-external int-test-async int-test int-test-rel test test-rel lint bench deny fuzz clean-all install
+.PHONY: build build-rel build-test build-test-rel build-examples-for-func-test build-examples build-all build-all-rel cargo-test nt nt-int int-test int-test-rel test test-rel lint bench deny fuzz clean-all install

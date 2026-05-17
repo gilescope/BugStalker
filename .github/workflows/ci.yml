@@ -53,33 +53,22 @@ jobs:
         run: |
           rustup toolchain install "$LRV"
           rustup toolchain install "$MSRV"
-      - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: "3.13"
-      - name: Install pip and test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pip
-          if [ -f requirements.txt ]; then sudo pip install -r requirements.txt; fi
-      - name: Verify installation
-        run: |
-          python --version
-          pip --version
       - name: Install debug symbols
         run: |
           sudo apt-get update
           sudo apt-get install libc6-dbg
-      - name: Build debugger and test applications
+      - name: Build test applications
+        run: make build-examples RUST_VERSION="$LRV"
+      - name: Verify test applications rustc version
         run: |
-          make build-rel
-          make build-examples RUST_VERSION="$LRV"
-      - name: Verify test applications and debugger rustc versions
-        run: |
-          strings ./target/release/bs | grep "rustc version" | grep "$MSRV"
           strings ./examples/target/debug/calc | grep "^rustc version" | grep "$LRV"
       - name: Run integration tests
-        run: make int-test-rel
+        # `cargo test --test integ` replaces the legacy
+        # `tests/integration/*.py` unittest suite (retired alongside
+        # this commit). `--features int_test` strips ANSI colour
+        # codes from bs's output so the `expect_exact` calls in the
+        # Rust helper see plain text.
+        run: cargo test --test integ --features int_test -- --test-threads=1
 
   lint:
     runs-on: ubuntu-latest

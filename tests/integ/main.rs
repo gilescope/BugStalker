@@ -18,6 +18,7 @@
 mod helper;
 mod test_async;
 mod test_call;
+mod test_command;
 mod test_external;
 mod test_hints;
 mod test_multithread;
@@ -26,3 +27,5 @@ mod test_pastebin;
 mod test_sharedlib;
 mod test_signals;
 mod test_todos;
+mod test_variables;
+mod test_watchpoint;
