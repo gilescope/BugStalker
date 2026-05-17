@@ -136,13 +136,18 @@ fn thread_switch() {
     dbg.cmd("thread current", &["#2 thread id"]);
 
     // Step until we land on `let mut sum = 0;`. Mirrors the
-    // Python try/except polling loop.
-    loop {
+    // Python try/except polling loop. Cap at 200 iterations so a
+    // misbehaving build can't make this run for hours — empirically
+    // ~30 steps is enough on a healthy run.
+    let mut found = false;
+    for _ in 0..200 {
         if dbg.try_expect("24     let mut sum = 0;", Duration::from_secs(1)) {
+            found = true;
             break;
         }
         dbg.cmd("step", &[]);
     }
+    assert!(found, "never reached `let mut sum = 0;` after 200 steps");
 
     dbg.cmd("step", &["25     for i in 0..10000"]);
     dbg.cmd("var locals", &["sum = i32(0)"]);

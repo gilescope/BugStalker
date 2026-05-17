@@ -55,11 +55,18 @@ fn step_over_until_response() {
     thread::sleep(Duration::from_secs(3));
 
     // Step over until the HTTP client thread reports the response
-    // came back. Same race-free polling loop as test_todos.
-    while done.try_recv().is_err() {
+    // came back. Capped at 500 iterations so a hung inferior can't
+    // make this run for hours.
+    let mut got_response = false;
+    for _ in 0..500 {
+        if done.try_recv().is_ok() {
+            got_response = true;
+            break;
+        }
         dbg.cmd("next", &["next"]);
         thread::sleep(Duration::from_millis(100));
     }
+    assert!(got_response, "curl never reported the response back");
     thread::sleep(Duration::from_millis(200));
 
     dbg.control('c');

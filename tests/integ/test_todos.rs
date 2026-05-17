@@ -72,10 +72,19 @@ fn step_over_until_response() {
     thread::sleep(Duration::from_secs(1));
 
     // Loop: step-over until the HTTP client thread reports done.
-    while done.try_recv().is_err() {
+    // Step over until the HTTP client thread signals it got the
+    // response. Cap iterations so a hung inferior can't make this
+    // run for hours.
+    let mut got_response = false;
+    for _ in 0..500 {
+        if done.try_recv().is_ok() {
+            got_response = true;
+            break;
+        }
         dbg.cmd("next", &["next"]);
         thread::sleep(Duration::from_millis(50));
     }
+    assert!(got_response, "curl never reported the response back");
 
     dbg.quit();
     cleanup_todos();

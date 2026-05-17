@@ -362,14 +362,6 @@ ci-test-matrix:
 # with everything else.
 ci-integration-test:
     FROM +ci-source
-    # `int-test-rel` invokes `sudo python3 …`; sudo isn't in
-    # `rust:1.89-bookworm` and the Earthly container runs as root
-    # anyway, so wire `sudo` to a no-op alias.
-    RUN echo '#!/bin/sh' > /usr/local/bin/sudo && \
-        echo 'exec "$@"' >> /usr/local/bin/sudo && \
-        chmod +x /usr/local/bin/sudo
-    COPY requirements.txt ./
-    RUN pip3 install --break-system-packages -r requirements.txt
     # Build the examples once into a non-cache location so the
     # integration suite — which spawns them as debuggees — can find
     # them inside the layer FS after the cache mount detaches.
@@ -380,17 +372,19 @@ ci-integration-test:
         cp -r examples/target/debug /bs/examples/_built/debug
     RUN rm -rf examples/target && mkdir -p examples/target && \
         mv examples/_built/debug examples/target/debug
-    # Build bs and run the integration suite in one RUN — `bs` is
-    # built into `target/release/` under the cache mount, and the
-    # python unittest layer runs from that same mount, so it sees
-    # the binary. The CI version-stamp check folds in here too.
+    # Build bs + run the integration suite in one RUN — `bs` and
+    # the test binary share the workspace cache mount, and the
+    # tests spawn `./target/release/bs` directly. The CI version-
+    # stamp check folds in here too. Earthly runs the container as
+    # root so `cargo test` already has the ptrace privileges the
+    # legacy Python harness needed via `sudo`.
     RUN --privileged \
         --mount=type=cache,target=/usr/local/cargo/registry \
         --mount=type=cache,target=/bs/target,sharing=locked \
-        make build-rel && \
+        cargo build --release --features int_test && \
         strings ./target/release/bs | grep "rustc version" | grep "1.89.0" && \
         strings ./examples/target/debug/calc | grep "^rustc version" | grep "1.95.0" && \
-        make int-test-rel
+        cargo test --test integ --features int_test -- --test-threads=1
 
 # Mirrors CI's `lint` job: cargo build (workspace + examples), MSRV
 # string check, fmt --check, clippy -D warnings, all on MSRV.
