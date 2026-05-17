@@ -22,61 +22,19 @@ use crate::dap::yadap::protocol::InternalEvent;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::debugger::register::RegisterMap;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use anyhow::{Context, anyhow};
+use anyhow::{Context as _, anyhow};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::unistd::Pid;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use serde_json::json;
 
-// Cross-platform bridge for the writable-state primitive. macOS uses
-// Mach's `mach_vm_*`; Linux uses `/proc/<pid>/{maps,mem}` via
-// `bs_replay::linux::checkpoint_capture`. The two implementations
-// share an identical wire-format payload (see each module's docs)
-// but expose slightly different signatures (pid type, error enum).
-// We bridge here so the rest of the module is platform-agnostic.
-
-#[cfg(target_os = "macos")]
-use bs_replay::darwin::checkpoint::WritableState;
-#[cfg(target_os = "linux")]
-use bs_replay::linux::checkpoint_capture::WritableState;
-
-#[cfg(target_os = "macos")]
-fn platform_capture(pid: Pid) -> anyhow::Result<WritableState> {
-    bs_replay::darwin::checkpoint::capture_writable_state(pid.as_raw())
-        .with_context(|| format!("capture writable state for {pid}"))
-}
-
-#[cfg(target_os = "linux")]
-fn platform_capture(pid: Pid) -> anyhow::Result<WritableState> {
-    bs_replay::linux::checkpoint_capture::capture_writable_state(pid)
-        .with_context(|| format!("capture writable state for {pid}"))
-}
-
-/// Restore report flattened to a (`written`, `skipped`) pair so the
-/// platform error types don't leak into the session module.
+// Cross-platform bridge for the writable-state primitive lives in
+// `crate::debugger::platform_checkpoint` — shared with the EnC
+// snapshot path so both consumers get the same `WritableState`
+// alias and the same capture/restore semantics.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-struct PlatformRestoreReport {
-    skipped: usize,
-}
-
-#[cfg(target_os = "macos")]
-fn platform_restore(pid: Pid, state: &WritableState) -> anyhow::Result<PlatformRestoreReport> {
-    let report = bs_replay::darwin::checkpoint::restore_writable_state(pid.as_raw(), state)
-        .with_context(|| format!("restore writable state for {pid}"))?;
-    Ok(PlatformRestoreReport {
-        skipped: report.skipped,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn platform_restore(pid: Pid, state: &WritableState) -> anyhow::Result<PlatformRestoreReport> {
-    let report = bs_replay::linux::checkpoint_capture::restore_writable_state(pid, state)
-        .with_context(|| format!("restore writable state for {pid}"))?;
-    Ok(PlatformRestoreReport {
-        skipped: report.skipped,
-    })
-}
+use crate::debugger::platform_checkpoint::{self, WritableState};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const LIVE_REVERSE_CAPACITY: usize = 32;
@@ -214,7 +172,7 @@ impl super::DebugSession {
             ));
         }
 
-        let writable = platform_capture(proc_pid)?;
+        let writable = platform_checkpoint::capture(proc_pid)?;
         self.live_reverse.push(LiveReverseCheckpoint {
             sequence: 0,
             proc_pid,
@@ -299,7 +257,7 @@ impl super::DebugSession {
             .debugger
             .as_mut()
             .ok_or_else(|| anyhow!("stepBack: debugger not initialized"))?;
-        let report = platform_restore(checkpoint.proc_pid, &checkpoint.writable)?;
+        let report = platform_checkpoint::restore(checkpoint.proc_pid, &checkpoint.writable)?;
         if report.skipped > 0 {
             log::warn!(
                 target: "dap",

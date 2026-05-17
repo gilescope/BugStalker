@@ -8,7 +8,9 @@ mod context;
 #[cfg(target_os = "macos")]
 pub mod darwin_mach;
 mod debugee;
+mod enc_checkpoint;
 mod error;
+pub(crate) mod platform_checkpoint;
 pub mod process;
 pub mod register;
 pub mod rust;
@@ -490,6 +492,14 @@ pub struct Debugger {
     /// `--release` (specs are debug-build artefacts by
     /// convention).
     viz: viz::VizRegistry,
+    /// EnC restart Tier-2: per-function fn-entry snapshots
+    /// captured by a hidden transparent breakpoint at the
+    /// function's start IP. Restored by `restart_top_frame` when
+    /// the function body contains outbound CALLs and the DWARF-
+    /// only restore path can't reconstruct enough state. See
+    /// [`enc_checkpoint`] for the full architecture.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    enc_checkpoints: enc_checkpoint::EncCheckpointStore,
 }
 
 impl Debugger {
@@ -573,6 +583,8 @@ impl Debugger {
             auto_traps,
             force_restart,
             viz,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            enc_checkpoints: enc_checkpoint::EncCheckpointStore::default(),
         })
     }
 
@@ -1558,6 +1570,75 @@ impl Debugger {
             .ok()
     }
 
+    /// Install a hidden transparent breakpoint at the entry of the
+    /// function containing `user_bp_addr`, if one isn't already
+    /// armed. When the snap-bp fires (on every call to that function),
+    /// it captures the inferior's writable memory + registers into
+    /// the EnC checkpoint store, so a later `restart_top_frame` for
+    /// a function with inner CALLs can route through Tier-2
+    /// restoration rather than the DWARF-only path.
+    ///
+    /// Best-effort: failures (no enclosing function found in DWARF,
+    /// transparent bp install errored, address can't be resolved)
+    /// log and silently return — the user's bp at `user_bp_addr` is
+    /// independent and the safety gate in `restart_top_frame` will
+    /// refuse cleanly if it can't find a snapshot.
+    ///
+    /// Idempotent per function: the second user bp in the same
+    /// function reuses the first snap-bp via
+    /// [`enc_checkpoint::EncCheckpointStore::is_armed`].
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn try_arm_enc_snap_bp_for_user_bp(&mut self, user_bp_addr: RelocatedAddress) {
+        let Some(fn_start) = self.function_start_ip_at(usize::from(user_bp_addr)) else {
+            log::debug!(
+                target: "enc_checkpoint",
+                "no enclosing function for user bp at 0x{:x}; skipping snap-bp arm",
+                usize::from(user_bp_addr),
+            );
+            return;
+        };
+        let fn_start_u64 = fn_start.as_u64();
+        if self.enc_checkpoints.is_armed(fn_start_u64) {
+            return;
+        }
+
+        // The callback captures the function-entry address as a
+        // plain `u64`. It runs on the supervisor thread inside the
+        // transparent-bp dispatch path (see `BrkptType::Transparent`
+        // handling in this module) and gets `&mut Debugger` —
+        // enough to reach `enc_checkpoints` directly without any
+        // RefCell dance.
+        let cb_fn_start = fn_start_u64;
+        let request = CreateTransparentBreakpointRequest::address(
+            fn_start,
+            move |dbg: &mut Debugger| {
+                let pid = dbg.ecx().pid_on_focus();
+                let regions = dbg.enc_checkpoints.capture_at(cb_fn_start, pid);
+                log::trace!(
+                    target: "enc_checkpoint",
+                    "snap-bp fired at fn_start=0x{cb_fn_start:x}; captured {regions} regions",
+                );
+            },
+        );
+        match self.set_transparent_breakpoint(request) {
+            Ok(()) => {
+                self.enc_checkpoints.mark_armed(fn_start_u64);
+                log::debug!(
+                    target: "enc_checkpoint",
+                    "armed snap-bp at fn_start=0x{fn_start_u64:x} (triggered by user bp at 0x{:x})",
+                    usize::from(user_bp_addr),
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    target: "enc_checkpoint",
+                    "failed to arm snap-bp at fn_start=0x{fn_start_u64:x}: {err}; \
+                     EnC restart for this function will refuse on inner CALLs",
+                );
+            }
+        }
+    }
+
     /// "Drop and re-enter" the top frame at `fn_start` with full
     /// state restoration: PC ← `fn_start`, SP ← function-entry SP
     /// (CFA computed from DWARF), and every callee-saved register
@@ -1607,13 +1688,45 @@ impl Debugger {
         // than a clean refusal because nothing flags that the
         // numbers are lies.
         //
-        // Until Tier-2 fn-entry checkpoints land (see
-        // `doc/plans/phase-5-time-travel.md`), the honest move is
-        // to refuse the cases we can't safely handle. Override
-        // with `DebuggerBuilder::with_force_restart(true)` when
-        // you know the function is restart-safe (e.g. you've
-        // paired the restart with a writable-state checkpoint
-        // captured at fn entry).
+        // Tier-2 fast path: if we have a fn-entry snapshot for this
+        // function (captured by the snap-bp armed in
+        // `try_arm_enc_snap_bp_for_user_bp`), restore writable memory
+        // + registers from it and we're done. This handles all the
+        // cases the DWARF-only path can't — caller-saved registers,
+        // iterator state in unnamed stack slots, float args in XMM,
+        // mid-body heap mutations — because the snapshot was taken
+        // before any of that ran.
+        //
+        // The snapshot's registers already encode the function-entry
+        // PC (== fn_start, the snap-bp address). We `set_pc(fn_start)`
+        // explicitly anyway to make the contract obvious to a future
+        // reader and to defend against the unlikely case where the
+        // snapshot was taken at a slightly different address.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(snapshot) = self.enc_checkpoints.peek(fn_start) {
+            let report = platform_checkpoint::restore(pid, &snapshot.writable)
+                .map_err(|e| Error::Hook(e))?;
+            if report.skipped > 0 {
+                log::warn!(
+                    target: "enc_checkpoint",
+                    "restore for fn_start=0x{fn_start:x}: {} regions skipped (of {} total)",
+                    report.skipped, report.written + report.skipped,
+                );
+            }
+            let mut regs = snapshot.registers.clone();
+            regs.set_pc(fn_start);
+            regs.persist(pid)?;
+            log::debug!(
+                target: "enc_checkpoint",
+                "restart_top_frame: Tier-2 restore from snapshot for fn_start=0x{fn_start:x}",
+            );
+            return Ok(());
+        }
+
+        // No snapshot. Inner-call safety gate — refuse the cases the
+        // DWARF-only path can't reconstruct. Override with
+        // `DebuggerBuilder::with_force_restart(true)` when you know
+        // the function is restart-safe.
         if !self.force_restart {
             let asm = self.disasm()?;
             let (inner_calls, first_call) = count_inner_calls(&asm.instructions);

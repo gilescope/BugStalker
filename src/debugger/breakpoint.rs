@@ -30,6 +30,12 @@ enum BrkptsToAddRequest {
 pub enum CreateTransparentBreakpointRequest {
     Line(String, u64, Rc<dyn Fn(&mut Debugger)>),
     Function(String, Rc<dyn Fn(&mut Debugger)>),
+    /// Install at a specific relocated address. Used by the EnC
+    /// snap-bp arming hook in [`crate::debugger::enc_checkpoint`] —
+    /// the address comes from `function_start_ip_at(user_bp_addr)`,
+    /// not from a source-level search, so the Function/Line variants
+    /// would have to re-resolve a name the hook had already resolved.
+    Address(RelocatedAddress, Rc<dyn Fn(&mut Debugger)>),
 }
 
 impl CreateTransparentBreakpointRequest {
@@ -54,11 +60,22 @@ impl CreateTransparentBreakpointRequest {
         Self::Line(file.to_string(), line, Rc::new(cb))
     }
 
+    /// Create request for transparent breakpoint at a specific relocated address.
+    ///
+    /// # Arguments
+    ///
+    /// * `addr`: relocated address in the running process
+    /// * `cb`: callback that invoked when breakpoint is heat
+    pub fn address(addr: RelocatedAddress, cb: impl Fn(&mut Debugger) + 'static) -> Self {
+        Self::Address(addr, Rc::new(cb))
+    }
+
     /// Return underline callback.
     fn callback(&self) -> Rc<dyn Fn(&mut Debugger)> {
         match self {
             CreateTransparentBreakpointRequest::Line(_, _, cb) => cb.clone(),
             CreateTransparentBreakpointRequest::Function(_, cb) => cb.clone(),
+            CreateTransparentBreakpointRequest::Address(_, cb) => cb.clone(),
         }
     }
 }
@@ -79,6 +96,15 @@ impl Debugger {
         addr: RelocatedAddress,
     ) -> Result<BreakpointView<'_>, Error> {
         if self.debugee.is_in_progress() {
+            // Arm an EnC snap-bp at the enclosing function's entry
+            // BEFORE the user bp goes in. Best-effort: any failure
+            // (no enclosing fn found, transparent bp install errored)
+            // leaves the user bp install path untouched. The snap-bp
+            // is what lets `restart_top_frame` use Tier-2 writable-
+            // state restoration for functions with inner CALLs.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            self.try_arm_enc_snap_bp_for_user_bp(addr);
+
             let dwarf = self
                 .debugee
                 .debug_info(addr)
@@ -176,6 +202,12 @@ impl Debugger {
                     let addr = brkpt.addr;
                     self.breakpoints.add_and_enable(brkpt)?;
                     result_addrs.push(addr);
+                }
+                // EnC snap-bp arming for each newly added bp.
+                // Best-effort; see set_breakpoint_at_addr.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                for addr in &result_addrs {
+                    self.try_arm_enc_snap_bp_for_user_bp(*addr);
                 }
                 result_addrs
                     .iter()
@@ -424,6 +456,25 @@ impl Debugger {
         // transparent breakpoint currently may be set only at main object file instructions
         let debug_info = self.debugee.program_debug_info()?;
 
+        let callback = request.callback();
+
+        // The Address variant short-circuits the source-place
+        // search — the caller already knows exactly which IP to
+        // arm at. Used by the EnC snap-bp hook in
+        // `crate::debugger::enc_checkpoint`, which resolves the
+        // address via `function_start_ip_at(user_bp_addr)` before
+        // calling in.
+        if let CreateTransparentBreakpointRequest::Address(addr, _) = &request {
+            let brkpt = Breakpoint::new_transparent(
+                debug_info.pathname(),
+                *addr,
+                self.process.pid(),
+                callback,
+            );
+            self.breakpoints.add_and_enable(brkpt)?;
+            return Ok(());
+        }
+
         let places: Vec<_> = match &request {
             CreateTransparentBreakpointRequest::Line(file, line, _) => {
                 self.search_lines_in_file(debug_info, file, *line)?
@@ -435,13 +486,15 @@ impl Debugger {
                     vec![]
                 }
             }
+            CreateTransparentBreakpointRequest::Address(_, _) => {
+                unreachable!("address variant short-circuits above")
+            }
         };
 
         if places.is_empty() {
             return Err(NoSuitablePlace);
         }
 
-        let callback = request.callback();
         let breakpoints: Vec<_> = places
             .into_iter()
             .flat_map(|place| {
