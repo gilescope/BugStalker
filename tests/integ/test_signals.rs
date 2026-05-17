@@ -63,20 +63,8 @@ fn multi_thread_multi_signal() {
     dbg.cmd("continue", &["threads join"]);
 }
 
-// Skipped: the Python port passed, but in the Rust port (against
-// the debug build of bs, where the auto-trap registry is wired up
-// differently than the release build the Python harness used) bs
-// hits an extra internal breakpoint at "undefined place" before
-// the program reaches its `Program exit` line. The test is
-// asserting that SIGWINCH gets handled then the program runs to
-// completion; the auto-trap interrupts step (3). Needs a follow-up
-// that either drives `continue` in a loop until exit OR opts the
-// debugger out of auto-traps for these tests (cf. the recently-
-// added `with_auto_traps(false)` test setting in
-// tests/debugger/*.rs).
 #[test]
 #[serial]
-#[ignore = "debug-build auto-trap interrupts before program exit; see comment above"]
 fn signal_stop_on_continue() {
     let mut dbg = Debugger::spawn(VARS_BINARY);
     dbg.cmd("break vars.rs:9", &["New breakpoint"]);

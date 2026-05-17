@@ -57,10 +57,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install libc6-dbg
-      - name: Build test applications
-        run: make build-examples RUST_VERSION="$LRV"
+      - name: Build release debugger + examples
+        # The integ tests spawn `./target/release/bs` (the Python
+        # harness did the same). Release strips debug overhead that
+        # would otherwise interleave with the per-test `expect`
+        # timing — debug builds emit extra auto-trap stops near
+        # library boundaries that throw expectations off.
+        run: |
+          make build-test-rel
+          make build-examples RUST_VERSION="$LRV"
       - name: Verify test applications rustc version
         run: |
+          strings ./target/release/bs | grep "rustc version" | grep "$MSRV"
           strings ./examples/target/debug/calc | grep "^rustc version" | grep "$LRV"
       - name: Run integration tests
         # `cargo test --test integ` replaces the legacy

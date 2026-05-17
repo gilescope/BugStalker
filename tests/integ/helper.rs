@@ -23,14 +23,15 @@ use expectrl::session::Session;
 use std::process::Command;
 use std::time::Duration;
 
-// `cargo test --features int_test --test integ` builds the bs binary
-// at `target/debug/bs` with ANSI colors disabled (see the
-// `cfg!(feature = "int_test")` branch in `src/ui/generic/print.rs`).
-// The Python harness used `target/release/bs` only because it ran
-// after `make build-test-rel`; running through cargo gives us a
-// fresh build with the right feature flags every time, which is
-// closer to "just works".
-const BS_BINARY: &str = "./target/debug/bs";
+// We expect `target/release/bs` to exist (built by `make
+// build-test-rel` or `cargo build --release --features int_test`).
+// The Python harness used the release binary too — running under
+// debug exposed timing-sensitive behaviour (auto-trap ordering,
+// step-over latency near library boundaries) that's papered over
+// by `-O`. The CI step now builds release first; locally use
+// `make build-test-rel` or set `BS_BINARY=./target/debug/bs` in
+// the env if you specifically want to test the debug build.
+const BS_BINARY: &str = "./target/release/bs";
 const READY_MARKER: &str = "BugStalker greets";
 
 /// Debugger session.
