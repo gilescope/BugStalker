@@ -183,6 +183,12 @@ mach2 = "0.6"
 serial_test = "3.2.0"
 criterion = { workspace = true }
 bs-test-harness = { path = "crates/bs-test-harness" }
+# PTY-driven integration tests. `expectrl` is a `pexpect` port that
+# spawns the inferior via `posix_spawn` (not `fork`), so the test
+# process can have background threads — HTTP clients, signal
+# senders — without the fork-multithreaded deadlocks the legacy
+# Python `pty.spawn()` tests trip into.
+expectrl = "0.7"
 
 [features]
 default = []
