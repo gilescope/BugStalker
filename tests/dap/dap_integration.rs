@@ -1305,7 +1305,7 @@ fn test_step_back_request() -> anyhow::Result<()> {
 
 #[test]
 #[serial]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn test_live_step_back_restores_previous_stop() -> anyhow::Result<()> {
     let mut session = DapSession::start()?;
     let thread_id = require_launch!(

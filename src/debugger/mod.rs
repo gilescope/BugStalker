@@ -8,7 +8,9 @@ mod context;
 #[cfg(target_os = "macos")]
 pub mod darwin_mach;
 mod debugee;
+mod enc_checkpoint;
 mod error;
+pub(crate) mod platform_checkpoint;
 pub mod process;
 pub mod register;
 pub mod rust;
@@ -346,6 +348,7 @@ pub struct DebuggerBuilder<H: EventHook + 'static = NopHook> {
     oracles: Vec<Arc<dyn Oracle>>,
     hooks: Option<H>,
     auto_traps: bool,
+    force_restart: bool,
 }
 
 impl<H: EventHook + 'static> DebuggerBuilder<H> {
@@ -355,6 +358,7 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
             oracles: vec![],
             hooks: None,
             auto_traps: true,
+            force_restart: false,
         }
     }
 
@@ -366,6 +370,22 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
     /// process.
     pub fn with_auto_traps(self, auto_traps: bool) -> Self {
         Self { auto_traps, ..self }
+    }
+
+    /// Bypass the EnC restart safety check that refuses to
+    /// auto-restart functions whose body contains outbound CALL/BL
+    /// instructions. Default: false (refuse). Set to true if you
+    /// know the function is safe to restart from entry — e.g. you
+    /// have a Tier-2 fn-entry checkpoint to pair with the restart,
+    /// or you're testing a specific code path and accept the
+    /// possibility of garbage output. See
+    /// [`crate::debugger::error::Error::RestartRefusedInnerCalls`]
+    /// for the rationale.
+    pub fn with_force_restart(self, force_restart: bool) -> Self {
+        Self {
+            force_restart,
+            ..self
+        }
     }
 
     /// Add oracles.
@@ -401,9 +421,21 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
     /// * `process`: debugee process
     pub fn build(self, process: Child<Installed>) -> Result<Debugger, Error> {
         if let Some(hooks) = self.hooks {
-            Debugger::new(process, hooks, self.oracles, self.auto_traps)
+            Debugger::new(
+                process,
+                hooks,
+                self.oracles,
+                self.auto_traps,
+                self.force_restart,
+            )
         } else {
-            Debugger::new(process, NopHook {}, self.oracles, self.auto_traps)
+            Debugger::new(
+                process,
+                NopHook {},
+                self.oracles,
+                self.auto_traps,
+                self.force_restart,
+            )
         }
     }
 
@@ -447,6 +479,12 @@ pub struct Debugger {
     /// Test scenarios that drive the inferior to completion need to
     /// disable this so the run doesn't stop at `std::process::exit`.
     auto_traps: bool,
+    /// When true, `restart_top_frame` skips the safety check that
+    /// refuses functions with outbound CALL/BL instructions in their
+    /// body. Default: false. Set via
+    /// [`DebuggerBuilder::with_force_restart`]. See
+    /// [`Error::RestartRefusedInnerCalls`] for the rationale.
+    force_restart: bool,
     /// Phase 4 Tier-A — declarative visualiser registry,
     /// populated from the debuggee's `.bs_viz_spec` /
     /// `__bs_viz_spec` section at construction. Empty when the
@@ -454,6 +492,14 @@ pub struct Debugger {
     /// `--release` (specs are debug-build artefacts by
     /// convention).
     viz: viz::VizRegistry,
+    /// EnC restart Tier-2: per-function fn-entry snapshots
+    /// captured by a hidden transparent breakpoint at the
+    /// function's start IP. Restored by `restart_top_frame` when
+    /// the function body contains outbound CALLs and the DWARF-
+    /// only restore path can't reconstruct enough state. See
+    /// [`enc_checkpoint`] for the full architecture.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    enc_checkpoints: enc_checkpoint::EncCheckpointStore,
 }
 
 impl Debugger {
@@ -462,6 +508,7 @@ impl Debugger {
         hooks: impl EventHook + 'static,
         oracles: impl IntoIterator<Item = Arc<dyn Oracle>>,
         auto_traps: bool,
+        force_restart: bool,
     ) -> Result<Self, Error> {
         let program_path = Path::new(process.program());
 
@@ -534,7 +581,10 @@ impl Debugger {
                 .collect(),
             detached: false,
             auto_traps,
+            force_restart,
             viz,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            enc_checkpoints: enc_checkpoint::EncCheckpointStore::default(),
         })
     }
 
@@ -1521,6 +1571,110 @@ impl Debugger {
             .ok()
     }
 
+    /// Install a hidden transparent breakpoint at the entry of the
+    /// function containing `user_bp_addr`, if one isn't already
+    /// armed. When the snap-bp fires (on every call to that function),
+    /// it captures the inferior's writable memory + registers into
+    /// the EnC checkpoint store, so a later `restart_top_frame` for
+    /// a function with inner CALLs can route through Tier-2
+    /// restoration rather than the DWARF-only path.
+    ///
+    /// Best-effort: failures (no enclosing function found in DWARF,
+    /// transparent bp install errored, address can't be resolved)
+    /// log and silently return — the user's bp at `user_bp_addr` is
+    /// independent and the safety gate in `restart_top_frame` will
+    /// refuse cleanly if it can't find a snapshot.
+    ///
+    /// Idempotent per function: the second user bp in the same
+    /// function reuses the first snap-bp via
+    /// [`enc_checkpoint::EncCheckpointStore::is_armed`].
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn try_arm_enc_snap_bp_for_user_bp(&mut self, user_bp_addr: RelocatedAddress) {
+        let Some(fn_start) = self.function_start_ip_at(usize::from(user_bp_addr)) else {
+            log::debug!(
+                target: "enc_checkpoint",
+                "no enclosing function for user bp at 0x{:x}; skipping snap-bp arm",
+                usize::from(user_bp_addr),
+            );
+            return;
+        };
+        let fn_start_u64 = fn_start.as_u64();
+        if self.enc_checkpoints.is_armed(fn_start_u64) {
+            return;
+        }
+
+        // Refuse to arm if the snap-bp would collide with the very
+        // user bp that triggered the arming. Short closures and
+        // single-statement function bodies often have
+        // `prolog_start_place() == line_table_entry_for_user_bp`, so
+        // `fn_start_u64 == user_bp_addr.as_u64()`. Installing a
+        // transparent bp at that address goes through
+        // `BreakpointRegistry::add_and_enable`, which disables and
+        // replaces any existing breakpoint at the same address —
+        // silently consuming the user bp via the transparent
+        // callback's auto-continue, so the user's `continue_debugee`
+        // never surfaces. Skip cleanly; the inner-call safety gate
+        // in `restart_top_frame` will refuse a Tier-2 restart for
+        // this function but the user bp itself works correctly.
+        if fn_start_u64 == user_bp_addr.as_u64() {
+            log::debug!(
+                target: "enc_checkpoint",
+                "user bp at 0x{:x} sits at the function entry; skipping snap-bp arm to avoid collision",
+                usize::from(user_bp_addr),
+            );
+            return;
+        }
+
+        // Same risk as the user-bp collision above, just one step
+        // removed: a *different* breakpoint already lives at
+        // `fn_start` (left over from a previous arm cycle, a manual
+        // user bp at the fn entry, or a transparent bp from another
+        // subsystem). Replacing it would either swallow that bp's
+        // semantics or have ours swallowed when the user adds
+        // theirs next. Leave the slot untouched.
+        if self.breakpoints.get_enabled(fn_start).is_some() {
+            log::debug!(
+                target: "enc_checkpoint",
+                "existing breakpoint at fn_start=0x{fn_start_u64:x}; skipping snap-bp arm",
+            );
+            return;
+        }
+
+        // The callback captures the function-entry address as a
+        // plain `u64`. It runs on the supervisor thread inside the
+        // transparent-bp dispatch path (see `BrkptType::Transparent`
+        // handling in this module) and gets `&mut Debugger` —
+        // enough to reach `enc_checkpoints` directly without any
+        // RefCell dance.
+        let cb_fn_start = fn_start_u64;
+        let request =
+            CreateTransparentBreakpointRequest::address(fn_start, move |dbg: &mut Debugger| {
+                let pid = dbg.ecx().pid_on_focus();
+                let regions = dbg.enc_checkpoints.capture_at(cb_fn_start, pid);
+                log::trace!(
+                    target: "enc_checkpoint",
+                    "snap-bp fired at fn_start=0x{cb_fn_start:x}; captured {regions} regions",
+                );
+            });
+        match self.set_transparent_breakpoint(request) {
+            Ok(()) => {
+                self.enc_checkpoints.mark_armed(fn_start_u64);
+                log::debug!(
+                    target: "enc_checkpoint",
+                    "armed snap-bp at fn_start=0x{fn_start_u64:x} (triggered by user bp at 0x{:x})",
+                    usize::from(user_bp_addr),
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    target: "enc_checkpoint",
+                    "failed to arm snap-bp at fn_start=0x{fn_start_u64:x}: {err}; \
+                     EnC restart for this function will refuse on inner CALLs",
+                );
+            }
+        }
+    }
+
     /// "Drop and re-enter" the top frame at `fn_start` with full
     /// state restoration: PC ← `fn_start`, SP ← function-entry SP
     /// (CFA computed from DWARF), and every callee-saved register
@@ -1545,6 +1699,90 @@ impl Debugger {
     /// modified ones; use Set Variable to fix manually if needed.
     pub fn restart_top_frame(&self, pid: Pid, fn_start: u64) -> Result<(), Error> {
         disable_when_not_stared!(self);
+
+        // EnC restart safety gate. The DWARF-only restart path
+        // restores the System-V int-arg registers and the callee-
+        // saved set from the unwound frame-1 view, plus the stack
+        // pointer from frame 0's CFA. That covers the *named*
+        // state DWARF describes, but not:
+        //   * caller-saved registers (RAX, RCX, RDX, RSI, R8..R11
+        //     and XMM0..7) that the function body happens to read
+        //     before writing,
+        //   * unnamed stack slots that hold iterator state
+        //     (`Iter::ptr/end`), drop flags, or temporary spills
+        //     for trait-object dispatch,
+        //   * floats passed in XMM registers (our parameter
+        //     restoration skips non-integer locations).
+        // Functions that only touch their named locals — leaves
+        // and simple non-leaves doing arithmetic over their
+        // arguments — restart safely. Functions whose body makes
+        // outbound calls (`compute` calling `Iterator::sum`,
+        // `slice::iter`, `precondition_check`, etc.) reliably
+        // don't, because those callees inherit state we couldn't
+        // reconstruct. The user-visible failure is plausible-
+        // looking garbage in the function's return value — worse
+        // than a clean refusal because nothing flags that the
+        // numbers are lies.
+        //
+        // Tier-2 fast path: if we have a fn-entry snapshot for this
+        // function (captured by the snap-bp armed in
+        // `try_arm_enc_snap_bp_for_user_bp`), restore writable memory
+        // + registers from it and we're done. This handles all the
+        // cases the DWARF-only path can't — caller-saved registers,
+        // iterator state in unnamed stack slots, float args in XMM,
+        // mid-body heap mutations — because the snapshot was taken
+        // before any of that ran.
+        //
+        // The snapshot's registers already encode the function-entry
+        // PC (== fn_start, the snap-bp address). We `set_pc(fn_start)`
+        // explicitly anyway to make the contract obvious to a future
+        // reader and to defend against the unlikely case where the
+        // snapshot was taken at a slightly different address.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(snapshot) = self.enc_checkpoints.peek(fn_start) {
+            let report =
+                platform_checkpoint::restore(pid, &snapshot.writable).map_err(Error::Hook)?;
+            if report.skipped > 0 {
+                log::warn!(
+                    target: "enc_checkpoint",
+                    "restore for fn_start=0x{fn_start:x}: {} regions skipped (of {} total)",
+                    report.skipped, report.written + report.skipped,
+                );
+            }
+            let mut regs = snapshot.registers.clone();
+            regs.set_pc(fn_start);
+            regs.persist(pid)?;
+            log::debug!(
+                target: "enc_checkpoint",
+                "restart_top_frame: Tier-2 restore from snapshot for fn_start=0x{fn_start:x}",
+            );
+            return Ok(());
+        }
+
+        // No snapshot. Inner-call safety gate — refuse the cases the
+        // DWARF-only path can't reconstruct. Override with
+        // `DebuggerBuilder::with_force_restart(true)` when you know
+        // the function is restart-safe.
+        if !self.force_restart {
+            let asm = self.disasm()?;
+            let (inner_calls, first_call) = count_inner_calls(&asm.instructions);
+            if inner_calls > 0 {
+                let function = asm
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("<at 0x{fn_start:x}>"));
+                let first_call_offset = first_call
+                    .map(|a| format!("first at 0x{:x}", u64::from(a)))
+                    .unwrap_or_else(|| "address unknown".to_string());
+                let plural = if inner_calls == 1 { "" } else { "s" };
+                return Err(Error::RestartRefusedInnerCalls {
+                    function,
+                    inner_calls,
+                    plural,
+                    first_call_offset,
+                });
+            }
+        }
 
         // Compute the caller's register state by unwinding one
         // frame. After this call `unwound` holds:
@@ -2006,6 +2244,187 @@ impl Drop for Debugger {
             }
             ExecutionStatus::Exited => {}
         }
+    }
+}
+
+/// Scan a function's disassembly and count outbound CALL/BL
+/// instructions in its body. Returns `(count, first_address)` where
+/// `first_address` is the location of the first such instruction —
+/// used by `restart_top_frame` to surface a precise diagnostic.
+///
+/// Mnemonic recognition is capstone-output-shape sensitive:
+///
+/// * x86_64 (AT&T syntax, our default): `callq` for near-direct,
+///   `callq *…` for near-indirect, occasionally `calll` / `callw`.
+///   All start with `call`.
+/// * aarch64: `bl` (branch-with-link to immediate) and `blr`
+///   (branch-with-link to register). `b` / `br` are tail calls
+///   that don't push a return address — restart-safe by
+///   definition, so we don't count them.
+///
+/// We deliberately do *not* try to follow the calls, classify them
+/// as intrinsic vs. user, or filter "obviously safe" tail calls of
+/// `core::panic` etc. The point of the gate is correctness under
+/// uncertainty; refusing the long tail of edge cases is the
+/// expected behaviour until Tier-2 fn-entry checkpoints land.
+fn count_inner_calls(
+    instructions: &[debugee::disasm::Instruction],
+) -> (usize, Option<GlobalAddress>) {
+    let mut count = 0usize;
+    let mut first: Option<GlobalAddress> = None;
+    for instr in instructions {
+        let Some(mn) = instr.mnemonic.as_deref() else {
+            continue;
+        };
+        if is_call_mnemonic(mn) {
+            count += 1;
+            if first.is_none() {
+                first = Some(instr.address);
+            }
+        }
+    }
+    (count, first)
+}
+
+/// True if this capstone mnemonic represents an outbound call that
+/// pushes a return address (and therefore changes program state in
+/// a way that DWARF restart can't reconstruct).
+#[cfg(target_arch = "x86_64")]
+fn is_call_mnemonic(mn: &str) -> bool {
+    // capstone may emit "call", "callq", "calll", "callw" depending
+    // on operand size and syntax. Match the common prefix to cover
+    // them in one rule.
+    let lower = mn.trim().to_ascii_lowercase();
+    lower.starts_with("call")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn is_call_mnemonic(mn: &str) -> bool {
+    let lower = mn.trim().to_ascii_lowercase();
+    lower == "bl" || lower == "blr"
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn is_call_mnemonic(_mn: &str) -> bool {
+    // On unsupported archs we don't run restart_top_frame anyway;
+    // returning false keeps the safety gate from firing spuriously
+    // if the cfg gates above ever shift.
+    false
+}
+
+#[cfg(test)]
+mod restart_safety_tests {
+    use super::*;
+    use crate::debugger::address::GlobalAddress;
+    use crate::debugger::debugee::disasm::Instruction;
+
+    fn mk_instr(addr: u64, mn: &str) -> Instruction {
+        Instruction {
+            address: GlobalAddress::from(addr),
+            mnemonic: Some(mn.to_string()),
+            operands: None,
+        }
+    }
+
+    #[test]
+    fn empty_body_has_no_inner_calls() {
+        let (n, first) = count_inner_calls(&[]);
+        assert_eq!(n, 0);
+        assert!(first.is_none());
+    }
+
+    #[test]
+    fn leaf_arithmetic_has_no_inner_calls() {
+        let body = [
+            mk_instr(0x1000, "mov"),
+            mk_instr(0x1003, "add"),
+            mk_instr(0x1006, "ret"),
+        ];
+        let (n, first) = count_inner_calls(&body);
+        assert_eq!(n, 0);
+        assert!(first.is_none());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_callq_is_recognised() {
+        let body = [
+            mk_instr(0x1000, "mov"),
+            mk_instr(0x1003, "callq"),
+            mk_instr(0x1008, "ret"),
+        ];
+        let (n, first) = count_inner_calls(&body);
+        assert_eq!(n, 1);
+        assert_eq!(first.map(u64::from), Some(0x1003));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_multiple_call_variants_all_count() {
+        let body = [
+            mk_instr(0x1000, "call"),
+            mk_instr(0x1005, "callq"),
+            mk_instr(0x100a, "calll"),
+            mk_instr(0x100f, "callw"),
+        ];
+        let (n, first) = count_inner_calls(&body);
+        assert_eq!(n, 4);
+        assert_eq!(first.map(u64::from), Some(0x1000));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_jmp_is_not_a_call() {
+        // jmp is a tail-call jump that doesn't push a return
+        // address — restart-safe, so it must not trip the gate.
+        let body = [
+            mk_instr(0x1000, "mov"),
+            mk_instr(0x1003, "jmp"),
+            mk_instr(0x1008, "jne"),
+            mk_instr(0x100c, "jz"),
+        ];
+        let (n, _) = count_inner_calls(&body);
+        assert_eq!(n, 0);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_bl_and_blr_count() {
+        let body = [
+            mk_instr(0x1000, "mov"),
+            mk_instr(0x1004, "bl"),
+            mk_instr(0x1008, "blr"),
+            mk_instr(0x100c, "ret"),
+        ];
+        let (n, first) = count_inner_calls(&body);
+        assert_eq!(n, 2);
+        assert_eq!(first.map(u64::from), Some(0x1004));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn aarch64_b_and_br_do_not_count() {
+        // Plain branches are tail-calls that don't push LR —
+        // restart-safe, must not count.
+        let body = [
+            mk_instr(0x1000, "b"),
+            mk_instr(0x1004, "br"),
+            mk_instr(0x1008, "b.ne"),
+            mk_instr(0x100c, "ret"),
+        ];
+        let (n, _) = count_inner_calls(&body);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn missing_mnemonics_are_ignored() {
+        let body = [Instruction {
+            address: GlobalAddress::from(0x1000_u64),
+            mnemonic: None,
+            operands: None,
+        }];
+        let (n, _) = count_inner_calls(&body);
+        assert_eq!(n, 0);
     }
 }
 

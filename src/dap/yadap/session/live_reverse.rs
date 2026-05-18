@@ -1,32 +1,45 @@
 // SPDX-License-Identifier: MIT
 //! Stop-level live reverse stepping for normal debuggee sessions.
+//!
+//! Captures a ring buffer of writable-memory + per-thread-register
+//! snapshots at every stop; `stepBack` rewinds the focused thread to
+//! the snapshot taken at the *previous* stop. Symmetric across macOS
+//! (Mach `mach_vm_*` primitives) and Linux (`/proc/<pid>/{maps,mem}`
+//! + ptrace `GETREGS`/`SETREGS`).
+//!
+//! Distinct from trace-driven replay (`replay.rs`): no recording up
+//! front, no `bs --record` step. The ring lives in the supervisor
+//! process and survives only the current debug session.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::collections::VecDeque;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::ThreadFocusByPid;
 use crate::dap::yadap::protocol::DapRequest;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::dap::yadap::protocol::InternalEvent;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::debugger::register::RegisterMap;
-#[cfg(target_os = "macos")]
-use anyhow::{Context, anyhow};
-#[cfg(target_os = "macos")]
-use bs_replay::darwin::checkpoint::{
-    WritableState, capture_writable_state, restore_writable_state,
-};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use anyhow::{Context as _, anyhow};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use nix::unistd::Pid;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use serde_json::json;
 
-#[cfg(target_os = "macos")]
+// Cross-platform bridge for the writable-state primitive lives in
+// `crate::debugger::platform_checkpoint` — shared with the EnC
+// snapshot path so both consumers get the same `WritableState`
+// alias and the same capture/restore semantics.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::debugger::platform_checkpoint::{self, WritableState};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const LIVE_REVERSE_CAPACITY: usize = 32;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Default)]
 pub(super) struct LiveReverseHistory {
     entries: VecDeque<LiveReverseCheckpoint>,
@@ -34,11 +47,11 @@ pub(super) struct LiveReverseHistory {
     capabilities_announced: bool,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[derive(Default)]
 pub(super) struct LiveReverseHistory;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone)]
 struct LiveReverseCheckpoint {
     sequence: u64,
@@ -49,14 +62,14 @@ struct LiveReverseCheckpoint {
     registers: Vec<ThreadRegisters>,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone)]
 struct ThreadRegisters {
     pid: Pid,
     registers: RegisterMap,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Clone, Copy)]
 struct RestoredLiveReverse {
     sequence: u64,
@@ -64,7 +77,7 @@ struct RestoredLiveReverse {
     pc: u64,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl LiveReverseHistory {
     fn has_announced_capabilities(&self) -> bool {
         self.capabilities_announced
@@ -74,7 +87,6 @@ impl LiveReverseHistory {
         self.capabilities_announced = true;
     }
 
-    #[cfg(target_os = "macos")]
     fn push(&mut self, mut checkpoint: LiveReverseCheckpoint) {
         self.next_sequence = self.next_sequence.saturating_add(1);
         checkpoint.sequence = self.next_sequence;
@@ -84,7 +96,6 @@ impl LiveReverseHistory {
         self.entries.push_back(checkpoint);
     }
 
-    #[cfg(target_os = "macos")]
     fn previous(&mut self) -> Option<LiveReverseCheckpoint> {
         if self.entries.len() < 2 {
             return None;
@@ -100,7 +111,7 @@ impl super::DebugSession {
             return;
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         match self.capture_live_reverse_stop_inner() {
             Ok(true) if !self.live_reverse.has_announced_capabilities() => {
                 self.live_reverse.mark_capabilities_announced();
@@ -112,13 +123,13 @@ impl super::DebugSession {
             }
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             log::debug!(target: "dap", "live reverse checkpoints are unsupported on this host");
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn capture_live_reverse_stop_inner(&mut self) -> anyhow::Result<bool> {
         let dbg = self
             .debugger
@@ -161,8 +172,7 @@ impl super::DebugSession {
             ));
         }
 
-        let writable = capture_writable_state(proc_pid.as_raw())
-            .with_context(|| format!("capture writable state for {proc_pid}"))?;
+        let writable = platform_checkpoint::capture(proc_pid)?;
         self.live_reverse.push(LiveReverseCheckpoint {
             sequence: 0,
             proc_pid,
@@ -179,21 +189,20 @@ impl super::DebugSession {
         req: &DapRequest,
         thread_id: i64,
     ) -> anyhow::Result<()> {
-        // On non-macOS the `return` is "needless" (no code follows
-        // in the expanded body) but on macOS the next cfg-block is
-        // the real implementation; the early-return form keeps both
-        // sides readable.
+        // On unsupported hosts the `return` short-circuits the
+        // function; the platform-specific block below is the
+        // real implementation.
         #[allow(clippy::needless_return)]
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let _ = thread_id;
             return self.send_err(
                 req,
-                "stepBack: live reverse execution is only implemented for macOS Mach checkpoints",
+                "stepBack: live reverse execution is not implemented on this host",
             );
         }
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let _requested_pid = self
                 .thread_cache
@@ -239,7 +248,7 @@ impl super::DebugSession {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn restore_live_reverse_checkpoint(
         &mut self,
         checkpoint: &LiveReverseCheckpoint,
@@ -248,8 +257,7 @@ impl super::DebugSession {
             .debugger
             .as_mut()
             .ok_or_else(|| anyhow!("stepBack: debugger not initialized"))?;
-        let report = restore_writable_state(checkpoint.proc_pid.as_raw(), &checkpoint.writable)
-            .with_context(|| format!("restore writable state for {}", checkpoint.proc_pid))?;
+        let report = platform_checkpoint::restore(checkpoint.proc_pid, &checkpoint.writable)?;
         if report.skipped > 0 {
             log::warn!(
                 target: "dap",
