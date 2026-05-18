@@ -1703,8 +1703,8 @@ impl Debugger {
         // snapshot was taken at a slightly different address.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(snapshot) = self.enc_checkpoints.peek(fn_start) {
-            let report = platform_checkpoint::restore(pid, &snapshot.writable)
-                .map_err(|e| Error::Hook(e))?;
+            let report =
+                platform_checkpoint::restore(pid, &snapshot.writable).map_err(Error::Hook)?;
             if report.skipped > 0 {
                 log::warn!(
                     target: "enc_checkpoint",
