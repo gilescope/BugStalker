@@ -183,6 +183,12 @@ mach2 = "0.6"
 serial_test = "3.2.0"
 criterion = { workspace = true }
 bs-test-harness = { path = "crates/bs-test-harness" }
+# PTY-driven integration tests. `expectrl` is a `pexpect` port that
+# spawns the inferior via `posix_spawn` (not `fork`), so the test
+# process can have background threads — HTTP clients, signal
+# senders — without the fork-multithreaded deadlocks the legacy
+# Python `pty.spawn()` tests trip into.
+expectrl = "0.7"
 
 [features]
 default = []
@@ -198,6 +204,19 @@ intel-pt = ["perf", "bs-perf/intel-pt"]
 # specialised renderer over a captured set of stdlib values;
 # `attach_cold` measures debugger setup → first breakpoint hit on
 # `examples/hello_world`.
+# PTY-driven integration tests (Rust port of the legacy
+# `tests/integration/*.py` harness). Gated behind `int_test` so a
+# plain `cargo test` — used by the rustc-matrix and arm64 CI jobs —
+# does not try to drive them. They need a release `bs` binary
+# (`make build-test-rel`) and the `int_test` feature, which strips
+# ANSI colour codes from bs's output so `expect_exact` sees plain
+# text. The integ job in `.github/workflows/ci.yml` opts in with
+# `cargo test --test integ --features int_test`.
+[[test]]
+name = "integ"
+path = "tests/integ/main.rs"
+required-features = ["int_test"]
+
 [[bench]]
 name = "render_value"
 path = "benches/render_value.rs"

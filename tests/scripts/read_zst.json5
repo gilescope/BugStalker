@@ -99,8 +99,8 @@ expect: {
   items: [
     {
       name: "hash_map_zst_key",
-      type: "HashMap<(), i32, std::hash::random::RandomState>",
-      value_text: "HashMap<(), i32, _> {\n    (): i32(1)\n}"
+      type: { $regex: "^HashMap<\\(\\), i32, std::hash::random::RandomState(, alloc::alloc::Global)?>$" },
+      value_text: { $regex: "^HashMap<\\(\\), i32(, _)+> \\{\n    \\(\\): i32\\(1\\)\n\\}$" }
     }
   ],
   total: 1,
@@ -112,8 +112,8 @@ expect: {
   items: [
     {
       name: "hash_map_zst_val",
-      type: "HashMap<i32, (), std::hash::random::RandomState>",
-      value_text: "HashMap<i32, (), _> {\n    i32(1): ()\n}"
+      type: { $regex: "^HashMap<i32, \\(\\), std::hash::random::RandomState(, alloc::alloc::Global)?>$" },
+      value_text: { $regex: "^HashMap<i32, \\(\\)(, _)+> \\{\n    i32\\(1\\): \\(\\)\n\\}$" }
     }
   ],
   total: 1,
@@ -125,8 +125,8 @@ expect: {
   items: [
     {
       name: "hash_map_zst",
-      type: "HashMap<(), (), std::hash::random::RandomState>",
-      value_text: "HashMap<(), (), _> {\n    (): ()\n}"
+      type: { $regex: "^HashMap<\\(\\), \\(\\), std::hash::random::RandomState(, alloc::alloc::Global)?>$" },
+      value_text: { $regex: "^HashMap<\\(\\), \\(\\)(, _)+> \\{\n    \\(\\): \\(\\)\n\\}$" }
     }
   ],
   total: 1,
@@ -138,8 +138,8 @@ expect: {
   items: [
     {
       name: "hash_set_zst",
-      type: "HashSet<(), std::hash::random::RandomState>",
-      value_text: "HashSet<(), _> [()]"
+      type: { $regex: "^HashSet<\\(\\), std::hash::random::RandomState(, alloc::alloc::Global)?>$" },
+      value_text: { $regex: "^HashSet<\\(\\)(, _)+> \\[\\(\\)\\]$" }
     }
   ],
   total: 1,

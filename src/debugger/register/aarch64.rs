@@ -258,7 +258,7 @@ impl RegisterMap {
     ///   * `sp`           ← `__sp`
     ///   * `pc`           ← `__pc`
     ///   * `pstate`       ← `__cpsr`  (only the low 32 bits are
-    ///                                  meaningful; high bits zero)
+    ///     meaningful; high bits zero)
     ///
     /// `pid` is interpreted as a synthetic per-thread id — the
     /// Tracer registers each Mach thread port under one such id in
