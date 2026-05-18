@@ -57,6 +57,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install libc6-dbg
+      - name: Relax YAMA ptrace_scope
+        # Ubuntu CI runners ship `kernel.yama.ptrace_scope=1`, which
+        # blocks `bs -p <pid>` from attaching to non-descendant
+        # processes. The `test_external::*` tests spawn a `sleeper`
+        # inferior and then `bs -p` onto it, so they need scope 0
+        # (same as the Earthly container, which is unrestricted).
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
       - name: Build release debugger + examples
         # The integ tests spawn `./target/release/bs` (the Python
         # harness did the same). Release strips debug overhead that
