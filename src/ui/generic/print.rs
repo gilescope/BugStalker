@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::ui::console::editor::BSEditor;
 use rustyline::ExternalPrinter as RLExternalPrinter;
 use std::cell::RefCell;

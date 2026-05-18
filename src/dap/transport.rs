@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! DAP transport abstraction layer.
 //! Supports both stdio (for embedded mode) and TCP (for server mode).
 

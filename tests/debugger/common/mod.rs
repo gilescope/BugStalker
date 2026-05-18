@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use bugstalker::debugger::address::RelocatedAddress;
 use bugstalker::debugger::register::debug::BreakCondition;
 use bugstalker::debugger::variable::value::Value;
@@ -103,16 +104,31 @@ impl EventHook for TestHooks {
 #[macro_export]
 macro_rules! assert_no_proc {
     ($pid:expr) => {
-        // Give the system a bit of time for process cleanup
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        let sys = sysinfo::System::new_with_specifics(
-            sysinfo::RefreshKind::everything()
-                .without_cpu()
-                .without_memory(),
-        );
+        // Poll for up to 10 seconds — earliest pass typically lands
+        // within 100 ms, but the multithreaded examples sleep for
+        // ~2–3 seconds *after* the breakpoint hit before main
+        // joins, so the inferior is genuinely still alive past the
+        // 2-second mark on slower CI runners. A stuck inferior
+        // won't disappear in any duration; 10 s is enough headroom
+        // to clear normal runtime + scheduler jitter without
+        // hanging the suite when something has really wedged.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let raw = $pid.as_raw() as u32;
+        let mut found = true;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let sys = sysinfo::System::new_with_specifics(
+                sysinfo::RefreshKind::everything()
+                    .without_cpu()
+                    .without_memory(),
+            );
+            if sysinfo::System::process(&sys, sysinfo::Pid::from_u32(raw)).is_none() {
+                found = false;
+                break;
+            }
+        }
         assert!(
-            sysinfo::System::process(&sys, sysinfo::Pid::from_u32($pid.as_raw() as u32)).is_none(),
+            !found,
             "Process {} should have been terminated but still exists",
             $pid
         )
@@ -123,9 +139,21 @@ pub fn rust_version(file: &str) -> Option<RustVersion> {
     let file = fs::File::open(file).unwrap();
     let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
     let object = object::File::parse(&*mmap).unwrap();
-    let sect = object
-        .section_by_name(".comment")
-        .expect(".comment section not found");
+
+    // ELF stores the rustc version string in `.comment`. Mach-O has
+    // no equivalent section — the version lives in each CU's
+    // `DW_AT_producer` instead. Walking DWARF here would be
+    // overkill for the few callers that use this helper, so on
+    // darwin we just fall back to the rustc the *test runner* was
+    // built with. The example binaries are built from the same
+    // workspace toolchain, so this matches in practice.
+    let sect = object.section_by_name(".comment");
+    let Some(sect) = sect else {
+        // RustVersion::parse expects "rustc version X.Y.Z" — wrap
+        // the workspace MSRV in that shape so it matches.
+        let synthetic = format!("rustc version {}", env!("CARGO_PKG_RUST_VERSION"));
+        return RustVersion::parse(&synthetic);
+    };
 
     let data = sect.data().unwrap();
     let string_data = std::str::from_utf8(data).unwrap();

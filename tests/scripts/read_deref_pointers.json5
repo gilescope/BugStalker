@@ -1,0 +1,76 @@
+// Migrated from tests/integration/test_variables.py::test_deref_pointers.
+// Uses DQE expressions to deref the pointers from read_pointers.
+
+{ method: "break.set", params: { at: "vars.rs:119" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { expression: "*ref_a",       hint: "*&i32 → i32",
+expect: {
+  items: [{ name: "ref_a", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*ptr_a",       hint: "*const i32 → i32",
+expect: {
+  items: [{ name: "ptr_a", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*ptr_ptr_a",   hint: "** → *const i32",
+expect: {
+  items: [
+    {
+      name: "ptr_ptr_a",
+      type: "*const i32",
+      value_text: { $regex: "^\\*const i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "**ptr_ptr_a",  hint: "*** → i32",
+expect: {
+  items: [{ name: "ptr_ptr_a", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*mut_ref_b",   hint: "*&mut i32 → i32",
+expect: {
+  items: [{ name: "mut_ref_b", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*mut_ptr_c",   hint: "**mut i32 → i32",
+expect: {
+  items: [{ name: "mut_ptr_c", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*box_d",       hint: "*Box<i32> → i32",
+expect: {
+  items: [{ name: "box_d", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*ref_f",       hint: "*&Foo → Foo",
+expect: {
+  items: [
+    {
+      name: "ref_f",
+      type: "Foo",
+      value_text: {
+        $regex: "^Foo \\{\n    bar: i32\\(1\\)\n    baz: \\[i32\\] \\[1, 2\\]\n    foo: \\&i32 \\[0x[0-9a-fA-F]+\\]\n\\}$"
+      }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

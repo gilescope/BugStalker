@@ -1,0 +1,32 @@
+// Migrated from tests/integration/test_variables.py::test_read_time.
+// Instant carries a non-deterministic delta; pin via $regex post-bless.
+
+{ method: "break.set", params: { at: "vars.rs:529" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "system_time", hint: "SystemTime(epoch)",
+expect: {
+  items: [
+    {
+      name: "system_time",
+      type: "SystemTime",
+      value_text: "SystemTime(1970-01-01T00:00:00Z)"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "instant",     hint: "Instant — delta is wallclock-dependent, pin via $regex",
+expect: {
+  items: [
+    {
+      name: "instant",
+      type: "Instant",
+      value_text: { $regex: "^Instant\\(now [+-] \\d{2}:\\d{2}:\\d{2}\\.\\d{3}\\)$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

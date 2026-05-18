@@ -1,0 +1,127 @@
+// Migrated from tests/integration/test_variables.py::test_read_vec_and_slice.
+
+{ method: "break.set", params: { at: "vars.rs:151" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "vec1",   hint: "Vec<i32>",
+expect: {
+  items: [
+    {
+      name: "vec1",
+      type: "Vec<i32, alloc::alloc::Global>",
+      value_text: "Vec<i32, _> [1, 2, 3]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "vec2",   hint: "Vec<Foo>",
+expect: {
+  items: [
+    {
+      name: "vec2",
+      type: "Vec<vars::vec_and_slice_types::Foo, alloc::alloc::Global>",
+      value_text: "Vec<Foo, _> [{\n        foo: i32(1)\n    }, {\n        foo: i32(2)\n    }]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "vec3",   hint: "Vec<Vec<i32>>",
+expect: {
+  items: [
+    {
+      name: "vec3",
+      type: "Vec<alloc::vec::Vec<i32, alloc::alloc::Global>, alloc::alloc::Global>",
+      value_text: "Vec<Vec<i32, _>, _> [[1, 2, 3], [1, 2, 3]]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "slice1", hint: "&[i32; 3]",
+expect: {
+  items: [
+    {
+      name: "slice1",
+      type: "&[i32; 3]",
+      value_text: { $regex: "^\\&\\[i32; 3\\] \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "slice2", hint: "&[&[i32; 3]; 2]",
+expect: {
+  items: [
+    {
+      name: "slice2",
+      type: "&[&[i32; 3]; 2]",
+      value_text: {
+        $regex: "^\\&\\[\\&\\[i32; 3\\]; 2\\] \\[0x[0-9a-fA-F]+\\]$"
+      }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+
+{ method: "assert.var", params: { expression: "*slice1",       hint: "deref &[i32; 3]",
+expect: {
+  items: [
+    {
+      name: "slice1",
+      type: "[i32]",
+      value_text: "[i32] [1, 2, 3]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*slice2",       hint: "deref outer slice",
+expect: {
+  items: [
+    {
+      name: "slice2",
+      type: "[&[i32; 3]]",
+      value_text: {
+        $regex: "^\\[\\&\\[i32; 3\\]\\] \\[0x[0-9a-fA-F]+, 0x[0-9a-fA-F]+\\]$"
+      }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*(*slice2)[0]", hint: "deref slice2 → [0] → deref → [i32; 3]",
+expect: {
+  items: [
+    {
+      name: "slice2",
+      type: "[i32]",
+      value_text: "[i32] [1, 2, 3]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*(*slice2)[1]", hint: "deref slice2 → [1] → deref → [i32; 3]",
+expect: {
+  items: [
+    {
+      name: "slice2",
+      type: "[i32]",
+      value_text: "[i32] [1, 2, 3]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

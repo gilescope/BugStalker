@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::TypeDeclaration;
 use crate::debugger::debugee::dwarf::r#type::{CModifier, TypeId, TypeIdentity};
 use crate::debugger::variable::ObjectBinaryRepr;
@@ -173,6 +174,106 @@ pub struct StructValue {
     /// Map of type parameters of a structure type.
     pub type_params: IndexMap<String, Option<TypeId>>,
     pub raw_address: Option<usize>,
+    /// Phase 3 Feature A batch A4 — populated by the dyn-resolver
+    /// when this struct *is* the fat-pointer pair for a `dyn Trait`
+    /// and we managed to read the vtable's slots. The renderer uses
+    /// it to surface drop / size / align / methods as a typed
+    /// record. `None` when detection misfires or every probe missed.
+    pub vtable_view: Option<VtableView>,
+}
+
+/// Resolved contents of a `dyn Trait` vtable. Built at parse time
+/// by walking the inferior's vtable memory and looking each slot up
+/// in the symbol table; consumed at render time. Slot indices
+/// follow rustc's layout — `[drop, size, align, methods…]` — so the
+/// renderer can present them with the right labels regardless of
+/// how many trait methods came after.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct VtableView {
+    /// Runtime address of the vtable itself (post-ASLR/PIE).
+    pub vtable_addr: u64,
+    /// Slot 0 — `core::ptr::drop_in_place::<Concrete>`. `None` when
+    /// the concrete type is `!Drop` (slot is a null pointer) or the
+    /// drop fn's symbol couldn't be resolved.
+    pub drop: Option<VtableSlot>,
+    /// Slot 1 — `size_of::<Concrete>()`. Read as a raw u64.
+    pub size: Option<u64>,
+    /// Slot 2 — `align_of::<Concrete>()`. Read as a raw u64.
+    pub align: Option<u64>,
+    /// Slots 3+ — trait method pointers in declaration order. Empty
+    /// when the trait has no methods (`dyn Send`, `dyn Sync`, …) or
+    /// every probe was unresolvable.
+    pub methods: Vec<VtableSlot>,
+    /// Total slots inspected (for "+N more" elision when the slot
+    /// count exceeds the renderer's display cap).
+    pub probed_slots: usize,
+    /// Phase 3 Feature A batch A5 — the concrete pointee, parsed
+    /// through its DWARF type. `Some` only when we found the
+    /// concrete's DIE *and* successfully parsed the inferior memory
+    /// at `data_ptr`. The renderer surfaces this inline so a dyn
+    /// stops being opaque.
+    pub concrete_value: Option<Box<Value>>,
+    /// Phase 3 Feature A batch A7 — auto-trait markers carried in
+    /// the `dyn` bound list (`Send`, `Sync`, `Unpin`, etc.). Parsed
+    /// out of the type-ident at resolve time and rendered compactly
+    /// as `[+ Send + Sync]` so the main trait name stays readable.
+    /// Empty for single-bound dyns (`&dyn Greeter`). Names are
+    /// short form — `Send` rather than `core::marker::Send`.
+    pub auto_traits: Vec<String>,
+}
+
+/// One vtable slot the resolver was able to identify by symbol.
+/// Methods carry `name` = the trait method ("greet"); the drop
+/// slot carries `name` = "drop".
+#[derive(Clone, PartialEq, Debug)]
+pub struct VtableSlot {
+    /// Runtime address of the function this slot points at.
+    pub addr: u64,
+    /// Phase 3 Feature A batch A9 — the trait this slot belongs
+    /// to. Parsed from the demangled symbol: `<X as Trait>::method`
+    /// yields `Trait`; default-impl `Path::Trait::method` yields
+    /// `Trait`. `None` for the drop slot and for symbols whose
+    /// shape we can't classify.
+    ///
+    /// The renderer groups methods by this so the inheritance
+    /// hierarchy (`dyn Error` ⇒ `Debug { fmt }`, `Display { fmt }`,
+    /// `Error { source, … }`) is visible without the user having
+    /// to read the `<X as Y>` symbol form.
+    pub trait_name: Option<String>,
+    /// Short label — the trait method's name, or "drop".
+    pub name: String,
+    /// Full demangled symbol — `<Concrete as Trait>::method` for a
+    /// method, `core::ptr::drop_in_place::<Concrete>` for the drop
+    /// slot. Surfaced verbatim in the renderer.
+    pub display: String,
+    /// `file.rs:line` if `addr2line` had a hit; `None` otherwise.
+    pub source_location: Option<String>,
+}
+
+impl StructValue {
+    /// Phase 3 Feature A — `true` when this struct is the
+    /// fat-pointer representation of a `dyn Trait`.
+    ///
+    /// **Layout-driven detection.** The fat pointer rustc emits for
+    /// `dyn Trait` (and `dyn Trait + Send + …`) is invariably a
+    /// 2-member struct with one pointer-named field (`pointer` /
+    /// `data_ptr`) and a `vtable` (or `v_table` / `vtbl`) sibling.
+    /// We match on layout because the type name — which may contain
+    /// `"dyn "` purely as a generic argument — is unreliable: e.g.
+    /// `UnsafeCell<Option<…Box<dyn Any + Send>>>` *mentions* `dyn`
+    /// but its own layout is a single `value:` field. Pre-fix that
+    /// wrapper got classified as a trait object and the renderer
+    /// emitted `[trait object — pointer fields missing]`.
+    pub fn is_trait_object(&self) -> bool {
+        if self.members.len() != 2 {
+            return false;
+        }
+        let m0 = self.members[0].field_name.as_deref();
+        let m1 = self.members[1].field_name.as_deref();
+        const DATA: [Option<&str>; 3] = [Some("pointer"), Some("data_ptr"), Some("data")];
+        const VT: [Option<&str>; 3] = [Some("vtable"), Some("v_table"), Some("vtbl")];
+        DATA.contains(&m0) && VT.contains(&m1) || VT.contains(&m0) && DATA.contains(&m1)
+    }
 }
 
 impl StructValue {
@@ -248,6 +349,26 @@ pub struct RustEnumValue {
     /// Variable IR representation of selected variant.
     pub value: Option<Box<Member>>,
     pub raw_address: Option<usize>,
+    /// Phase 3 Feature D — `(file, line)` of the active variant's
+    /// captured-locals fields, as emitted by rustc on the variant
+    /// struct's members. For coroutine state-machine enums this is
+    /// the source position of the corresponding `.await` point and
+    /// drives the await-trace renderer. `None` for ordinary enums.
+    pub await_location: Option<(std::path::PathBuf, u64)>,
+}
+
+impl RustEnumValue {
+    /// Phase 3 Feature D step 1 — `true` when the enum's DWARF type
+    /// name marks it as a rustc coroutine state machine (the body of
+    /// an `async fn` or any generator). Cheap inspection — no extra
+    /// storage, no plumbing. Used for intent-clear prefilters in the
+    /// async walker and for richer diagnostics when state-name
+    /// parsing fails.
+    pub fn is_coroutine(&self) -> bool {
+        self.type_ident
+            .name()
+            .is_some_and(crate::debugger::debugee::dwarf::r#type::looks_like_coroutine_type_name)
+    }
 }
 
 /// Raw pointers, references, Box.
@@ -261,6 +382,11 @@ pub struct PointerValue {
     pub target_type: Option<TypeId>,
     pub target_type_size: Option<u64>,
     pub raw_address: Option<usize>,
+    /// Phase 1 S9 — populated at parse time for smart pointers like
+    /// `Box<T>` so the renderer can surface the pointee inline. For
+    /// raw `*const T` / `&T` / `&mut T` references this stays
+    /// `None` and rendering falls back to address-only display.
+    pub dereffed: Option<Box<Value>>,
 }
 
 impl PointerValue {
@@ -359,6 +485,12 @@ pub struct CModifiedValue {
 }
 
 /// Program typed value representation.
+// `StructValue` and `ArrayValue` carry substantially more state than
+// the simpler scalar variants. `Box`-ing them just to shave the enum
+// size would impose a heap allocation on every variable construction
+// and break borrow patterns through the rendering code, so the size
+// difference is accepted deliberately.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq)]
 pub enum Value {
     Scalar(ScalarValue),
@@ -486,6 +618,13 @@ impl Value {
                 }
                 SpecializedValue::String(str) => Some(Literal::String(str.value.clone())),
                 SpecializedValue::Str(str) => Some(Literal::String(str.value.clone())),
+                SpecializedValue::Slice(slice) => {
+                    let mut array = vec![];
+                    for item in &slice.items {
+                        array.push(LiteralOrWildcard::Literal(item.value.as_literal()?))
+                    }
+                    Some(Literal::Array(array.into_boxed_slice()))
+                }
                 SpecializedValue::Tls(tls) => tls.inner_value.as_ref()?.as_literal(),
                 SpecializedValue::Cell(c) => c.as_literal(),
                 SpecializedValue::RefCell(c) => c.as_literal(),
@@ -502,6 +641,35 @@ impl Value {
                     ))
                 }
                 SpecializedValue::Instant(_) => None,
+                // Atomic delegates to its inner scalar/pointer literal.
+                SpecializedValue::Atomic(inner) => inner.as_literal(),
+                // NonNull is address-shaped, like Rc/Arc above.
+                SpecializedValue::NonNull(ptr) => Some(Literal::Address(ptr.raw_address?)),
+                // Pin delegates to the pinnee.
+                SpecializedValue::Pin(inner) => inner.as_literal(),
+                // Range as a literal — surface the rendered form as a
+                // string. Useful for DAP `evaluate` where the client
+                // wants something it can show inline.
+                SpecializedValue::Range(r) => Some(Literal::String(r.render())),
+                // Duration: surface the (secs, nanos) pair as a
+                // 2-element Array literal so users can pattern-match
+                // on it. Mirrors how `SystemTime` does it just above.
+                SpecializedValue::Duration(_) => None,
+                // CString: surface the rendered display form.
+                SpecializedValue::CString(s) => Some(Literal::String(s.value.clone())),
+                // OsString / PathBuf: same shape as CString.
+                SpecializedValue::OsString(s) => Some(Literal::String(s.value.clone())),
+                // MaybeUninit: surface the inner literal — the
+                // [possibly uninit] caveat lives on the rendered text
+                // path, not the literal one (clients pattern-matching
+                // on the value want the raw literal).
+                SpecializedValue::MaybeUninit(inner) => inner.as_literal(),
+                // Mutex/RwLock: surface the guarded payload's literal.
+                SpecializedValue::Mutex { inner, .. } => inner.as_literal(),
+                // Lock guards: surface the guarded payload's literal.
+                SpecializedValue::LockGuard(inner) => inner.as_literal(),
+                // Weak: surface the allocation address as a literal.
+                SpecializedValue::Weak { ptr, .. } => Some(Literal::Address(ptr.raw_address?)),
             },
             Value::CModifiedVariable(val) => Some(val.value.as_ref()?.as_literal()?),
         }
@@ -632,6 +800,14 @@ impl Value {
                 value: Some(SpecializedValue::Arc(ptr)),
                 ..
             } => ptr.deref(pcx),
+            // Phase 1 S15: Weak — deref still works (reads RcBox /
+            // ArcInner) so the existing `weak.deref(pcx)` test path
+            // keeps working alongside the new `(strong=N, weak=M)`
+            // render output.
+            Value::Specialized {
+                value: Some(SpecializedValue::Weak { ptr, .. }),
+                ..
+            } => ptr.deref(pcx),
             Value::Specialized {
                 value: Some(SpecializedValue::Tls(tls_var)),
                 ..
@@ -660,6 +836,7 @@ impl Value {
                 .and_then(|t| pcx.type_graph.type_size_in_bytes(pcx.evcx, t)),
             raw_address: None,
             type_id: None,
+            dereffed: None,
         }))
     }
 
@@ -670,44 +847,69 @@ impl Value {
             Value::Struct(structure) => structure.field(field_name),
             Value::RustEnum(r_enum) => r_enum.value.and_then(|v| v.value.field(field_name)),
             Value::Specialized {
-                value: specialized, ..
-            } => match specialized {
-                Some(SpecializedValue::HashMap(map)) | Some(SpecializedValue::BTreeMap(map)) => {
-                    map.kv_items.into_iter().find_map(|(key, value)| match key {
-                        Value::Specialized {
-                            value: specialized, ..
-                        } => match specialized {
-                            Some(SpecializedValue::String(string_key)) => {
-                                (string_key.value == field_name).then_some(value)
-                            }
-                            Some(SpecializedValue::Str(string_key)) => {
-                                (string_key.value == field_name).then_some(value)
-                            }
+                value: specialized,
+                original,
+            } => {
+                // Container-shaped specialisations have their own
+                // semantics for `.field()` (HashMap key lookup,
+                // Vector "buf" alias, Cell/RefCell pass-through, …).
+                // Anything else — notably `AtomicU*` / `AtomicI*` /
+                // bespoke pretty-printers that don't carry a real
+                // field map — should fall through to the underlying
+                // struct so callers can navigate by DWARF field
+                // name (e.g. tokio's `AtomicU64 { v: UnsafeCell { value } }`).
+                let from_specialized = matches!(
+                    &specialized,
+                    Some(SpecializedValue::HashMap(_))
+                        | Some(SpecializedValue::BTreeMap(_))
+                        | Some(SpecializedValue::Vector(_))
+                        | Some(SpecializedValue::VecDeque(_))
+                        | Some(SpecializedValue::Tls(_))
+                        | Some(SpecializedValue::Cell(_))
+                        | Some(SpecializedValue::RefCell(_))
+                );
+                if !from_specialized {
+                    return original.field(field_name);
+                }
+                match specialized {
+                    Some(SpecializedValue::HashMap(map))
+                    | Some(SpecializedValue::BTreeMap(map)) => {
+                        map.kv_items.into_iter().find_map(|(key, value)| match key {
+                            Value::Specialized {
+                                value: specialized, ..
+                            } => match specialized {
+                                Some(SpecializedValue::String(string_key)) => {
+                                    (string_key.value == field_name).then_some(value)
+                                }
+                                Some(SpecializedValue::Str(string_key)) => {
+                                    (string_key.value == field_name).then_some(value)
+                                }
+                                _ => None,
+                            },
                             _ => None,
-                        },
-                        _ => None,
-                    })
-                }
-                Some(SpecializedValue::Vector(vec_val))
-                | Some(SpecializedValue::VecDeque(vec_val)) => {
-                    if field_name == "buf" {
-                        vec_val
-                            .structure
-                            .members
-                            .first()
-                            .map(|member| member.value.clone())
-                    } else {
-                        None
+                        })
                     }
+                    Some(SpecializedValue::Vector(vec_val))
+                    | Some(SpecializedValue::VecDeque(vec_val)) => {
+                        if field_name == "buf" {
+                            vec_val
+                                .structure
+                                .members
+                                .first()
+                                .map(|member| member.value.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    Some(SpecializedValue::Tls(tls_var)) => tls_var
+                        .inner_value
+                        .and_then(|inner| inner.field(field_name)),
+                    Some(SpecializedValue::Cell(cell)) | Some(SpecializedValue::RefCell(cell)) => {
+                        cell.field(field_name)
+                    }
+                    _ => None,
                 }
-                Some(SpecializedValue::Tls(tls_var)) => tls_var
-                    .inner_value
-                    .and_then(|inner| inner.field(field_name)),
-                Some(SpecializedValue::Cell(cell)) | Some(SpecializedValue::RefCell(cell)) => {
-                    cell.field(field_name)
-                }
-                _ => None,
-            },
+            }
             _ => None,
         }
     }
@@ -1014,6 +1216,44 @@ impl Value {
 }
 
 #[cfg(test)]
+mod rust_enum_value_tests {
+    use super::*;
+
+    fn enum_named(name: &str) -> RustEnumValue {
+        RustEnumValue {
+            type_ident: TypeIdentity::no_namespace(name),
+            type_id: None,
+            value: None,
+            raw_address: None,
+            await_location: None,
+        }
+    }
+
+    #[test]
+    fn is_coroutine_matches_async_fn_env() {
+        assert!(enum_named("my_app::handler::{async_fn_env#0}").is_coroutine());
+    }
+
+    #[test]
+    fn is_coroutine_matches_coroutine_env() {
+        assert!(enum_named("my_app::handler::{coroutine_env#3}").is_coroutine());
+    }
+
+    #[test]
+    fn is_coroutine_rejects_ordinary_enums() {
+        assert!(!enum_named("Option<i32>").is_coroutine());
+        assert!(!enum_named("MyAppError").is_coroutine());
+    }
+
+    #[test]
+    fn is_coroutine_rejects_closure_env() {
+        // Plain `{closure_env#}` is not a coroutine — only the
+        // async/coroutine/generator env markers count.
+        assert!(!enum_named("my_app::handler::{closure_env#0}").is_coroutine());
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
     use crate::debugger::variable::value::specialization::VecValue;
@@ -1033,6 +1273,7 @@ mod test {
         Value::Specialized {
             value: Some(SpecializedValue::Str(StrVariable {
                 value: val.to_string(),
+                elided: None,
             })),
             original: StructValue {
                 ..Default::default()
@@ -1044,6 +1285,7 @@ mod test {
         Value::Specialized {
             value: Some(SpecializedValue::String(StringVariable {
                 value: val.to_string(),
+                elided: None,
             })),
             original: StructValue {
                 ..Default::default()
@@ -1079,7 +1321,9 @@ mod test {
                 ],
                 type_params: IndexMap::default(),
                 raw_address: None,
+                vtable_view: None,
             },
+            elided: None,
         }
     }
 
@@ -1106,6 +1350,7 @@ mod test {
             value: Some(SpecializedValue::HashSet(HashSetVariable {
                 type_ident: TypeIdentity::no_namespace("hashset"),
                 items,
+                elided: None,
             })),
             original: StructValue {
                 ..Default::default()
@@ -1118,6 +1363,7 @@ mod test {
             value: Some(SpecializedValue::BTreeSet(HashSetVariable {
                 type_ident: TypeIdentity::no_namespace("btreeset"),
                 items,
+                elided: None,
             })),
             original: StructValue {
                 ..Default::default()
@@ -1193,6 +1439,7 @@ mod test {
                     value: Some(123usize as *const ()),
                     raw_address: None,
                     target_type_size: None,
+                    dereffed: None,
                 }),
                 eq_literal: Literal::Address(123),
                 neq_literals: vec![Literal::Address(124), Literal::Int(123)],
@@ -1205,6 +1452,7 @@ mod test {
                     value: Some(123usize as *const ()),
                     raw_address: None,
                     target_type_size: None,
+                    dereffed: None,
                 }),
                 eq_literal: Literal::Address(123),
                 neq_literals: vec![Literal::Address(124), Literal::Int(123)],
@@ -1242,9 +1490,11 @@ mod test {
                             }],
                             type_params: Default::default(),
                             raw_address: None,
+                            vtable_view: None,
                         }),
                     })),
                     raw_address: None,
+                    await_location: None,
                 }),
                 eq_literal: Literal::EnumVariant(
                     "Variant1".to_string(),
@@ -1591,6 +1841,7 @@ mod test {
                     ],
                     type_params: Default::default(),
                     raw_address: None,
+                    vtable_view: None,
                 }),
                 eq_literals: vec![
                     Literal::AssocArray(HashMap::from([
@@ -1690,6 +1941,7 @@ mod test {
                     ],
                     type_params: Default::default(),
                     raw_address: None,
+                    vtable_view: None,
                 }),
                 eq_literals: vec![
                     Literal::Array(Box::new([

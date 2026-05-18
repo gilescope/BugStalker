@@ -1,0 +1,19 @@
+[package]
+name = "bs-syscall-macro"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "BugStalker time-travel — syscall! { … } DSL macro for sub-phase 3B (Phase 5)."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+[dev-dependencies]
+bs-syscall-spec = { path = "../bs-syscall-spec" }

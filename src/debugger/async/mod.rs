@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 mod context;
 mod future;
 mod tokio;
@@ -171,20 +172,24 @@ impl Debugger {
             if let Some(Some(w)) = worker {
                 // if this is an async worker we need to extract whole future list once
                 if tasks.is_empty() {
-                    let mut context_initialized_var = analyze_context
-                        .debugger()
-                        .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))?;
+                    // See worker.rs::find_runtime_context for the
+                    // multi-candidate selection logic — different
+                    // platforms surface up to three CONTEXT DIEs and
+                    // only one carries a real `raw_address`.
                     let context_initialized =
-                        context_initialized_var
-                            .pop_if_single_el()
-                            .ok_or(Error::Async(AsyncError::IncorrectAssumption(
-                                "CONTEXT not found",
-                            )))?;
+                        crate::debugger::r#async::tokio::worker::find_runtime_context(
+                            analyze_context.debugger(),
+                        )
+                        .ok_or(Error::Async(
+                            AsyncError::IncorrectAssumption("CONTEXT not found"),
+                        ))?;
 
+                    let owned = OwnedList::try_extract(&analyze_context, context_initialized)?;
+                    let dbg = analyze_context.debugger();
                     tasks = Rc::new(
-                        OwnedList::try_extract(&analyze_context, context_initialized)?
+                        owned
                             .into_iter()
-                            .filter_map(|t| weak_error!(t.backtrace()))
+                            .filter_map(|t| weak_error!(t.backtrace(dbg)))
                             .collect(),
                     );
                     backtrace.tasks = tasks.clone();

@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: MIT
+#
+# Soak-suite workflow per `doc/plans/phase-0-preflight.md`.
+# Long-running scenarios that flake out under shorter PR-time budgets:
+# attach + detach loops on a 100 MB binary, watchpoint hit-rate under
+# load, multi-thread variable rendering at scale. Phase 0 ships the
+# workflow shape; soak scenarios are added per-phase as they become
+# relevant (see Phase 8 for the canonical scenario list).
+name: CI / soak
+
+on:
+  schedule:
+    # 05:31 UTC weekly (Sunday). Soak runs are >1h; daily would burn
+    # GHA minutes for no incremental value.
+    - cron: "31 5 * * 0"
+  workflow_dispatch:
+
+env:
+  MSRV: 1.89.0
+  LRV: 1.95.0
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install debug symbols
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libc6-dbg
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install "$LRV"
+          rustup default "$LRV"
+      - name: Build the workspace
+        run: cargo build --workspace --release
+      - name: Run soak placeholder
+        run: |
+          # Phase 0 placeholder. Real soak scenarios are added per
+          # phase — see `doc/plans/phase-8-testing.md`.
+          echo "soak: no scenarios registered yet"

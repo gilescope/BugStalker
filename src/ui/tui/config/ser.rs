@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::ui::tui::config::{CommonAction, KeyMap, SpecialAction};
 use anyhow::bail;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};

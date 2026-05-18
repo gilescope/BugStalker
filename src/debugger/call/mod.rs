@@ -1,26 +1,43 @@
+// SPDX-License-Identifier: MIT
 mod cache;
 pub mod fmt;
 pub use cache::CallCache;
 
 use super::{
-    Debugger, Error, TypeDeclaration,
-    address::RelocatedAddress,
-    debugee::dwarf::{DebugInformation, r#type::ComplexType},
-    register::{Register, RegisterMap},
-    utils::PopIf,
-    variable::dqe::Literal,
+    Debugger, Error, debugee::dwarf::DebugInformation, utils::PopIf, variable::dqe::Literal,
 };
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use super::{
+    TypeDeclaration,
+    address::RelocatedAddress,
+    debugee::dwarf::r#type::ComplexType,
+    register::{Register, RegisterMap},
+};
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux")
+))]
+use crate::debugger::utils;
 use crate::{
     debugger::{
         FunctionInfo,
-        context::gcx,
         debugee::dwarf::unit::die_ref::{FatDieRef, Function},
-        read_memory_by_pid, utils,
     },
-    disable_when_not_stared, weak_error,
+    weak_error,
 };
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::{
+    debugger::{context::gcx, read_memory_by_pid},
+    disable_when_not_stared,
+};
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use log::debug;
+#[cfg(any(
+    target_arch = "x86_64",
+    all(target_arch = "aarch64", target_os = "linux")
+))]
 use nix::sys::{self, signal::Signal, wait::WaitStatus};
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use std::rc::Rc;
 
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +65,7 @@ pub enum CallError {
 }
 
 /// Use general registers or floating point registers.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[derive(Clone, Copy)]
 enum RegType {
     General,
@@ -56,9 +74,11 @@ enum RegType {
 }
 
 /// Function call arguments.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[derive(Default)]
-struct CallArgs(Box<[(u64, RegType)]>);
+pub(super) struct CallArgs(Box<[(u64, RegType)]>);
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn liter_to_arg_bin_repr(
     no: usize,
     lit: &Literal,
@@ -177,6 +197,7 @@ fn liter_to_arg_bin_repr(
 }
 
 /// Map argument to the register according to System V AMD64 ABI.
+#[cfg(target_arch = "x86_64")]
 fn get_reg_for_no(no: usize, reg_type: RegType) -> Register {
     match (no, reg_type) {
         (0, RegType::General) => Register::Rdi,
@@ -189,6 +210,27 @@ fn get_reg_for_no(no: usize, reg_type: RegType) -> Register {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+fn get_reg_for_no(no: usize, reg_type: RegType) -> Register {
+    match (no, reg_type) {
+        (0, RegType::General) => Register::X0,
+        (1, RegType::General) => Register::X1,
+        (2, RegType::General) => Register::X2,
+        (3, RegType::General) => Register::X3,
+        (4, RegType::General) => Register::X4,
+        (5, RegType::General) => Register::X5,
+        (6, RegType::General) => Register::X6,
+        (7, RegType::General) => Register::X7,
+        _ => unreachable!("unsupported arg no or unknown register"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+const MAX_REGISTER_ARGS: usize = 6;
+#[cfg(target_arch = "aarch64")]
+const MAX_REGISTER_ARGS: usize = 8;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl CallArgs {
     fn new(literals: &[Literal], fn_params: &[Rc<ComplexType>]) -> Result<Self, CallError> {
         if literals.len() != fn_params.len() {
@@ -198,7 +240,7 @@ impl CallArgs {
             ));
         }
 
-        if literals.len() > 6 {
+        if literals.len() > MAX_REGISTER_ARGS {
             return Err(CallError::TooManyArguments);
         }
 
@@ -213,10 +255,7 @@ impl CallArgs {
 
     /// Fill registers with arguments.
     fn prepare_registers(self, reg_map: &mut RegisterMap) {
-        debug_assert!(
-            self.0.len() < 7,
-            "only 6 6-byte arguments allowed at this moment"
-        );
+        debug_assert!(self.0.len() <= MAX_REGISTER_ARGS);
         for (idx, (val, reg_type)) in self.0.iter().enumerate() {
             reg_map.update(get_reg_for_no(idx, *reg_type), *val);
         }
@@ -224,6 +263,7 @@ impl CallArgs {
 }
 
 /// Call context (or ccx). Program state before a call.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 struct CallContext<'a> {
     dbg: &'a Debugger,
     pid: nix::unistd::Pid,
@@ -232,6 +272,7 @@ struct CallContext<'a> {
     text: usize,
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl<'a> CallContext<'a> {
     fn new(dbg: &'a Debugger) -> Result<Self, Error> {
         let pid = dbg.ecx().pid_on_focus();
@@ -271,6 +312,7 @@ impl<'a> CallContext<'a> {
 
 struct CallHelper;
 
+#[cfg(target_arch = "x86_64")]
 impl CallHelper {
     fn call_fn(ccx: &CallContext, rip: u64, fn_addr: u64, args: CallArgs) -> Result<(), Error> {
         // new text:
@@ -286,6 +328,24 @@ impl CallHelper {
         args.prepare_registers(&mut regs);
         regs.update(Register::Rax, fn_addr);
         regs.update(Register::Rip, rip);
+        // System V AMD64 ABI: at the point of `CALL`, RSP must be 16-byte
+        // aligned so that on entry to the callee `RSP + 8` is aligned
+        // (the callee's prologue compensates for the pushed return
+        // address). The debuggee's RSP at the stop point is whatever
+        // its compiler arranged for *that* instruction — typically
+        // 16-aligned at function-call sites but commonly only 8-aligned
+        // mid-function. If we leave it as-is, callees that use
+        // alignment-sensitive instructions (movaps/movdqa on SSE
+        // locals, e.g. inside Vec::reserve/realloc) take a #GP at a
+        // load that happens to land on an odd 8-byte slot — which made
+        // `test_debug_trait_repr_vars` flake whenever the breakpoint
+        // line happened to leave RSP & 0xf == 8.
+        //
+        // Round RSP down to 16 bytes (we're allocating into unused
+        // scratch below the live frame; ccx.regs is restored after the
+        // call so the alignment shim is invisible to the debuggee).
+        let aligned_sp = regs.value(Register::Rsp) & !0xfu64;
+        regs.update(Register::Rsp, aligned_sp);
         regs.persist(ccx.pid)?;
 
         debug!(target: "debugger", "call a function, wait until breakpoint are hit");
@@ -395,8 +455,367 @@ impl CallHelper {
     }
 }
 
+// aarch64 CallHelper still uses ptrace::cont / ptrace::step to
+// drive the trampoline (cont-until-BRK + single-step). That works
+// on linux/aarch64 but is incompatible with the darwin/aarch64
+// pure-Mach Tracer cutover (`Child::install` no longer calls
+// PT_TRACE_ME, so the inferior isn't in a ptrace relationship and
+// these ptrace ops fail). A Mach-native CallHelper for darwin
+// would need to allocate a temporary exception port, swap it in
+// over the Tracer's port via task_set_exception_ports (saving the
+// original via the LLDB-style SaveExceptionPortInfo pattern),
+// drive task_resume / arm_set_single_step + port.receive for each
+// trampoline step, then restore. Deferred — see roadmap.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+impl CallHelper {
+    fn call_fn(ccx: &CallContext, pc: u64, fn_addr: u64, args: CallArgs) -> Result<(), Error> {
+        const BLR_X8_BRK0: usize = 0xD420_0000usize << 32 | 0xD63F_0100usize;
+
+        debug!(target: "debugger", "add call instructions");
+        ccx.dbg.write_memory(pc as usize, BLR_X8_BRK0)?;
+
+        debug!(target: "debugger", "prepare function arguments");
+        let mut regs: RegisterMap = ccx.regs.clone();
+        args.prepare_registers(&mut regs);
+        regs.update(Register::X8, fn_addr);
+        regs.update(Register::Pc, pc);
+        regs.persist(ccx.pid)?;
+
+        debug!(target: "debugger", "call a function, wait until breakpoint are hit");
+        sys::ptrace::cont(ccx.pid, None).map_err(Error::Ptrace)?;
+        let res = nix::sys::wait::waitpid(ccx.pid, None).map_err(Error::Waitpid)?;
+        debug_assert!(res == WaitStatus::Stopped(ccx.pid, Signal::SIGTRAP));
+
+        Ok(())
+    }
+
+    fn jump(ccx: &CallContext, dest_ptr: u64) -> Result<(), Error> {
+        debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
+
+        let mut regs = ccx.regs.clone();
+        regs.update(Register::X8, dest_ptr);
+        regs.persist(ccx.pid)?;
+
+        const BR_X8: usize = 0xD61F_0100;
+        const BR_X8_MASK: usize = 0xFFFF_FFFF_0000_0000;
+
+        let new_text = (ccx.text & BR_X8_MASK) | BR_X8;
+
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_text)?;
+
+        sys::ptrace::step(ccx.pid, None).map_err(Error::Ptrace)?;
+        let res = nix::sys::wait::waitpid(ccx.pid, None).map_err(Error::Waitpid)?;
+        debug_assert!(matches!(res, WaitStatus::Stopped(_, _)));
+
+        if RegisterMap::current(ccx.pid)?.value(Register::Pc) != dest_ptr {
+            return Err(CallError::Jmp.into());
+        }
+
+        Ok(())
+    }
+
+    fn mmap(ccx: &CallContext) -> Result<u64, Error> {
+        debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
+
+        let mut regs = ccx.regs.clone();
+        const PROT: u64 =
+            (nix::libc::PROT_READ | nix::libc::PROT_EXEC | nix::libc::PROT_WRITE) as u64;
+        const FLAGS: u64 = (nix::libc::MAP_PRIVATE | nix::libc::MAP_ANONYMOUS) as u64;
+        regs.update(syscall_abi::NR_REG, syscall_abi::NR_MMAP);
+        regs.update(Register::X0, 0);
+        let page_size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as u64 };
+        regs.update(Register::X1, page_size);
+        regs.update(Register::X2, PROT);
+        regs.update(Register::X3, FLAGS);
+        regs.update(Register::X4, -1i32 as u64);
+        regs.update(Register::X5, 0);
+
+        regs.persist(ccx.pid)?;
+
+        let new_instructions = (ccx.text & syscall_abi::SVC_MASK) | syscall_abi::SVC_INSTR;
+
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_instructions)?;
+
+        sys::ptrace::step(ccx.pid, None).map_err(Error::Ptrace)?;
+        let res = nix::sys::wait::waitpid(ccx.pid, None).map_err(Error::Waitpid)?;
+        debug_assert!(matches!(res, WaitStatus::Stopped(_, _)));
+
+        let regs = RegisterMap::current(ccx.pid)?;
+        let alloc_ptr: u64 = regs.value(Register::X0);
+        if syscall_abi::is_syscall_error(&regs, alloc_ptr) {
+            return Err(CallError::Mmap.into());
+        }
+
+        debug_assert!(utils::region_exist(ccx.pid, alloc_ptr)?);
+
+        Ok(alloc_ptr)
+    }
+
+    fn munmap(ccx: &CallContext, addr: u64) -> Result<(), Error> {
+        let new_text = (ccx.text & syscall_abi::SVC_MASK) | syscall_abi::SVC_INSTR;
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_text)?;
+
+        let mut regs = ccx.regs.clone();
+        regs.update(syscall_abi::NR_REG, syscall_abi::NR_MUNMAP);
+        regs.update(Register::X0, addr);
+        let page_size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) as u64 };
+        regs.update(Register::X1, page_size);
+        regs.persist(ccx.pid)?;
+
+        sys::ptrace::step(ccx.pid, None).map_err(Error::Ptrace)?;
+        let res = nix::sys::wait::waitpid(ccx.pid, None).map_err(Error::Waitpid)?;
+        debug_assert!(matches!(res, WaitStatus::Stopped(_, _)));
+
+        let regs: RegisterMap = RegisterMap::current(ccx.pid)?;
+        if syscall_abi::is_syscall_error(&regs, regs.value(Register::X0)) {
+            return Err(CallError::Munmap.into());
+        }
+        debug_assert!(utils::region_non_exist(ccx.pid, addr)?);
+
+        ccx.dbg.write_memory(ccx.pc.as_usize(), ccx.text)?;
+
+        Ok(())
+    }
+}
+
+/// Darwin/aarch64 stub CallHelper. Inferior function calls
+/// (`vard`, `argd`, `fmt::call_debug_fmt`, `Debugger::call`) are
+/// not yet wired to the Mach exception-port loop — the linux
+/// impl above uses ptrace::cont/step which is incompatible with
+/// our pure-Mach Tracer cutover. Returning a clear `Mmap` error
+/// (the first step the caller takes) keeps the engine's state
+/// machine intact and surfaces the gap to the user instead of
+/// hanging or corrupting the inferior.
+#[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
+impl CallHelper {
+    /// Drive one trampoline step on darwin: arm software single-step
+    /// (or not, for a BRK-terminated trampoline), reply the prior
+    /// pending exception to release the parked thread, `task_resume`
+    /// the kernel-suspended task, block on the Tracer's exception
+    /// port for the resulting trap, re-suspend, save the new pending
+    /// reply, optionally disarm SS.
+    ///
+    /// Mutates `darwin_state.pending_reply` via `Cell` (mutation
+    /// through `&Tracer` — the only reason this is reachable from
+    /// `&CallContext.dbg`).
+    fn drive_one(ccx: &CallContext, single_step: bool) -> Result<(), Error> {
+        use crate::debugger::darwin_mach::{self, ExceptionPort};
+        use mach2::kern_return::KERN_SUCCESS;
+
+        let supervision = ccx
+            .dbg
+            .debugee()
+            .tracer()
+            .darwin_state()
+            .ok_or(CallError::Mmap)?;
+        let task = supervision.task();
+        let port = supervision.port();
+
+        let focus = darwin_mach::first_thread_of(task).map_err(Error::from)?;
+        if single_step {
+            darwin_mach::arm_set_single_step(focus, true).map_err(Error::from)?;
+        }
+
+        if let Some((remote, id, retcode)) = supervision.take_pending_reply() {
+            ExceptionPort::reply(remote, id, retcode).map_err(Error::from)?;
+        }
+
+        darwin_mach::task_resume(task).map_err(Error::from)?;
+
+        let exc = loop {
+            match port.receive(u32::MAX).map_err(Error::from)? {
+                Some(e) => break e,
+                None => continue,
+            }
+        };
+
+        darwin_mach::task_suspend(task).map_err(Error::from)?;
+        if single_step {
+            let _ = darwin_mach::arm_set_single_step(focus, false);
+        }
+        supervision.set_pending_reply(Some((exc.remote_port, exc.msg_id, KERN_SUCCESS)));
+        Ok(())
+    }
+
+    fn call_fn(ccx: &CallContext, pc: u64, fn_addr: u64, args: CallArgs) -> Result<(), Error> {
+        use crate::debugger::darwin_mach;
+
+        const BLR_X8_BRK0: usize = 0xD420_0000usize << 32 | 0xD63F_0100usize;
+        ccx.dbg.write_memory(pc as usize, BLR_X8_BRK0)?;
+
+        // The trampoline page came from the inferior's `mmap`,
+        // which on darwin/aarch64 can only return `R+W` (W^X bars
+        // `PROT_EXEC` without `MAP_JIT`). Flip the page to `R+X`
+        // from the parent task port so the CPU can fetch the
+        // `BLR x8 ; BRK #0` we just wrote. Mirrors what the linux
+        // path gets for free by mmap-ing `R+W+X` directly.
+        let task = darwin_mach::task_for_pid(ccx.pid)?;
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        darwin_mach::vm_protect_rx(task, pc as usize, page_size).map_err(Error::from)?;
+
+        let mut regs: RegisterMap = ccx.regs.clone();
+        args.prepare_registers(&mut regs);
+        regs.update(Register::X8, fn_addr);
+        regs.update(Register::Pc, pc);
+        regs.persist(ccx.pid)?;
+
+        // Run-to-BRK; not single-step.
+        Self::drive_one(ccx, false)
+    }
+
+    fn jump(ccx: &CallContext, dest_ptr: u64) -> Result<(), Error> {
+        debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
+
+        let mut regs = ccx.regs.clone();
+        regs.update(Register::X8, dest_ptr);
+        regs.persist(ccx.pid)?;
+
+        const BR_X8: usize = 0xD61F_0100;
+        const BR_X8_MASK: usize = 0xFFFF_FFFF_0000_0000;
+        let new_text = (ccx.text & BR_X8_MASK) | BR_X8;
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_text)?;
+
+        Self::drive_one(ccx, true)?;
+
+        if RegisterMap::current(ccx.pid)?.value(Register::Pc) != dest_ptr {
+            return Err(CallError::Jmp.into());
+        }
+        Ok(())
+    }
+
+    fn mmap(ccx: &CallContext) -> Result<u64, Error> {
+        debug_assert!(ccx.regs.value(Register::Pc) == ccx.pc.as_u64());
+
+        // The page is used only as a data scratchpad (string header,
+        // vtable copy, Formatter struct, etc.) — no inferior code
+        // ever runs from it. PROT_EXEC was historically requested
+        // for parity with linux's behaviour, but darwin's W^X policy
+        // returns EACCES for any anonymous mapping that asks for
+        // both PROT_WRITE and PROT_EXEC without `MAP_JIT` (which in
+        // turn needs the `com.apple.security.cs.allow-jit`
+        // entitlement). Drop EXEC on darwin — we never need it here.
+        let mut regs = ccx.regs.clone();
+        #[cfg(target_os = "linux")]
+        const PROT: u64 = (libc::PROT_READ | libc::PROT_EXEC | libc::PROT_WRITE) as u64;
+        #[cfg(not(target_os = "linux"))]
+        const PROT: u64 = (libc::PROT_READ | libc::PROT_WRITE) as u64;
+        const FLAGS: u64 = (libc::MAP_PRIVATE | libc::MAP_ANON) as u64;
+        regs.update(syscall_abi::NR_REG, syscall_abi::NR_MMAP);
+        regs.update(Register::X0, 0);
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+        regs.update(Register::X1, page_size);
+        regs.update(Register::X2, PROT);
+        regs.update(Register::X3, FLAGS);
+        regs.update(Register::X4, -1i32 as u64);
+        regs.update(Register::X5, 0);
+        regs.persist(ccx.pid)?;
+
+        let new_instructions = (ccx.text & syscall_abi::SVC_MASK) | syscall_abi::SVC_INSTR;
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_instructions)?;
+
+        Self::drive_one(ccx, true)?;
+
+        let regs = RegisterMap::current(ccx.pid)?;
+        let alloc_ptr: u64 = regs.value(Register::X0);
+        if syscall_abi::is_syscall_error(&regs, alloc_ptr) {
+            if std::env::var_os("BS_DARWIN_DEBUG").is_some() {
+                eprintln!(
+                    "[mmap] errno={} pstate=0x{:x} pc=0x{:x}",
+                    alloc_ptr,
+                    regs.value(Register::Pstate),
+                    regs.value(Register::Pc)
+                );
+            }
+            return Err(CallError::Mmap.into());
+        }
+        Ok(alloc_ptr)
+    }
+
+    fn munmap(ccx: &CallContext, addr: u64) -> Result<(), Error> {
+        let new_text = (ccx.text & syscall_abi::SVC_MASK) | syscall_abi::SVC_INSTR;
+        ccx.dbg.write_memory(ccx.pc.as_usize(), new_text)?;
+
+        let mut regs = ccx.regs.clone();
+        regs.update(syscall_abi::NR_REG, syscall_abi::NR_MUNMAP);
+        regs.update(Register::X0, addr);
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+        regs.update(Register::X1, page_size);
+        regs.persist(ccx.pid)?;
+
+        Self::drive_one(ccx, true)?;
+
+        let regs: RegisterMap = RegisterMap::current(ccx.pid)?;
+        if syscall_abi::is_syscall_error(&regs, regs.value(Register::X0)) {
+            return Err(CallError::Munmap.into());
+        }
+        ccx.dbg.write_memory(ccx.pc.as_usize(), ccx.text)?;
+        Ok(())
+    }
+}
+
+/// aarch64 OS-specific syscall ABI bits. Both linux and darwin run
+/// the AArch64 architecture, but the syscall convention is OS, not
+/// arch:
+///
+/// |               | linux            | darwin           |
+/// |---------------|------------------|------------------|
+/// | nr register   | x8               | x16              |
+/// | trap insn     | `svc #0`         | `svc #0x80`      |
+/// | mmap nr       | 222              | 197 (BSD)        |
+/// | munmap nr     | 215              | 73  (BSD)        |
+/// | error signal  | x0 = -errno      | CPSR.C set, x0=errno |
+///
+/// The encoding for `svc #imm16` is
+/// `1101_0100_000_imm16_0000_1`, so:
+/// * `svc #0`     → `0xD400_0001`
+/// * `svc #0x80`  → `0xD400_0001 | (0x80 << 5)` = `0xD400_1001`
+#[cfg(target_arch = "aarch64")]
+mod syscall_abi {
+    use super::{Register, RegisterMap};
+
+    #[cfg(target_os = "linux")]
+    pub const NR_REG: Register = Register::X8;
+    #[cfg(not(target_os = "linux"))]
+    pub const NR_REG: Register = Register::X16;
+
+    #[cfg(target_os = "linux")]
+    pub const NR_MMAP: u64 = 222;
+    #[cfg(target_os = "linux")]
+    pub const NR_MUNMAP: u64 = 215;
+
+    #[cfg(not(target_os = "linux"))]
+    pub const NR_MMAP: u64 = 197;
+    #[cfg(not(target_os = "linux"))]
+    pub const NR_MUNMAP: u64 = 73;
+
+    #[cfg(target_os = "linux")]
+    pub const SVC_INSTR: usize = 0xD400_0001;
+    #[cfg(not(target_os = "linux"))]
+    pub const SVC_INSTR: usize = 0xD400_1001;
+    pub const SVC_MASK: usize = 0xFFFF_FFFF_0000_0000;
+
+    /// linux: raw syscall return is `-errno` on failure; valid mmap
+    /// addresses are large positive values, so `x0 == -1` means
+    /// `EPERM` (or any address-as-MAP_FAILED).  Stricter checks
+    /// would inspect the full negative range; we keep the original
+    /// liberal check for behavioural parity.
+    #[cfg(target_os = "linux")]
+    pub fn is_syscall_error(_regs: &RegisterMap, x0: u64) -> bool {
+        x0 as i64 == -1
+    }
+
+    /// darwin BSD syscall: success → `CPSR.C = 0`, x0 holds the
+    /// result; failure → `CPSR.C = 1`, x0 holds the errno (positive).
+    /// Read CPSR via the `pstate` slot of the register map; the C
+    /// flag lives at bit 29 of NZCV.
+    #[cfg(not(target_os = "linux"))]
+    pub fn is_syscall_error(regs: &RegisterMap, _x0: u64) -> bool {
+        regs.value(Register::Pstate) & (1u64 << 29) != 0
+    }
+}
+
 impl Debugger {
-    fn search_fn_to_call(
+    pub(crate) fn search_fn_to_call(
         &self,
         linkage_name_tpl: &str,
         name: Option<&str>,
@@ -441,6 +860,7 @@ impl Debugger {
             .ok_or(CallError::FunctionNotFoundOrTooMany)
     }
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn with_disabled_brkpts<F>(&self, f: F) -> Result<(), Error>
     where
         F: FnOnce(&Self) -> Result<(), Error>,
@@ -462,7 +882,12 @@ impl Debugger {
         cb_result
     }
 
-    fn call_fn_raw(&self, fn_addr: RelocatedAddress, args: CallArgs) -> Result<(), Error> {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub(super) fn call_fn_raw(
+        &self,
+        fn_addr: RelocatedAddress,
+        args: CallArgs,
+    ) -> Result<(), Error> {
         let call_context = CallContext::new(self)?;
 
         call_context.with_ccx(|ccx| {
@@ -485,6 +910,7 @@ impl Debugger {
         })
     }
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn call_fn(&self, linkage_name: &str, arguments: &[Literal]) -> Result<(), Error> {
         debug!(target: "debugger", "find function address and prepare arguments");
 
@@ -500,6 +926,7 @@ impl Debugger {
     ///
     /// * `fn_name`: function to call.
     /// * `arguments`: list of literals.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub fn call(&mut self, fn_name: &str, arguments: &[Literal]) -> Result<(), Error> {
         disable_when_not_stared!(self);
 

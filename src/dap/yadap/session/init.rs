@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::dap::yadap::protocol::{DapRequest, InternalEvent};
 use crate::dap::yadap::sourcemap::SourceMap;
 use crate::debugger;
@@ -32,6 +33,14 @@ impl super::DebugSession {
             "supportsCancelRequest": true,
             "supportsSetVariable": true,
             "supportsSetExpression": true,
+            // Tell DAP clients the `type` field on Variable responses
+            // is meaningful — VSCode renders it in grey alongside the
+            // value (e.g. `pair = (1, "one")   (i32, &str)`), which
+            // is enormously more useful than the default
+            // type-less name/value pair. We've been populating
+            // `type` in the responses all along; without this flag
+            // the IDE silently drops it on the floor.
+            "supportsVariableType": true,
             "supportsStepBack": false,
             "supportsReverseContinue": false,
             "supportsStepInTargetsRequest": true,
@@ -194,6 +203,19 @@ impl super::DebugSession {
         req: &DapRequest,
         oracles: &[String],
     ) -> anyhow::Result<()> {
+        if req
+            .arguments
+            .get("tracePath")
+            .or_else(|| req.arguments.get("trace_path"))
+            .is_some()
+        {
+            self.source_map = SourceMap::from_launch_args(&req.arguments);
+            self.terminated = false;
+            self.exit_code = None;
+            self.session_mode = Some(SessionMode::Launch);
+            return self.handle_replay_load(req);
+        }
+
         let program = req
             .arguments
             .get("program")
@@ -292,6 +314,7 @@ impl super::DebugSession {
     fn emit_attached_stop(&mut self) -> anyhow::Result<()> {
         self.begin_stop_epoch();
         let _ = self.refresh_threads_with_events();
+        self.capture_live_reverse_stop();
 
         let pid_info = self
             .debugger
@@ -356,12 +379,26 @@ impl super::DebugSession {
             reason: "pause".to_string(),
             thread_id,
             description,
+            preserve_focus_hint: false,
         });
         self.drain_events()?;
         Ok(())
     }
 
     pub(super) fn handle_configuration_done(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        if self.has_replay_session() && self.debugger.is_none() {
+            self.send_success(req)?;
+            let event_index = self.replay_position().unwrap_or_default();
+            self.enqueue_event(InternalEvent::Stopped {
+                reason: "pause".to_string(),
+                thread_id: Some(super::replay::REPLAY_THREAD_ID),
+                description: Some(format!("Replay at event {event_index}")),
+                preserve_focus_hint: false,
+            });
+            self.drain_events()?;
+            return Ok(());
+        }
+
         let dbg = self
             .debugger
             .as_mut()

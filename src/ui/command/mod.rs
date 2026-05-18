@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: MIT
 //! An interface to a debugger.
 //! This is the most preferred way to use a debugger functional from UI layer.
 //!
 //! Contains commands and corresponding command handlers. Command is a some sort of request to
 //! debugger that defines an action and a list of input arguments.
 
+pub mod apply_patch;
 pub mod r#async;
 pub mod backtrace;
 pub mod r#break;
@@ -14,6 +16,7 @@ pub mod memory;
 pub mod parser;
 pub mod print;
 pub mod register;
+pub mod replay;
 pub mod run;
 pub mod sharedlib;
 pub mod source_code;
@@ -56,6 +59,7 @@ pub enum Command {
     Breakpoint(r#break::Command),
     Watchpoint(watch::Command),
     Memory(memory::Command),
+    ApplyPatch(apply_patch::Command),
     Register(register::Command),
     Thread(thread::Command),
     SharedLib,
@@ -65,6 +69,10 @@ pub enum Command {
     Async(r#async::Command),
     Trigger(trigger::Command),
     Call(call::Command),
+    /// Phase 5 Tier 1 reverse-step navigation against a loaded
+    /// trace. Sidecar to live debugging — does not rewind the
+    /// running tracee.
+    Replay(replay::Command),
     Help {
         command: Option<String>,
         reason: Option<String>,

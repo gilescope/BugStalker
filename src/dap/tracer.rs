@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use anyhow::Context;
 use std::fs::OpenOptions;
 use std::io::Write;

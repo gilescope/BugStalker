@@ -1,0 +1,33 @@
+[package]
+name = "bs-replay"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "BugStalker time-travel — Tier 2 fork-checkpoint replay (Phase 5)."
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true, features = ["process", "thread", "fs"] }
+# nix gives us safe fork/waitpid/raise + Pid newtype. The root
+# bugstalker crate already pins nix 0.27 with overlapping
+# features; matching that here.
+nix = { version = "0.27.1", features = ["process", "signal", "ptrace"] }
+# libc::user_regs_struct for the ptrace getregs/setregs path.
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6"
+
+[dev-dependencies]
+proptest.workspace = true
+# Cross-crate integration test: stash a Tier 2 capture's payload
+# in a Tier 3 trace and round-trip the whole thing. dev-dep keeps
+# the dependency direction (bs-replay-driver → bs-replay,
+# bs-replay-engine) clean while still letting bs-replay's tests
+# exercise the bridge.
+bs-replay-engine = { path = "../bs-replay-engine" }

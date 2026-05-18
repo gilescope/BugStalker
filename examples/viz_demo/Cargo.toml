@@ -1,0 +1,13 @@
+[package]
+name = "viz_demo"
+version = "0.0.0"
+edition = "2024"
+workspace = "./.."
+publish = false
+
+[[bin]]
+name = "viz_demo"
+path = "src/main.rs"
+
+[dependencies]
+bs-viz-sdk = { path = "../../crates/bs-viz-sdk" }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::ui::tui::config::KeyMap;
 use std::sync::OnceLock;
 use strum_macros::{Display, EnumString, IntoStaticStr};

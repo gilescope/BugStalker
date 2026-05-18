@@ -1,21 +1,35 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::address::RelocatedAddress;
 use crate::debugger::debugee::tracee::StopType::Interrupt;
-use crate::debugger::debugee::tracee::TraceeStatus::{Running, Stopped};
+use crate::debugger::debugee::tracee::TraceeStatus::Stopped;
 use crate::debugger::debugee::{Debugee, Location};
 use crate::debugger::error::Error;
-use crate::debugger::error::Error::{MultipleErrors, NoThreadDB, Ptrace, ThreadDB, Waitpid};
-use crate::debugger::register::{Register, RegisterMap};
-use log::{debug, warn};
-use nix::errno::Errno;
-use nix::sys;
+use crate::debugger::error::Error::{NoThreadDB, ThreadDB};
+use crate::debugger::register::RegisterMap;
+use log::debug;
 use nix::sys::signal::Signal;
-use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use ouroboros::self_referencing;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use thread_db;
+
+#[cfg(target_os = "linux")]
+use crate::debugger::debugee::tracee::TraceeStatus::Running;
+#[cfg(target_os = "linux")]
+use crate::debugger::error::Error::{MultipleErrors, Ptrace, Waitpid};
+#[cfg(target_os = "linux")]
+use log::warn;
+#[cfg(target_os = "linux")]
+use nix::errno::Errno;
+#[cfg(target_os = "linux")]
+use nix::sys;
+#[cfg(target_os = "linux")]
+use nix::sys::wait::{WaitStatus, waitpid};
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
+
+use crate::debugger::thread_db_compat as thread_db;
 
 #[self_referencing]
 struct ThreadDBProcess {
@@ -59,6 +73,9 @@ impl Tracee {
     }
 
     /// Wait for change of tracee status.
+    /// Linux-only — the darwin Tracer drives waits through Mach
+    /// exception ports, not `waitpid`.
+    #[cfg(target_os = "linux")]
     pub fn wait_one(&self) -> Result<WaitStatus, Error> {
         debug!(target: "tracer", "wait for tracee status, thread {pid}", pid = self.pid);
         let status = waitpid(self.pid, None).map_err(Waitpid)?;
@@ -67,6 +84,10 @@ impl Tracee {
     }
 
     /// Move the stopped tracee process forward by a single instruction step.
+    /// Linux-only — the darwin Tracer drives stepping through
+    /// `arm_set_single_step` + `task_resume` + Mach exception
+    /// receive; no caller on darwin reaches this.
+    #[cfg(target_os = "linux")]
     pub fn step(&self, sig: Option<Signal>) -> Result<(), Error> {
         sys::ptrace::step(self.pid, sig).map_err(Ptrace)
     }
@@ -81,6 +102,9 @@ impl Tracee {
     }
 
     /// Resume tracee with, if signal is some - inject signal or resuming.
+    /// Linux-only — darwin's Tracer uses `task_resume` + Mach
+    /// exception reply for the same purpose.
+    #[cfg(target_os = "linux")]
     pub fn r#continue(&mut self, sig: Option<Signal>) -> Result<(), Error> {
         debug!(
             target: "tracer",
@@ -109,24 +133,37 @@ impl Tracee {
 
     /// Get current program counter value.
     pub fn pc(&self) -> Result<RelocatedAddress, Error> {
-        RegisterMap::current(self.pid)
-            .map(|reg_map| RelocatedAddress::from(reg_map.value(Register::Rip)))
+        RegisterMap::current(self.pid).map(|reg_map| RelocatedAddress::from(reg_map.pc()))
     }
 
     /// Set new program counter value.
     pub fn set_pc(&self, value: u64) -> Result<(), Error> {
         let mut map = RegisterMap::current(self.pid)?;
-        map.update(Register::Rip, value);
+        map.set_pc(value);
         map.persist(self.pid)
     }
 
     /// Get current tracee location.
+    ///
+    /// If the registry has no mapping for `pc` (e.g. we stopped
+    /// inside a system module like dyld which we don't load DWARF
+    /// for), fall back to `global_pc = pc.as_usize() as u64`. The
+    /// caller will then see no DWARF match and treat the PC as
+    /// "outside the user's source" — which is exactly the situation.
+    /// Without this fallback any internal stop in dyld (e.g. the
+    /// rendezvous LinkerMapFn BP, or a stray BRK during dylib
+    /// loading) would propagate `MappingOffsetNotFound` back to the
+    /// user even though the debugger is fine.
     pub fn location(&self, debugee: &Debugee) -> Result<Location, Error> {
+        use crate::debugger::address::GlobalAddress;
         let pc = self.pc()?;
+        let global_pc = pc
+            .into_global(debugee)
+            .unwrap_or_else(|_| GlobalAddress::from(pc.as_u64()));
         Ok(Location {
             pid: self.pid,
             pc,
-            global_pc: pc.into_global(debugee)?,
+            global_pc,
         })
     }
 }
@@ -167,6 +204,7 @@ impl TraceeCtl {
         self.threads_state.get(&pid)
     }
 
+    #[allow(dead_code)] // kept for symmetry with the &-getters; in-tree uses may follow
     pub(crate) fn tracee_mut(&mut self, pid: Pid) -> Option<&mut Tracee> {
         self.threads_state.get_mut(&pid)
     }
@@ -175,6 +213,7 @@ impl TraceeCtl {
         self.threads_state.get(&pid).unwrap()
     }
 
+    #[allow(dead_code)] // kept for symmetry with the &-getters; in-tree uses may follow
     pub(crate) fn tracee_ensure_mut(&mut self, pid: Pid) -> &mut Tracee {
         self.tracee_mut(pid).unwrap()
     }
@@ -198,7 +237,9 @@ impl TraceeCtl {
         self.threads_state.remove(&pid)
     }
 
-    /// Continue all currently stopped tracees.
+    /// Continue all currently stopped tracees. Linux-only —
+    /// darwin's Tracer drives resumption through `task_resume`.
+    #[cfg(target_os = "linux")]
     pub fn cont_stopped(&mut self) -> Result<(), Vec<Error>> {
         let mut errors = vec![];
 
@@ -224,12 +265,13 @@ impl TraceeCtl {
         Ok(())
     }
 
-    /// Continue all currently stopped tracees.
+    /// Continue all currently stopped tracees. Linux-only.
     ///
     /// # Arguments
     ///
     /// * `inject_request`: send signal to one of threads.
     /// * `exclude`: set of threads that must be not continued.
+    #[cfg(target_os = "linux")]
     pub fn cont_stopped_ex(
         &mut self,
         inject_request: Option<(Pid, Signal)>,
@@ -305,5 +347,16 @@ impl TraceeCtl {
         Ok(RelocatedAddress::from(
             thread.tls_addr(link_map_addr.into(), offset)? as usize,
         ))
+    }
+
+    /// Get TLS base address for a module by its module ID.
+    /// For the main executable, modid is always 1.
+    pub fn tls_base(&self, tid: Pid, modid: u32) -> Result<RelocatedAddress, Error> {
+        let td_proc = self.thread_db_proc.as_ref().ok_or(NoThreadDB)?;
+
+        let thread: thread_db::Thread =
+            td_proc.borrow_process().get_thread(tid).map_err(ThreadDB)?;
+
+        Ok(RelocatedAddress::from(thread.tls_base(modid)? as usize))
     }
 }

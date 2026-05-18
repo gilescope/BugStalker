@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::ui;
 use crate::ui::tui::Msg;
 use crate::ui::tui::app::port::UserEvent;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::context::gcx;
 use crate::debugger::debugee::dwarf::DebugInformation;
 use crate::debugger::debugee::dwarf::eval::{EvaluationContext, ExpressionEvaluator};
@@ -102,7 +103,12 @@ impl QueryResult<'_> {
         let value = self.value.take().expect("should be `Some`");
         let type_graph = self.type_graph();
         let eval_cb = |evcx: &EvaluationContext| {
-            let pcx = &ParseContext { evcx, type_graph };
+            let pcx = &ParseContext {
+                evcx,
+                type_graph,
+                visited_allocations: Default::default(),
+                recursion_depth: Default::default(),
+            };
             cb(pcx, value)
         };
         let new_value = self.evcx_builder.with_evcx(eval_cb)?;
@@ -209,34 +215,59 @@ impl<'dbg> DqeExecutor<'dbg> {
         let ecx = self.debugger.ecx();
 
         let debugee = &self.debugger.debugee;
-        let (current_func, _) = debugee
-            .debug_info(ecx.location().pc)?
-            .find_function_by_pc(ecx.location().global_pc)?
-            .ok_or(FunctionNotFound(ecx.location().global_pc))?;
+        // For a global lookup by name (`local_only = false`) we
+        // must NOT require the focus PC to live in a registered
+        // dylib: tokio worker threads are routinely parked deep in
+        // libsystem on darwin (no DWARF, no entry in our
+        // registry), and the global TLS variable being asked for
+        // (e.g. tokio's `CONTEXT`) lives in the main executable
+        // regardless. Only a `local_only = true` selector or
+        // `Selector::Any` actually need the current function.
+        let pc_debug_info_and_func = debugee.debug_info(ecx.location().pc).and_then(|di| {
+            let func = di
+                .find_function_by_pc(ecx.location().global_pc)?
+                .ok_or(FunctionNotFound(ecx.location().global_pc))?;
+            Ok((di, func))
+        });
 
         let vars = match selector {
             Selector::Name {
                 var_name,
                 local_only: local,
             } => {
-                let local_variants = current_func
-                    .local_variable(ecx.location().global_pc, var_name)
+                let local_variants = pc_debug_info_and_func
+                    .as_ref()
+                    .ok()
+                    .and_then(|(_, (current_func, _))| {
+                        current_func.local_variable(ecx.location().global_pc, var_name)
+                    })
                     .map(|v| vec![v])
                     .unwrap_or_default();
 
                 let local = *local;
 
                 // local variables is in priority anyway, if there are no local variables and
-                // selector allow non-locals then try to search in a whole object
+                // selector allow non-locals then try to search in a whole object.
                 if !local && local_variants.is_empty() {
-                    debugee
-                        .debug_info(ecx.location().pc)?
-                        .find_variables(ecx.location(), var_name)?
+                    // Walk every loaded debug_info — the variable
+                    // may live in a dylib other than the one the
+                    // focus PC is in, and on darwin the focus may
+                    // not have a tracked debug_info at all.
+                    let mut found = vec![];
+                    for di in debugee.debug_info_all() {
+                        if let Ok(vars) = di.find_variables(ecx.location(), var_name) {
+                            found.extend(vars);
+                        }
+                    }
+                    found
                 } else {
                     local_variants
                 }
             }
-            Selector::Any => current_func.local_variables(ecx.location().global_pc),
+            Selector::Any => {
+                let (_, (current_func, _)) = pc_debug_info_and_func?;
+                current_func.local_variables(ecx.location().global_pc)
+            }
         };
 
         Ok(vars)
@@ -291,6 +322,8 @@ impl<'dbg> DqeExecutor<'dbg> {
                 let pcx = &ParseContext {
                     evcx,
                     type_graph: &r#type,
+                    visited_allocations: Default::default(),
+                    recursion_depth: Default::default(),
                 };
                 let modifiers = &ValueModifiers::from_identity(pcx, Identity::from_die(die_ref));
                 parser.parse(pcx, data, modifiers)
@@ -358,6 +391,8 @@ impl<'dbg> DqeExecutor<'dbg> {
             let pcx = &ParseContext {
                 evcx,
                 type_graph: &r#type,
+                visited_allocations: Default::default(),
+                recursion_depth: Default::default(),
             };
             parser.parse(pcx, Some(data), &ValueModifiers::default())
         });
@@ -413,6 +448,8 @@ impl<'dbg> DqeExecutor<'dbg> {
             let pcx = &ParseContext {
                 evcx,
                 type_graph: &r#type,
+                visited_allocations: Default::default(),
+                recursion_depth: Default::default(),
             };
             parser.parse(pcx, Some(data), &ValueModifiers::default())
         });

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::call::CallError;
 use super::call::fmt::FmtCallError;
 use crate::debugger::address::GlobalAddress;
@@ -65,6 +66,52 @@ pub enum Error {
     Waitpid(nix::Error),
     #[error("ptrace syscall error: {0}")]
     Ptrace(nix::Error),
+    #[error(
+        "macOS denied debugger access ({mach}). \n  \
+         help: re-sign the bs/bugstalker binary with the \
+         `com.apple.security.cs.debugger` entitlement. The \
+         entitlements XML has been written to `{entitlements}` for you. \
+         Run:\n    codesign -s - --entitlements {entitlements} --force {binary}\n  \
+         note: bs normally auto-signs and re-execs itself on first run; if \
+         you saw this message it means auto-sign failed (set \
+         BS_NO_AUTO_SIGN to disable, or check the [bs] auto-sign log line \
+         above for the underlying reason)."
+    )]
+    DarwinDebuggerEntitlementMissing {
+        mach: String,
+        binary: String,
+        entitlements: String,
+    },
+    /// Generic Mach failure that isn't task_for_pid's
+    /// missing-entitlement signature. Preserves the kr code +
+    /// description verbatim so the user (and grep) can match it
+    /// against `<mach/kern_return.h>` instead of being told a
+    /// confidently-wrong remediation.
+    ///
+    /// `backtrace` carries a frame chain captured at the
+    /// `From<MachError>` conversion — that's the cheapest way to
+    /// pinpoint which Mach call (`thread_set_state`, `task_resume`,
+    /// `vm_write`, …) actually failed without instrumenting every
+    /// call site by hand. It's appended to the user-facing error
+    /// message so the failure report carries its own diagnostics.
+    #[error("Mach failure: {mach}\n{backtrace}")]
+    DarwinMach { mach: String, backtrace: String },
+    /// Write attempted to a region whose `max_protection` does not
+    /// include `VM_PROT_WRITE`, so `mach_vm_protect` cannot widen the
+    /// page even temporarily. Typical hits: the LC_CODE_SIGNATURE
+    /// blob, the dyld shared cache, and pages explicitly sealed by
+    /// the loader (`__DATA_CONST` post-init).
+    ///
+    /// This is a callable signal — `apply-patch` skips entries that
+    /// hit it, since for the EnC use case the only writable target
+    /// that matters is `__TEXT` (function bodies). The codesign blob
+    /// changes wild emits when re-linking are disk-only artefacts;
+    /// the running process's signature check has already happened.
+    #[error(
+        "darwin: target region at 0x{addr:x} is read-only \
+         (max_prot=0x{max_prot:x}); skipping"
+    )]
+    DarwinReadOnlyRegion { addr: usize, max_prot: u32 },
     #[error("{0} syscall error: {1}")]
     Syscall(&'static str, nix::Error),
     #[error("multiple syscall errors {0:?}")]
@@ -85,6 +132,8 @@ pub enum Error {
     WatchpointWrongSize,
     #[error("watchpoint limit is reached (maximum 4 watchpoints), try to remove unused")]
     WatchpointLimitReached,
+    #[error("hardware watchpoints are not supported on this architecture")]
+    WatchpointUnsupported,
     #[error("memory location observed by another watchpoint")]
     AddressAlreadyObserved,
     #[error("unknown expression scope")]
@@ -130,7 +179,7 @@ pub enum Error {
     #[error("libthread_db not enabled")]
     NoThreadDB,
     #[error("libthread_db: {0}")]
-    ThreadDB(#[from] thread_db::ThreadDbError),
+    ThreadDB(#[from] crate::debugger::thread_db_compat::ThreadDbError),
 
     // --------------------------------- linker errors ---------------------------------------------
     #[error(transparent)]
@@ -203,6 +252,19 @@ impl Error {
             Error::MappingNotFound(_) => false,
             Error::Waitpid(_) => false,
             Error::Ptrace(_) => false,
+            // Missing debugger entitlement on darwin is fatal —
+            // every subsequent ptrace/task_for_pid call will fail
+            // for the same reason. Surface it once and stop.
+            Error::DarwinDebuggerEntitlementMissing { .. } => true,
+            // Generic Mach failures aren't always fatal — a single
+            // failed `thread_set_state` during step-over shouldn't
+            // tear down the whole session — but we don't have
+            // per-call recovery yet, so treat them like ptrace
+            // errors and let the user continue/inspect the session.
+            Error::DarwinMach { .. } => false,
+            // Read-only region writes are recoverable: callers (like
+            // `apply-patch`) skip the offending entry and keep going.
+            Error::DarwinReadOnlyRegion { .. } => false,
             Error::MultipleErrors(_) => false,
             Error::DebugIDFormat => false,
             Error::VariableParsing(_) => false,
@@ -231,6 +293,7 @@ impl Error {
             Error::WatchpointUndefinedSize => false,
             Error::WatchpointWrongSize => false,
             Error::WatchpointLimitReached => false,
+            Error::WatchpointUnsupported => false,
             Error::WatchSubjectNotFound => false,
             Error::AddressAlreadyObserved => false,
             Error::UnknownScope => false,

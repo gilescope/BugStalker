@@ -1,9 +1,10 @@
+// SPDX-License-Identifier: MIT
 pub mod expression;
 
 use super::r#break::BreakpointIdentity;
 use super::{
-    Command, CommandError, r#async, call, frame, memory, print, register, source_code, thread,
-    trigger, watch,
+    Command, CommandError, apply_patch, r#async, call, frame, memory, print, register, source_code,
+    thread, trigger, watch,
 };
 use super::{CommandResult, r#break};
 use crate::debugger::register::debug::BreakCondition;
@@ -68,6 +69,8 @@ pub const THREAD_COMMAND_CURRENT_SUBCOMMAND: &str = "current";
 pub const SHARED_LIB_COMMAND: &str = "sharedlib";
 pub const SHARED_LIB_COMMAND_INFO_SUBCOMMAND: &str = "info";
 pub const SOURCE_COMMAND: &str = "source";
+pub const APPLY_PATCH_COMMAND: &str = "apply-patch";
+pub const WATCH_PATCH_COMMAND: &str = "watch-patch";
 pub const SOURCE_COMMAND_DISASM_SUBCOMMAND: &str = "asm";
 pub const SOURCE_COMMAND_FUNCTION_SUBCOMMAND: &str = "fn";
 pub const ORACLE_COMMAND: &str = "oracle";
@@ -81,12 +84,33 @@ pub const ASYNC_COMMAND_STEP_OVER_SUBCOMMAND: &str = "stepover";
 pub const ASYNC_COMMAND_STEP_OVER_SUBCOMMAND_SHORT: &str = "next";
 pub const ASYNC_COMMAND_STEP_OUT_SUBCOMMAND: &str = "stepout";
 pub const ASYNC_COMMAND_STEP_OUT_SUBCOMMAND_SHORT: &str = "finish";
+/// Phase 3 Feature D batch D2a — `async await-trace` / `async at`
+/// renders the current task's awaitee chain with source-coord-first
+/// formatting (file:line per `.await`).
+pub const ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND: &str = "await-trace";
+pub const ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND_SHORT: &str = "at";
 pub const TRIGGER_COMMAND: &str = "trigger";
 pub const TRIGGER_COMMAND_ANY_TRIGGER_SUBCOMMAND: &str = "any";
 pub const TRIGGER_COMMAND_BRKPT_TRIGGER_SUBCOMMAND: &str = "b";
 pub const TRIGGER_COMMAND_WP_TRIGGER_SUBCOMMAND: &str = "w";
 pub const TRIGGER_COMMAND_INFO_SUBCOMMAND: &str = "info";
 pub const CALL_COMMAND: &str = "call";
+
+// Phase 5 Tier 1 reverse-step REPL surface. `replay` is the
+// session-management namespace; the `r*` aliases are the
+// session-active navigation commands.
+pub const REPLAY_COMMAND: &str = "replay";
+pub const REPLAY_LOAD_SUBCOMMAND: &str = "load";
+pub const REPLAY_UNLOAD_SUBCOMMAND: &str = "unload";
+pub const REPLAY_STATUS_SUBCOMMAND: &str = "status";
+pub const RSTEP_COMMAND: &str = "rstep";
+pub const RSTEP_COMMAND_SHORT: &str = "rs";
+pub const RSTEP_FORWARD_COMMAND: &str = "rstep-fwd";
+pub const RSTEP_FORWARD_COMMAND_SHORT: &str = "rsf";
+pub const RCONTINUE_COMMAND: &str = "rcontinue";
+pub const RCONTINUE_COMMAND_SHORT: &str = "rc";
+pub const RBREAK_COMMAND: &str = "rbreak";
+pub const RBREAK_CLEAR_COMMAND: &str = "rbreak-clear";
 
 pub const HELP_COMMAND: &str = "help";
 pub const HELP_COMMAND_SHORT: &str = "h";
@@ -161,7 +185,7 @@ pub fn watchpoint_cond<'a>() -> impl chumsky::Parser<'a, &'a str, BreakCondition
 pub fn watchpoint_at_dqe<'a>() -> impl chumsky::Parser<'a, &'a str, WatchpointIdentity, Err<'a>> {
     let source_rewind_parser = any::<_, Err>().repeated().to_slice().rewind();
     source_rewind_parser
-        .then(expression::parser().padded())
+        .then(expression::parser().padded().then_ignore(end()))
         .map(|(source, dqe)| WatchpointIdentity::DQE(source.trim().to_string(), dqe))
 }
 
@@ -268,6 +292,31 @@ impl Command {
         let sub_op = |sym| just(sym).then(ws_req_or_end);
         let sub_op_w_arg = |sym| just(sym).then(ws_req);
 
+        // Phase 1 F4 — optional format-spec suffix on print/var/argd.
+        // Syntax: `/x`, `/b`, `/o`, `/d`, `/iso` (GDB convention).
+        // Requires preceding whitespace (`var x /x`, `argd y /iso`)
+        // because both `:` (collides with `rust_identifier`'s `::`
+        // separator) and `/` (the expression parser doesn't yield on
+        // it) bleed into the expression's tokenisation otherwise.
+        // Composition with path expressions: `var foo.bar /x`.
+        // Mismatched type-vs-spec combinations fall back to the
+        // default render (handled in `print::Handler::handle`).
+        // Multi-character specs (`utf8`, `iso`, `hex`) are tried
+        // before single-character specs so the longest match wins
+        // (`/hex` must not be parsed as `/h` followed by `ex` — the
+        // single-char arm doesn't exist for `h` so chumsky already
+        // gets it right, but ordering keeps the grammar predictable
+        // for future single-char additions like `/c`, `/s`).
+        let format_spec = just('/').ignore_then(choice((
+            just("utf8").to(print::FormatSpec::Utf8),
+            just("iso").to(print::FormatSpec::Iso),
+            just("hex").to(print::FormatSpec::BytesHex),
+            just('x').to(print::FormatSpec::Hex),
+            just('b').to(print::FormatSpec::Bin),
+            just('o').to(print::FormatSpec::Oct),
+            just('d').to(print::FormatSpec::Dec),
+        )));
+
         let print_local_vars = choice((
             op_w_arg(VAR_COMMAND).to(print::RenderMode::Builtin),
             op_w_arg(VAR_DEBUG_COMMAND).to(print::RenderMode::Debug),
@@ -277,6 +326,7 @@ impl Command {
             Command::Print(print::Command::Variable {
                 mode,
                 dqe: Dqe::Variable(Selector::Any),
+                format: None,
             })
         });
         let print_var = choice((
@@ -284,7 +334,10 @@ impl Command {
             op_w_arg(VAR_DEBUG_COMMAND).to(print::RenderMode::Debug),
         ))
         .then(expression::parser())
-        .map(|(mode, dqe)| Command::Print(print::Command::Variable { mode, dqe }));
+        .then(format_spec.or_not())
+        .map(|((mode, dqe), format)| {
+            Command::Print(print::Command::Variable { mode, dqe, format })
+        });
 
         let print_variables = choice((print_local_vars, print_var)).boxed();
 
@@ -297,6 +350,7 @@ impl Command {
             Command::Print(print::Command::Argument {
                 mode,
                 dqe: Dqe::Variable(Selector::Any),
+                format: None,
             })
         });
         let print_arg = choice((
@@ -304,7 +358,10 @@ impl Command {
             op_w_arg(ARG_DEBUG_COMMAND).to(print::RenderMode::Debug),
         ))
         .then(expression::parser())
-        .map(|(mode, dqe)| Command::Print(print::Command::Argument { mode, dqe }));
+        .then(format_spec.or_not())
+        .map(|((mode, dqe), format)| {
+            Command::Print(print::Command::Argument { mode, dqe, format })
+        });
 
         let print_arguments = choice((print_all_args, print_arg)).boxed();
 
@@ -516,6 +573,13 @@ impl Command {
                     ASYNC_COMMAND_STEP_OUT_SUBCOMMAND_SHORT,
                 )
                 .to(Command::Async(r#async::Command::StepOut)),
+                // Phase 3 Feature D batch D2a — accepts both
+                // `await-trace` and the short alias `at`.
+                sub_op2(
+                    ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND,
+                    ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND_SHORT,
+                )
+                .to(Command::Async(r#async::Command::AwaitTrace)),
             )))
             .boxed();
 
@@ -561,6 +625,115 @@ impl Command {
             .padded()
             .boxed();
 
+        // `apply-patch <path> [<hex-base>]` — read a wild-emitted patch
+        // file and write each byte run into the running process. With
+        // `<hex-base>`, write at `base + entry.offset`; without, ask the
+        // debugger to translate via the loaded executable's mapping.
+        // See ui/command/apply_patch.rs.
+        let apply_patch_path = any()
+            .filter(|c: &char| !c.is_whitespace())
+            .repeated()
+            .at_least(1)
+            .to_slice()
+            .map(|s: &str| s.to_string());
+        let apply_patch = op_w_arg(APPLY_PATCH_COMMAND)
+            .ignore_then(apply_patch_path)
+            .then(whitespace().ignore_then(hex()).or_not())
+            .map(|(path, base)| {
+                Command::ApplyPatch(apply_patch::Command::ApplyPatch {
+                    path: std::path::PathBuf::from(path),
+                    base: base.map(|b| b as nix::libc::uintptr_t),
+                    verify_executable_hash: true,
+                })
+            })
+            .padded()
+            .boxed();
+
+        // `watch-patch <path> [<hex-base>]` — apply patch on first
+        // call, then poll the file's mtime every 250 ms and re-apply
+        // on change. Blocks the REPL.
+        let watch_patch = op_w_arg(WATCH_PATCH_COMMAND)
+            .ignore_then(apply_patch_path)
+            .then(whitespace().ignore_then(hex()).or_not())
+            .map(|(path, base)| {
+                Command::ApplyPatch(apply_patch::Command::WatchPatch {
+                    path: std::path::PathBuf::from(path),
+                    base: base.map(|b| b as nix::libc::uintptr_t),
+                    interval_ms: 250,
+                    verify_executable_hash: true,
+                })
+            })
+            .padded()
+            .boxed();
+
+        // Phase 5 Tier 1 reverse-step REPL surface. Six commands
+        // total — bundled into one `choice((..))` arm so the outer
+        // dispatch table doesn't have to grow by six entries
+        // (chumsky's choice tuple has a fixed arity).
+        let replay_path = any()
+            .filter(|c: &char| !c.is_whitespace())
+            .repeated()
+            .at_least(1)
+            .to_slice()
+            .map(|s: &str| s.to_string());
+
+        let replay_load = op_w_arg(REPLAY_COMMAND)
+            .ignore_then(sub_op_w_arg(REPLAY_LOAD_SUBCOMMAND))
+            .ignore_then(replay_path)
+            .map(|trace_path| Command::Replay(super::replay::Command::Load { trace_path }))
+            .padded()
+            .boxed();
+        let replay_unload = op_w_arg(REPLAY_COMMAND)
+            .ignore_then(sub_op(REPLAY_UNLOAD_SUBCOMMAND))
+            .to(Command::Replay(super::replay::Command::Unload))
+            .padded()
+            .boxed();
+        let replay_status = op_w_arg(REPLAY_COMMAND)
+            .ignore_then(sub_op(REPLAY_STATUS_SUBCOMMAND))
+            .to(Command::Replay(super::replay::Command::Status))
+            .padded()
+            .boxed();
+        let rstep = op2(RSTEP_COMMAND, RSTEP_COMMAND_SHORT)
+            .to(Command::Replay(super::replay::Command::RStep))
+            .padded()
+            .boxed();
+        let rstep_fwd = op2(RSTEP_FORWARD_COMMAND, RSTEP_FORWARD_COMMAND_SHORT)
+            .to(Command::Replay(super::replay::Command::RStepForward))
+            .padded()
+            .boxed();
+        let rcontinue = op2(RCONTINUE_COMMAND, RCONTINUE_COMMAND_SHORT)
+            .to(Command::Replay(super::replay::Command::RContinue))
+            .padded()
+            .boxed();
+        let rbreak = op_w_arg(RBREAK_COMMAND)
+            .ignore_then(text::int(10).from_str().unwrapped())
+            .map(|event_index: u64| {
+                Command::Replay(super::replay::Command::RAddBreakpoint { event_index })
+            })
+            .padded()
+            .boxed();
+        let rbreak_clear = op_w_arg(RBREAK_CLEAR_COMMAND)
+            .ignore_then(text::int(10).from_str().unwrapped())
+            .map(|event_index: u64| {
+                Command::Replay(super::replay::Command::RRemoveBreakpoint { event_index })
+            })
+            .padded()
+            .boxed();
+        let replay_commands = choice((
+            // Order matters when one command's prefix is another's:
+            // `rstep-fwd` before `rstep` so the longer literal binds
+            // first; same for `rbreak-clear` before `rbreak`.
+            rstep_fwd,
+            rstep,
+            rcontinue,
+            rbreak_clear,
+            rbreak,
+            replay_load,
+            replay_unload,
+            replay_status,
+        ))
+        .boxed();
+
         choice((
             command(VAR_COMMAND, print_variables),
             command(ARG_COMMAND, print_arguments),
@@ -585,6 +758,9 @@ impl Command {
             command(ASYNC_COMMAND, r#async),
             command(TRIGGER_COMMAND, trigger),
             command(CALL_COMMAND, call),
+            command(APPLY_PATCH_COMMAND, apply_patch),
+            command(WATCH_PATCH_COMMAND, watch_patch),
+            replay_commands,
         ))
     }
 
@@ -686,6 +862,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Variable {
                 dqe: Dqe::Variable(Selector::Any),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -693,6 +870,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Variable {
                 dqe: Dqe::Variable(Selector::Any),
                 mode: print::RenderMode::Debug,
+                format: None,
             })),
         },
         TestCase {
@@ -702,6 +880,7 @@ fn test_parser() {
                     Dqe::Deref(Dqe::Variable(Selector::by_name("var1", false)).boxed()).boxed(),
                 ),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -709,6 +888,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Variable {
                 dqe: Dqe::Variable(Selector::by_name("locals_var", false)),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -716,6 +896,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Variable {
                 dqe: Dqe::Variable(Selector::by_name("locals_var", false)),
                 mode: print::RenderMode::Debug,
+                format: None,
             })),
         },
         TestCase {
@@ -743,6 +924,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Argument {
                 dqe: Dqe::Variable(Selector::Any),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -750,6 +932,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Argument {
                 dqe: Dqe::Variable(Selector::Any),
                 mode: print::RenderMode::Debug,
+                format: None,
             })),
         },
         TestCase {
@@ -757,6 +940,7 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Argument {
                 dqe: Dqe::Variable(Selector::by_name("all_arg", false)),
                 mode: print::RenderMode::Builtin,
+                format: None,
             })),
         },
         TestCase {
@@ -764,6 +948,73 @@ fn test_parser() {
             expected: Expect::Ok(Command::Print(print::Command::Argument {
                 dqe: Dqe::Variable(Selector::by_name("all_arg", false)),
                 mode: print::RenderMode::Debug,
+                format: None,
+            })),
+        },
+        // Phase 1 F4 — colon-suffix format spec parser tests.
+        TestCase {
+            inputs: vec!["var x /x"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("x", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Hex),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var x /b"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("x", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Bin),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var x /o"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("x", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Oct),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var x /d"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("x", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Dec),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var d /iso"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("d", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Iso),
+            })),
+        },
+        TestCase {
+            inputs: vec!["argd y /x"],
+            expected: Expect::Ok(Command::Print(print::Command::Argument {
+                dqe: Dqe::Variable(Selector::by_name("y", false)),
+                mode: print::RenderMode::Debug,
+                format: Some(print::FormatSpec::Hex),
+            })),
+        },
+        // Phase 1 S16 byte-slice overrides.
+        TestCase {
+            inputs: vec!["var v /utf8"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("v", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::Utf8),
+            })),
+        },
+        TestCase {
+            inputs: vec!["var v /hex"],
+            expected: Expect::Ok(Command::Print(print::Command::Variable {
+                dqe: Dqe::Variable(Selector::by_name("v", false)),
+                mode: print::RenderMode::Builtin,
+                format: Some(print::FormatSpec::BytesHex),
             })),
         },
         TestCase {
@@ -1040,6 +1291,10 @@ fn test_parser() {
             expected: Expect::Ok(Command::Async(r#async::Command::StepOut)),
         },
         TestCase {
+            inputs: vec!["async await-trace", " async   at  "],
+            expected: Expect::Ok(Command::Async(r#async::Command::AwaitTrace)),
+        },
+        TestCase {
             inputs: vec!["async task abc.*", " async   task abc.*  "],
             expected: Expect::Ok(Command::Async(r#async::Command::CurrentTask(Some(
                 "abc.*".into(),
@@ -1103,6 +1358,51 @@ fn test_parser() {
             inputs: vec!["oracle tokio all ", " oracle  tokio   all"],
             expected: Expect::Ok(Command::Oracle("tokio".into(), Some("all".into()))),
         },
+        // Phase 5 Tier 1 reverse-step REPL surface (step 113).
+        TestCase {
+            inputs: vec!["replay load /tmp/trace", "  replay   load   /tmp/trace  "],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::Load {
+                trace_path: "/tmp/trace".to_owned(),
+            })),
+        },
+        TestCase {
+            inputs: vec!["replay unload", "replay  unload  "],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::Unload)),
+        },
+        TestCase {
+            inputs: vec!["replay status"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::Status)),
+        },
+        TestCase {
+            inputs: vec!["rstep", "rs"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RStep)),
+        },
+        TestCase {
+            inputs: vec!["rstep-fwd", "rsf"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RStepForward)),
+        },
+        TestCase {
+            inputs: vec!["rcontinue", "rc"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RContinue)),
+        },
+        TestCase {
+            inputs: vec!["rbreak 42"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RAddBreakpoint {
+                event_index: 42,
+            })),
+        },
+        TestCase {
+            inputs: vec!["rbreak-clear 42"],
+            expected: Expect::Ok(Command::Replay(super::replay::Command::RRemoveBreakpoint {
+                event_index: 42,
+            })),
+        },
+        // `rstep-fwd` must bind before `rstep` even though `rstep`
+        // is its prefix — the parser orders them longest-first.
+        TestCase {
+            inputs: vec!["replay"],
+            expected: Expect::Err,
+        },
     ];
 
     for case in cases {
@@ -1110,10 +1410,14 @@ fn test_parser() {
             let result = Command::parse(input);
             match case.expected {
                 Expect::Ok(ref expected_cmd) => {
-                    assert!(result.is_ok());
-                    assert_eq!(&result.unwrap(), expected_cmd);
+                    assert!(
+                        result.is_ok(),
+                        "expected Ok for input {input:?}, got Err: {:?}",
+                        result.err()
+                    );
+                    assert_eq!(&result.unwrap(), expected_cmd, "input: {input:?}");
                 }
-                Expect::Err => assert!(result.is_err()),
+                Expect::Err => assert!(result.is_err(), "expected Err for input {input:?}"),
             }
         }
     }

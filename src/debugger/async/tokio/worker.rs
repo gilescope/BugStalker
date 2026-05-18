@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::types::TaskIdValue;
 use crate::debugger::TypeDeclaration;
 use crate::debugger::r#async::context::TokioAnalyzeContext;
@@ -12,7 +13,7 @@ use crate::debugger::variable::execute::DqeExecutor;
 use crate::debugger::variable::execute::QueryResult;
 use crate::debugger::variable::value::{SupportedScalar, Value};
 use crate::debugger::variable::r#virtual::VirtualVariableDie;
-use crate::debugger::{Debugger, Error, ThreadSnapshot, Tracee, utils};
+use crate::debugger::{Debugger, Error, ThreadSnapshot, Tracee};
 use crate::type_from_cache;
 use crate::ui::command::parser::expression;
 use crate::version::RustVersion;
@@ -98,6 +99,56 @@ impl LocalQueue {
     }
 }
 
+/// Pick the right `tokio::runtime::context::CONTEXT` candidate.
+///
+/// `thread_local! { static CONTEXT … }` expands to two static items
+/// in tokio 1.40+ (init-closure VAL + cached-value VAL); both
+/// surface as "CONTEXT" via name-based DQE, but only one carries
+/// the runtime context (it has a `scheduler` field).
+///
+/// On Linux aarch64 (rustc 1.95) there's a further wrinkle: rustc
+/// emits a *third* candidate — a direct `Context`-typed DIE that
+/// shadows the storage. It exposes `.scheduler` but has no
+/// in-memory address (it's the const-evaluator's compile-time
+/// result, not a real variable), so navigating through it produces
+/// pointers with `value: None` and the `scheduler.inner.deref()`
+/// chain fails downstream — leaving every tokio test in the
+/// async-backtrace suite without a worker.
+///
+/// Prefer the candidate whose inner `Context` carries a real
+/// `raw_address`. Fall back to the original `.find()` behaviour
+/// when no candidate carries one (older rustc / Darwin), so
+/// pre-existing platforms keep working.
+pub(crate) fn find_runtime_context<'a>(
+    debugger: &'a crate::debugger::Debugger,
+) -> Option<QueryResult<'a>> {
+    fn ctx_raw_address(qr: &QueryResult<'_>) -> Option<usize> {
+        match qr.value() {
+            Value::Specialized {
+                value: Some(crate::debugger::variable::value::SpecializedValue::Tls(tls)),
+                ..
+            } => tls.inner_value.as_ref().and_then(|v| match v.as_ref() {
+                Value::Struct(s) => s.raw_address,
+                _ => None,
+            }),
+            Value::Struct(s) => s.raw_address,
+            _ => None,
+        }
+    }
+
+    let candidates: Vec<QueryResult<'a>> = debugger
+        .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))
+        .ok()?
+        .into_iter()
+        .filter(|c| c.value().clone().field("scheduler").is_some())
+        .collect();
+
+    if let Some(i) = candidates.iter().position(|c| ctx_raw_address(c).is_some()) {
+        return candidates.into_iter().nth(i);
+    }
+    candidates.into_iter().next()
+}
+
 /// Async worker known states.
 pub(super) enum WorkerState {
     RunTask(usize),
@@ -120,10 +171,7 @@ impl WorkerInternal {
     /// * `thread`: thread information
     pub(super) fn analyze(ctx: &mut TokioAnalyzeContext, thread: &ThreadSnapshot) -> Option<Self> {
         let debugger = ctx.debugger_mut();
-        let context = debugger
-            .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))
-            .ok()?
-            .pop_if_single_el()?;
+        let context = find_runtime_context(debugger)?;
 
         let backtrace = thread.bt.as_ref()?;
 
@@ -159,8 +207,6 @@ impl WorkerInternal {
             state = Some(WorkerState::Unknown);
         }
         let state = state?;
-
-        use utils::PopIf;
 
         // local queue DQE: var (*(*(*CONTEXT.scheduler.inner).0.core.value.0).run_queue.inner).data
         let mut core_run_queue_inner = context.modify_value(|c, v: Value| {
@@ -238,7 +284,7 @@ impl WorkerInternal {
     }
 }
 
-/// Tokio async worker (https://github.com/tokio-rs/tokio/blob/tokio-1.39.x/tokio/src/runtime/scheduler/multi_thread/worker.rs#L91) representation.
+/// Tokio async worker (<https://github.com/tokio-rs/tokio/blob/tokio-1.39.x/tokio/src/runtime/scheduler/multi_thread/worker.rs#L91>) representation.
 #[derive(Debug, Clone)]
 pub struct Worker {
     /// Active task number.
@@ -266,13 +312,29 @@ pub fn try_as_worker(
         .program_debug_info()?
         .pathname()
         .to_path_buf();
-    for i in 0..thread.bt.as_ref().map(|bt| bt.len()).unwrap_or_default() {
-        let ecx = debugger.ecx();
-        let debug_info = debugger.debugee.debug_info(ecx.location().pc)?;
-        if debug_info.pathname() == main_debug_info {
-            break;
+    // Walk the precomputed backtrace looking for the first frame
+    // whose IP is in the main executable, then set focus there.
+    //
+    // We do *not* call `set_frame_into_focus(i)` for intermediate
+    // frames: on darwin, tokio worker threads are typically parked
+    // in libsystem (e.g. `kevent_qos`, `__psynch_*`), and those
+    // frames have no mapping offset in our registry — focusing
+    // them blows up with `MappingOffsetNotFound`. We just inspect
+    // each frame's IP to test inclusion, and call
+    // `set_frame_into_focus` once when we've found the target.
+    if let Some(bt) = thread.bt.as_ref() {
+        for (i, frame) in bt.iter().enumerate() {
+            let in_main = debugger
+                .debugee
+                .debug_info(frame.ip)
+                .ok()
+                .map(|di| di.pathname() == main_debug_info)
+                .unwrap_or(false);
+            if in_main {
+                debugger.set_frame_into_focus(i as u32)?;
+                break;
+            }
         }
-        debugger.set_frame_into_focus(i as u32)?;
     }
 
     let Some(worker) = WorkerInternal::analyze(context, thread) else {
@@ -296,6 +358,7 @@ pub fn try_as_worker(
 
     let active_task_from_frame = || -> Option<TaskBacktrace> {
         let task_header_ptr_dqe = expression::parser()
+            .then_ignore(chumsky::prelude::end())
             .parse("task.__0.raw.ptr.pointer")
             .into_output()?;
         let task_header_ptr = context
@@ -305,17 +368,13 @@ pub fn try_as_worker(
             .pop_if_single_el()?;
 
         let task = task_from_header(context.debugger(), task_header_ptr).ok()?;
-        task.backtrace().ok()
+        task.backtrace(context.debugger()).ok()
     };
     let task_bt_standby = active_task_from_frame();
 
-    let context_initialized = context
-        .debugger()
-        .read_variable(Dqe::Variable(Selector::by_name("CONTEXT", false)))?
-        .pop_if_single_el()
-        .ok_or(Error::Async(AsyncError::IncorrectAssumption(
-            "CONTEXT not found",
-        )))?;
+    let context_initialized = find_runtime_context(context.debugger()).ok_or(Error::Async(
+        AsyncError::IncorrectAssumption("CONTEXT not found"),
+    ))?;
 
     let current_task_id = context_initialized
         .value()

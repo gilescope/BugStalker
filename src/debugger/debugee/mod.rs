@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 mod disasm;
 pub mod dwarf;
 mod ldd;
@@ -6,7 +7,7 @@ mod rendezvous;
 pub mod tracee;
 pub mod tracer;
 
-pub use registry::RegionInfo;
+pub use registry::{DwarfRegistry, RegionInfo};
 pub use rendezvous::RendezvousError;
 
 use super::r#async::TokioVersion;
@@ -18,7 +19,6 @@ use crate::debugger::debugee::dwarf::DebugInformation;
 use crate::debugger::debugee::dwarf::unit::PlaceDescriptorOwned;
 use crate::debugger::debugee::dwarf::unwind;
 use crate::debugger::debugee::dwarf::unwind::Backtrace;
-use crate::debugger::debugee::registry::DwarfRegistry;
 use crate::debugger::debugee::rendezvous::Rendezvous;
 use crate::debugger::debugee::tracee::{Tracee, TraceeCtl};
 use crate::debugger::debugee::tracer::{StopReason, TraceContext, Tracer};
@@ -28,6 +28,7 @@ use crate::debugger::error::Error::{
 };
 use crate::debugger::process::{Child, Installed};
 use crate::debugger::register::DwarfRegisterMap;
+use crate::debugger::thread_db_compat as thread_db;
 use crate::debugger::unwind::FrameSpan;
 use crate::debugger::{ExplorationContext, PlaceDescriptor};
 use crate::{muted_error, print_warns, weak_error};
@@ -246,6 +247,59 @@ impl Debugee {
         self.execution_status
     }
 
+    /// Path to the main executable being debugged.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Read-only access to the DWARF/load-mapping registry. Used by
+    /// callers (e.g. `apply-patch`) that want to render diagnostics
+    /// listing the mapping keys we know about.
+    pub fn dwarf_registry(&self) -> &DwarfRegistry {
+        &self.dwarf_registry
+    }
+
+    /// Translate a file offset within the main executable (the kind
+    /// `wild --emit-patch` outputs) into the runtime virtual address
+    /// it ended up at in the running process. Returns `None` if the
+    /// executable hasn't been mapped yet (debugee.run not called).
+    ///
+    /// Linux PIE: simple — `load_base + file_offset`. (DWARF and the
+    /// patch share the same RVA space.)
+    ///
+    /// macOS Mach-O: `slide + vmaddr + (file_offset - text_fileoff)`.
+    /// Wild's tier-4 padding emits patch offsets relative to the file,
+    /// and on typical Mach-O the `__TEXT` segment is mapped at file
+    /// offset 0 with `vmaddr = 0x100000000`. We hard-code that here
+    /// for the common case; binaries with custom `__TEXT.fileoff` or
+    /// `__TEXT.vmaddr` would need a more thorough calculation that
+    /// reads the load commands at runtime.
+    pub fn file_offset_to_runtime(&self, file_offset: u64) -> Option<usize> {
+        // `update_mappings` stores under the original `self.path` key
+        // (registry.rs `mappings.insert(file.clone(), …)`). Try that
+        // first; only fall back to a canonicalised form if the original
+        // isn't there — covers cases where the path BugStalker was
+        // launched with differs in spelling from what proc_maps reports
+        // (e.g. relative input, trailing slash, /var ↔ /private/var).
+        let mapping = self
+            .dwarf_registry
+            .find_mapping_offset_by_path(&self.path)
+            .or_else(|| {
+                let canonical = self.path.canonicalize().ok()?;
+                self.dwarf_registry.find_mapping_offset_by_path(&canonical)
+            })?;
+        #[cfg(target_os = "linux")]
+        {
+            Some(mapping + file_offset as usize)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // typical Mach-O __TEXT.vmaddr on aarch64 / x86_64
+            const MACHO_TEXT_VMADDR_DEFAULT: usize = 0x1_0000_0000;
+            Some(mapping + MACHO_TEXT_VMADDR_DEFAULT + file_offset as usize)
+        }
+    }
+
     /// Return true if debugging process in progress
     pub fn is_in_progress(&self) -> bool {
         self.execution_status == ExecutionStatus::InProgress
@@ -266,6 +320,10 @@ impl Debugee {
     }
 
     /// Return debugee [`Tracer`]
+    pub fn tracer(&self) -> &Tracer {
+        &self.tracer
+    }
+
     pub fn tracer_mut(&mut self) -> &mut Tracer {
         &mut self.tracer
     }

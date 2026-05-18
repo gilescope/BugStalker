@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::task::Task;
 use crate::debugger::address::RelocatedAddress;
 use crate::debugger::r#async::context::TokioAnalyzeContext;
@@ -60,9 +61,10 @@ pub fn try_as_park_thread(
         fut,
     );
 
+    let dbg = context.debugger();
     Ok(Some(BlockThread {
         thread: thread.thread.clone(),
         in_focus: thread.in_focus,
-        bt: task.backtrace()?,
+        bt: task.backtrace(dbg)?,
     }))
 }

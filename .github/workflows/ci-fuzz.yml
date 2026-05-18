@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: MIT
+#
+# Nightly fuzz harness per `doc/plans/phase-0-preflight.md`.
+# Phase 0 ships only the workflow shape: real `cargo fuzz` targets
+# land in Phase 8 (`bs-test-harness`, `rust-mangle-tree`, `bs-replay-engine`).
+# Until a target is registered, the job exits cleanly so the schedule
+# stays green; the alert lives in the absence of a target, not in a
+# red badge.
+name: CI / fuzz
+
+on:
+  schedule:
+    # 04:23 UTC, daily.
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install rust toolchain
+        run: rustup toolchain install nightly
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --locked
+      - name: List registered fuzz targets
+        run: |
+          if [ -d fuzz ]; then
+            cargo +nightly fuzz list
+          else
+            echo "no fuzz/ directory yet — see doc/plans/phase-8-testing.md"
+          fi

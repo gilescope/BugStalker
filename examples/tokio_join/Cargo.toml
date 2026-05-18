@@ -1,0 +1,9 @@
+[package]
+name = "tokio_join"
+version = "0.0.0"
+edition = "2024"
+workspace = "./.."
+publish = false
+
+[dependencies]
+tokio = { version = "1.48.0", features = ["time", "default", "rt-multi-thread", "macros"] }

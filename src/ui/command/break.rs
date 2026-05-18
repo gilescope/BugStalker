@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::BreakpointView;
 use crate::debugger::Debugger;
 use crate::debugger::Error;

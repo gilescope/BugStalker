@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::command::r#async::Command as AsyncCommand;
 use super::generic::trigger::TriggerRegistry;
 use crate::debugger::process::{Child, Installed};
@@ -227,6 +228,7 @@ impl TerminalApplication {
             ready_to_next_command_tx,
             helper,
             trigger_reg: self.trigger_reg,
+            replay_session: None,
         };
 
         static CTRLC_ONCE: Once = Once::new();
@@ -318,6 +320,9 @@ struct AppLoop {
     helper: Helper,
     ready_to_next_command_tx: mpsc::Sender<EditorMode>,
     trigger_reg: Rc<TriggerRegistry>,
+    /// Phase 5 Tier 1 reverse-step session — sidecar to the live
+    /// debuggee. `None` until the user types `replay load <path>`.
+    replay_session: crate::ui::command::replay::Session,
 }
 
 impl AppLoop {
@@ -453,6 +458,7 @@ impl AppLoop {
             printer: &self.printer,
             file_view: &self.file_view,
             helper: &self.helper,
+            replay_session: &mut self.replay_session,
         };
 
         loop {

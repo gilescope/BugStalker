@@ -4,7 +4,9 @@ sidebar_position: 1
 
 # Overview
 
-BugStalker is a modern debugger for GNU/Linux x86-64, written in Rust for Rust programs.
+BugStalker is a modern debugger for GNU/Linux on x86-64 (aarch64 support is experimental:
+software breakpoints work; hardware watchpoints, inferior function calls and `libthread_db`
+are not yet ported), written in Rust for Rust programs.
 
 import BrowserOnly from '@docusaurus/BrowserOnly';
 import AsciinemaPlayer from '@site/src/components/AsciinemaPlayer';
@@ -34,4 +36,3 @@ import AsciinemaPlayer from '@site/src/components/AsciinemaPlayer';
 * **DAP (debugger adapter protocol) support:**
   * VSCode extension
 * **And many more powerful features!**
-

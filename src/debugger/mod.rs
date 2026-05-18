@@ -1,17 +1,22 @@
+// SPDX-License-Identifier: MIT
 pub mod address;
 pub mod r#async;
 mod breakpoint;
 pub mod call;
 mod code;
 mod context;
+#[cfg(target_os = "macos")]
+pub mod darwin_mach;
 mod debugee;
 mod error;
 pub mod process;
 pub mod register;
 pub mod rust;
 mod step;
+pub(crate) mod thread_db_compat;
 mod utils;
 pub mod variable;
+pub mod viz;
 mod watchpoint;
 
 pub use breakpoint::BreakpointView;
@@ -22,6 +27,10 @@ pub use debugee::FunctionAssembly;
 pub use debugee::FunctionRange;
 pub use debugee::RegionInfo;
 pub use debugee::ThreadSnapshot;
+pub use debugee::dwarf::CandidateStatus as LineCandidateStatus;
+pub use debugee::dwarf::InlineFrame;
+pub use debugee::dwarf::LineCandidate;
+pub use debugee::dwarf::LineDiagnostics;
 pub use debugee::dwarf::Symbol;
 pub use debugee::dwarf::r#type::ComplexType;
 pub use debugee::dwarf::r#type::TypeDeclaration;
@@ -31,6 +40,7 @@ pub use debugee::dwarf::unit::PlaceDescriptorOwned;
 /// Public unwind API backed by the internal DWARF unwinder (no libunwind feature gate).
 pub use debugee::dwarf::unwind;
 pub use debugee::tracee::Tracee;
+pub use debugee::tracee::TraceeStatus;
 pub use debugee::tracer::StopReason;
 pub use error::Error;
 pub use watchpoint::WatchpointView;
@@ -58,15 +68,23 @@ use crate::oracle::Oracle;
 use crate::{print_warns, weak_error};
 use indexmap::IndexMap;
 use log::debug;
-use nix::libc::{c_void, uintptr_t};
+#[cfg(target_os = "linux")]
+use nix::libc::c_void;
+use nix::libc::uintptr_t;
+#[cfg(target_os = "linux")]
 use nix::sys;
 use nix::sys::signal;
 use nix::sys::signal::{SIGKILL, Signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
+// `Object` is consumed for trait-method dispatch (e.g. `object.entry()`).
+// On macOS the cfg-gated call sites can elide all uses of it; rather
+// than litter call-site cfgs, allow the unused-import lint here.
+#[allow(unused_imports)]
 use object::Object;
 use os_pipe::PipeWriter;
 use regex::Regex;
+#[cfg(target_os = "linux")]
 use std::ffi::c_long;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -92,6 +110,24 @@ pub trait EventHook {
         function: Option<&FunctionInfo>,
         thread_num: Option<u32>,
     ) -> anyhow::Result<()>;
+
+    /// Phase 9 follow-up — same as `on_breakpoint`, but the call
+    /// site also provides the `addr2line`-computed inline chain
+    /// (innermost first; `chain.last()` is the concrete enclosing
+    /// subprogram). Default impl drops the chain and forwards to
+    /// `on_breakpoint`, so existing hooks compile unchanged. Hooks
+    /// that want the chain (the JSON-RPC ScriptHook) override this.
+    fn on_breakpoint_with_chain(
+        &self,
+        pc: RelocatedAddress,
+        num: u32,
+        place: Option<PlaceDescriptor<'_>>,
+        function: Option<&FunctionInfo>,
+        thread_num: Option<u32>,
+        _inline_chain: &[InlineFrame],
+    ) -> anyhow::Result<()> {
+        self.on_breakpoint(pc, num, place, function, thread_num)
+    }
 
     /// Called when watchpoint is activated.
     ///
@@ -133,6 +169,20 @@ pub trait EventHook {
         function: Option<&FunctionInfo>,
         thread_num: Option<u32>,
     ) -> anyhow::Result<()>;
+
+    /// Step-event variant carrying the inline chain (same shape as
+    /// `on_breakpoint_with_chain`). Default impl forwards to
+    /// `on_step`.
+    fn on_step_with_chain(
+        &self,
+        pc: RelocatedAddress,
+        place: Option<PlaceDescriptor<'_>>,
+        function: Option<&FunctionInfo>,
+        thread_num: Option<u32>,
+        _inline_chain: &[InlineFrame],
+    ) -> anyhow::Result<()> {
+        self.on_step(pc, place, function, thread_num)
+    }
 
     /// Called when one of async step commands is done.
     ///
@@ -295,6 +345,7 @@ impl ExplorationContext {
 pub struct DebuggerBuilder<H: EventHook + 'static = NopHook> {
     oracles: Vec<Arc<dyn Oracle>>,
     hooks: Option<H>,
+    auto_traps: bool,
 }
 
 impl<H: EventHook + 'static> DebuggerBuilder<H> {
@@ -303,7 +354,18 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
         Self {
             oracles: vec![],
             hooks: None,
+            auto_traps: true,
         }
+    }
+
+    /// Enable or disable the panic / process-exit auto-trap
+    /// breakpoints. Default: enabled. Test scenarios that drive
+    /// the inferior to completion (and expect it to *exit*) want
+    /// to disable these — otherwise the run stops at
+    /// `std::process::exit` instead of letting the OS reap the
+    /// process.
+    pub fn with_auto_traps(self, auto_traps: bool) -> Self {
+        Self { auto_traps, ..self }
     }
 
     /// Add oracles.
@@ -339,9 +401,9 @@ impl<H: EventHook + 'static> DebuggerBuilder<H> {
     /// * `process`: debugee process
     pub fn build(self, process: Child<Installed>) -> Result<Debugger, Error> {
         if let Some(hooks) = self.hooks {
-            Debugger::new(process, hooks, self.oracles)
+            Debugger::new(process, hooks, self.oracles, self.auto_traps)
         } else {
-            Debugger::new(process, NopHook {}, self.oracles)
+            Debugger::new(process, NopHook {}, self.oracles, self.auto_traps)
         }
     }
 
@@ -381,6 +443,17 @@ pub struct Debugger {
     oracles: IndexMap<&'static str, (Arc<dyn Oracle>, bool)>,
     /// Detach flag to skip destructive cleanup on drop.
     detached: bool,
+    /// When false, the EntryPoint handler skips `install_auto_traps`.
+    /// Test scenarios that drive the inferior to completion need to
+    /// disable this so the run doesn't stop at `std::process::exit`.
+    auto_traps: bool,
+    /// Phase 4 Tier-A — declarative visualiser registry,
+    /// populated from the debuggee's `.bs_viz_spec` /
+    /// `__bs_viz_spec` section at construction. Empty when the
+    /// debuggee was built without `bs-viz-sdk` or compiled with
+    /// `--release` (specs are debug-build artefacts by
+    /// convention).
+    viz: viz::VizRegistry,
 }
 
 impl Debugger {
@@ -388,6 +461,7 @@ impl Debugger {
         process: Child<Installed>,
         hooks: impl EventHook + 'static,
         oracles: impl IntoIterator<Item = Arc<dyn Oracle>>,
+        auto_traps: bool,
     ) -> Result<Self, Error> {
         let program_path = Path::new(process.program());
 
@@ -395,7 +469,29 @@ impl Debugger {
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let object = object::File::parse(&*mmap)?;
 
+        // `object.entry()`:
+        //   linux ELF: returns a virtual address (PIE: an RVA;
+        //     non-PIE: a fixed VA). The downstream `GlobalAddress`
+        //     + `mapping_offset` flow expects this RVA-style value.
+        //   darwin Mach-O: returns the LC_MAIN `entryoff` — a
+        //     __TEXT-relative offset (e.g. `0x9F8` for hello_world,
+        //     not `0x1000009F8`). Add `__TEXT.vmaddr` to convert
+        //     into a runtime VA assuming the default load base,
+        //     matching the convention DWARF line tables use on
+        //     Mach-O. The shared `mapping_offset = slide` then
+        //     applies uniformly across DWARF and entry.
+        #[cfg(target_os = "linux")]
         let entry_point = GlobalAddress::from(object.entry());
+        #[cfg(not(target_os = "linux"))]
+        let entry_point = {
+            use object::{Object, ObjectSegment};
+            let text_vmaddr = object
+                .segments()
+                .find(|s| s.name().ok().flatten() == Some("__TEXT"))
+                .map(|s| s.address())
+                .unwrap_or(0);
+            GlobalAddress::from(object.entry() + text_vmaddr)
+        };
         let mut breakpoints = BreakpointRegistry::default();
         breakpoints.add_uninit(UninitBreakpoint::new_entry_point(
             None::<PathBuf>,
@@ -412,6 +508,19 @@ impl Debugger {
             Debugee::new_non_running(program_path, &process, &object)?
         };
 
+        // Phase 4 Tier-A: scan visualiser specs out of the
+        // executable. Done here, while the `object::File` is
+        // still alive and we don't have to re-parse it later.
+        let viz = viz::VizRegistry::from_object(&object);
+        if !viz.is_empty() {
+            log::debug!(
+                target: "viz",
+                "loaded {} #[derive(DebugView)] spec(s) from {}",
+                viz.len(),
+                program_path.display(),
+            );
+        }
+
         Ok(Self {
             debugee,
             process,
@@ -424,7 +533,80 @@ impl Debugger {
                 .map(|oracle| (oracle.name(), (oracle, false)))
                 .collect(),
             detached: false,
+            auto_traps,
+            viz,
         })
+    }
+
+    /// Phase 4 Tier-A — return the registered
+    /// [`bs_viz_spec::TypeViewSpec`] for `type_name`, if any.
+    /// `type_name` should be the fully-qualified rustc/v0
+    /// demangled form (e.g. `my_crate::Person`); the registry
+    /// also matches against the local-only name the proc-macro
+    /// currently emits, so callers don't have to pre-strip the
+    /// module path.
+    pub fn view_spec_for(&self, type_name: &str) -> Option<&bs_viz_spec::TypeViewSpec> {
+        self.viz.find(type_name)
+    }
+
+    /// Total number of visualiser specs loaded from the debuggee.
+    /// Useful for tests + the eventual `bs/visualiserList` DAP
+    /// request.
+    pub fn view_spec_count(&self) -> usize {
+        self.viz.len()
+    }
+
+    /// Borrow the full visualiser registry. Render-layer callers
+    /// (DAP `variables` response, TUI rendering pipeline) thread
+    /// this through so registered types render via their
+    /// declarative spec.
+    pub fn view_registry(&self) -> &viz::VizRegistry {
+        &self.viz
+    }
+
+    /// Disable every currently-enabled breakpoint and return the
+    /// list of their runtime addresses so the caller can restore
+    /// them later via [`enable_breakpoints_at`]. Used by the
+    /// edit-and-continue flow: while wild's patch overwrites text
+    /// bytes, any `INT3` (0xCC) bytes the debugger has injected
+    /// would cause the patch's pre-image drift check to fail —
+    /// we drop them, apply the patch against the clean original
+    /// bytes, then re-arm.
+    ///
+    /// Idempotent — calling twice with no intervening
+    /// [`enable_breakpoints_at`] returns an empty list the second
+    /// time.
+    pub fn disable_all_breakpoints(&self) -> Vec<RelocatedAddress> {
+        let mut addrs = Vec::new();
+        for bp in self.breakpoints.active_breakpoints() {
+            if bp.is_enabled() {
+                addrs.push(bp.addr);
+                let _ = bp.disable();
+            }
+        }
+        addrs
+    }
+
+    /// Re-enable breakpoints at each of the given runtime
+    /// addresses. Addresses not present in the registry are
+    /// silently skipped (a breakpoint may have been removed
+    /// between the disable + re-enable). Errors on a single bp's
+    /// `enable()` are logged but don't abort the whole batch —
+    /// best-effort restore so a partial failure doesn't leave
+    /// the user with no breakpoints at all.
+    pub fn enable_breakpoints_at(&self, addrs: &[RelocatedAddress]) {
+        for bp in self.breakpoints.active_breakpoints() {
+            if addrs.contains(&bp.addr)
+                && !bp.is_enabled()
+                && let Err(e) = bp.enable()
+            {
+                log::warn!(
+                    target: "breakpoint",
+                    "failed to re-enable breakpoint at {}: {e}",
+                    bp.addr,
+                );
+            }
+        }
     }
 
     /// Return installed oracle, or `None` if oracle not found or not installed.
@@ -459,6 +641,10 @@ impl Debugger {
         &self.process
     }
 
+    pub(crate) fn debugee(&self) -> &Debugee {
+        &self.debugee
+    }
+
     pub fn detach(&mut self) -> Result<(), Error> {
         if self.detached {
             return Ok(());
@@ -476,12 +662,24 @@ impl Debugger {
             .collect();
 
         if !current_tids.is_empty() {
-            current_tids
-                .iter()
-                .try_for_each(|tid| sys::ptrace::detach(*tid, None).map_err(Ptrace))?;
+            #[cfg(target_os = "linux")]
+            {
+                current_tids
+                    .iter()
+                    .try_for_each(|tid| sys::ptrace::detach(*tid, None).map_err(Ptrace))?;
 
-            signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGCONT)
-                .map_err(|e| Syscall("kill", e))?;
+                signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGCONT)
+                    .map_err(|e| Syscall("kill", e))?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Darwin: no ptrace relationship to detach. Drop
+                // the Mach suspend count so the inferior can run
+                // free from us.
+                if let Ok(task) = darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid()) {
+                    let _ = darwin_mach::task_resume(task);
+                }
+            }
         }
 
         self.detached = true;
@@ -617,6 +815,25 @@ impl Debugger {
                                     }
                                 }
 
+                                // Auto-traps: stop the debuggee one last
+                                // time before a panic unwinds away the
+                                // stack, and again just before the
+                                // process exits — that's the user's
+                                // chance to inspect locals + backtrace
+                                // before the world goes away. Symbols
+                                // that aren't present in this binary
+                                // (e.g. `_exit` in a no_std build) get
+                                // skipped silently.
+                                //
+                                // Opt-out via `DebuggerBuilder::with_auto_traps(false)`:
+                                // some scenarios (notably the test
+                                // suite's "run to completion" tests)
+                                // need the inferior to actually exit
+                                // rather than stop at `process::exit`.
+                                if self.auto_traps {
+                                    self.install_auto_traps();
+                                }
+
                                 // ignore possible signals and watchpoints
                                 while self.step_over_breakpoint()?.is_some() {}
                                 continue;
@@ -638,13 +855,24 @@ impl Debugger {
                                 let tracee_in_focus = tracee_ctl
                                     .tracee(self.ecx().pid_on_focus())
                                     .map(|t| t.number);
+                                let inline_chain = current_pc
+                                    .into_global(&self.debugee)
+                                    .ok()
+                                    .and_then(|gpc| {
+                                        self.debugee
+                                            .debug_info(current_pc)
+                                            .ok()
+                                            .map(|d| d.find_inline_chain(gpc))
+                                    })
+                                    .unwrap_or_default();
                                 self.hooks
-                                    .on_breakpoint(
+                                    .on_breakpoint_with_chain(
                                         current_pc,
                                         bp.number(),
                                         place,
                                         func,
                                         tracee_in_focus,
+                                        &inline_chain,
                                     )
                                     .map_err(Hook)?;
                                 break event;
@@ -693,6 +921,53 @@ impl Debugger {
         Ok(stop_reason)
     }
 
+    /// Darwin-only: clear our Mach exception subscription, reply to any
+    /// pending Mach exception (so the inferior advances past whatever
+    /// trapped it), and detach the ptrace half that `PT_ATTACHEXC` put
+    /// us in. Without this, a subsequent `kill(SIGKILL)` is queued in
+    /// the kernel's signal layer but never delivered because the
+    /// inferior is still ptrace-stopped on its last exception. Used by
+    /// both `restart_debugee` and `Drop` to make `kill(SIGKILL)` actually
+    /// land. Idempotent and tolerant of a vanished inferior (ESRCH).
+    #[cfg(not(target_os = "linux"))]
+    fn darwin_release_inferior_for_kill(&self) {
+        use crate::debugger::darwin_mach::ExceptionPort;
+        use mach2::exception_types::{EXC_MASK_BAD_ACCESS, EXC_MASK_BREAKPOINT, EXC_MASK_SOFTWARE};
+        use mach2::kern_return::KERN_FAILURE;
+        use mach2::port::MACH_PORT_NULL;
+        use mach2::thread_status::THREAD_STATE_NONE;
+        let pid = self.debugee.tracee_ctl().proc_pid();
+        if let Ok(task) = darwin_mach::task_for_pid(pid) {
+            let mask = EXC_MASK_BREAKPOINT | EXC_MASK_SOFTWARE | EXC_MASK_BAD_ACCESS;
+            // SAFETY: task is a valid task port; MACH_PORT_NULL clears
+            // the subscription so post-teardown BRK / SEGV falls
+            // through to the BSD default handler.
+            unsafe {
+                mach2::task::task_set_exception_ports(
+                    task,
+                    mask,
+                    MACH_PORT_NULL,
+                    0,
+                    THREAD_STATE_NONE,
+                );
+            }
+        }
+        if let Some(state) = self.debugee.tracer().darwin_state()
+            && let Some((remote, id, _retcode)) = state.take_pending_reply()
+        {
+            let _ = ExceptionPort::reply(remote, id, KERN_FAILURE);
+        }
+        // SAFETY: ptrace(PT_DETACH, pid, 0, 0) — addr ignored, data is
+        // the signal to inject (0 = none). ESRCH if the inferior died
+        // first; we don't care.
+        unsafe {
+            libc::ptrace(libc::PT_DETACH, pid.as_raw(), std::ptr::null_mut(), 0);
+        }
+        if let Ok(task) = darwin_mach::task_for_pid(pid) {
+            let _ = darwin_mach::task_resume(task);
+        }
+    }
+
     /// Restart debugee by recreating debugee process, save all user-defined breakpoints.
     /// Return when new debugee stopped or ends.
     ///
@@ -719,11 +994,44 @@ impl Debugger {
 
         if !self.debugee.is_exited() {
             let proc_pid = self.process.pid();
+            // Darwin: with PT_ATTACHEXC active, the inferior is
+            // ptrace-stopped on its last Mach exception. SIGKILL would
+            // queue but not deliver until ptrace is released, so do
+            // the same teardown dance as Drop before kill.
+            #[cfg(not(target_os = "linux"))]
+            self.darwin_release_inferior_for_kill();
             signal::kill(proc_pid, SIGKILL).map_err(|e| Syscall("kill", e))?;
             _ = self
                 .debugee
                 .tracer_mut()
                 .resume(TraceContext::new(&[], &self.watchpoints));
+            // Reap the now-dead inferior so its pid frees up before
+            // we ask the kernel to spawn the next one. On linux this
+            // is implicit via the ptrace state machine; on darwin the
+            // process otherwise lingers as a zombie until the polling
+            // `assert_no_proc!` times out. Poll with `WNOHANG` so we
+            // don't block forever if the kernel never delivers the
+            // terminal event (mirrors the `Drop` teardown).
+            #[cfg(not(target_os = "linux"))]
+            {
+                use nix::sys::wait::WaitPidFlag;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+                while std::time::Instant::now() < deadline {
+                    match waitpid(proc_pid, Some(WaitPidFlag::WNOHANG)) {
+                        Ok(WaitStatus::StillAlive) => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Ok(WaitStatus::Signaled(_, _, _))
+                        | Ok(WaitStatus::Exited(_, _))
+                        | Err(_) => break,
+                        Ok(_) => {
+                            let _ = signal::kill(proc_pid, Signal::SIGCONT);
+                            let _ = signal::kill(proc_pid, Signal::SIGKILL);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    }
+                }
+            }
         }
 
         self.process = self.process.install()?;
@@ -886,11 +1194,12 @@ impl Debugger {
         let func = weak_error!(dwarf.find_function_by_pc(global_pc))
             .flatten()
             .map(|(_, info)| info);
+        let inline_chain = dwarf.find_inline_chain(global_pc);
         let tracee_ctl = self.debugee.tracee_ctl();
         let thread_in_focus = tracee_ctl.tracee(ecx.pid_on_focus()).map(|t| t.number);
 
         self.hooks
-            .on_step(pc, place, func, thread_in_focus)
+            .on_step_with_chain(pc, place, func, thread_in_focus, &inline_chain)
             .map_err(Hook)
     }
 
@@ -957,6 +1266,18 @@ impl Debugger {
         self.debugee.thread_state(self.ecx())
     }
 
+    /// Return IDs of currently attached debugee threads without unwinding them.
+    pub fn thread_tids(&self) -> Result<Vec<Pid>, Error> {
+        disable_when_not_stared!(self);
+        Ok(self
+            .debugee
+            .tracee_ctl()
+            .snapshot()
+            .into_iter()
+            .map(|tracee| tracee.pid)
+            .collect())
+    }
+
     /// Sets the thread into focus.
     ///
     /// # Arguments
@@ -997,6 +1318,7 @@ impl Debugger {
     ///
     /// * `addr`: address to write
     /// * `value`: value to write
+    #[cfg(target_os = "linux")]
     pub fn write_memory(&self, addr: uintptr_t, value: uintptr_t) -> Result<(), Error> {
         disable_when_not_stared!(self);
         unsafe {
@@ -1007,6 +1329,18 @@ impl Debugger {
             )
             .map_err(Ptrace)
         }
+    }
+
+    /// Darwin path: `mach_vm_write` framed by `mach_vm_protect` so
+    /// read-only pages (typically `r-x` for code) are temporarily
+    /// writable. The `value` is `usize`-sized — the caller composes
+    /// breakpoint opcodes / restored bytes into a usize first, same
+    /// shape as the linux `PTRACE_POKEDATA` path above.
+    #[cfg(target_os = "macos")]
+    pub fn write_memory(&self, addr: uintptr_t, value: uintptr_t) -> Result<(), Error> {
+        disable_when_not_stared!(self);
+        let task = darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid())?;
+        darwin_mach::vm_write_word(task, addr, value)
     }
 
     /// Move to higher stack frame.
@@ -1100,7 +1434,8 @@ impl Debugger {
     ///
     /// # Arguments
     ///
-    /// * `register_name`: x86-64 register name (ex: `rip`)
+    /// * `register_name`: target-architecture register name
+    ///   (e.g. `rip` on x86_64, `pc` on aarch64)
     pub fn get_register_value(&self, register_name: &str) -> Result<u64, Error> {
         disable_when_not_stared!(self);
 
@@ -1138,8 +1473,9 @@ impl Debugger {
     ///
     /// # Arguments
     ///
-    /// * `register_name`: x86-64 register name (ex: `rip`)
-    /// * `val`: 8 bite value
+    /// * `register_name`: target-architecture register name
+    ///   (e.g. `rip` on x86_64, `pc` on aarch64)
+    /// * `val`: 8-byte value
     pub fn set_register_value(&self, register_name: &str, val: u64) -> Result<(), Error> {
         disable_when_not_stared!(self);
 
@@ -1151,6 +1487,279 @@ impl Debugger {
             val,
         );
         map.persist(in_focus_pid)
+    }
+
+    /// Architecture-agnostic program-counter setter. Prefer this over
+    /// `set_register_value("rip", _)` from cross-arch call sites (DAP
+    /// `goto` / `restartFrame`, internal stepping helpers): the
+    /// register is named `rip` on x86_64 but `pc` on aarch64.
+    pub fn set_pc(&self, val: u64) -> Result<(), Error> {
+        disable_when_not_stared!(self);
+
+        let in_focus_pid = self.ecx().pid_on_focus();
+        let mut map = RegisterMap::current(in_focus_pid)?;
+        map.set_pc(val);
+        map.persist(in_focus_pid)
+    }
+
+    /// Return the function-entry runtime address (`fn_start_ip` in
+    /// FrameSpan terminology) of the function that contains `addr`,
+    /// or `None` if `addr` lies outside any function we have DWARF
+    /// for. Used by `bs/applyPatch` to decide whether the just-
+    /// applied patch landed in the same function the focused thread
+    /// is currently paused inside, which is the trigger for an
+    /// auto-restart-frame.
+    pub fn function_start_ip_at(&self, addr: usize) -> Option<RelocatedAddress> {
+        let reloc = RelocatedAddress::from(addr);
+        let global = reloc.into_global(&self.debugee).ok()?;
+        let dwarf = self.debugee.debug_info(reloc).ok()?;
+        let (die_ref, _) = dwarf.find_function_by_pc(global).ok().flatten()?;
+        let prolog = die_ref.prolog_start_place().ok()?;
+        prolog
+            .address
+            .relocate_to_segment_by_pc(&self.debugee, reloc)
+            .ok()
+    }
+
+    /// "Drop and re-enter" the top frame at `fn_start` with full
+    /// state restoration: PC ← `fn_start`, SP ← function-entry SP
+    /// (CFA computed from DWARF), and every callee-saved register
+    /// reset to the value it held at function entry (recovered via
+    /// the same DWARF unwind rules `backtrace` uses). On aarch64,
+    /// LR is set to the original return address so that a future
+    /// RET out of the function still returns to the caller correctly.
+    ///
+    /// Why all this matters: the naive form (just `set_pc`) re-runs
+    /// the prologue, which pushes another `fp/lr` pair, growing the
+    /// stack by one frame per restart and clobbering the saved-
+    /// register slots so a later step-out would land somewhere
+    /// nonsense. Resetting SP + LR + the callee-saved set makes the
+    /// prologue write into the SAME slots the original entry's
+    /// prologue wrote into — net effect is a clean re-entry as if
+    /// the function had been called fresh from the caller.
+    ///
+    /// **Caller-saved registers (x0..x18 on aarch64) are NOT
+    /// restored** — we don't have entry-time arg values without an
+    /// explicit snapshot, which is a Phase-2-snapshot-args item. If
+    /// the function modified its args you'll re-enter with the
+    /// modified ones; use Set Variable to fix manually if needed.
+    pub fn restart_top_frame(&self, pid: Pid, fn_start: u64) -> Result<(), Error> {
+        disable_when_not_stared!(self);
+
+        // Compute the caller's register state by unwinding one
+        // frame. After this call `unwound` holds:
+        //   SP = CFA of frame 0 = function-entry SP
+        //   PC = caller's resume address = return address LR had at fn entry
+        //   X29, X19..X28, etc = values restored per DWARF register rules
+        let raw = RegisterMap::current(pid)?;
+        let mut unwound = DwarfRegisterMap::from(raw.clone());
+        crate::debugger::debugee::dwarf::unwind::restore_registers_at_frame(
+            &self.debugee,
+            pid,
+            &mut unwound,
+            1,
+        )?;
+
+        // Helper: read a value from the unwound map by Register
+        // (architecture-typed), via DWARF's numeric register id.
+        // Kept named (rather than `_`-prefixed) so the cfg-gated
+        // architectures that *do* use it below find it.
+        #[allow(unused_variables)]
+        let read_unwound = |reg: Register| -> Option<u64> {
+            let dwarf_reg = reg.dwarf_register()?;
+            unwound.value(dwarf_reg).ok()
+        };
+
+        let mut map = raw;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if let Some(sp) = read_unwound(Register::SP) {
+                map.set_sp(sp);
+            }
+            // Return-address column → x30. On aarch64 the CIE's
+            // `return_address_register` is conventionally x30, so the
+            // unwound x30 holds the value lr had at fn entry.
+            if let Some(ra) = read_unwound(Register::RA) {
+                map.update(Register::X30, ra);
+            }
+            // Callee-saved set: x19..x28 plus x29 (frame pointer).
+            for reg in [
+                Register::X19,
+                Register::X20,
+                Register::X21,
+                Register::X22,
+                Register::X23,
+                Register::X24,
+                Register::X25,
+                Register::X26,
+                Register::X27,
+                Register::X28,
+                Register::X29,
+            ] {
+                if let Some(v) = read_unwound(reg) {
+                    map.update(reg, v);
+                }
+            }
+        }
+
+        // x86_64 path: System-V passes the return address on the
+        // stack — CALL pushes the resume PC and decrements RSP by
+        // 8 before transferring control. To recreate fn-entry
+        // state from the unwound frame-1 values:
+        //
+        //   * `unwound.value(SP)` at frame 1 = caller's SP at its
+        //     call site = the CFA of frame 0 in DWARF terms. On
+        //     x86_64 this is "RSP *before* CALL pushed the
+        //     return addr" — i.e. the function-entry SP plus 8.
+        //   * `unwound.value(RA)` at frame 1 = address right
+        //     after CALL in the caller = the return PC that
+        //     CALL pushed onto the stack.
+        //
+        // So fn-entry RSP = unwound_SP - 8, and the byte at that
+        // slot needs to hold unwound_RA. Plus the System-V
+        // callee-saved set (RBX, RBP, R12..R15) gets restored
+        // from the unwinder so the patched function starts with
+        // the same live state the original did.
+        //
+        // When the unwinder can't recover SP/RA — possible if
+        // frame 0 sits in a no-DWARF leaf (signal trampoline,
+        // hand-rolled asm) — fall through to set_pc only. The
+        // RET at function exit will then pop garbage; the EnC
+        // flow's auto-resume usually catches the user's pre-
+        // patch bp before that matters.
+        // x86_64 path: use frame 0's CFA (already computed by
+        // the FDE for the current PC) to derive fn-entry SP,
+        // then read the *actual* saved return address from
+        // inferior memory at that slot. The previous spike tried
+        // to use the unwinder's frame-1 RA, which is wrong for
+        // leaf functions (no prologue → no FDE rows → unwinder
+        // propagates a stale register through some unrelated
+        // function's first row). Reading [fn_entry_RSP] direct
+        // is correct regardless: at entry to ANY function the
+        // saved return PC sits at the current RSP, before the
+        // prologue runs.
+        //
+        // The DWARF CFA at the current PC encodes "where the
+        // caller's RSP was just before the CALL", so:
+        //   fn_entry_RSP = CFA - 8     (CALL pushed 8 bytes)
+        //   [fn_entry_RSP] = the byte CALL pushed (saved return PC)
+        //
+        // For leaf functions (compute), CFA = current_RSP + 8,
+        // so fn_entry_RSP = current_RSP — set_sp is a no-op.
+        // For functions with a prologue, CFA includes the
+        // prologue's allocation, so fn_entry_RSP = current_RSP
+        // + allocation — set_sp moves RSP back up to entry.
+        //
+        // The byte at [fn_entry_RSP] is the actual return PC;
+        // it's already there (CALL wrote it). We don't need to
+        // re-write — just leave it and let the patched function's
+        // RET pop it.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Re-evaluate frame 0 in the current ecx so we can
+            // read its CFA directly. This is the same evaluation
+            // the unwinder did above, but we use the CFA only —
+            // not the propagated registers.
+            let frame_0_cfa = self.frame_info().ok().map(|info| u64::from(info.cfa));
+            if let Some(cfa) = frame_0_cfa {
+                let fn_entry_rsp = cfa.wrapping_sub(8);
+                map.set_sp(fn_entry_rsp);
+                // The byte at [fn_entry_rsp] is whatever CALL
+                // pushed; the RET at the end of the patched
+                // function will pop it and resume in the caller.
+                // No write needed — it's already correct.
+            }
+
+            // Argument restoration. The patched function will re-
+            // run its prologue, which reads input args from the
+            // System-V int-arg registers (RDI, RSI, RDX, RCX, R8,
+            // R9 — first 6 integer/pointer args). If those
+            // registers have been clobbered between fn entry and
+            // the pause point, the restart would compute on
+            // garbage. We read each parameter's *current* value
+            // via its DWARF location list — which, at the current
+            // PC, resolves to the spill slot the prologue wrote
+            // to — and copy that back into the input register.
+            //
+            // The spill slots live in the function's local frame,
+            // BELOW the post-set_sp RSP (the prologue pushed RSP
+            // down before spilling), so they survive our SP reset
+            // intact. Tested with a non-leaf compute: paused at
+            // the multiply, EDI clobbered to a loop counter; the
+            // restore reads the spilled u32 and restarts compute
+            // with the original input.
+            //
+            // V1 limits: integer/pointer args only (no floats →
+            // XMM regs, no args by-value larger than 8 bytes).
+            // Args 7+ live on the stack pre-call and aren't
+            // touched here — the prologue reads them direct from
+            // [rbp+offset] which is still correct after our SP
+            // reset. Failures are silent — a missing location
+            // list or unsupported type leaves the corresponding
+            // register at whatever it currently holds.
+            const SYSV_INT_ARG_REGS: [Register; 6] = [
+                Register::Rdi,
+                Register::Rsi,
+                Register::Rdx,
+                Register::Rcx,
+                Register::R8,
+                Register::R9,
+            ];
+            if let Ok(dwarf) = self.debugee.debug_info(self.ecx().location().pc) {
+                let global_pc = self.ecx().location().global_pc;
+                if let Ok(Some((func_die, _))) = dwarf.find_function_by_pc(global_pc) {
+                    let params = func_die.parameters();
+                    for (i, param) in params.iter().enumerate() {
+                        if i >= SYSV_INT_ARG_REGS.len() {
+                            break;
+                        }
+                        let Some(ty) = param.r#type() else { continue };
+                        let Some(obj) = param.read_value(self.ecx(), &self.debugee, &ty) else {
+                            continue;
+                        };
+                        if obj.raw_data.is_empty() || obj.raw_data.len() > 8 {
+                            continue;
+                        }
+                        let mut buf = [0u8; 8];
+                        buf[..obj.raw_data.len()].copy_from_slice(&obj.raw_data);
+                        let value = u64::from_le_bytes(buf);
+                        map.update(SYSV_INT_ARG_REGS[i], value);
+                    }
+                }
+            }
+
+            // Callee-saved restoration. The patched function's
+            // prologue will save these registers (push rbp, save
+            // r12-r15 etc.) — they need to hold the CALLER's
+            // values at fn entry, not whatever the current body
+            // has clobbered them to. The DWARF unwinder for
+            // frame 0 already knows where each callee-saved was
+            // spilled by the prologue (via the FDE RegisterRule
+            // columns); we read those back from the stack and
+            // restore. Unlike the broken RA propagation, the
+            // saved-callee-register slots ARE in compute's own
+            // frame and the FDE rule reads them direct from
+            // [CFA + offset], so this is correct for both leaf
+            // and non-leaf cases (a leaf simply has no saved
+            // registers to read — the loop just does nothing).
+            for reg in [
+                Register::Rbx,
+                Register::Rbp,
+                Register::R12,
+                Register::R13,
+                Register::R14,
+                Register::R15,
+            ] {
+                if let Some(v) = read_unwound(reg) {
+                    map.update(reg, v);
+                }
+            }
+        }
+
+        map.set_pc(fn_start);
+        map.persist(pid)?;
+        Ok(())
     }
 
     /// Return list of known files income from dwarf parser.
@@ -1243,12 +1852,23 @@ impl Drop for Debugger {
                 .collect();
 
             if !current_tids.is_empty() {
-                current_tids.iter().for_each(|tid| {
-                    sys::ptrace::detach(*tid, None).expect("detach debugee");
-                });
+                #[cfg(target_os = "linux")]
+                {
+                    current_tids.iter().for_each(|tid| {
+                        sys::ptrace::detach(*tid, None).expect("detach debugee");
+                    });
 
-                signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGCONT)
-                    .expect("kill debugee");
+                    signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGCONT)
+                        .expect("kill debugee");
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    if let Ok(task) =
+                        darwin_mach::task_for_pid(self.debugee.tracee_ctl().proc_pid())
+                    {
+                        let _ = darwin_mach::task_resume(task);
+                    }
+                }
             }
 
             return;
@@ -1274,34 +1894,115 @@ impl Drop for Debugger {
                     .map(|t| t.pid)
                     .collect();
 
-                // todo currently ok only if all threads in group stop
-                // continue all threads with SIGSTOP
-                let prepare_stopped: Vec<_> = current_tids
-                    .into_iter()
-                    .filter(|&tid| sys::ptrace::cont(tid, Signal::SIGSTOP).is_ok())
-                    .collect();
-                let stopped: Vec<_> = prepare_stopped
-                    .into_iter()
-                    .filter(|&tid| waitpid(tid, None).is_ok())
-                    .collect();
-                // detach ptrace
-                stopped.into_iter().for_each(|tid| {
-                    sys::ptrace::detach(tid, None).expect("detach tracee");
-                });
-                // kill debugee process
-                signal::kill(self.debugee.tracee_ctl().proc_pid(), Signal::SIGKILL)
-                    .expect("kill debugee");
-                let wait_result = loop {
-                    let wait_result = waitpid(Pid::from_raw(-1), None).expect("waiting debugee");
-                    if wait_result.pid() == Some(self.debugee.tracee_ctl().proc_pid()) {
-                        break wait_result;
+                #[cfg(target_os = "linux")]
+                {
+                    // todo currently ok only if all threads in group stop
+                    // continue all threads with SIGSTOP
+                    let prepare_stopped: Vec<_> = current_tids
+                        .into_iter()
+                        .filter(|&tid| sys::ptrace::cont(tid, Signal::SIGSTOP).is_ok())
+                        .collect();
+                    let stopped: Vec<_> = prepare_stopped
+                        .into_iter()
+                        .filter(|&tid| waitpid(tid, None).is_ok())
+                        .collect();
+                    // detach ptrace
+                    stopped.into_iter().for_each(|tid| {
+                        sys::ptrace::detach(tid, None).expect("detach tracee");
+                    });
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = current_tids; // captured for symmetry; unused on darwin
+                    self.darwin_release_inferior_for_kill();
+                }
+                // kill debugee process. On darwin, the inferior
+                // may have already exited cleanly (passing through
+                // user BPs and running to completion) by the time
+                // we get here — the engine surfaces BPs and
+                // inspect commands without halting forever, so the
+                // inferior naturally finishes. Tolerate ESRCH from
+                // kill and Exited from waitpid.
+                let kill_pid = self.debugee.tracee_ctl().proc_pid();
+                let _ = signal::kill(kill_pid, Signal::SIGKILL);
+                // Drain wait events. On darwin, KERN_FAILURE'ing a
+                // pending Mach BRK during teardown can cause the BSD
+                // default to surface as a signal-*stop* (SIGTRAP)
+                // before our SIGKILL lands; treat any non-terminal
+                // status as "release-and-retry" (SIGCONT + SIGKILL
+                // clears the stop and finishes the kill).
+                //
+                // Use `WNOHANG` with a short poll deadline rather
+                // than a blocking `waitpid` — if the kernel never
+                // delivers the terminal event (process gone on
+                // another path, signal queued behind a Mach state,
+                // …) we still need to give up rather than hang the
+                // whole test runner.
+                use nix::sys::wait::WaitPidFlag;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+                let mut wait_result = WaitStatus::StillAlive;
+                while std::time::Instant::now() < deadline {
+                    let wp = waitpid(kill_pid, Some(WaitPidFlag::WNOHANG));
+                    match wp {
+                        Ok(WaitStatus::StillAlive) => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Ok(w @ (WaitStatus::Signaled(_, _, _) | WaitStatus::Exited(_, _))) => {
+                            wait_result = w;
+                            break;
+                        }
+                        Ok(_) => {
+                            // Stopped / Continued / PtraceEvent — release and retry
+                            let _ = signal::kill(kill_pid, Signal::SIGCONT);
+                            let _ = signal::kill(kill_pid, Signal::SIGKILL);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        Err(_) => {
+                            // ECHILD or similar — process is gone (or never was a child)
+                            break;
+                        }
                     }
-                };
+                }
 
-                debug_assert!(matches!(
+                // On darwin the inferior may die with a variety of
+                // signals during teardown:
+                //   * SIGKILL — our explicit kill landed first.
+                //   * SIGTRAP — an in-flight BRK exception fell
+                //     through to the BSD default handler when the
+                //     Mach exception port was torn down.
+                //   * Any user signal that was queued in the ptrace
+                //     stop at teardown time (e.g. a "transparent"
+                //     SIGINT we consumed in Mach but ptrace had
+                //     already queued for the BSD layer) — when we
+                //     release ptrace via PT_KILL the queued signal
+                //     is delivered, and its default action
+                //     (terminate) wins the race against our
+                //     SIGKILL.
+                // All of these still mean "the inferior is gone",
+                // which is the only thing the surrounding test
+                // suite cares about.
+                // Drop cleanup is best-effort. If `waitpid` never
+                // returns a terminal status within the deadline (the
+                // process is wedged in uninterruptible sleep, the
+                // kernel is being slow to deliver our SIGKILL, …)
+                // we just log and move on — the surrounding `Drop`
+                // path is on a panic-unwinding stack, and a panic
+                // here turns into a non-unwinding abort that takes
+                // out the whole test process and masks every later
+                // test's result. assert_no_proc!() in the test will
+                // surface "still exists" as the primary failure
+                // instead.
+                if !matches!(
                     wait_result,
-                    WaitStatus::Signaled(_, Signal::SIGKILL, _)
-                ));
+                    WaitStatus::Signaled(_, _, _) | WaitStatus::Exited(_, _)
+                ) {
+                    log::warn!(
+                        target: "debugger",
+                        "kill_pid={kill_pid} did not reach a terminal wait \
+                         status within deadline (last seen {wait_result:?}); \
+                         giving up — the OS will reap the inferior."
+                    );
+                }
             }
             ExecutionStatus::Exited => {}
         }
@@ -1309,6 +2010,7 @@ impl Drop for Debugger {
 }
 
 /// Read N bytes from `PID` process.
+#[cfg(target_os = "linux")]
 pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8>, nix::Error> {
     let mut read_reminder = read_n as isize;
     let mut result = Vec::with_capacity(read_n);
@@ -1327,4 +2029,31 @@ pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8
     debug_assert!(result.len() == read_n);
 
     Ok(result)
+}
+
+/// Darwin path: `mach_vm_read_overwrite` reads N bytes in a single
+/// kernel round-trip (no PTRACE_PEEKDATA-style word loop). We map
+/// any Mach error to a coarse `nix::Error::EFAULT` so callers don't
+/// have to know about Mach error codes.
+#[cfg(target_os = "macos")]
+pub fn read_memory_by_pid(pid: Pid, addr: usize, read_n: usize) -> Result<Vec<u8>, nix::Error> {
+    // Log the rich MachError before collapsing to EFAULT — the
+    // signature returns nix::Error so we can't propagate the kr
+    // upstream; logging keeps the diagnostic recoverable from
+    // `--log` output. Use `task_for_pid_or_proc` so synthetic
+    // per-thread Pids (worker threads tracked by
+    // `Tracer::reconcile_threads`) fall back to the inferior
+    // process's task port — memory is process-scoped, the kernel
+    // rejects `task_for_pid` on synthetic ids.
+    let task = darwin_mach::task_for_pid_or_proc(pid).map_err(|e| {
+        log::error!(target: "darwin_mach", "read_memory_by_pid task_for_pid({pid}): {e}");
+        nix::errno::Errno::EFAULT
+    })?;
+    darwin_mach::vm_read_n(task, addr, read_n).map_err(|e| {
+        log::error!(
+            target: "darwin_mach",
+            "read_memory_by_pid vm_read_n(addr={addr:#x}, n={read_n}): {e}"
+        );
+        nix::errno::Errno::EFAULT
+    })
 }

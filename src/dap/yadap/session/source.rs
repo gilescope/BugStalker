@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::dap::yadap::protocol::DapRequest;
 use crate::dap::yadap::sourcemap::SourceMap;
 use crate::debugger;
@@ -5,6 +6,23 @@ use anyhow::{Context, anyhow};
 use capstone::prelude::*;
 use serde_json::json;
 use std::time::{Duration, Instant};
+
+#[cfg(target_arch = "x86_64")]
+fn new_capstone() -> Result<Capstone, capstone::Error> {
+    Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Att)
+        .build()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn new_capstone() -> Result<Capstone, capstone::Error> {
+    Capstone::new()
+        .arm64()
+        .mode(arch::arm64::ArchMode::Arm)
+        .build()
+}
 
 #[derive(Debug, Clone)]
 pub struct DisasmSource {
@@ -356,12 +374,7 @@ pub fn disassemble_from_address(
     instruction_count: usize,
     timeout: Duration,
 ) -> anyhow::Result<Vec<DisasmInstruction>> {
-    let cs = Capstone::new()
-        .x86()
-        .mode(arch::x86::ArchMode::Mode64)
-        .syntax(arch::x86::ArchSyntax::Att)
-        .build()
-        .map_err(|err| anyhow!("disassemble: init capstone: {err}"))?;
+    let cs = new_capstone().map_err(|err| anyhow!("disassemble: init capstone: {err}"))?;
     let max_len = 16usize;
     let read_len = instruction_count.saturating_mul(max_len).max(max_len);
     let start = Instant::now();
@@ -415,12 +428,7 @@ pub fn disassemble_from_range(
     let len = end_addr - start_addr;
     let max_len = 0x10000usize;
     let read_len = len.min(max_len);
-    let cs = Capstone::new()
-        .x86()
-        .mode(arch::x86::ArchMode::Mode64)
-        .syntax(arch::x86::ArchSyntax::Att)
-        .build()
-        .map_err(|err| anyhow!("disassemble: init capstone: {err}"))?;
+    let cs = new_capstone().map_err(|err| anyhow!("disassemble: init capstone: {err}"))?;
     let start = Instant::now();
     let bytes = dbg
         .read_memory(start_addr, read_len)

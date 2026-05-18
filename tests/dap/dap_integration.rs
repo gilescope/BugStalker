@@ -1,14 +1,28 @@
+// SPDX-License-Identifier: MIT
 use crate::dap_client;
 
+use anyhow::Context as _;
 use base64::Engine as _;
+use bs_replay_driver::engine::format::TraceWriter;
+use bs_replay_driver::engine::format::event::Event;
+use bs_replay_driver::engine::format::manifest::Manifest;
+use bs_replay_driver::engine::format::version::FormatVersion;
 use dap_client::{DapSession, example_bin, example_source, spawn_attach_target, wait_for_exit};
 use serde_json::{Value, json};
 use serial_test::serial;
+use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 const HELLO_LINE: i64 = 5;
 const SET_VAR_LINE: i64 = 35;
+const BS_VIZ_SPEC_REQUESTED_COMMENT_LINE: i64 = 91;
+const BS_VIZ_SPEC_BOUND_STATEMENT_LINE: i64 = 96;
+/// Last line of `showcase`'s `main`, after every local in sections
+/// 1..12 is in scope. Used by the showcase regression test below.
+const SHOWCASE_LINE: i64 = 144;
 const OPTIONAL_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn assert_response(response: &Value, command: &str, request_seq: i64, success: bool) -> bool {
@@ -74,6 +88,20 @@ macro_rules! require_frame {
             }
         }
     }};
+}
+
+/// `handle_variables` in the DAP layer formats each variable's name as
+/// `"<name> : <type>"` so IDEs that don't honour the DAP `type` field
+/// inline still render the type next to the value (see
+/// `src/dap/yadap/session/data.rs`). Tests that look up variables by
+/// name should use this matcher instead of an exact equality check so
+/// they stay robust to a type that may or may not be present (e.g. a
+/// raw lambda capture has no name, and locals always do).
+fn var_name_matches(v: &Value, want: &str) -> bool {
+    let Some(name) = v["name"].as_str() else {
+        return false;
+    };
+    name == want || name.starts_with(&format!("{want} : "))
 }
 
 fn initialize(session: &mut DapSession) -> anyhow::Result<()> {
@@ -145,6 +173,17 @@ fn first_frame_id(session: &mut DapSession, thread_id: i64) -> anyhow::Result<Op
     Ok(Some(frame_id))
 }
 
+fn top_frame_line(session: &mut DapSession, thread_id: i64) -> anyhow::Result<Option<i64>> {
+    let stack_seq = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let stack_response = session.client.read_response(stack_seq)?;
+    if !assert_response(&stack_response, "stackTrace", stack_seq, true) {
+        return Ok(None);
+    }
+    Ok(stack_response["body"]["stackFrames"][0]["line"].as_i64())
+}
+
 fn wait_for_event_or_terminated(
     session: &mut DapSession,
     event_name: &str,
@@ -166,6 +205,382 @@ fn wait_for_event_or_terminated(
             _ => continue,
         }
     }
+}
+
+fn replay_manifest() -> Manifest {
+    Manifest {
+        format_version: FormatVersion::V1,
+        build_id: "deadbeef".repeat(8),
+        kernel_release: "test".to_owned(),
+        cpu_features: vec![],
+        engine_version: env!("CARGO_PKG_VERSION").to_owned(),
+        initial_env: vec![],
+        initial_cwd: "/tmp".to_owned(),
+        initial_args: vec![],
+        recorded_at: None,
+        initial_fds: vec![],
+    }
+}
+
+fn temp_replay_trace(label: &str) -> anyhow::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("bs-dap-replay-{label}-{}", std::process::id(),));
+    let _ = fs::remove_dir_all(&dir);
+
+    let mut writer = TraceWriter::create(&dir, &replay_manifest())?;
+    writer.write_event(Event::Marker { tag: 1, data: 0 })?;
+    writer.write_event(Event::Marker { tag: 2, data: 0 })?;
+    writer.write_event(Event::Marker { tag: 3, data: 0 })?;
+    writer.finish()?;
+    Ok(dir)
+}
+
+fn bs_viz_spec_test_binary() -> anyhow::Result<PathBuf> {
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "bs-viz-spec",
+            "--lib",
+            "--no-run",
+            "--message-format=json",
+        ])
+        .current_dir(dap_client::repo_root())
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to build bs-viz-spec test binary: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_artifact = msg.get("reason").and_then(Value::as_str) == Some("compiler-artifact");
+        let is_bs_viz_spec = msg
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(Value::as_str)
+            == Some("bs_viz_spec");
+        let is_test_executable = msg
+            .get("profile")
+            .and_then(|profile| profile.get("test"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if is_artifact
+            && is_bs_viz_spec
+            && is_test_executable
+            && let Some(executable) = msg.get("executable").and_then(Value::as_str)
+        {
+            return Ok(PathBuf::from(executable));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "cargo did not report the bs-viz-spec test executable"
+    ))
+}
+
+fn bs_viz_spec_target_test_binary() -> anyhow::Result<Option<PathBuf>> {
+    let Some(target) = edit_continue_target() else {
+        eprintln!("skipping target breakpoint diagnostic: unsupported target platform");
+        return Ok(None);
+    };
+
+    let target_dir =
+        std::env::temp_dir().join(format!("bugstalker-target-dap-test-{}", std::process::id()));
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "bs-viz-spec",
+            "--lib",
+            "--no-run",
+            "--target",
+            target,
+            "--message-format=json",
+        ])
+        .current_dir(dap_client::repo_root())
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to build target bs-viz-spec test binary: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_artifact = msg.get("reason").and_then(Value::as_str) == Some("compiler-artifact");
+        let is_bs_viz_spec = msg
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(Value::as_str)
+            == Some("bs_viz_spec");
+        let is_test_executable = msg
+            .get("profile")
+            .and_then(|profile| profile.get("test"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if is_artifact
+            && is_bs_viz_spec
+            && is_test_executable
+            && let Some(executable) = msg.get("executable").and_then(Value::as_str)
+        {
+            return Ok(Some(PathBuf::from(executable)));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "cargo did not report the target bs-viz-spec test executable"
+    ))
+}
+
+fn bs_viz_spec_edit_continue_rustflags_test_binary() -> anyhow::Result<Option<PathBuf>> {
+    let Some(target) = edit_continue_target() else {
+        eprintln!(
+            "skipping edit-and-continue rustflags breakpoint diagnostic: unsupported target platform"
+        );
+        return Ok(None);
+    };
+
+    let target_dir = std::env::temp_dir().join(format!(
+        "bugstalker-enc-rustflags-dap-test-{}",
+        std::process::id()
+    ));
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "bs-viz-spec",
+            "--lib",
+            "--no-run",
+            "--target",
+            target,
+            "--message-format=json",
+        ])
+        .current_dir(dap_client::repo_root())
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env(
+            cargo_target_rustflags_env(target),
+            "-C symbol-mangling-version=v0 -C linker=clang",
+        )
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to build edit-and-continue rustflags bs-viz-spec test binary: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_artifact = msg.get("reason").and_then(Value::as_str) == Some("compiler-artifact");
+        let is_bs_viz_spec = msg
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(Value::as_str)
+            == Some("bs_viz_spec");
+        let is_test_executable = msg
+            .get("profile")
+            .and_then(|profile| profile.get("test"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if is_artifact
+            && is_bs_viz_spec
+            && is_test_executable
+            && let Some(executable) = msg.get("executable").and_then(Value::as_str)
+        {
+            return Ok(Some(PathBuf::from(executable)));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "cargo did not report the edit-and-continue rustflags bs-viz-spec test executable"
+    ))
+}
+
+fn bs_viz_spec_edit_continue_test_binary() -> anyhow::Result<Option<PathBuf>> {
+    let Some(linker) = edit_continue_linker() else {
+        eprintln!("skipping edit-and-continue breakpoint diagnostic: wild linker not found");
+        return Ok(None);
+    };
+    let Some(target) = edit_continue_target() else {
+        eprintln!("skipping edit-and-continue breakpoint diagnostic: unsupported target platform");
+        return Ok(None);
+    };
+
+    let target_dir =
+        std::env::temp_dir().join(format!("bugstalker-enc-dap-test-{}", std::process::id()));
+    let patch_path = target_dir.join("bugstalker.wild-patch");
+    let rustflags = format!(
+        "-C symbol-mangling-version=v0 \
+         -C linker=clang \
+         -C link-arg=-fuse-ld={} \
+         -C link-arg=-Wl,--incremental-cache=read-write \
+         -C link-arg=-Wl,--emit-patch={}",
+        linker.display(),
+        patch_path.display()
+    );
+    let output = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "bs-viz-spec",
+            "--lib",
+            "--no-run",
+            "--target",
+            target,
+            "--message-format=json",
+        ])
+        .current_dir(dap_client::repo_root())
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env(cargo_target_rustflags_env(target), rustflags)
+        .output()?;
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to build edit-and-continue bs-viz-spec test binary: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let is_artifact = msg.get("reason").and_then(Value::as_str) == Some("compiler-artifact");
+        let is_bs_viz_spec = msg
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(Value::as_str)
+            == Some("bs_viz_spec");
+        let is_test_executable = msg
+            .get("profile")
+            .and_then(|profile| profile.get("test"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if is_artifact
+            && is_bs_viz_spec
+            && is_test_executable
+            && let Some(executable) = msg.get("executable").and_then(Value::as_str)
+        {
+            return Ok(Some(PathBuf::from(executable)));
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "cargo did not report the edit-and-continue bs-viz-spec test executable"
+    ))
+}
+
+fn edit_continue_linker() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("BUGSTALKER_WILD_LINKER") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    [
+        dap_client::repo_root().join("../linker/target/release/wild"),
+        dap_client::repo_root().join("../linker/target/debug/wild"),
+    ]
+    .into_iter()
+    .find(|path| path.exists())
+}
+
+fn edit_continue_target() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        _ => None,
+    }
+}
+
+fn cargo_target_rustflags_env(target: &str) -> String {
+    format!(
+        "CARGO_TARGET_{}_RUSTFLAGS",
+        target.to_uppercase().replace('-', "_")
+    )
+}
+
+fn assert_bs_viz_spec_breakpoint_binds_to_requested_statement(
+    program: &Path,
+) -> anyhow::Result<()> {
+    let source = example_source("crates/bs-viz-spec/src/lib.rs");
+    let mut session = DapSession::start()?;
+    initialize(&mut session)?;
+
+    let launch_seq = session.client.send_request(
+        "launch",
+        json!({
+            "program": program,
+            "args": ["roundtrip_one", "--nocapture"],
+        }),
+    )?;
+    let launch_response = session.client.read_response(launch_seq)?;
+    ensure_response!(session, &launch_response, "launch", launch_seq, true);
+
+    let bp_seq = session.client.send_request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": source },
+            "breakpoints": [{ "line": BS_VIZ_SPEC_REQUESTED_COMMENT_LINE }],
+        }),
+    )?;
+    let bp_response = session.client.read_response(bp_seq)?;
+    ensure_response!(session, &bp_response, "setBreakpoints", bp_seq, true);
+    let bp = &bp_response["body"]["breakpoints"][0];
+    assert_eq!(bp["verified"].as_bool(), Some(true), "{bp_response}");
+    assert_eq!(
+        bp["line"].as_i64(),
+        Some(BS_VIZ_SPEC_BOUND_STATEMENT_LINE),
+        "breakpoint must slide from the comment at line {BS_VIZ_SPEC_REQUESTED_COMMENT_LINE} \
+         to Format::from_tag, not to the unrelated layout line 25: {bp_response}"
+    );
+
+    let config_seq = session
+        .client
+        .send_request("configurationDone", json!({}))?;
+    let config_response = session.client.read_response(config_seq)?;
+    ensure_response!(
+        session,
+        &config_response,
+        "configurationDone",
+        config_seq,
+        true
+    );
+
+    let stopped = session.client.wait_for_event("stopped")?;
+    let thread_id = stopped
+        .get("body")
+        .and_then(|body| body.get("threadId"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let stopped_line = top_frame_line(&mut session, thread_id)?;
+    assert_eq!(
+        stopped_line,
+        Some(BS_VIZ_SPEC_BOUND_STATEMENT_LINE),
+        "debuggee stopped at the wrong source line; stopped event was {stopped}"
+    );
+
+    session.shutdown();
+    Ok(())
 }
 
 #[test]
@@ -263,6 +678,72 @@ fn test_set_breakpoints_request() -> anyhow::Result<()> {
     assert_eq!(event["event"], "breakpoint");
     session.shutdown();
     Ok(())
+}
+
+#[test]
+#[serial]
+fn test_set_breakpoint_slides_from_blank_line() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    initialize(&mut session)?;
+    let program = example_bin("hello_world");
+    let launch_seq = session
+        .client
+        .send_request("launch", json!({ "program": program }))?;
+    let launch_response = session.client.read_response(launch_seq)?;
+    ensure_response!(session, &launch_response, "launch", launch_seq, true);
+
+    let bp_seq = session.client.send_request(
+        "setBreakpoints",
+        json!({
+            "source": { "path": example_source("examples/hello_world/src/hello_world.rs") },
+            "breakpoints": [{ "line": 3 }],
+        }),
+    )?;
+    let bp_response = session.client.read_response(bp_seq)?;
+    ensure_response!(session, &bp_response, "setBreakpoints", bp_seq, true);
+    let bp = &bp_response["body"]["breakpoints"][0];
+    assert_eq!(bp["verified"].as_bool(), Some(true));
+    assert!(
+        bp["line"].as_i64().unwrap_or_default() > 3,
+        "breakpoint should bind to the next statement: {bp_response}"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_bs_viz_spec_breakpoint_binds_to_requested_file_statement() -> anyhow::Result<()> {
+    let program = bs_viz_spec_test_binary()?;
+    assert_bs_viz_spec_breakpoint_binds_to_requested_statement(&program)
+}
+
+#[test]
+#[serial]
+fn test_bs_viz_spec_breakpoint_with_explicit_target() -> anyhow::Result<()> {
+    let Some(program) = bs_viz_spec_target_test_binary()? else {
+        return Ok(());
+    };
+    assert_bs_viz_spec_breakpoint_binds_to_requested_statement(&program)
+}
+
+#[test]
+#[serial]
+fn test_bs_viz_spec_breakpoint_with_edit_continue_rustflags() -> anyhow::Result<()> {
+    let Some(program) = bs_viz_spec_edit_continue_rustflags_test_binary()? else {
+        return Ok(());
+    };
+    assert_bs_viz_spec_breakpoint_binds_to_requested_statement(&program)
+}
+
+#[test]
+#[serial]
+fn test_bs_viz_spec_breakpoint_with_edit_continue_linker() -> anyhow::Result<()> {
+    let Some(program) = bs_viz_spec_edit_continue_test_binary()? else {
+        return Ok(());
+    };
+    assert_bs_viz_spec_breakpoint_binds_to_requested_statement(&program)
 }
 
 #[test]
@@ -444,6 +925,178 @@ fn test_variables_request() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression test: walking every local in the showcase example
+/// (which exercises most variable shapes BugStalker renders) must
+/// not crash bs. Currently reproduces a kill-on-debug seen when
+/// `let captured_copy = 10;` is uncommented at showcase main.rs:120
+/// — that shifts the stack layout and exposes a panic somewhere in
+/// the variable-rendering code. The test:
+///
+///   1. builds `showcase` so the example binary exists,
+///   2. launches it under bs DAP and breaks at the last line of
+///      `main` (every local in sections 1..12 is in scope),
+///   3. requests `variables` for the top-level locals scope,
+///   4. recursively expands every child whose `variablesReference`
+///      is non-zero (depth-first walk),
+///
+/// Any DAP error / EOF during the walk is treated as bs crashing
+/// or hanging — the test fails with the captured error. When the
+/// underlying panic is fixed the walk completes and the test passes.
+///
+/// macOS-only: the original kill-on-debug was reproduced with the
+/// `wild` linker on `aarch64-apple-darwin`, and this test hard-codes
+/// that target triple to build showcase the same way the
+/// codelldb-fork extension does. Building for `aarch64-apple-darwin`
+/// from a Linux host fails with `error[E0463]: can't find crate for
+/// std` because that target's libstd isn't installed there.
+#[cfg(target_os = "macos")]
+#[test]
+#[serial]
+fn test_showcase_locals_no_crash() -> anyhow::Result<()> {
+    // Build showcase the same way the codelldb-fork extension does
+    // when EnC is enabled: with the `wild` linker and the
+    // symbol-mangling / emit-patch RUSTFLAGS. The original kill-on-
+    // debug report came from that exact build path; default ld64
+    // builds may not reproduce it (this is the test's main reason
+    // to exist).
+    let linker_dir = dap_client::repo_root()
+        .parent()
+        .map(|p| p.join("linker").join("target").join("release").join("wild"));
+    let mut env_args: Vec<(String, String)> = Vec::new();
+    let target_triple = "aarch64-apple-darwin";
+    if let Some(wild) = linker_dir.as_ref().filter(|p| p.exists()) {
+        // CARGO_TARGET_<triple>_RUSTFLAGS — same key the extension uses.
+        let key = format!(
+            "CARGO_TARGET_{}_RUSTFLAGS",
+            target_triple.to_uppercase().replace('-', "_")
+        );
+        let rustflags = format!(
+            "-C symbol-mangling-version=v0 -C linker=clang -C link-arg=-fuse-ld={} \
+             -C link-arg=-Wl,--incremental-cache=read-write",
+            wild.display()
+        );
+        env_args.push((key, rustflags));
+    }
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "-p", "showcase", "--target", target_triple])
+        .current_dir(dap_client::repo_root().join("examples"));
+    // Strip the inherited RUSTFLAGS so cargo's precedence doesn't
+    // override our CARGO_TARGET_<triple>_RUSTFLAGS.
+    cmd.env_remove("RUSTFLAGS");
+    cmd.env_remove("CARGO_ENCODED_RUSTFLAGS");
+    for (k, v) in &env_args {
+        cmd.env(k, v);
+    }
+    let status = cmd.status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build showcase example");
+    }
+
+    let showcase_bin = dap_client::repo_root()
+        .join("examples")
+        .join("target")
+        .join(target_triple)
+        .join("debug")
+        .join("showcase");
+    if !showcase_bin.exists() {
+        anyhow::bail!(
+            "showcase binary not at expected path {} after build",
+            showcase_bin.display()
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Showcase has to be debuggable by the spawned bs — give it
+        // the get-task-allow entitlement the existing
+        // `ensure_example_binaries` codesign would normally apply.
+        let _ = Command::new("codesign")
+            .args(["--entitlements"])
+            .arg(
+                dap_client::repo_root()
+                    .join("tests")
+                    .join("darwin.entitlements"),
+            )
+            .args(["--force", "--sign", "-"])
+            .arg(&showcase_bin)
+            .status();
+    }
+
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &showcase_bin,
+        &dap_client::example_source("examples/showcase/src/main.rs"),
+        SHOWCASE_LINE
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+
+    let scopes_seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes_response = session
+        .client
+        .read_response(scopes_seq)
+        .context("scopes response — bs likely crashed")?;
+    ensure_response!(session, &scopes_response, "scopes", scopes_seq, true);
+    let locals_ref = scopes_response["body"]["scopes"][0]["variablesReference"]
+        .as_i64()
+        .unwrap_or(0);
+
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": locals_ref }))?;
+    let response = session
+        .client
+        .read_response(seq)
+        .context("variables (locals) response — bs likely crashed")?;
+    ensure_response!(session, &response, "variables", seq, true);
+
+    // DFS-expand every child reference. The walk is bounded so a
+    // bogus self-referential `variablesReference` chain can't loop
+    // forever.
+    let mut queue: Vec<i64> = response["body"]["variables"]
+        .as_array()
+        .map(|vars| {
+            vars.iter()
+                .filter_map(|v| v["variablesReference"].as_i64())
+                .filter(|r| *r > 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut visited: std::collections::HashSet<i64> = Default::default();
+    let mut depth = 0usize;
+    const MAX_EXPAND_DEPTH: usize = 8;
+    while let Some(r) = queue.pop() {
+        if !visited.insert(r) {
+            continue;
+        }
+        depth += 1;
+        if depth > MAX_EXPAND_DEPTH * 64 {
+            break;
+        }
+        let s = session
+            .client
+            .send_request("variables", json!({ "variablesReference": r }))?;
+        let resp = session
+            .client
+            .read_response(s)
+            .with_context(|| format!("variables ref={r} — bs likely crashed mid-walk"))?;
+        ensure_response!(session, &resp, "variables", s, true);
+        if let Some(arr) = resp["body"]["variables"].as_array() {
+            for v in arr {
+                if let Some(child_ref) = v["variablesReference"].as_i64() {
+                    if child_ref > 0 {
+                        queue.push(child_ref);
+                    }
+                }
+            }
+        }
+    }
+
+    session.shutdown();
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_set_variable_request() -> anyhow::Result<()> {
@@ -471,7 +1124,7 @@ fn test_set_variable_request() -> anyhow::Result<()> {
     ensure_response!(session, &vars_response, "variables", vars_seq, true);
     let container = vars_response["body"]["variables"]
         .as_array()
-        .and_then(|vars| vars.iter().find(|v| v["name"] == "container"))
+        .and_then(|vars| vars.iter().find(|v| var_name_matches(v, "container")))
         .cloned()
         .unwrap();
     let container_ref = container["variablesReference"].as_i64().unwrap_or(0);
@@ -483,7 +1136,7 @@ fn test_set_variable_request() -> anyhow::Result<()> {
     ensure_response!(session, &point_response, "variables", point_seq, true);
     let point = point_response["body"]["variables"]
         .as_array()
-        .and_then(|vars| vars.iter().find(|v| v["name"] == "point"))
+        .and_then(|vars| vars.iter().find(|v| var_name_matches(v, "point")))
         .cloned()
         .unwrap();
     let point_ref = point["variablesReference"].as_i64().unwrap_or(0);
@@ -647,6 +1300,131 @@ fn test_step_back_request() -> anyhow::Result<()> {
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "stepBack", seq, false);
     session.shutdown();
+    Ok(())
+}
+
+#[test]
+#[serial]
+#[cfg(target_os = "macos")]
+fn test_live_step_back_restores_previous_stop() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    assert_eq!(top_frame_line(&mut session, thread_id)?, Some(HELLO_LINE));
+
+    let next_seq = session
+        .client
+        .send_request("next", json!({ "threadId": thread_id }))?;
+    let next_response = session.client.read_response(next_seq)?;
+    ensure_response!(session, &next_response, "next", next_seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    let stepped_line = top_frame_line(&mut session, thread_id)?;
+    assert_ne!(stepped_line, Some(HELLO_LINE));
+
+    let step_back_seq = session
+        .client
+        .send_request("stepBack", json!({ "threadId": thread_id }))?;
+    let step_back_response = session.client.read_response(step_back_seq)?;
+    ensure_response!(
+        session,
+        &step_back_response,
+        "stepBack",
+        step_back_seq,
+        true
+    );
+    let stopped = session.client.wait_for_event("stopped")?;
+    assert_eq!(
+        stopped
+            .get("body")
+            .and_then(|b| b.get("reason"))
+            .and_then(Value::as_str),
+        Some("step")
+    );
+
+    assert_eq!(top_frame_line(&mut session, thread_id)?, Some(HELLO_LINE));
+
+    session.shutdown();
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_step_back_request_with_loaded_replay_trace() -> anyhow::Result<()> {
+    let trace_dir = temp_replay_trace("step-back")?;
+    let mut session = DapSession::start()?;
+    initialize(&mut session)?;
+
+    let launch_seq = session.client.send_request(
+        "launch",
+        json!({ "tracePath": trace_dir.to_string_lossy() }),
+    )?;
+    let launch_response = session.client.read_response(launch_seq)?;
+    ensure_response!(session, &launch_response, "launch", launch_seq, true);
+    assert_eq!(launch_response["body"]["totalEvents"], 3);
+    assert_eq!(launch_response["body"]["eventIndex"], 3);
+
+    let config_seq = session
+        .client
+        .send_request("configurationDone", json!({}))?;
+    let config_response = session.client.read_response(config_seq)?;
+    ensure_response!(
+        session,
+        &config_response,
+        "configurationDone",
+        config_seq,
+        true
+    );
+    let _ = session.client.wait_for_event("stopped")?;
+
+    let seq = session
+        .client
+        .send_request("stepBack", json!({ "threadId": 1 }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "stepBack", seq, true);
+    assert_eq!(response["body"]["eventIndex"], 2);
+
+    let stopped = session.client.wait_for_event("stopped")?;
+    assert_eq!(
+        stopped
+            .get("body")
+            .and_then(|b| b.get("reason"))
+            .and_then(Value::as_str),
+        Some("step")
+    );
+    assert_eq!(
+        stopped
+            .get("body")
+            .and_then(|b| b.get("threadId"))
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+
+    let threads_seq = session.client.send_request("threads", json!({}))?;
+    let threads_response = session.client.read_response(threads_seq)?;
+    ensure_response!(session, &threads_response, "threads", threads_seq, true);
+    assert_eq!(threads_response["body"]["threads"][0]["id"], 1);
+
+    let stack_seq = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": 1 }))?;
+    let stack_response = session.client.read_response(stack_seq)?;
+    ensure_response!(session, &stack_response, "stackTrace", stack_seq, true);
+    assert_eq!(stack_response["body"]["totalFrames"], 1);
+    assert!(
+        stack_response["body"]["stackFrames"][0]["name"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("replay event 2")
+    );
+
+    session.shutdown();
+    fs::remove_dir_all(&trace_dir).ok();
     Ok(())
 }
 

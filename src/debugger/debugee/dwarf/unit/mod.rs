@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 pub mod die;
 pub mod die_ref;
 mod parser;
@@ -483,16 +484,33 @@ impl BsUnit {
     pub fn find_exact_place_by_pc(&self, pc: GlobalAddress) -> Option<PlaceDescriptor<'_>> {
         let pc = u64::from(pc);
         match self.lines.binary_search_by_key(&pc, |line| line.address) {
-            Ok(mut p) => {
+            Ok(p) => {
+                debug_assert!(p < self.lines.len(), "binary_search Ok index out of range");
+                // `LineRow` is `repr(Rust, packed)`, so `address`
+                // is unaligned; copy through a local before
+                // formatting it.
+                let landed_addr = self.lines[p].address;
+                debug_assert_eq!(
+                    landed_addr, pc,
+                    "binary_search Ok at p={p} but lines[p].address != pc"
+                );
                 let mut place = self.find_place_by_idx(p);
-                p -= 1;
-
-                while let Some(next_place) = self.find_place_by_idx(p)
+                // Walk backwards to find the *first* line whose
+                // address equals `pc` (binary_search may land on
+                // any matching index when duplicates exist). Bail
+                // before `p` underflows.
+                let mut p = p;
+                while let Some(prev) = p.checked_sub(1)
+                    && let Some(next_place) = self.find_place_by_idx(prev)
                     && u64::from(next_place.address) == pc
                 {
                     place = Some(next_place);
-                    p -= 1;
+                    p = prev;
                 }
+                debug_assert!(
+                    place.as_ref().is_none_or(|pd| u64::from(pd.address) == pc),
+                    "find_exact_place_by_pc returned a place at a different address",
+                );
 
                 place
             }

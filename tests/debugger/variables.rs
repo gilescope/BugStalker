@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::VARS_APP;
 use crate::common::TestHooks;
 use crate::common::{TestInfo, rust_version};
@@ -24,7 +25,18 @@ fn assert_struct(val: &Value, exp_type: &str, for_each_member: impl Fn(usize, &M
     let Value::Struct(structure) = val else {
         panic!("not a struct");
     };
-    assert_eq!(val.r#type().name_fmt(), exp_type);
+    // Phase 3A annotates `dyn Trait` fat-pointer structs with a
+    // `[→ Concrete]` suffix on the type name when the vtable
+    // resolves. The annotation is render-only metadata; for the
+    // canonical type-name check we strip it before comparing so
+    // these tests don't have to know whether vtable resolution
+    // succeeded for the build under test.
+    let actual = val.r#type().name_fmt().to_string();
+    let actual_canonical = actual
+        .split_once(" [→ ")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(&actual);
+    assert_eq!(actual_canonical, exp_type);
     for (i, member) in structure.members.iter().enumerate() {
         for_each_member(i, member)
     }
@@ -206,6 +218,66 @@ fn assert_vec_deque(val: &Value, exp_type: &str, exp_cap: usize, with_buf: impl 
     with_buf(&vector.structure.members[0].value);
 }
 
+/// Phase 1 S7 helper: assert a `Pin<P>` peeled to its pinnee, with
+/// the wrapper type-identity preserved.
+fn assert_pin(val: &Value, exp_outer_type: &str, with_inner: impl FnOnce(&Value)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Pin(inner)),
+        ..
+    } = val
+    else {
+        panic!("not a Pin spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    with_inner(inner.as_ref());
+}
+
+/// Phase 1 S11 helper: assert a `NonNull<T>` rendered as the bare
+/// inner pointer with the wrapper type-identity preserved.
+fn assert_nonnull_pointer(val: &Value, exp_outer_type: &str, exp_inner_type: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::NonNull(ptr)),
+        ..
+    } = val
+    else {
+        panic!("not a NonNull spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    assert_pointer(&Value::Pointer(ptr.clone()), exp_inner_type);
+}
+
+/// Phase 1 S3 helper: assert an `Atomic*` rendered as a bare scalar
+/// with the wrapper type-identity preserved.
+fn assert_atomic_scalar(
+    val: &Value,
+    exp_outer_type: &str,
+    exp_inner_type: &str,
+    exp_val: SupportedScalar,
+) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Atomic(inner)),
+        ..
+    } = val
+    else {
+        panic!("not an Atomic spec value");
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    assert_scalar(inner.as_ref(), exp_inner_type, Some(exp_val));
+}
+
+/// Phase 1 S3 helper: assert an `AtomicPtr<T>` rendered as a bare pointer.
+fn assert_atomic_pointer(val: &Value, exp_outer_type: &str, exp_inner_type: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Atomic(inner)),
+        ..
+    } = val
+    else {
+        panic!("not an Atomic spec value");
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    assert_pointer(inner.as_ref(), exp_inner_type);
+}
+
 fn assert_cell(val: &Value, exp_type: &str, with_value: impl FnOnce(&Value)) {
     let Value::Specialized {
         value: Some(SpecializedValue::Cell(value)),
@@ -261,6 +333,20 @@ fn assert_arc(val: &Value, exp_type: &str) {
         panic!("not an arc");
     };
     assert_eq!(val.r#type().name_fmt(), exp_type);
+}
+
+/// Phase 1 S15 helper: assert a Weak with expected strong/weak counts.
+fn assert_weak(val: &Value, exp_type: &str, exp_strong: u64, exp_weak: u64) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Weak { strong, weak, .. }),
+        ..
+    } = val
+    else {
+        panic!("not a Weak spec value: type={:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_type);
+    assert_eq!(*strong, exp_strong, "strong count mismatch for {exp_type}");
+    assert_eq!(*weak, exp_weak, "weak count mismatch for {exp_type}");
 }
 
 fn assert_uuid(val: &Value, exp_type: &str) {
@@ -346,7 +432,9 @@ fn test_read_scalar_variables() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 30).unwrap();
@@ -391,7 +479,9 @@ fn test_read_scalar_variables_at_place() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 11).unwrap();
@@ -415,7 +505,9 @@ fn test_read_struct() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 53).unwrap();
@@ -492,7 +584,9 @@ fn test_read_array() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 61).unwrap();
@@ -549,7 +643,9 @@ fn test_read_enum() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 93).unwrap();
@@ -644,7 +740,9 @@ fn test_read_pointers() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 119).unwrap();
@@ -686,6 +784,24 @@ fn test_read_pointers() {
     );
     let deref = box_d.clone().modify_value(|pcx, v| v.deref(pcx));
     assert_scalar(deref.unwrap().value(), "i32", Some(SupportedScalar::I32(2)));
+    // Phase 1 S9 — `Box<T>` smart-deref: the renderer surfaces the
+    // pointee inline via `Wrapped(inner)` rather than the bare
+    // address. Confirm the hook fired (a raw `*const i32` pointer
+    // would render `Referential`).
+    use bugstalker::debugger::variable::render::ValueLayout;
+    let box_layout = box_d.value().value_layout().expect("box_d layout missing");
+    match box_layout {
+        ValueLayout::Wrapped(inner) => {
+            assert_scalar(inner, "i32", Some(SupportedScalar::I32(2)));
+        }
+        other => panic!("expected Wrapped(inner) for Box<T> smart-deref, got {other:?}"),
+    }
+    // Raw `*const i32` should still be Referential.
+    let ptr_a_layout = ptr_a.value().value_layout().expect("ptr_a layout missing");
+    assert!(
+        matches!(ptr_a_layout, ValueLayout::Referential(_)),
+        "raw *const i32 should render as Referential, got {ptr_a_layout:?}"
+    );
     assert_struct(f.value(), "Foo", |i, member| match i {
         0 => assert_member(member, "bar", |val| {
             assert_scalar(val, "i32", Some(SupportedScalar::I32(1)))
@@ -737,7 +853,9 @@ fn test_read_type_alias() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 126).unwrap();
@@ -758,7 +876,9 @@ fn test_type_parameters() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 135).unwrap();
@@ -785,7 +905,9 @@ fn test_read_vec_and_slice() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 151).unwrap();
@@ -902,7 +1024,9 @@ fn test_read_strings() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 159).unwrap();
@@ -927,7 +1051,9 @@ fn test_read_static_variables() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 168).unwrap();
@@ -953,7 +1079,9 @@ fn test_read_only_local_variables() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 168).unwrap();
@@ -976,7 +1104,9 @@ fn test_read_static_variables_different_modules() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 179).unwrap();
@@ -1001,7 +1131,9 @@ fn test_read_tls_variables() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     let rust_version = rust_version(VARS_APP).unwrap();
 
@@ -1107,7 +1239,9 @@ fn test_read_tls_const_variables() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 538).unwrap();
@@ -1119,16 +1253,20 @@ fn test_read_tls_const_variables() {
             "CONSTANT_THREAD_LOCAL",
             false,
         )) => const_tls);
+    // Darwin's dsymutil numbers anonymous closures starting at 1
+    // (Linux rustc emits 0). Same DIE, different index — accept either.
+    let ident = const_tls.identity().to_string();
+    let normalised = ident.replace("{closure#1}", "{closure#0}");
     version_switch!(
         rust_version,
         .. (1 . 80) => {
-            assert_idents!(const_tls => "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::__getit::VAL");
+            assert_eq!(normalised, "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::__getit::VAL");
         },
         (1 . 80) .. (1 . 92) => {
-            assert_idents!(const_tls => "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::{constant#0}::{closure#0}::VAL");
+            assert_eq!(normalised, "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::{constant#0}::{closure#0}::VAL");
         },
         (1 . 92) .. => {
-            assert_idents!(const_tls => "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::{constant#0}::{closure#0}::__RUST_STD_INTERNAL_VAL");
+            assert_eq!(normalised, "vars::thread_local_const_init::CONSTANT_THREAD_LOCAL::{constant#0}::{closure#0}::__RUST_STD_INTERNAL_VAL");
         }
     );
     assert_init_tls(const_tls.value(), "i32", |value| {
@@ -1145,7 +1283,9 @@ fn test_read_closures() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 223).unwrap();
@@ -1286,7 +1426,9 @@ fn test_arguments() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 232).unwrap();
@@ -1311,6 +1453,36 @@ fn test_arguments() {
             _ => panic!("3 items expected"),
         })
     });
+
+    // Phase 1 S16: the Vec<u8> render goes through the byte-preview
+    // path *only when the bytes look like text* (printable ASCII +
+    // common whitespace; see `vec_bytes_are_stringy`). Bytes 3/4/5
+    // are valid utf-8 but not printable, so `b"\u{3}\u{4}\u{5}"`
+    // would be harder to read than the numeric form — the renderer
+    // deliberately falls through to `IndexedList`. Assert that's
+    // what we get; the renderer prints these as `Vec<u8> [3, 4, 5]`.
+    use bugstalker::debugger::variable::render::ValueLayout;
+    let layout = vec.value().value_layout().expect("Vec<u8> layout missing");
+    match layout {
+        ValueLayout::IndexedList(items) => {
+            let got: Vec<u64> = items
+                .iter()
+                .filter_map(|it| match &it.value {
+                    Value::Scalar(s) => match s.value {
+                        Some(SupportedScalar::U8(b)) => Some(b as u64),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                got,
+                vec![3, 4, 5],
+                "non-stringy Vec<u8> should render as numeric IndexedList"
+            );
+        }
+        other => panic!("expected numeric IndexedList for non-printable bytes, got {other:?}"),
+    }
 
     assert_struct(
         box_arr.value(),
@@ -1341,7 +1513,9 @@ fn test_read_union() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 244).unwrap();
@@ -1370,7 +1544,9 @@ fn test_read_hashmap() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 290).unwrap();
@@ -1556,7 +1732,9 @@ fn test_read_hashset() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 307).unwrap();
@@ -1647,7 +1825,9 @@ fn test_circular_ref_types() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 334).unwrap();
@@ -1724,7 +1904,9 @@ fn test_lexical_blocks() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 340).unwrap();
@@ -1768,7 +1950,9 @@ fn test_btree_map() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 396).unwrap();
@@ -1934,7 +2118,9 @@ fn test_read_btree_set() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 413).unwrap();
@@ -2022,7 +2208,9 @@ fn test_read_vec_deque() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 431).unwrap();
@@ -2098,7 +2286,9 @@ fn test_read_atomic() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 441).unwrap();
@@ -2109,36 +2299,810 @@ fn test_read_atomic() {
     read_locals!(debugger => int32_atomic, _int32, int32_atomic_ptr);
     assert_idents!(int32_atomic => "int32_atomic", int32_atomic_ptr => "int32_atomic_ptr");
 
-    assert_struct(int32_atomic.value(), "AtomicI32", |i, member| match i {
-        0 => assert_member(member, "v", |val| {
-            assert_struct(val, "UnsafeCell<i32>", |i, member| match i {
-                0 => assert_member(member, "value", |val| {
-                    assert_scalar(val, "i32", Some(SupportedScalar::I32(1)))
-                }),
-                _ => panic!("1 members expected"),
-            })
-        }),
-        _ => panic!("1 members expected"),
+    // Phase 1 S3: AtomicI32 is now rendered as the bare scalar payload
+    // (peeling the outer Atomic wrapper and the UnsafeCell wrapper).
+    // The wrapper type identity is preserved on `Value::r#type()`.
+    assert_atomic_scalar(
+        int32_atomic.value(),
+        "AtomicI32",
+        "i32",
+        SupportedScalar::I32(1),
+    );
+
+    // AtomicPtr<i32> peels to the inner *mut i32 pointer.
+    assert_atomic_pointer(int32_atomic_ptr.value(), "AtomicPtr<i32>", "*mut i32");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S6 helper: assert a Range-family value rendered to text.
+fn assert_range_text(val: &Value, exp_outer_type: &str, exp_text: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Range(r)),
+        ..
+    } = val
+    else {
+        panic!("not a Range spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(val.r#type().name_fmt(), exp_outer_type);
+    assert_eq!(r.render(), exp_text);
+}
+
+/// Phase 1 S2 helper: assert a lock guard peeled to the guarded T.
+fn assert_lock_guard_inner(val: &Value, with_inner: impl FnOnce(&Value)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::LockGuard(inner)),
+        ..
+    } = val
+    else {
+        panic!("not a LockGuard spec value: {:?}", val.r#type().name_fmt());
+    };
+    with_inner(inner.as_ref());
+}
+
+/// Phase 1 S2 — `MutexGuard<T>` and `RwLockReadGuard<T>` peel
+/// through their `lock` reference and the parent's
+/// `data: UnsafeCell<T>` field to surface the guarded T directly.
+#[test]
+#[serial]
+fn test_read_lock_guards() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_lock_guard_inner(pick("mtx_guard").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(123)));
+    });
+    assert_lock_guard_inner(pick("rwl_read").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(456)));
     });
 
-    assert_struct(
-        int32_atomic_ptr.value(),
-        "AtomicPtr<i32>",
-        |i, member| match i {
-            0 => assert_member(member, "p", |val| {
-                assert_struct(val, "UnsafeCell<*mut i32>", |i, member| match i {
-                    0 => assert_member(member, "value", |val| assert_pointer(val, "*mut i32")),
-                    _ => panic!("1 members expected"),
-                })
-            }),
-            _ => panic!("1 members expected"),
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S1 helper: assert a Mutex/RwLock peeled to its inner T.
+fn assert_mutex_inner(val: &Value, with_inner: impl FnOnce(&Value)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Mutex { inner, .. }),
+        ..
+    } = val
+    else {
+        panic!(
+            "not a Mutex/RwLock spec value: {:?}",
+            val.r#type().name_fmt()
+        );
+    };
+    with_inner(inner.as_ref());
+}
+
+/// Phase 1 S1 (poison) helper: assert poison flag matches expectation.
+fn assert_mutex_poisoned(val: &Value, exp_poisoned: bool) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Mutex { poisoned, .. }),
+        ..
+    } = val
+    else {
+        panic!(
+            "not a Mutex/RwLock spec value: {:?}",
+            val.r#type().name_fmt()
+        );
+    };
+    assert_eq!(*poisoned, exp_poisoned);
+}
+
+/// Phase 1 S1 (locked) helper: assert lock-state matches expectation.
+/// Note: the futex backend (Linux, modern Windows, etc.) reports
+/// accurate state; macOS / Win7 always report `false`.
+fn assert_mutex_locked(val: &Value, exp_locked: bool) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Mutex { locked, .. }),
+        ..
+    } = val
+    else {
+        panic!(
+            "not a Mutex/RwLock spec value: {:?}",
+            val.r#type().name_fmt()
+        );
+    };
+    assert_eq!(*locked, exp_locked);
+}
+
+/// Phase 1 S1 — `Mutex<T>` and `RwLock<T>` peel through their `data:
+/// UnsafeCell<T>` field to surface the inner T directly.
+#[test]
+#[serial]
+fn test_read_mutex_rwlock() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_mutex_inner(pick("mtx").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(123)));
+    });
+    assert_mutex_inner(pick("rwl").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(456)));
+    });
+    // Phase 1 S1 (poison): a freshly-constructed mutex/rwlock is
+    // not poisoned. Future fixtures with deliberately-poisoned
+    // locks would assert `true` here.
+    assert_mutex_poisoned(pick("mtx").value(), false);
+    assert_mutex_poisoned(pick("rwl").value(), false);
+    // Phase 1 S1 (locked): the fixture *does* hold both locks at
+    // the breakpoint — `mtx.lock()` runs at vars.rs:734 and
+    // `rwl.read()` at vars.rs:735, both before the bp at 749. The
+    // probe correctly reports `locked = true`. On macOS the futex
+    // backend isn't used so the probe reports `false` there even
+    // when held; gate that platform out below if/when this test is
+    // re-enabled on darwin.
+    assert_mutex_locked(pick("mtx").value(), true);
+    assert_mutex_locked(pick("rwl").value(), true);
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S10 helper: assert a MaybeUninit peeled to its inner T.
+fn assert_maybe_uninit_inner(val: &Value, with_inner: impl FnOnce(&Value)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::MaybeUninit(inner)),
+        ..
+    } = val
+    else {
+        panic!(
+            "not a MaybeUninit spec value: {:?}",
+            val.r#type().name_fmt()
+        );
+    };
+    with_inner(inner.as_ref());
+}
+
+/// Phase 1 S10 — `MaybeUninit<T>` peels through the union's `value`
+/// arm and `ManuallyDrop` wrapper to surface the inner T directly.
+#[test]
+#[serial]
+fn test_read_maybe_uninit() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_maybe_uninit_inner(pick("mu_init").value(), |inner| {
+        assert_scalar(inner, "i32", Some(SupportedScalar::I32(99)));
+    });
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S12/S13/S14 DST companions — `&CStr`, `&OsStr`, `&Path`
+/// route through the same parsers as their owned counterparts.
+#[test]
+#[serial]
+fn test_read_dst_refs() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    let dst_cs = pick("dst_cs").value();
+    let Value::Specialized {
+        value: Some(SpecializedValue::CString(s)),
+        ..
+    } = dst_cs
+    else {
+        panic!(
+            "dst_cs not a CString-spec value: {:?}",
+            dst_cs.r#type().name_fmt()
+        );
+    };
+    assert_eq!(s.value, "c\"hi\"");
+
+    let dst_os = pick("dst_os").value();
+    let Value::Specialized {
+        value: Some(SpecializedValue::OsString(s)),
+        ..
+    } = dst_os
+    else {
+        panic!(
+            "dst_os not an OsString-spec value: {:?}",
+            dst_os.r#type().name_fmt()
+        );
+    };
+    assert_eq!(s.value, "\"hi\"");
+
+    let dst_pa = pick("dst_pa").value();
+    let Value::Specialized {
+        value: Some(SpecializedValue::OsString(s)),
+        ..
+    } = dst_pa
+    else {
+        panic!(
+            "dst_pa not an OsString-spec value: {:?}",
+            dst_pa.r#type().name_fmt()
+        );
+    };
+    assert_eq!(s.value, "\"/etc\"");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S13/S14 helper: assert an OsString/PathBuf rendered to a
+/// particular pre-rendered string form.
+fn assert_os_string(val: &Value, exp_outer_type_contains: &str, exp_text: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::OsString(s)),
+        ..
+    } = val
+    else {
+        panic!("not an OsString spec value: {:?}", val.r#type().name_fmt());
+    };
+    let actual_type = val.r#type().name_fmt();
+    assert!(
+        actual_type.contains(exp_outer_type_contains),
+        "expected type to contain {exp_outer_type_contains:?}, got {actual_type:?}"
+    );
+    assert_eq!(s.value, exp_text);
+}
+
+/// Phase 1 S13/S14 — `OsString` and `PathBuf` peel through their
+/// wrapper chain to the underlying `Vec<u8>` and render as a quoted
+/// utf-8 string (or hex preview when not utf-8).
+#[test]
+#[serial]
+fn test_read_os_string_pathbuf() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_os_string(pick("os_str").value(), "OsString", "\"hello\"");
+    assert_os_string(pick("pb").value(), "PathBuf", "\"/tmp/foo\"");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S12 helper: assert a CString rendered to a particular
+/// pre-rendered string form.
+fn assert_cstring(val: &Value, exp_outer_type_contains: &str, exp_text: &str) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::CString(s)),
+        ..
+    } = val
+    else {
+        panic!("not a CString spec value: {:?}", val.r#type().name_fmt());
+    };
+    let actual_type = val.r#type().name_fmt();
+    assert!(
+        actual_type.contains(exp_outer_type_contains),
+        "expected type to contain {exp_outer_type_contains:?}, got {actual_type:?}"
+    );
+    assert_eq!(s.value, exp_text);
+}
+
+/// Phase 1 S12 — `CString` renders as `c"…"` (utf-8) or `c"\\xNN…"`
+/// hex preview when not valid utf-8.
+#[test]
+#[serial]
+fn test_read_cstring() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_cstring(pick("cs_hello").value(), "CString", "c\"hello\"");
+    assert_cstring(pick("cs_empty").value(), "CString", "c\"\"");
+    // 0x68 0x69 0x80 0xff — the 0x80 0xff bytes break utf-8, expect
+    // hex preview that begins with the literal escape pattern.
+    let cs_bytes = pick("cs_bytes").value();
+    let Value::Specialized {
+        value: Some(SpecializedValue::CString(s)),
+        ..
+    } = cs_bytes
+    else {
+        panic!("cs_bytes not a CString")
+    };
+    assert!(
+        s.value.starts_with("c\"\\x"),
+        "expected hex-preview prefix, got {:?}",
+        s.value
+    );
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S4 helper: assert a `Duration` peeled to (secs, nanos).
+fn assert_duration(val: &Value, exp: (u64, u32)) {
+    let Value::Specialized {
+        value: Some(SpecializedValue::Duration(got)),
+        ..
+    } = val
+    else {
+        panic!("not a Duration spec value: {:?}", val.r#type().name_fmt());
+    };
+    assert_eq!(*got, exp);
+}
+
+/// Phase 1 S4 — `core::time::Duration` peels to `(secs, nanos)` and
+/// renders human-readable via `format_duration`.
+#[test]
+#[serial]
+fn test_read_duration() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_duration(pick("d_zero").value(), (0, 0));
+    assert_duration(pick("d_ms").value(), (1, 500_000_000));
+    assert_duration(pick("d_s").value(), (7, 0));
+    assert_duration(pick("d_h").value(), (3661, 500_000_000));
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S6 — `core::ops::Range*` family renders to canonical
+/// Rust source form (`a..b`, `a..=b`, `a..`, `..b`).
+#[test]
+#[serial]
+fn test_read_ranges() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pick = |needle: &str| {
+        vars.iter()
+            .find(|v| v.identity().to_string().contains(needle))
+            .unwrap_or_else(|| panic!("`{needle}` not in locals"))
+    };
+
+    assert_range_text(pick("r1").value(), "Range<i32>", "0..10");
+    assert_range_text(pick("r2").value(), "RangeInclusive<i32>", "0..=10");
+    assert_range_text(pick("r3").value(), "RangeFrom<i32>", "5..");
+    assert_range_text(pick("r4").value(), "RangeTo<i32>", "..10");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S7 — `Pin<P>` peels to the pinnee.
+#[test]
+#[serial]
+fn test_read_pin() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside `phase1_specs_b` —
+    // see `examples/vars/src/vars.rs`. If you renumber that function,
+    // update this constant in lockstep.
+    debugger.set_breakpoint_at_line("vars.rs", 749).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(749));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let pinned_box = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("pinned_box"))
+        .expect("pinned_box not in locals");
+    let pinned_ref = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("pinned_ref"))
+        .expect("pinned_ref not in locals");
+
+    // Pin<Box<i32>> peels to a Box (still a pointer-shaped Value).
+    assert_pin(
+        pinned_box.value(),
+        "Pin<alloc::boxed::Box<i32, alloc::alloc::Global>>",
+        |inner| {
+            assert!(
+                matches!(inner, Value::Pointer(_)),
+                "pinned_box pinnee should be a pointer; got {:?}",
+                inner.r#type().name_fmt()
+            );
         },
     );
 
-    let deref = int32_atomic_ptr
-        .clone()
-        .modify_value(|pcx, v| v.field("p").unwrap().field("value").unwrap().deref(pcx));
-    assert_scalar(deref.unwrap().value(), "i32", Some(SupportedScalar::I32(2)));
+    // Pin<&mut i32> peels to a &mut i32 reference (also pointer-shaped).
+    assert_pin(pinned_ref.value(), "Pin<&mut i32>", |inner| {
+        assert!(
+            matches!(inner, Value::Pointer(_)),
+            "pinned_ref pinnee should be a pointer; got {:?}",
+            inner.r#type().name_fmt()
+        );
+    });
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 1 S11 — `NonNull<T>` is rendered as the bare inner pointer.
+#[test]
+#[serial]
+fn test_read_nonnull() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside `phase1_specs` —
+    // see `examples/vars/src/vars.rs`. If you renumber that function,
+    // update this constant in lockstep.
+    debugger.set_breakpoint_at_line("vars.rs", 698).unwrap();
+
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(698));
+
+    let vars = debugger.read_local_variables().unwrap();
+    let nn = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("nn"))
+        .unwrap_or_else(|| {
+            panic!(
+                "`nn` not in {:?}",
+                vars.iter()
+                    .map(|v| v.identity().to_string())
+                    .collect::<Vec<_>>()
+            )
+        });
+
+    assert_nonnull_pointer(nn.value(), "NonNull<i32>", "*const i32");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 3 Feature C — `Rc<RefCell<Node>>` cycle detection. The
+/// renderer must terminate gracefully on a 2-node cycle (no stack
+/// overflow) and emit a `[cycle to 0x…]` marker on the second
+/// visit. Deep but acyclic chains hit the depth cap with a
+/// `[depth limit 64]` marker instead.
+#[test]
+#[serial]
+fn test_rc_cycle_detection() {
+    use bugstalker::ui::generic::variable::render_value;
+
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside `phase3_rc_cycle`
+    // — keep in lockstep with vars.rs.
+    debugger.set_breakpoint_at_line("vars.rs", 915).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(915));
+
+    let vars = debugger.read_local_variables().unwrap();
+
+    let cycle_root = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("cycle_root"))
+        .expect("cycle_root not in locals");
+    let deep = vars
+        .iter()
+        .find(|v| v.identity().to_string().contains("deep"))
+        .expect("deep not in locals");
+
+    // Render must not stack-overflow. If we get here, that's
+    // already half the value of Feature C.
+    let cycle_str = render_value(cycle_root.value());
+    let deep_str = render_value(deep.value());
+
+    eprintln!("[cycle] cycle_root rendered as:\n{cycle_str}\n");
+    eprintln!(
+        "[cycle] deep (truncated to 200 chars): {}",
+        &deep_str[..deep_str.len().min(200)]
+    );
+
+    assert!(
+        cycle_str.contains("cycle to"),
+        "cycle_root missing cycle marker: {cycle_str:?}"
+    );
+    // Acyclic deep chain should hit the depth cap.
+    assert!(
+        deep_str.contains("depth limit"),
+        "deep chain missing depth-cap marker: {deep_str:?}"
+    );
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 3 Feature B — niche-encoded `Option<T>` resolution.
+/// Verifies that for every niche pattern (`Option<&T>`,
+/// `Option<Box<T>>`, `Option<NonNull<T>>`, `Option<NonZero*>`,
+/// `Option<bool>`, `Option<fn(…)>`), the renderer correctly picks
+/// `Some(…)` vs `None` from the underlying bytes — no
+/// `RUST$ENCODED$ENUM$` fallback, no DWARF-discriminant guessing.
+#[test]
+#[serial]
+fn test_niche_option_recovery() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside
+    // `phase3_niche_options` — keep in lockstep with vars.rs.
+    debugger.set_breakpoint_at_line("vars.rs", 864).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(864));
+
+    let vars = debugger.read_local_variables().unwrap();
+
+    let pick_variant = |name: &str| -> String {
+        let v = vars
+            .iter()
+            .find(|v| v.identity().to_string().contains(name))
+            .unwrap_or_else(|| panic!("{name} not in locals"));
+        match v.value() {
+            Value::RustEnum(re) => re
+                .value
+                .as_ref()
+                .map(|m| {
+                    m.field_name
+                        .clone()
+                        .unwrap_or_else(|| String::from("<anonymous>"))
+                })
+                .unwrap_or_else(|| String::from("<no variant>")),
+            other => panic!(
+                "{name}: not a RustEnum, got {:?}",
+                other.r#type().name_fmt()
+            ),
+        }
+    };
+
+    let cases: &[(&str, &str)] = &[
+        ("opt_ref_some", "Some"),
+        ("opt_ref_none", "None"),
+        ("opt_box_some", "Some"),
+        ("opt_box_none", "None"),
+        ("opt_nn_some", "Some"),
+        ("opt_nn_none", "None"),
+        ("opt_nz_some", "Some"),
+        ("opt_nz_none", "None"),
+        ("opt_bool_some", "Some"),
+        ("opt_bool_none", "None"),
+        ("opt_fn_some", "Some"),
+        ("opt_fn_none", "None"),
+        // Result<T, ZST>: niche of T doubles as the discriminant
+        // for the ZST error arm.
+        ("res_ok", "Ok"),
+        ("res_err", "Err"),
+        ("res_nz_ok", "Ok"),
+        ("res_nz_err", "Err"),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (name, expected) in cases {
+        let got = pick_variant(name);
+        eprintln!("[niche] {name:14} → {got}");
+        if got != *expected {
+            failures.push(format!("  {name}: expected {expected}, got {got}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} niche misclassifications:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Phase 3 Feature A — `dyn Trait` fat-pointer detection. Verifies
+/// the renderer recognises trait objects (`Box<dyn Error>`,
+/// `&dyn Iterator<Item = u32>`, `Arc<dyn Debug + Send + Sync>`)
+/// and emits the `[concrete type unavailable; vtable resolution
+/// pending — Phase 3A follow-up]` annotation. Concrete type recovery
+/// itself lands in a follow-up batch; this test guards the
+/// detection layer.
+///
+/// **macOS 26.4.1 (`xnu-12377.101.15`) — DISABLED ON DARWIN PENDING APPLE FIX.**
+/// Two reproducible kernel panics observed on this kernel
+/// (2026-05-14 20:09 and 20:20, `/Library/Logs/DiagnosticReports/
+/// panic-full-2026-05-14-{200917,202052}.0002.panic`) with byte-
+/// identical fingerprint: panicked task = this cargo-test binary,
+/// 19 threads, PC = kernel_text_exec_base + 0x66970, caller =
+/// +0x956338, ESR=0x96000007 (data abort level-3) with FAR landing
+/// inside the kernel Zone Metadata range — a zone-allocator UAF/race
+/// in xnu, tripped by the bs darwin harness (mach_vm_read_overwrite /
+/// mach_vm_protect / task_for_pid across multiple worker threads).
+/// Apple Feedback Assistant report filed 2026-05-15.
+///
+/// Re-enable when one of:
+///   - macOS ships a kernel build past `xnu-12377.101.15`/`25.4.0`
+///     and the panic no longer reproduces on a single rerun of this
+///     test, OR
+///   - `src/debugger/darwin_mach.rs` grows a process-wide serialising
+///     mutex around every `mach_vm_*` and `task_for_pid` call so
+///     concurrent worker threads can't race the kernel zone code.
+/// To undo: delete the `cfg(not(target_os = "macos"))` line below
+/// and grep this file for "26.4.1" to find the banner.
+#[cfg(not(target_os = "macos"))]
+#[test]
+#[serial]
+fn test_dyn_trait_detection() {
+    // Phase 3 Feature A batch A8 — `value_layout()` for trait
+    // objects used to return `PreRendered(<multi-line summary>)`.
+    // That summary is now built by the ui renderer
+    // (`render_value`) because it needs the depth context that
+    // `value_layout` can't carry. So this test now drives the
+    // public renderer instead of inspecting the layout enum.
+    use bugstalker::ui::generic::variable::render_value;
+
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    // Line of `let nop: Option<u8> = None;` inside
+    // `phase3_dyn_trait` — keep in lockstep with vars.rs.
+    debugger.set_breakpoint_at_line("vars.rs", 796).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(796));
+
+    let vars = debugger.read_local_variables().unwrap();
+
+    let pick = |name: &str| -> String {
+        let v = vars
+            .iter()
+            .find(|v| v.identity().to_string().contains(name))
+            .unwrap_or_else(|| panic!("{name} not in locals"));
+        render_value(v.value())
+    };
+
+    // `Box<dyn Error>` renders as the wrapping struct's two-pointer
+    // layout — that's the case our detector catches today.
+    let boxed_err = pick("boxed_err");
+    eprintln!("[dyn-trait] boxed_err rendered as: {boxed_err}");
+    assert!(
+        boxed_err.contains("dyn") && boxed_err.contains("vtable"),
+        "boxed_err missing dyn / vtable annotation: {boxed_err:?}"
+    );
+    // Phase 3A batch A2 — vtable resolution should now fire on a
+    // standard rustc build; the trait-object summary carries the
+    // recovered concrete type as `… [→ Concrete]`.
+    assert!(
+        boxed_err.contains("→") && boxed_err.contains("MyError"),
+        "boxed_err missing concrete-type recovery (`[→ MyError]`): {boxed_err:?}"
+    );
+    // `Arc<dyn Debug + Send + Sync>` and `&dyn Iterator<…>` route
+    // through the smart-pointer / reference-deref paths
+    // respectively; their detection lands in a follow-up batch
+    // alongside vtable resolution.
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);
@@ -2150,7 +3114,9 @@ fn test_cell() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 453).unwrap();
@@ -2191,7 +3157,9 @@ fn test_shared_ptr() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     let rust_version = rust_version(VARS_APP).unwrap();
 
@@ -2249,7 +3217,13 @@ fn test_shared_ptr() {
         _ => panic!("3 members expected"),
     });
 
-    assert_rc(weak_rc2.value(), "Weak<i32, alloc::alloc::Global>");
+    // Phase 1 S15: Weak now reports strong/weak counts.
+    assert_weak(
+        weak_rc2.value(),
+        "Weak<i32, alloc::alloc::Global>",
+        2, // strong
+        2, // weak (rc1 + weak_rc2)
+    );
     let deref = weak_rc2.clone().modify_value(|pcx, v| v.deref(pcx));
     assert_struct(deref.unwrap().value(), deref_type, |i, member| match i {
         0 => assert_member(member, "strong", |val| {
@@ -2274,29 +3248,12 @@ fn test_shared_ptr() {
         deref.unwrap().value(),
         "ArcInner<i32>",
         |i, member| match i {
+            // Phase 1 S3: AtomicUsize is now a peeled scalar.
             0 => assert_member(member, "strong", |val| {
-                assert_struct(val, "AtomicUsize", |i, member| match i {
-                    0 => assert_member(member, "v", |val| {
-                        assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                            assert_member(member, "value", |val| {
-                                assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                            })
-                        })
-                    }),
-                    _ => panic!("1 member expected"),
-                })
+                assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
             }),
             1 => assert_member(member, "weak", |val| {
-                assert_struct(val, "AtomicUsize", |i, member| match i {
-                    0 => assert_member(member, "v", |val| {
-                        assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                            assert_member(member, "value", |val| {
-                                assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                            })
-                        })
-                    }),
-                    _ => panic!("1 member expected"),
-                })
+                assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
             }),
             2 => assert_member(member, "data", |val| {
                 assert_scalar(val, "i32", Some(SupportedScalar::I32(2)))
@@ -2311,29 +3268,12 @@ fn test_shared_ptr() {
         deref.unwrap().value(),
         "ArcInner<i32>",
         |i, member| match i {
+            // Phase 1 S3: AtomicUsize is now a peeled scalar.
             0 => assert_member(member, "strong", |val| {
-                assert_struct(val, "AtomicUsize", |i, member| match i {
-                    0 => assert_member(member, "v", |val| {
-                        assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                            assert_member(member, "value", |val| {
-                                assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                            })
-                        })
-                    }),
-                    _ => panic!("1 member expected"),
-                })
+                assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
             }),
             1 => assert_member(member, "weak", |val| {
-                assert_struct(val, "AtomicUsize", |i, member| match i {
-                    0 => assert_member(member, "v", |val| {
-                        assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                            assert_member(member, "value", |val| {
-                                assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                            })
-                        })
-                    }),
-                    _ => panic!("1 member expected"),
-                })
+                assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
             }),
             2 => assert_member(member, "data", |val| {
                 assert_scalar(val, "i32", Some(SupportedScalar::I32(2)))
@@ -2342,35 +3282,24 @@ fn test_shared_ptr() {
         },
     );
 
-    assert_arc(weak_arc2.value(), "Weak<i32, alloc::alloc::Global>");
+    // Phase 1 S15: Weak (sync flavour) reports strong/weak counts.
+    assert_weak(
+        weak_arc2.value(),
+        "Weak<i32, alloc::alloc::Global>",
+        2, // strong
+        2, // weak (arc1 + weak_arc2)
+    );
     let deref = weak_arc2
         .clone()
         .modify_value(|pcx, v| v.deref(pcx))
         .unwrap();
     assert_struct(deref.value(), "ArcInner<i32>", |i, member| match i {
+        // Phase 1 S3: AtomicUsize is now a peeled scalar.
         0 => assert_member(member, "strong", |val| {
-            assert_struct(val, "AtomicUsize", |i, member| match i {
-                0 => assert_member(member, "v", |val| {
-                    assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                        assert_member(member, "value", |val| {
-                            assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                        })
-                    })
-                }),
-                _ => panic!("1 member expected"),
-            })
+            assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
         }),
         1 => assert_member(member, "weak", |val| {
-            assert_struct(val, "AtomicUsize", |i, member| match i {
-                0 => assert_member(member, "v", |val| {
-                    assert_struct(val, "UnsafeCell<usize>", |_, member| {
-                        assert_member(member, "value", |val| {
-                            assert_scalar(val, "usize", Some(SupportedScalar::Usize(2)))
-                        })
-                    })
-                }),
-                _ => panic!("1 member expected"),
-            })
+            assert_atomic_scalar(val, "AtomicUsize", "usize", SupportedScalar::Usize(2))
         }),
         2 => assert_member(member, "data", |val| {
             assert_scalar(val, "i32", Some(SupportedScalar::I32(2)))
@@ -2388,7 +3317,9 @@ fn test_zst_types() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 496).unwrap();
@@ -2575,7 +3506,9 @@ fn test_read_static_in_fn_variable() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     // brkpt in function where static is declared
@@ -2607,7 +3540,9 @@ fn test_slice_operator() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 61).unwrap();
@@ -2677,7 +3612,9 @@ fn test_cast_pointers() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 119).unwrap();
@@ -2709,7 +3646,9 @@ fn test_read_uuid() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 519).unwrap();
@@ -2732,7 +3671,9 @@ fn test_address_operator() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 119).unwrap();
@@ -2852,7 +3793,9 @@ fn test_read_time() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 529).unwrap();
@@ -2865,6 +3808,47 @@ fn test_read_time() {
     assert_system_time(system_time.value(), (0, 0));
     assert_instant(instant.value());
 
+    // Phase 1 S5: SystemTime renders as ISO-8601 / RFC3339 UTC.
+    // The debugee constructs `SystemTime::UNIX_EPOCH` so the format
+    // is fixed across platforms: "1970-01-01T00:00:00Z".
+    use bugstalker::debugger::variable::render::ValueLayout;
+    let st_layout = system_time
+        .value()
+        .value_layout()
+        .expect("SystemTime layout missing");
+    match st_layout {
+        ValueLayout::PreRendered(s) => {
+            assert_eq!(s.as_ref(), "1970-01-01T00:00:00Z");
+        }
+        other => panic!("expected PreRendered ISO-8601, got {other:?}"),
+    }
+
+    // Phase 1 S5: Instant renders as `now ± HH:MM:SS.mmm`. The
+    // direction sign and digit-shape are stable; the wall-clock
+    // delta against `now` isn't, so we just check the prefix +
+    // shape (`now ` + sign + 8-digit time + 4-digit fractional).
+    let inst_layout = instant
+        .value()
+        .value_layout()
+        .expect("Instant layout missing");
+    match inst_layout {
+        ValueLayout::PreRendered(s) => {
+            let s = s.as_ref();
+            assert!(
+                s.starts_with("now + ") || s.starts_with("now - "),
+                "Instant should render as `now ± …`, got {s:?}"
+            );
+            // After `now ± `, expect "HH:MM:SS.mmm" — 12 chars.
+            let suffix = &s[6..];
+            assert_eq!(
+                suffix.len(),
+                12,
+                "Instant time format should be 12 chars (HH:MM:SS.mmm), got {suffix:?}"
+            );
+        }
+        other => panic!("expected PreRendered Instant delta, got {other:?}"),
+    }
+
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);
 }
@@ -2875,7 +3859,9 @@ fn test_debug_trait_repr_vars() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("vars.rs", 641).unwrap();
@@ -2925,7 +3911,9 @@ fn test_debug_trait_repr_args() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_fn("debug_fmt_args").unwrap();

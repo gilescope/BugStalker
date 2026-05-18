@@ -1,0 +1,14 @@
+[package]
+name = "bs-viz-spec"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "BugStalker visualiser spec — binary format for `.bs_viz_spec` debuggee sections."
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use itertools::Itertools;
 use std::borrow::Cow;
 

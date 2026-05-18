@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use super::{AsyncError, Future, TaskBacktrace, types};
 use crate::{
     debugger::{
@@ -28,65 +29,233 @@ impl Task {
         Self { raw_ptr, id, repr }
     }
 
-    pub fn backtrace(self) -> Result<TaskBacktrace, AsyncError> {
+    pub fn backtrace(self, debugger: &Debugger) -> Result<TaskBacktrace, AsyncError> {
         Ok(TaskBacktrace {
             task_id: self.id,
             raw_ptr: self.raw_ptr,
-            futures: self.future_stack()?,
+            futures: build_chain_from_repr(self.repr, Some(debugger)),
         })
     }
+}
 
-    fn future_stack(self) -> Result<Vec<Future>, AsyncError> {
-        const AWAITEE_FIELD: &str = "__awaitee";
+const AWAITEE_FIELD: &str = "__awaitee";
+/// Phase 3 Feature D step 5 — depth cap on the recursive
+/// chain-builder. Each `Multi` branch counts as a recursion step;
+/// pathological nesting bails out with a leaf `UnknownFuture`.
+const MAX_BRANCH_DEPTH: u32 = 8;
 
-        let mut result = vec![];
+/// Build the linear future chain starting from a coroutine
+/// state-machine [`RustEnumValue`]. Walks `__awaitee` for the
+/// single-active-future case and emits a [`Future::Multi`] branch
+/// when the active variant carries 2+ coroutine-shaped fields
+/// (`tokio::join!` / `tokio::select!`-style shapes). When `debugger`
+/// is `Some`, also attempts Phase 3 step 6's deep dyn-Future recovery
+/// (re-read the awaitee at the recovered concrete TypeId).
+fn build_chain_from_repr(start: RustEnumValue, debugger: Option<&Debugger>) -> Vec<Future> {
+    build_chain_from_repr_bounded(start, MAX_BRANCH_DEPTH, debugger)
+}
 
-        let mut next_future_repr = Some(self.repr);
-        while let Some(next_future) = next_future_repr.take() {
-            let future = AsyncFnFuture::try_from(&next_future)?;
-            result.push(Future::AsyncFn(future));
+fn build_chain_from_repr_bounded(
+    start: RustEnumValue,
+    depth: u32,
+    debugger: Option<&Debugger>,
+) -> Vec<Future> {
+    let mut result: Vec<Future> = vec![];
 
-            let Some(member) = next_future.value else {
-                break;
-            };
-            let Value::Struct(val) = member.value else {
-                break;
-            };
+    if depth == 0 {
+        result.push(Future::UnknownFuture);
+        return result;
+    }
 
-            let awaitee = val.field(AWAITEE_FIELD);
-            match awaitee {
-                Some(Value::RustEnum(next_future)) => {
-                    next_future_repr = Some(next_future);
-                }
-                Some(Value::Struct(next_future)) => {
-                    let type_ident = &next_future.type_ident;
-                    let fmt_name = type_ident.name_fmt();
-                    match fmt_name {
-                        "Sleep" => {
-                            let future = weak_error!(TokioSleepFuture::try_from(next_future))
-                                .map(Future::TokioSleep)
-                                .unwrap_or(Future::UnknownFuture);
-                            result.push(future);
-                        }
-                        _ if fmt_name.contains("JoinHandle") => {
-                            let future = weak_error!(TokioJoinHandleFuture::try_from(next_future))
-                                .map(Future::TokioJoinHandleFuture)
-                                .unwrap_or(Future::UnknownFuture);
-                            result.push(future);
-                        }
-                        _ => {
-                            let future: CustomFuture = CustomFuture::from(&next_future);
-                            result.push(Future::Custom(future));
-                        }
-                    }
+    let mut next_future_repr = Some(start);
+    while let Some(next_future) = next_future_repr.take() {
+        let Ok(future) = AsyncFnFuture::try_from(&next_future) else {
+            break;
+        };
+        result.push(Future::AsyncFn(future));
 
-                    break;
-                }
-                _ => {}
-            }
+        let Some(member) = next_future.value else {
+            break;
+        };
+        let Value::Struct(val) = member.value else {
+            break;
+        };
+
+        // Phase 3 Feature D step 5 — collect every coroutine-shaped
+        // field of the active variant (excluding the canonical
+        // `__awaitee`), recursing through wrapper structs so that
+        // tokio's `select!` / `join!` desugars (which bury captured
+        // branch futures inside a `poll_fn(|cx| {...})` closure
+        // environment) are reachable. When two or more coroutine
+        // seeds exist, the variant is capturing parallel branches
+        // and we emit `Future::Multi` *in addition to* the linear
+        // `__awaitee` chain (if any).
+        let parallel_branches: Vec<RustEnumValue> =
+            collect_coroutine_seeds(&val, COROUTINE_SCAN_DEPTH);
+        if parallel_branches.len() >= 2 {
+            let branches = parallel_branches
+                .into_iter()
+                .map(|seed| build_chain_from_repr_bounded(seed, depth - 1, debugger))
+                .collect();
+            result.push(Future::Multi(branches));
         }
 
-        Ok(result)
+        let awaitee = val.field(AWAITEE_FIELD);
+        match awaitee {
+            Some(Value::RustEnum(next_future)) => {
+                next_future_repr = Some(next_future);
+            }
+            Some(Value::Struct(next_future)) => {
+                let fmt_name = next_future.type_ident.name_fmt();
+                let is_dyn_box = !matches!(fmt_name, "Sleep") && !fmt_name.contains("JoinHandle");
+                let leaf = if fmt_name == "Sleep" {
+                    weak_error!(TokioSleepFuture::try_from(next_future.clone()))
+                        .map(Future::TokioSleep)
+                        .unwrap_or(Future::UnknownFuture)
+                } else if fmt_name.contains("JoinHandle") {
+                    weak_error!(TokioJoinHandleFuture::try_from(next_future.clone()))
+                        .map(Future::TokioJoinHandleFuture)
+                        .unwrap_or(Future::UnknownFuture)
+                } else {
+                    Future::Custom(CustomFuture::from(&next_future))
+                };
+                result.push(leaf);
+
+                // Phase 3 Feature D step 6 (deeper half) — when the
+                // awaitee is a `Pin<Box<dyn Future>>`-shaped Custom
+                // future and a debugger handle is available, attempt
+                // the concrete-type re-read. D2b's annotation in
+                // `type_ident` already names the recovered concrete
+                // type; this step parses the pointee at that type
+                // and recurses into its state machine if it's a
+                // coroutine.
+                if is_dyn_box && let Some(dbg) = debugger {
+                    let probe = Value::Struct(next_future.clone());
+                    if let Some(loc) =
+                        crate::debugger::r#async::future::locate_dyn_future(&probe, 4)
+                        && let Some(re) = recover_concrete_future(dbg, &loc)
+                    {
+                        let inner = build_chain_from_repr_bounded(re, depth - 1, debugger);
+                        result.extend(inner);
+                    }
+                }
+
+                // Phase 3 Feature D `poll_fn`-closure walker — when
+                // the awaitee struct itself buries 2+ coroutine
+                // seeds (the canonical case is tokio's `select!` /
+                // `join!` macros: they wrap captured branch futures
+                // inside a `poll_fn(|cx| {...})` whose closure
+                // environment carries the futures as its captured
+                // locals). The same recursive scan we used on the
+                // active variant finds them here too.
+                let nested_seeds: Vec<RustEnumValue> =
+                    collect_coroutine_seeds(&next_future, COROUTINE_SCAN_DEPTH);
+                if nested_seeds.len() >= 2 {
+                    let branches = nested_seeds
+                        .into_iter()
+                        .map(|seed| build_chain_from_repr_bounded(seed, depth - 1, debugger))
+                        .collect();
+                    result.push(Future::Multi(branches));
+                }
+
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    result
+}
+
+/// Phase 3 Feature D step 5 + `poll_fn`-walker — recursive scan for
+/// coroutine state-machine values inside a struct. Skips the
+/// canonical `__awaitee` field (already followed linearly), only
+/// admits `RustEnumValue`s that pass `AsyncFnFuture::try_from` (so
+/// non-coroutine enums like `Option<T>` / `Result<T, E>` captured
+/// as locals don't pollute the branch list), and is depth-bounded.
+const COROUTINE_SCAN_DEPTH: u32 = 6;
+
+fn collect_coroutine_seeds(
+    s: &crate::debugger::variable::value::StructValue,
+    depth: u32,
+) -> Vec<RustEnumValue> {
+    if depth == 0 {
+        return vec![];
+    }
+    let mut found = vec![];
+    for m in &s.members {
+        if m.field_name.as_deref() == Some(AWAITEE_FIELD) {
+            continue;
+        }
+        match &m.value {
+            Value::RustEnum(re) => {
+                // Source of truth is the variant *state-name* parse
+                // performed by `AsyncFnFuture::try_from`. Step 1's
+                // `is_coroutine()` (a type-name check) is
+                // *deliberately not* used as a prefilter here — a
+                // future rustc could rename the synthesised type
+                // and silently drop matches; the state-name parse
+                // is robust against that. `is_coroutine()` is
+                // available as a separate diagnostic if a renderer
+                // needs to distinguish "ordinary RustEnum that
+                // happens to have an `Unresumed`-like variant" from
+                // "real coroutine".
+                if AsyncFnFuture::try_from(re).is_ok() {
+                    found.push(re.clone());
+                } else if let Some(active) = re.value.as_ref()
+                    && let Value::Struct(inner) = &active.value
+                {
+                    // Non-coroutine enum (e.g. tokio's `MaybeDone`,
+                    // `Option`, `Result`) — recurse into the active
+                    // variant's payload so branches buried under
+                    // join!-style wrappers stay reachable.
+                    let nested = collect_coroutine_seeds(inner, depth - 1);
+                    found.extend(nested);
+                }
+            }
+            Value::Struct(inner) => {
+                let nested = collect_coroutine_seeds(inner, depth - 1);
+                found.extend(nested);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Phase 3 Feature D step 6 (deeper half) — given a recovered
+/// concrete type name and the dyn-pointer's data address, look up
+/// the type DIE across every loaded `DebugInformation`, issue a
+/// `Dqe::DataCast` to read the pointee at that type, and return the
+/// resulting `RustEnumValue` if the type is a coroutine state
+/// machine. Any failure (type not found, parse error, non-enum
+/// result) returns `None` so the caller can degrade gracefully to
+/// the bare `Future::Custom` annotation.
+fn recover_concrete_future(
+    dbg: &Debugger,
+    loc: &crate::debugger::r#async::future::DynFutureLocator,
+) -> Option<RustEnumValue> {
+    use crate::debugger::variable::dqe::DataCast;
+
+    let (debug_info, unit_off, die_off) =
+        dbg.debugee.debug_info_all().into_iter().find_map(|di| {
+            let (u, d) = di.find_type_die_ref(&loc.concrete_name)?;
+            Some((di, u, d))
+        })?;
+
+    let dqe = Dqe::DataCast(DataCast::new(
+        loc.pointer,
+        debug_info.pathname(),
+        unit_off,
+        die_off,
+    ));
+
+    let mut results = weak_error!(dbg.read_variable(dqe))?;
+    let qr = results.pop_if_single_el()?;
+    if let Value::RustEnum(re) = qr.into_value() {
+        Some(re)
+    } else {
+        None
     }
 }
 
@@ -306,4 +475,157 @@ pub fn task_from_header<'a>(
     };
     let task = Task::from_enum_repr(ptr, task_id, future);
     Ok(task)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::debugger::debugee::dwarf::r#type::TypeIdentity;
+    use crate::debugger::variable::value::{Member, StructValue};
+
+    fn coroutine_enum(name: &str, state: &str) -> RustEnumValue {
+        // Minimum-viable shape for `AsyncFnFuture::try_from` to
+        // succeed: outer enum with a struct member whose name is one
+        // of the recognised state strings.
+        RustEnumValue {
+            type_ident: TypeIdentity::no_namespace(name),
+            type_id: None,
+            value: Some(Box::new(Member {
+                field_name: Some("0".to_string()),
+                value: Value::Struct(StructValue {
+                    type_ident: TypeIdentity::no_namespace(state),
+                    type_id: None,
+                    members: vec![],
+                    type_params: Default::default(),
+                    raw_address: None,
+                    vtable_view: None,
+                }),
+            })),
+            raw_address: None,
+            await_location: None,
+        }
+    }
+
+    fn struct_with(name: &str, members: Vec<Member>) -> StructValue {
+        StructValue {
+            type_ident: TypeIdentity::no_namespace(name),
+            type_id: None,
+            members,
+            type_params: Default::default(),
+            raw_address: None,
+            vtable_view: None,
+        }
+    }
+
+    #[test]
+    fn collect_coroutine_seeds_skips_awaitee_field() {
+        // The canonical `__awaitee` field is *always* skipped — the
+        // outer linear walker is responsible for following it. Other
+        // RustEnum members are picked up.
+        let s = struct_with(
+            "ActiveVariant",
+            vec![
+                Member {
+                    field_name: Some(AWAITEE_FIELD.to_string()),
+                    value: Value::RustEnum(coroutine_enum("ChildFn", "Suspend0")),
+                },
+                Member {
+                    field_name: Some("branch_a".to_string()),
+                    value: Value::RustEnum(coroutine_enum("BranchAFn", "Suspend0")),
+                },
+            ],
+        );
+        let seeds = collect_coroutine_seeds(&s, 4);
+        assert_eq!(seeds.len(), 1);
+    }
+
+    #[test]
+    fn collect_coroutine_seeds_filters_non_coroutine_enums() {
+        // An enum whose inner state-name doesn't match the
+        // AsyncFnFuture state set should NOT count as a seed
+        // (otherwise an `Option<T>` captured as a local pollutes the
+        // branch list).
+        let bogus = RustEnumValue {
+            type_ident: TypeIdentity::no_namespace("Option<i32>"),
+            type_id: None,
+            value: Some(Box::new(Member {
+                field_name: Some("0".to_string()),
+                value: Value::Struct(StructValue {
+                    type_ident: TypeIdentity::no_namespace("Some"),
+                    type_id: None,
+                    members: vec![],
+                    type_params: Default::default(),
+                    raw_address: None,
+                    vtable_view: None,
+                }),
+            })),
+            raw_address: None,
+            await_location: None,
+        };
+        let s = struct_with(
+            "ActiveVariant",
+            vec![Member {
+                field_name: Some("local".to_string()),
+                value: Value::RustEnum(bogus),
+            }],
+        );
+        assert!(collect_coroutine_seeds(&s, 4).is_empty());
+    }
+
+    #[test]
+    fn collect_coroutine_seeds_descends_through_pollfn_wrapper() {
+        // The poll_fn walker case: branches are nested inside a
+        // wrapper struct (the closure environment). Recursion finds
+        // them.
+        let inner_env = struct_with(
+            "ClosureEnv",
+            vec![
+                Member {
+                    field_name: Some("__0".to_string()),
+                    value: Value::RustEnum(coroutine_enum("FastFn", "Suspend0")),
+                },
+                Member {
+                    field_name: Some("__1".to_string()),
+                    value: Value::RustEnum(coroutine_enum("SlowFn", "Suspend0")),
+                },
+            ],
+        );
+        let outer = struct_with(
+            "PollFn",
+            vec![Member {
+                field_name: Some("f".to_string()),
+                value: Value::Struct(inner_env),
+            }],
+        );
+        let seeds = collect_coroutine_seeds(&outer, 4);
+        assert_eq!(
+            seeds.len(),
+            2,
+            "expected 2 branches inside the PollFn wrapper, got {}",
+            seeds.len()
+        );
+    }
+
+    #[test]
+    fn collect_coroutine_seeds_depth_cap_protects_against_pathology() {
+        // 5 levels deep, cap = 2 → walker bails before reaching
+        // the inner coroutine.
+        let mut s = struct_with(
+            "Inner",
+            vec![Member {
+                field_name: Some("c".to_string()),
+                value: Value::RustEnum(coroutine_enum("Buried", "Suspend0")),
+            }],
+        );
+        for _ in 0..4 {
+            s = struct_with(
+                "Wrap",
+                vec![Member {
+                    field_name: Some("inner".to_string()),
+                    value: Value::Struct(s),
+                }],
+            );
+        }
+        assert!(collect_coroutine_seeds(&s, 2).is_empty());
+    }
 }

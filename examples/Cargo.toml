@@ -3,9 +3,15 @@ members = [
     "pastebin",
     "todos",
     "tokiotiker",
+    "tokio_simple_await",
+    "tokio_chained_await",
+    "tokio_select",
+    "tokio_join",
+    "tokio_dyn_future",
     "calc",
     "fizzbuzz",
     "hello_world",
+    "showcase",
     "vars",
     "mt",
     "recursion",
@@ -26,6 +32,7 @@ members = [
     "dap_set_variable",
     "dap_data_breakpoints",
     "dap_source_map",
+    "viz_demo",
 ]
 
 exclude = [

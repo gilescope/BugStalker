@@ -1,0 +1,216 @@
+// Migrated from tests/integration/test_variables.py::test_address.
+// Exercises the address-of (`&`) and deref (`*`) operators across
+// several breakpoints. Each `assert.var` runs a DQE expression.
+
+{ method: "break.set", params: { at: "vars.rs:30"  } }
+{ method: "break.set", params: { at: "vars.rs:53"  } }
+{ method: "break.set", params: { at: "vars.rs:61"  } }
+{ method: "break.set", params: { at: "vars.rs:119" } }
+{ method: "break.set", params: { at: "vars.rs:168" } }
+{ method: "break.set", params: { at: "vars.rs:290" } }
+{ method: "run" }
+
+// bp 1 — vars.rs:30  (scalars in scope)
+{ method: "assert.var", params: { expression: "&int8",  hint: "&i8 — address-of scalar",
+expect: {
+  items: [
+    {
+      name: "int8",
+      type: "&i8",
+      value_text: { $regex: "^\\&i8 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*&int8", hint: "*&i8 round-trip → i8",
+expect: {
+  items: [{ name: "int8", type: "i8", value_text: "i8(1)" }],
+  total: 1,
+  truncated: false
+}
+} }
+
+{ method: "continue" }
+// bp 2 — vars.rs:53  (structs / tuples in scope)
+{ method: "assert.var", params: { expression: "&tuple_1",       hint: "&(f64, f64)",
+expect: {
+  items: [
+    {
+      name: "tuple_1",
+      type: "&(f64, f64)",
+      value_text: { $regex: "^\\&\\(f64, f64\\) \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*&tuple_1",      hint: "*& → (f64, f64)",
+expect: {
+  items: [
+    {
+      name: "tuple_1",
+      type: "(f64, f64)",
+      value_text: "(0, 1.1)"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "&tuple_1.__0",   hint: "&f64 inside tuple",
+expect: {
+  items: [
+    {
+      name: "tuple_1",
+      type: "&f64",
+      value_text: { $regex: "^\\&f64 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*&tuple_1.__0",  hint: "deref of field address",
+expect: {
+  items: [{ name: "tuple_1", type: "f64", value_text: "f64(0)" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "&foo2.foo.bar",  hint: "&i32 deep inside nested struct",
+expect: {
+  items: [
+    {
+      name: "foo2",
+      type: "&i32",
+      value_text: { $regex: "^\\&i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*&foo2.foo.bar", hint: "deref of deep field address",
+expect: {
+  items: [{ name: "foo2", type: "i32", value_text: "i32(100)" }],
+  total: 1,
+  truncated: false
+}
+} }
+
+{ method: "continue" }
+// bp 3 — vars.rs:61  (arrays in scope)
+{ method: "assert.var", params: { expression: "&arr_1",     hint: "&[i32; 5]",
+expect: {
+  items: [
+    {
+      name: "arr_1",
+      type: "&[i32]",
+      value_text: { $regex: "^\\&\\[i32\\] \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*&arr_1",    hint: "deref → [i32; 5]",
+expect: {
+  items: [
+    {
+      name: "arr_1",
+      type: "[i32]",
+      value_text: "[i32] [1, -1, 2, -2, 3]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "&arr_1[3]",  hint: "&i32 indexed slot",
+expect: {
+  items: [
+    {
+      name: "arr_1",
+      type: "&i32",
+      value_text: { $regex: "^\\&i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*&arr_1[3]", hint: "deref to element value",
+expect: {
+  items: [{ name: "arr_1", type: "i32", value_text: "i32(-2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+
+{ method: "continue" }
+// bp 4 — vars.rs:119 (references in scope)
+{ method: "assert.var", params: { expression: "&ref_a",   hint: "address of a reference",
+expect: {
+  items: [
+    {
+      name: "ref_a",
+      type: "&&i32",
+      value_text: { $regex: "^\\&\\&i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*&ref_a",  hint: "round-trip → &i32",
+expect: {
+  items: [
+    {
+      name: "ref_a",
+      type: "&i32",
+      value_text: { $regex: "^\\&i32 \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "**&ref_a", hint: "double deref → i32",
+expect: {
+  items: [{ name: "ref_a", type: "i32", value_text: "i32(2)" }],
+  total: 1,
+  truncated: false
+}
+} }
+
+{ method: "continue" }
+// bp 5 — vars.rs:168 (globals in scope)
+{ method: "assert.var", params: { expression: "&GLOB_1",  hint: "&&str",
+expect: {
+  items: [
+    {
+      name: "GLOB_1",
+      type: "&&str",
+      value_text: { $regex: "^\\&\\&str \\[0x[0-9a-fA-F]+\\]$" }
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { expression: "*&GLOB_1", hint: "deref → &str",
+expect: {
+  items: [
+    {
+      name: "GLOB_1",
+      type: "&str",
+      value_text: "&str(\"glob_1\")"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

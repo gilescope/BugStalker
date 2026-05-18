@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Debugger application entry point.
 
 use bugstalker::dap;
@@ -16,8 +17,14 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+/// `--version` output. We carry the build stamp from `build.rs` so
+/// `bs --version` is enough to tell a stale `~/.cargo/bin/bs` (or a
+/// pre-fix tarball install) from a fresh local build — no mtime
+/// archaeology required.
+const BS_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("BS_BUILD_STAMP"), ")");
+
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = BS_VERSION, about, long_about = None)]
 pub struct Args {
     /// Start with terminal ui
     #[clap(long)]
@@ -40,6 +47,49 @@ pub struct Args {
     /// DAP: log file for adapter diagnostics
     #[clap(long)]
     dap_log_file: Option<PathBuf>,
+
+    /// Phase 9 AI-bot scripting front-end: read JSON-RPC 2.0 requests
+    /// (JSON5 with comments allowed) on stdin, write responses + events
+    /// on stdout. See `doc/scripting/usage.md`.
+    #[clap(long)]
+    #[arg(default_value_t = false)]
+    script: bool,
+
+    /// Test-runner mode: read the given .json5 script, dispatch every
+    /// request through the same engine `--script` uses, accumulate
+    /// `assert.*` results into TAP 14 on stdout, and exit `0` if every
+    /// assertion passed (else `1`). See `doc/scripting/usage.md`.
+    #[clap(long, value_name = "SCRIPT")]
+    test: Option<PathBuf>,
+
+    /// Combined with `--test`: rewrite mismatched `expect:` blocks in
+    /// the script in place using the current responses. Idempotent.
+    /// `0x…` addresses are auto-masked into `$regex` placeholders.
+    #[clap(long, requires = "test")]
+    #[arg(default_value_t = false)]
+    bless: bool,
+
+    /// With `--bless` or `--record`: skip the address auto-mask
+    /// step. Use when you want a recorded test to assert on a
+    /// literal `0x…` value.
+    #[clap(long)]
+    #[arg(default_value_t = false)]
+    no_masks: bool,
+
+    /// Recorder mode: take a JSON-RPC stream on stdin (same wire
+    /// format as `--script`), tee every request into the given file
+    /// as a runnable test script. Read-only inspections (`var`,
+    /// `arg`, `frame.info`) auto-promote to `assert.*` blocks pinned
+    /// against the observed response.
+    #[clap(long, value_name = "OUT")]
+    record: Option<PathBuf>,
+
+    /// Pure metadata mode: write the JSON Schema catalogue of every
+    /// scripting method to stdout and exit. Pair with `bs --script` to
+    /// drive the debugger from an agent.
+    #[clap(long)]
+    #[arg(default_value_t = false)]
+    describe_commands: bool,
 
     /// Attach to running process PID
     #[clap(long, short)]
@@ -111,10 +161,51 @@ impl From<&Args> for UIConfig {
     }
 }
 
+/// Print a one-line warning to stderr when bs starts on a macOS
+/// kernel known to force-reboot under bs's mach syscall traffic.
+/// Three byte-identical kernel panics captured on
+/// `xnu-12377.101.15 / 25E253` so far; see
+/// `doc/macos-26.4.1-panic-risk.md`. Suppress with
+/// `BS_DARWIN_PANIC_WARN=0` once you've internalised the risk.
+fn warn_macos_panic_risk_once() {
+    #[cfg(target_os = "macos")]
+    {
+        if std::env::var_os("BS_DARWIN_PANIC_WARN").as_deref() == Some(std::ffi::OsStr::new("0")) {
+            return;
+        }
+        // Probe the running kernel build. `uname -v` looks like
+        //   "Darwin Kernel Version 25.4.0: Thu Mar 19 19:26:07 PDT 2026; root:xnu-12377.101.15~1/RELEASE_ARM64_T6031"
+        let kver = std::process::Command::new("uname")
+            .arg("-v")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let is_known_bad = kver.contains("xnu-12377.101.15");
+        if !is_known_bad {
+            return;
+        }
+        eprintln!(
+            "[bs] WARNING: macOS kernel xnu-12377.101.15 is known to \
+             force-reboot the host under bs's mach syscall load."
+        );
+        eprintln!(
+            "[bs]          Apple Feedback Assistant report filed \
+             2026-05-15; see doc/macos-26.4.1-panic-risk.md."
+        );
+        eprintln!(
+            "[bs]          Suppress this warning with \
+             BS_DARWIN_PANIC_WARN=0 once you've internalised the risk."
+        );
+    }
+}
+
 fn main() {
     let logger = env_logger::Logger::from_default_env();
     let filter = logger.filter();
     LOGGER_SWITCHER.switch(logger, filter);
+
+    warn_macos_panic_risk_once();
 
     let args = Args::parse();
     ui::config::set(UIConfig::from(&args));
@@ -123,6 +214,14 @@ fn main() {
     }
 
     rust::Environment::init(args.std_lib_path.as_ref().map(fun_name));
+
+    // --describe-commands is a pure metadata path: no debuggee required.
+    if args.describe_commands {
+        let mut stdout = std::io::stdout().lock();
+        bugstalker::ui::script::run_describe(&mut stdout)
+            .unwrap_or_exit(ErrorKind::Io, "describe-commands");
+        return;
+    }
 
     let debugee_src = || {
         if let Some(ref debugee) = args.debugee {
@@ -140,6 +239,50 @@ fn main() {
             );
         }
     };
+
+    // --script bypasses the supervisor entirely. JSON-RPC over stdio.
+    if args.script {
+        bugstalker::ui::script::run_script(debugee_src(), args.oracle.clone())
+            .unwrap_or_exit(ErrorKind::Io, "script");
+        return;
+    }
+
+    // --record drives a JSON-RPC session and writes a runnable test
+    // script as we go. Same wire format as --script for the inputs
+    // and outputs.
+    if let Some(out_path) = args.record.clone() {
+        bugstalker::ui::script::run_record(
+            &out_path,
+            debugee_src(),
+            args.oracle.clone(),
+            !args.no_masks,
+        )
+        .unwrap_or_exit(ErrorKind::Io, "record");
+        return;
+    }
+
+    // --test reads a script file, accumulates assertions into TAP, and
+    // exits with 0 on all-pass / 1 on any failure or bail-out. Same
+    // dispatcher as --script underneath. `--bless` rewrites mismatched
+    // expect blocks instead of failing.
+    if let Some(script_path) = args.test.clone() {
+        let opts = if args.bless {
+            bugstalker::ui::script::RunOptions {
+                bless: true,
+                address_masking: !args.no_masks,
+            }
+        } else {
+            bugstalker::ui::script::RunOptions::default()
+        };
+        let code = bugstalker::ui::script::run_test_with(
+            &script_path,
+            debugee_src(),
+            args.oracle.clone(),
+            opts,
+        )
+        .unwrap_or_exit(ErrorKind::Io, "test");
+        exit(code);
+    }
 
     // Determine interface mode
     let interface = if args.dap_local {

@@ -1,0 +1,86 @@
+// Migrated from tests/integration/test_variables.py::test_read_enum.
+
+{ method: "break.set", params: { at: "vars.rs:93" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "enum_1", hint: "C-style EnumA::B",
+expect: {
+  items: [{ name: "enum_1", type: "EnumA", value_text: "EnumA::B" }],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "enum_2", hint: "EnumC::C(char)",
+expect: {
+  items: [
+    { name: "enum_2", type: "EnumC", value_text: "EnumC::C(b)" }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "enum_3", hint: "EnumC::D(f64, f32)",
+expect: {
+  items: [
+    {
+      name: "enum_3",
+      type: "EnumC",
+      value_text: "EnumC::D(1.1, 1.2)"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "enum_4", hint: "EnumC::E unit variant",
+expect: {
+  items: [
+    {
+      name: "enum_4",
+      type: "EnumC",
+      value_text: "EnumC::E {\n}"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "enum_5", hint: "EnumF::F wrapping EnumC::C",
+expect: {
+  items: [
+    {
+      name: "enum_5",
+      type: "EnumF",
+      value_text: "EnumF::F(EnumC::C(f))"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "enum_6", hint: "EnumF::G wrapping struct Foo",
+expect: {
+  items: [
+    {
+      name: "enum_6",
+      type: "EnumF",
+      value_text: "EnumF::G(Foo {\n    a: i32(1)\n    b: char(1)\n})"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }
+{ method: "assert.var", params: { name: "enum_7", hint: "EnumF::J wrapping EnumA::A",
+expect: {
+  items: [
+    {
+      name: "enum_7",
+      type: "EnumF",
+      value_text: "EnumF::J(EnumA::A)"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

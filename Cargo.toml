@@ -1,3 +1,37 @@
+[workspace]
+members = [".", "crates/*"]
+# examples/ is its own workspace (separate Cargo.lock); never pull it in.
+# Note: nested `examples/tokio_tcp/tokio_1_4X` and
+# `examples/tokio_vars/tokio_1_4X` packages each carry their own empty
+# `[workspace]` table so cargo stops walking up; adding them here doesn't
+# help because the exclude check matches against this root's own dir tree.
+exclude = ["examples", "examples/target", "fuzz"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.89.0"
+license = "MIT"
+repository = "https://github.com/godzie44/BugStalker"
+authors = ["Derevtsov Konstantin <godzie@yandex.ru>"]
+
+# Shared deps for new workspace crates. Versions track the root crate so
+# the lockfile stays single-resolved. Root [dependencies] keep their
+# explicit versions until per-dep migration to `.workspace = true` lands.
+[workspace.dependencies]
+gimli = "=0.33.0"
+object = "0.32.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+proptest = "1"
+arbitrary = { version = "1", features = ["derive"] }
+rustix = "0.38"
+thiserror = "1"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+criterion = "0.5"
+
 [package]
 name = "bugstalker"
 version = "0.4.5"
@@ -12,12 +46,19 @@ repository = "https://github.com/godzie44/BugStalker"
 keywords = ["debugger", "debug", "gdb"]
 categories = ["command-line-utilities", "development-tools::debugging"]
 build = "build.rs"
-exclude = ["/.github", "/doc", "/website", "/extension"]
+exclude = ["/.github", "/doc", "/website", "/extension", "/crates", "/fuzz"]
 
 [[bin]]
 bench = false
 path = "src/main.rs"
 name = "bs"
+
+# Library doesn't ship benchmarks of its own; the workspace bench
+# scaffolding lives under `benches/` (see `[[bench]]` entries below).
+# Disabling the libtest bench harness keeps `cargo bench -- --quick`
+# usable across the workspace without libtest rejecting the flag.
+[lib]
+bench = false
 
 [profile.release]
 codegen-units = 1
@@ -33,16 +74,43 @@ nix = { version = "0.27.1", features = [
 ] }
 once_cell = "1.21.3"
 anyhow = "1.0.100"
+blake3 = { version = "=1.5.5", default-features = false, features = ["pure"] }
 rustyline = "17.0.2"
 rustyline-derive = "0.11.1"
 gimli = "=0.33.0"
+# Phase 9 follow-up — canonical PC→function (and inline chain) lookup.
+# Pinned to the addr2line release whose gimli dep matches ours
+# exactly; doing the inline-frame walk by hand is what the upstream
+# crate already does correctly (see `addr2line/src/function.rs`).
+addr2line = "=0.26.1"
+# macOS arm64 unwind: Rust release+debug binaries put most functions
+# in `__compact_unwind` (indexed by `__unwind_info`); `__eh_frame`
+# only covers functions whose unwinder is too complex for the
+# compact encoding. Without this, bs can't compute CFA / frame_base
+# for the majority of functions on macOS arm64, so variable reads
+# at PCs whose function lacks eh_frame coverage return garbage.
+# Crate is from the same Mozilla / Markus Stange family that
+# maintains addr2line; zero-copy parser used by Firefox Profiler.
+macho-unwind-info = "0.5"
 object = "0.32.2"
 memmap2 = "0.9.9"
 ouroboros = "0.18.5"
 typed-arena = "2.0.2"
 fallible-iterator = "0.3.0"
 itertools = "0.12.1"
-rustc-demangle = "0.1.26"
+rust-mangle-tree = { path = "crates/rust-mangle-tree" }
+bs-viz-spec = { path = "crates/bs-viz-spec" }
+# Phase 5 Tier 1 navigation primitives — TraceReplayer +
+# ReverseDebugger. Cross-platform; the Linux-only record/replay
+# bits aren't reached from the REPL handler.
+bs-replay-driver = { path = "crates/bs-replay-driver" }
+# Live reverse stepping on macOS uses the Mach writable-memory checkpoint
+# primitives directly; trace-file navigation stays in bs-replay-driver.
+bs-replay = { path = "crates/bs-replay" }
+# Phase 6 perf overlay. Optional at the root so default builds keep
+# zero perf collector/linkage overhead; `bs-perf` itself stays pure
+# Rust until its `intel-pt` feature is enabled.
+bs-perf = { path = "crates/bs-perf", optional = true }
 thiserror = "1.0.69"
 bytes = "1.11.0"
 log = "0.4.29"
@@ -52,7 +120,6 @@ clap = { version = "4.5", features = ["derive", "env"] }
 uuid = { version = "1.19.0", features = ["v4", "fast-rng", "macro-diagnostics"] }
 os_pipe = "1.2.3"
 proc-maps = "0.3.2"
-thread_db = "0.1.4"
 smallvec = "1.15.1"
 rand = "0.8.5"
 ctrlc = "3.5.1"
@@ -60,7 +127,7 @@ strum = "0.26.3"
 strum_macros = "0.26.4"
 signal-hook = "0.3.18"
 rayon = "1.11.0"
-trie-rs = "0.2.0"
+trie-rs = "0.4.2"
 regex = "1.12.2"
 walkdir = "2.5.0"
 timeout-readwrite = "0.3.3"
@@ -70,7 +137,7 @@ syntect = "5.3.0"
 unicode-width = "0.1.14"
 tui-realm-treeview = { version = "3" }
 capstone = "0.11.0"
-lru = "0.12.5"
+lru = "0.16.3"
 chrono = "0.4.42"
 sysinfo = "0.30.13"
 indexmap = "2.12.1"
@@ -80,16 +147,82 @@ bit_field = "0.10.3"
 base64 = "0.22.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
+# Phase 9 scripting front-end: input parser. JSON5 is a strict superset of
+# JSON that allows comments and trailing commas, which is what an agent
+# (or human) writing a script wants.
+json5 = "0.4"
+# Phase 9: schema generation for `--describe-commands`. Reflective schemas
+# from the request/response types directly — keeps the schema in lockstep
+# with the wire format with no hand-rolling.
+schemars = { version = "0.8", features = ["preserve_order"] }
 toml = "0.8.23"
 home = "0.5.12"
 which = "6.0.3"
 string-interner = "0.19.0"
 libc = "0.2"
 
+# thread_db wraps glibc's libthread_db for TLS variable access.
+# Linux-only: there's no equivalent library on macOS (TLS lookup goes
+# via Mach thread_get_state + the glibc-equivalent in libpthread).
+# Pinned to gilescope/thread_db's giles-aarch64-support branch until
+# aarch64 support is upstreamed (the crates.io 0.1.4 release is
+# x86_64/i686 only). Pinned by rev for reproducibility.
+[target.'cfg(target_os = "linux")'.dependencies.thread_db]
+git = "https://github.com/gilescope/thread_db"
+rev = "c36ca728d12aff4083375b7823fcf5794c2438a5"
+
+# Mach kernel bindings for the macOS debuggee backend: task_for_pid,
+# mach_vm_read_overwrite/mach_vm_write, thread_get_state, and the
+# exception-port machinery. mach2 is the maintained successor to
+# the original `mach` crate; both expose autogenerated bindings to
+# `<mach/*.h>` so we don't have to hand-roll every struct.
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.6"
+
 [dev-dependencies]
 serial_test = "3.2.0"
+criterion = { workspace = true }
+bs-test-harness = { path = "crates/bs-test-harness" }
+# PTY-driven integration tests. `expectrl` is a `pexpect` port that
+# spawns the inferior via `posix_spawn` (not `fork`), so the test
+# process can have background threads — HTTP clients, signal
+# senders — without the fork-multithreaded deadlocks the legacy
+# Python `pty.spawn()` tests trip into.
+expectrl = "0.7"
 
 [features]
 default = []
 nightly = []
 int_test = ["nightly"]
+perf = ["dep:bs-perf"]
+intel-pt = ["perf", "bs-perf/intel-pt"]
+
+# Bench scaffolding. Each bench seeds a Criterion baseline so
+# `ci-bench.yml` can flag >10 % regressions vs the trailing 7-day
+# median (see `doc/plans/phase-0-preflight.md`). Bodies pulled
+# forward from Phase 8 — `render_value` measures the Phase 1
+# specialised renderer over a captured set of stdlib values;
+# `attach_cold` measures debugger setup → first breakpoint hit on
+# `examples/hello_world`.
+# PTY-driven integration tests (Rust port of the legacy
+# `tests/integration/*.py` harness). Gated behind `int_test` so a
+# plain `cargo test` — used by the rustc-matrix and arm64 CI jobs —
+# does not try to drive them. They need a release `bs` binary
+# (`make build-test-rel`) and the `int_test` feature, which strips
+# ANSI colour codes from bs's output so `expect_exact` sees plain
+# text. The integ job in `.github/workflows/ci.yml` opts in with
+# `cargo test --test integ --features int_test`.
+[[test]]
+name = "integ"
+path = "tests/integ/main.rs"
+required-features = ["int_test"]
+
+[[bench]]
+name = "render_value"
+path = "benches/render_value.rs"
+harness = false
+
+[[bench]]
+name = "attach_cold"
+path = "benches/attach_cold.rs"
+harness = false

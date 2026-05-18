@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use std::{
     collections::{HashMap, hash_map::Entry},
     rc::Rc,

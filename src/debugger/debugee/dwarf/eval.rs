@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::address::{GlobalAddress, RelocatedAddress};
 use crate::debugger::debugee::Debugee;
 use crate::debugger::debugee::dwarf::unit::BsUnit;
@@ -91,11 +92,52 @@ impl<'a> RequirementsResolver<'a> {
         self.debugee.mapping_offset_for_pc(ecx.location().pc)
     }
 
+    #[cfg(target_os = "linux")]
     fn resolve_tls(&self, pid: Pid, offset: u64) -> Result<RelocatedAddress, Error> {
         let lm_addr = self.debugee.rendezvous().link_map_main();
         self.debugee
             .tracee_ctl()
             .tls_addr(pid, lm_addr, offset as usize)
+    }
+
+    /// Mach-O / darwin TLS resolution.
+    ///
+    /// `DW_OP_form_tls_address` on darwin pushes the *static* (pre-
+    /// slide) VA of a `tlv_descriptor` in `__DATA,__thread_vars`.
+    /// We add the slide of the dylib containing the current PC —
+    /// for any well-formed Rust binary the descriptor lives in the
+    /// same dylib as its access points, so the PC's slide matches
+    /// the descriptor's slide. Then `darwin_mach::resolve_tlv` reads
+    /// the descriptor and walks the thread's pthread TSD.
+    #[cfg(not(target_os = "linux"))]
+    fn resolve_tls(&self, pid: Pid, offset: u64) -> Result<RelocatedAddress, Error> {
+        use crate::debugger::darwin_mach;
+        // The focus pid may be a synthetic per-thread Pid (worker
+        // threads tracked by `Tracer::reconcile_threads`); the kernel
+        // rejects `task_for_pid` on those. `…_or_proc` falls back to
+        // the inferior's task port, which is what we want — TLS
+        // descriptors live in the process address space, only the
+        // thread-local *slot* is per-thread. The thread port lookup
+        // already understands synthetic Pids via the registry.
+        let task = darwin_mach::task_for_pid_or_proc(pid).map_err(Error::from)?;
+        let thread = darwin_mach::thread_port_for_pid_or_first(pid).map_err(Error::from)?;
+        // Slide for the dylib that owns the descriptor: try each
+        // loaded image (small list) and use the first slide that
+        // produces a readable, plausibly-initialised descriptor.
+        // Iterating is robust against the TLS-in-dylib case without
+        // requiring a static-VA → dylib registry.
+        let mut last_err: Option<Error> = None;
+        for dwarf in self.debugee.debug_info_all() {
+            let Ok(slide) = self.debugee.mapping_offset_for_file(dwarf) else {
+                continue;
+            };
+            let runtime = offset.wrapping_add(slide as u64);
+            match darwin_mach::resolve_tlv(task, thread, runtime) {
+                Ok(addr) => return Ok(RelocatedAddress::from(addr as usize)),
+                Err(e) => last_err = Some(Error::from(e)),
+            }
+        }
+        Err(last_err.unwrap_or(Error::Ptrace(nix::errno::Errno::EFAULT)))
     }
 
     fn debug_addr_section(
@@ -204,6 +246,14 @@ impl<'a> ExpressionEvaluator<'a> {
 
     pub fn unit(&self) -> &BsUnit {
         self.unit
+    }
+
+    /// Phase 3 Feature A — expose the [`Debugee`] so the trait-
+    /// object resolver in `crate::debugger::variable::value::parser`
+    /// can read the symbol table by address (vtable resolution
+    /// strategy 2).
+    pub fn debugee(&self) -> &'a Debugee {
+        self.resolver.debugee
     }
 
     fn value_type_from_offset(&self, base_type: UnitOffset) -> ValueType {

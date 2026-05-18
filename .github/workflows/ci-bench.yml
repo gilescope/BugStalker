@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: MIT
+#
+# Nightly bench suite per `doc/plans/phase-0-preflight.md`.
+# Runs criterion against the workspace, archives the `target/criterion`
+# reports, and (in a future commit) posts a PR comment when any bench
+# regresses by >10 % vs the trailing 7-day median.
+#
+# Phase 0 ships the workflow shape with placeholder benches. Real
+# workloads land per-crate as Phases 1+ add `crates/rust-mangle-tree`,
+# `crates/bs-perf`, etc.
+name: CI / bench
+
+on:
+  schedule:
+    # 02:09 UTC, daily. Different slot from ci-nightly so the bench
+    # box (the 16-core x86 NixOS host, when it joins the runner pool)
+    # isn't competing with itself.
+    - cron: "9 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install rust toolchain
+        run: rustup toolchain install stable
+      - name: Install debug symbols
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libc6-dbg
+      - name: cargo bench --quick
+        run: cargo bench --workspace -- --quick
+      - name: Archive criterion reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: criterion-reports
+          path: target/criterion/
+          if-no-files-found: warn
+          retention-days: 30

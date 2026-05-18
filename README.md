@@ -1,11 +1,11 @@
 # BugStalker
 
 <p align="center">
-    <img src="website/static/img/biglogo.png" width="300"></a>
+    <img src="website/static/img/biglogo.png" width="300" alt="BugStalker logo">
     <br>
 </p>
 
-> Modern debugger for Linux x86-64. Written in Rust for Rust programs.
+> Modern debugger for Linux x86-64 (aarch64 experimental). Written in Rust for Rust programs.
 
 <h4 align="center">
   <a href="https://godzie44.github.io/BugStalker/docs/overview">Documentation</a> |
@@ -17,22 +17,22 @@
 <div align="center">
 
 <a href="https://github.com/godzie44/BugStalker/releases">
-    <img src="https://img.shields.io/github/v/release/godzie44/BugStalker?style=for-the-badge">
+    <img src="https://img.shields.io/github/v/release/godzie44/BugStalker?style=for-the-badge" alt="latest release">
 </a>
 
 <a href="https://crates.io/crates/bugstalker/">
-    <img src="https://img.shields.io/crates/v/bugstalker?style=for-the-badge">
+    <img src="https://img.shields.io/crates/v/bugstalker?style=for-the-badge" alt="crates.io">
 </a>
 
 <a href="https://github.com/godzie44/BugStalker/actions">
-    <img src="https://img.shields.io/github/actions/workflow/status/godzie44/BugStalker/ci.yml?style=for-the-badge&label=test">
+    <img src="https://img.shields.io/github/actions/workflow/status/godzie44/BugStalker/ci.yml?style=for-the-badge&label=test" alt="CI status">
 </a>
 
 <a href="https://docs.rs/bugstalker/">
-    <img src="https://img.shields.io/docsrs/bugstalker?style=for-the-badge">
+    <img src="https://img.shields.io/docsrs/bugstalker?style=for-the-badge" alt="docs.rs">
 </a>
 
-<img src="https://img.shields.io/crates/l/BugStalker?style=for-the-badge">
+<img src="https://img.shields.io/crates/l/BugStalker?style=for-the-badge" alt="MIT licensed">
 
 </div>
 
@@ -46,7 +46,6 @@
 
 ---
 
-
 ## Features
 
 * **Rust-native**: Built in Rust specifically for Rust development, with a focus on simplicity
@@ -57,7 +56,11 @@
 * **Advanced runtime inspection:**
   * Full multithreaded application support
   * Data query expressions
-  * Deep Rust type system integration (collections, smart pointers, thread locals, etc.), not only for printing but also for interaction
+  * Deep Rust type system integration — collections, smart pointers (`Box`, `Rc`, `Arc`, `Weak`),
+    sync primitives (`Mutex`/`RwLock` with `[locked]`/`[poisoned]` badges, `Atomic*`),
+    time (`Duration` as `1h 1m 1.500s`, `SystemTime`/`Instant` as RFC3339 / now-relative),
+    ranges, `Pin`, `MaybeUninit`, `NonNull`, `CString`, `OsString`/`PathBuf`, `&[u8]` utf-8 probe
+  * Slash-suffix format specs on `print`/`var`/`argd`: `/x`, `/b`, `/o`, `/d`, `/iso`
   * Variable rendering using core::fmt::Debug trait
 * **Flexible interfaces:**
   * Switch between console and TUI modes at any time
@@ -69,6 +72,33 @@
   * VSCode [extension](https://marketplace.visualstudio.com/items?itemName=BugStalker.bugstalker)
   * Two modes: stdio (embedded) and TCP (remote)
   * See [DAP Documentation](./doc/DAP.md) for details
+* **Time-travel debugging (Phase 5):**
+  * **Tier 1 reverse step** — navigation over a recorded trace
+    (`step` / `rstep` / `rcontinue` / breakpoint scan).
+  * **Tier 2 fork checkpoints** — Linux `fork(2)` + Darwin
+    `mach_vm_remap`-style snapshotter; ring buffer of up to 32
+    checkpoints with drop-oldest-via-SIGKILL eviction.
+  * **Tier 3 deterministic record + replay** — Linux x86-64.
+    PTRACE-only recorder captures every syscall (entry+exit
+    pairs), every signal, every classified non-deterministic
+    instruction (RDTSC/RDRAND/CPUID); replay-side seccomp NOTIF
+    intercepts every syscall and supplies the recorded result
+    via `process_vm_writev`. Pure-Rust trace format
+    (`rkyv` + `lz4_flex`); zero `*-sys` deps.
+  * **User-facing CLIs**: `replay-record /tmp/trace.bs --
+    /your/program`, then `replay-load /tmp/trace.bs --
+    /your/program` reproduces the recorded execution. See
+    [doc/phase-5-usage.md](./doc/phase-5-usage.md) for the
+    walkthrough.
+  * **Five workspace crates**: [`bs-syscall-spec`](./crates/bs-syscall-spec/),
+    [`bs-syscall-macro`](./crates/bs-syscall-macro/),
+    [`bs-replay-engine`](./crates/bs-replay-engine/),
+    [`bs-replay`](./crates/bs-replay/),
+    [`bs-replay-driver`](./crates/bs-replay-driver/) +
+    `bs/replay*` DAP shapes for IDE integration.
+  * **200+ tests** across the five crates;
+    [Phase 5 overview](./doc/phase-5-overview.md) tracks the
+    status of every plan sub-phase.
 * **And many more powerful features!**
 
 ---
@@ -84,8 +114,6 @@ Any contributions are very welcome.
 
 [How to contribute](https://github.com/godzie44/BugStalker/blob/master/CONTRIBUTING.md).
 
-
 ## Copyright
 
 © 2026 Derevtsov Konstantin. Distributed under the MIT License.
-

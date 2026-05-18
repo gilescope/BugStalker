@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::PlaceDescriptor;
 use crate::ui::syntax;
 use crate::ui::syntax::StylizedLine;

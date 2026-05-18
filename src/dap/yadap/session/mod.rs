@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! DAP session implementation (handlers, state machine, and integration with debugger).
 
 use crate::dap::transport::DapTransport;
@@ -6,6 +7,7 @@ use crate::dap::yadap::sourcemap::SourceMap;
 use crate::debugger;
 use crate::oracle::{Oracle, builtin};
 use anyhow::{Context, anyhow};
+use bs_replay_driver::ReverseDebugger;
 use log::{info, warn};
 use nix::unistd::Pid;
 use serde::Serialize;
@@ -20,9 +22,13 @@ use std::time::Duration;
 pub mod breakpoint;
 pub mod control;
 pub mod data;
+pub mod edit_continue;
 pub mod frame;
 pub mod init;
+pub mod live_reverse;
 pub mod other;
+pub mod perf;
+pub mod replay;
 pub mod source;
 
 pub struct DebugSession {
@@ -51,8 +57,13 @@ pub struct DebugSession {
     exception_filters: Vec<String>,
     last_stop: Option<control::LastStop>,
     module_info: Option<init::ModuleInfo>,
+    replay_session: Option<ReverseDebugger>,
+    #[allow(dead_code)] // populated/used on Linux only; reserved on macOS
+    live_reverse: live_reverse::LiveReverseHistory,
     canceled_request_ids: HashSet<i64>,
     canceled_progress_ids: HashSet<String>,
+    #[cfg(feature = "perf")]
+    perf_overlay: perf::PerfOverlaySession,
 }
 
 const EXCEPTION_FILTER_SIGNAL: &str = "signal";
@@ -123,8 +134,16 @@ impl DebugSession {
             ],
             last_stop: None,
             module_info: None,
+            replay_session: None,
+            // `LiveReverseHistory` is a unit struct on non-macOS,
+            // so clippy nags about `::default()` there; the macOS
+            // build has fields and needs the derive.
+            #[allow(clippy::default_constructed_unit_structs)]
+            live_reverse: live_reverse::LiveReverseHistory::default(),
             canceled_request_ids: HashSet::new(),
             canceled_progress_ids: HashSet::new(),
+            #[cfg(feature = "perf")]
+            perf_overlay: perf::PerfOverlaySession::default(),
         }
     }
 
@@ -198,6 +217,7 @@ impl DebugSession {
         self.vars.clear();
         self.scope_cache.clear();
         self.child_links.clear();
+        self.begin_perf_run();
     }
 
     fn enqueue_thread_event(&mut self, reason: &'static str, thread_id: i64) {
@@ -292,13 +312,23 @@ impl DebugSession {
                     reason,
                     thread_id,
                     description,
+                    preserve_focus_hint,
                 } => {
-                    let body = json!({
+                    self.finish_perf_stop();
+                    let mut body = json!({
                         "reason": reason,
                         "threadId": thread_id,
                         "allThreadsStopped": true,
                         "description": description,
                     });
+                    if *preserve_focus_hint && let Some(obj) = body.as_object_mut() {
+                        obj.insert("preserveFocusHint".to_owned(), json!(true));
+                    }
+                    if let Some(perf) = self.perf_stopped_summary_body()
+                        && let Some(obj) = body.as_object_mut()
+                    {
+                        obj.insert("bs_perf".to_owned(), perf);
+                    }
                     self.send_event_raw("stopped", Some(body))?;
                 }
                 InternalEvent::Continued {
@@ -651,6 +681,22 @@ impl DebugSession {
                 self.handle_source(req)?;
                 return Ok(true);
             }
+            // Phase 3 Feature D batch D3 — BugStalker-specific custom
+            // requests. Spec lives in `doc/plans/phase-3-dyn-trait-and-async.md`.
+            "bs/awaitTrace" => self.handle_await_trace(req)?,
+            // Phase 4 step 12 — Tier-A visualiser introspection.
+            "bs/visualiserList" => self.handle_visualiser_list(req)?,
+            // Phase 4 step 13 — per-session toggle.
+            "bs/visualiserToggle" => self.handle_visualiser_toggle(req)?,
+            // Phase 6 step 120 — perf overlay DAP JSON boundary.
+            "bs/perfOverlay" => self.handle_perf_overlay(req)?,
+            "bs/perfOverlayEnable" => self.handle_perf_overlay_enable(req)?,
+            "bs/perfOverlayDisable" => self.handle_perf_overlay_disable(req)?,
+            "bs/replayLoad" => self.handle_replay_load(req)?,
+            "bs/replayCheckpointList" => self.handle_replay_checkpoint_list(req)?,
+            "bs/replayJump" => self.handle_replay_jump(req)?,
+            "bs/replayTimeline" => self.handle_replay_timeline(req)?,
+            "bs/applyPatch" => self.handle_apply_patch(req)?,
             other => {
                 self.send_err(req, format!("Unsupported DAP command: {other}"))?;
             }

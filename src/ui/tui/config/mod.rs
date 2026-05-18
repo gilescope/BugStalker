@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::ui::tui::config::ser::KeyMapConfig;
 use crate::{muted_error, weak_error};
 use log::error;

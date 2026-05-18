@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::common::TestHooks;
 use crate::common::TestInfo;
 use crate::{CALC_APP, prepare_debugee_process};
@@ -10,7 +11,9 @@ use serial_test::serial;
 fn test_debugee_run() {
     let process = prepare_debugee_process(HW_APP, &[]);
     let debugee_pid = process.pid();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
     debugger.start_debugee().unwrap();
     assert_no_proc!(debugee_pid);
@@ -22,7 +25,9 @@ fn test_multiple_brkpt_on_addr() {
     let process = prepare_debugee_process(HW_APP, &[]);
     let attempt_1_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut dbg = builder.build(process).unwrap();
     dbg.set_breakpoint_at_line("hello_world.rs", 5).unwrap();
     dbg.set_breakpoint_at_line("hello_world.rs", 9).unwrap();
@@ -65,7 +70,9 @@ fn test_brkpt_on_function() {
     let process = prepare_debugee_process(CALC_APP, &["1", "2", "3", "--description", "result"]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     debugger.set_breakpoint_at_fn("sum2").unwrap();
 
@@ -90,7 +97,9 @@ fn test_brkpt_on_function() {
 fn test_brkpt_on_function_name_collision() {
     let process = prepare_debugee_process(CALC_APP, &[]);
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info));
     let mut debugger = builder.build(process).unwrap();
 
     // assert that two breakpoints is set
@@ -122,7 +131,9 @@ fn test_brkpt_on_function_name_collision() {
 fn test_brkpt_on_line_collision() {
     let process = prepare_debugee_process(SHARED_LIB_APP, &[]);
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     debugger.set_breakpoint_at_line("main.rs", 19).unwrap();
     debugger.start_debugee().unwrap();
@@ -152,7 +163,9 @@ fn test_brkpt_on_line() {
     let process = prepare_debugee_process(HW_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     debugger
         .set_breakpoint_at_line("hello_world.rs", 15)
@@ -178,7 +191,9 @@ fn test_brkpt_on_line2() {
     let process = prepare_debugee_process(VARS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     debugger.set_breakpoint_at_line("vars.rs", 144).unwrap();
     debugger.set_breakpoint_at_line("vars.rs", 310).unwrap();
@@ -199,7 +214,9 @@ fn test_set_breakpoint_idempotence() {
     let process = prepare_debugee_process(HW_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
     debugger
         .set_breakpoint_at_line("hello_world.rs", 15)
@@ -225,7 +242,9 @@ fn test_set_breakpoint_idempotence() {
 fn test_deferred_breakpoint() {
     let process = prepare_debugee_process(SHARED_LIB_APP, &[]);
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     assert!(debugger.set_breakpoint_at_fn("print_sum").is_err());
@@ -241,7 +260,9 @@ fn test_breakpoint_at_fn_with_monomorphization() {
     let process = prepare_debugee_process(FIZZBUZZ_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     let brkpts = debugger.set_breakpoint_at_fn("solve").unwrap();
@@ -274,7 +295,9 @@ fn test_breakpoint_at_line_with_monomorphization() {
     let process = prepare_debugee_process(FIZZBUZZ_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     let brkpts = debugger.set_breakpoint_at_line("main.rs", 83).unwrap();

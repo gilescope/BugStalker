@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! DAP stdio transport tests
 //! Tests for DAP in stdio mode (--dap-local)
 
@@ -45,6 +46,10 @@ fn start_bs_stdio_dap(debugee: &str) -> anyhow::Result<StdioDAP> {
 }
 
 pub struct StdioDAP {
+    /// Held only to keep the spawned `bs` process alive for the
+    /// lifetime of the DAP session — `Child::drop` reaps and
+    /// kills it when this struct goes out of scope.
+    #[allow(dead_code)]
     child: Child,
     stdin: Box<dyn Write + Send>,
     reader: BufReader<std::process::ChildStdout>,
@@ -1242,6 +1247,235 @@ fn test_stdio_dap_source() -> anyhow::Result<()> {
         }
     }
     assert!(found, "source response not received");
+
+    Ok(())
+}
+
+/// Phase 4 step 12 — `bs/visualiserList` custom DAP request.
+/// Verifies an IDE settings panel can enumerate every Tier-A
+/// visualiser the loader recovered from the `viz_demo` debuggee
+/// without first having to hit a value.
+#[test]
+fn test_stdio_dap_visualiser_list() -> anyhow::Result<()> {
+    let viz_demo = std::env::var("CARGO_BIN_EXE_viz_demo")
+        .unwrap_or_else(|_| "./examples/target/debug/viz_demo".to_string());
+
+    let mut dap = start_bs_stdio_dap(&viz_demo)?;
+
+    dap.send_request(
+        1,
+        "initialize",
+        json!({
+            "clientID":   "test",
+            "clientName": "test-client",
+            "adapterID":  "bs-dap",
+        }),
+    )?;
+    let _ = dap.read_message()?; // initialize response
+    let _ = dap.read_message()?; // initialized event
+
+    dap.send_request(
+        2,
+        "launch",
+        json!({
+            "request":     "launch",
+            "program":     &viz_demo,
+            "stopOnEntry": true,
+        }),
+    )?;
+    loop {
+        let msg = dap.read_message()?;
+        if msg["type"] == "response" && msg["command"] == "launch" {
+            break;
+        }
+    }
+
+    dap.send_request(3, "bs/visualiserList", json!({}))?;
+    let response = loop {
+        let msg = dap.read_message()?;
+        if msg["type"] == "response" && msg["command"] == "bs/visualiserList" {
+            break msg;
+        }
+    };
+
+    assert_eq!(
+        response["success"], true,
+        "request should succeed: {response:?}"
+    );
+    let visualisers = response["body"]["visualisers"]
+        .as_array()
+        .expect("body.visualisers should be an array");
+    assert_eq!(
+        visualisers.len(),
+        10,
+        "expected 10 visualisers from viz_demo, got {} ({visualisers:?})",
+        visualisers.len(),
+    );
+
+    // Pick out a few specific specs and assert their shape end-
+    // to-end through the DAP wire.
+    let person = visualisers
+        .iter()
+        .find(|v| v["typeName"] == "viz_demo::Person")
+        .expect("viz_demo::Person should be in the list");
+    assert_eq!(person["origin"], "tier-a");
+    assert_eq!(person["summary"], "Person({name}, age {age})");
+    let person_fields = person["fields"]
+        .as_array()
+        .expect("Person.fields should be an array");
+    assert_eq!(person_fields.len(), 5);
+    let flags = person_fields
+        .iter()
+        .find(|f| f["name"] == "flags")
+        .expect("Person.flags field should be in the list");
+    assert_eq!(flags["format"], "hex");
+    let token = person_fields
+        .iter()
+        .find(|f| f["name"] == "_private_token")
+        .expect("Person._private_token field should be in the list");
+    assert_eq!(token["hidden"], true);
+
+    let status = visualisers
+        .iter()
+        .find(|v| v["typeName"] == "viz_demo::Status")
+        .expect("viz_demo::Status should be in the list");
+    let status_variants = status["variants"]
+        .as_array()
+        .expect("Status.variants should be an array");
+    assert_eq!(status_variants.len(), 3);
+    let connected = status_variants
+        .iter()
+        .find(|v| v["name"] == "Connected")
+        .expect("Status::Connected variant should be in the list");
+    assert_eq!(connected["tag"], "ok");
+    assert_eq!(connected["summary"], "✓ Connected (port {__0})");
+
+    let marker = visualisers
+        .iter()
+        .find(|v| v["typeName"] == "qualified::Marker")
+        .expect("qualified::Marker (via name override) should be in the list");
+    assert_eq!(marker["summary"], "Marker#{__0}");
+
+    Ok(())
+}
+
+/// Phase 4 step 13 — `bs/visualiserToggle` per-session mute.
+/// Toggle a registered visualiser off, verify
+/// `bs/visualiserList` reflects the new `enabled` state, then
+/// toggle it back on. Also covers the unknown-typeName error
+/// path so a typo from the IDE produces an actionable response
+/// listing the registered keys.
+#[test]
+fn test_stdio_dap_visualiser_toggle() -> anyhow::Result<()> {
+    let viz_demo = std::env::var("CARGO_BIN_EXE_viz_demo")
+        .unwrap_or_else(|_| "./examples/target/debug/viz_demo".to_string());
+
+    let mut dap = start_bs_stdio_dap(&viz_demo)?;
+    dap.send_request(
+        1,
+        "initialize",
+        json!({
+            "clientID":   "test",
+            "clientName": "test-client",
+            "adapterID":  "bs-dap",
+        }),
+    )?;
+    let _ = dap.read_message()?;
+    let _ = dap.read_message()?;
+    dap.send_request(
+        2,
+        "launch",
+        json!({
+            "request":     "launch",
+            "program":     &viz_demo,
+            "stopOnEntry": true,
+        }),
+    )?;
+    loop {
+        let msg = dap.read_message()?;
+        if msg["type"] == "response" && msg["command"] == "launch" {
+            break;
+        }
+    }
+
+    // Sanity: Person is enabled by default.
+    let read_person_enabled = |dap: &mut StdioDAP, seq: i64| -> anyhow::Result<bool> {
+        dap.send_request(seq, "bs/visualiserList", json!({}))?;
+        let resp = loop {
+            let m = dap.read_message()?;
+            if m["type"] == "response" && m["command"] == "bs/visualiserList" {
+                break m;
+            }
+        };
+        let v = resp["body"]["visualisers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["typeName"] == "viz_demo::Person")
+            .expect("Person should be in the list")
+            .clone();
+        Ok(v["enabled"].as_bool().unwrap_or(true))
+    };
+    assert!(read_person_enabled(&mut dap, 3)?);
+
+    // Toggle Person off.
+    dap.send_request(
+        4,
+        "bs/visualiserToggle",
+        json!({
+            "typeName": "viz_demo::Person",
+            "enabled":  false,
+        }),
+    )?;
+    let toggle_resp = loop {
+        let m = dap.read_message()?;
+        if m["type"] == "response" && m["command"] == "bs/visualiserToggle" {
+            break m;
+        }
+    };
+    assert_eq!(toggle_resp["success"], true);
+    assert_eq!(toggle_resp["body"]["typeName"], "viz_demo::Person");
+    assert_eq!(toggle_resp["body"]["enabled"], false);
+
+    // List now reports `enabled = false` for Person.
+    assert!(!read_person_enabled(&mut dap, 5)?);
+
+    // Toggle back on.
+    dap.send_request(
+        6,
+        "bs/visualiserToggle",
+        json!({ "typeName": "viz_demo::Person", "enabled": true }),
+    )?;
+    loop {
+        let m = dap.read_message()?;
+        if m["type"] == "response" && m["command"] == "bs/visualiserToggle" {
+            break;
+        }
+    }
+    assert!(read_person_enabled(&mut dap, 7)?);
+
+    // Unknown typeName: error response with actionable message.
+    dap.send_request(
+        8,
+        "bs/visualiserToggle",
+        json!({ "typeName": "Nonexistent", "enabled": false }),
+    )?;
+    let err_resp = loop {
+        let m = dap.read_message()?;
+        if m["type"] == "response" && m["command"] == "bs/visualiserToggle" {
+            break m;
+        }
+    };
+    assert_eq!(err_resp["success"], false);
+    let msg = err_resp["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("\"Nonexistent\""),
+        "error message should quote the bad name: {msg}",
+    );
+    assert!(
+        msg.contains("known: ["),
+        "error message should list known keys: {msg}",
+    );
 
     Ok(())
 }

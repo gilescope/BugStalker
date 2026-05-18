@@ -1,9 +1,17 @@
+// SPDX-License-Identifier: MIT
 pub mod command;
 pub mod config;
 pub mod console;
 pub mod generic;
 pub mod proto;
+/// Phase 9 AI-bot scripting front-end. JSON-RPC 2.0 over stdin/stdout
+/// with JSON5-with-comments input. See `doc/scripting/`.
+pub mod script;
 pub mod short;
+/// Phase 9 structured-command core. The transport-agnostic dispatch
+/// layer; `script` is one transport, DAP shims could call into the
+/// same dispatch table.
+pub mod structured;
 pub mod supervisor;
 mod syntax;
 pub mod tui;

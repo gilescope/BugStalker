@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use std::collections::LinkedList;
 use tuirealm::command::{Cmd, CmdResult, Direction, Position};
 use tuirealm::props::{Borders, PropPayload, PropValue, Style, TextModifiers, TextSpan};

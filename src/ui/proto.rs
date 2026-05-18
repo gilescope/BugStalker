@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /// Utilities for communication between the debugger thread and UI threads
 use crate::debugger::Debugger;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::ui::config;
 use std::sync::OnceLock;
 use syntect::easy::HighlightLines;

@@ -1,6 +1,24 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger;
 use fallible_iterator::FallibleIterator;
 use nix::unistd::Pid;
+
+/// Width of one hashbrown control-byte group in the debuggee.
+///
+/// Must match the `Group` size the debuggee's hashbrown was compiled
+/// with. Rust's std hashmap (which embeds hashbrown) uses 16-byte
+/// groups on x86_64 (SSE2) and 8-byte groups in the portable fallback
+/// path that ships for aarch64-unknown-linux-gnu on stable. Mismatching
+/// this silently misreports element counts, because the extra bytes
+/// read past the end of the control array look like "full" entries.
+#[cfg(target_arch = "x86_64")]
+const GROUP_WIDTH: usize = 16;
+#[cfg(not(target_arch = "x86_64"))]
+const GROUP_WIDTH: usize = 8;
+
+/// Mask of the bits in `BitMask::0` that correspond to the current
+/// group width (one bit per control byte).
+const GROUP_BIT_MASK: u16 = ((1u32 << GROUP_WIDTH) - 1) as u16;
 
 /// A bit mask which contains the result of a Match operation on a Group and allows iterating through them.
 #[derive(Copy, Clone, PartialEq, Debug)]
@@ -10,7 +28,7 @@ impl BitMask {
     const BITMASK_STRIDE: usize = 1;
 
     fn invert(self) -> Self {
-        BitMask(self.0 ^ 0xffff_u16)
+        BitMask((self.0 ^ GROUP_BIT_MASK) & GROUP_BIT_MASK)
     }
 
     pub fn remove_lowest_bit(self) -> Self {
@@ -34,16 +52,16 @@ impl BitMask {
     }
 }
 
-struct GroupReflection([u8; 16]);
+struct GroupReflection([u8; GROUP_WIDTH]);
 
 impl GroupReflection {
     fn width() -> usize {
-        16
+        GROUP_WIDTH
     }
 
     /// Load group of control bytes from debugee process.
     fn load(pid: Pid, ptr: *const u8) -> Result<Self, nix::Error> {
-        let mut data: [u8; 16] = Default::default();
+        let mut data: [u8; GROUP_WIDTH] = [0u8; GROUP_WIDTH];
         data.copy_from_slice(&debugger::read_memory_by_pid(
             pid,
             ptr as usize,
@@ -178,7 +196,7 @@ impl FallibleIterator for BucketIterator {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 mod test {
     use super::*;
 

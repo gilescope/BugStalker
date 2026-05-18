@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "bs-test-harness"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Test- and bench-side helpers for spawning a debuggee under `bugstalker` and capturing values at a breakpoint. Phase 8 will move the rest of `tests/debugger/`'s scaffolding here; Phase 1 seeded the crate with the bench-side `spawn_at_breakpoint` / `capture_locals` helpers used by `benches/render_value.rs` and `benches/attach_cold.rs`."
+
+[lib]
+path = "src/lib.rs"
+# Stub crate has no bench targets. Disable libtest's bench harness so
+# `cargo bench --workspace -- --quick` can pass criterion-only flags
+# without the libtest harness rejecting them.
+bench = false
+
+[dependencies]
+anyhow.workspace = true
+bugstalker = { path = "../.." }
+os_pipe = "1"
+tracing.workspace = true

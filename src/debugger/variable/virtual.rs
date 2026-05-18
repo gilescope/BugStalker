@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::Error::TypeNotFound;
 use crate::debugger::debugee::Debugee;
 use crate::debugger::debugee::dwarf::DebugInformation;

@@ -13,7 +13,7 @@ pub fn main() {
         .to_string()
         + "/examples/target/debug";
     let print_lib =
-        unsafe { libloading::Library::new(format!("{cwd}/libprinter_lib.so")).unwrap() };
+        unsafe { libloading::Library::new(format!("{cwd}/libprinter_lib.{}", if cfg!(target_os = "macos") { "dylib" } else { "so" })).unwrap() };
 
     let print_sum_fn: libloading::Symbol<unsafe extern "C" fn(u32)> =
         unsafe { print_lib.get(b"print_sum").unwrap() };

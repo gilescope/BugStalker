@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use proc_maps::MapRange;
 
 /// Types can implement this trait for include cache functionality.
@@ -46,12 +47,14 @@ impl<T> PopIf<T> for Vec<T> {
 }
 
 /// Return true if address exist in VAS.
+#[allow(dead_code)]
 pub fn region_exist(pid: nix::unistd::Pid, addr: u64) -> std::io::Result<bool> {
     let proc_maps: Vec<MapRange> = proc_maps::get_process_maps(pid.as_raw())?;
     Ok(proc_maps.iter().any(|range| range.start() == addr as usize))
 }
 
 /// Return true if address not exist in VAS.
+#[allow(dead_code)]
 pub fn region_non_exist(pid: nix::unistd::Pid, addr: u64) -> std::io::Result<bool> {
     region_exist(pid, addr).map(|exist| !exist)
 }

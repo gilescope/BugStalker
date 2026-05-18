@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::common::{TestHooks, TestInfo, wait_for_stop_line};
 use crate::{SIGNALS_APP, SLEEPER_APP, assert_no_proc, prepare_debugee_process};
 use bugstalker::debugger::DebuggerBuilder;
@@ -13,7 +14,9 @@ fn test_signal_stop_single_thread() {
     let process = prepare_debugee_process(SIGNALS_APP, &["single_thread"]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("signals.rs", 12).unwrap();
@@ -41,7 +44,9 @@ fn test_signal_stop_multi_thread() {
     let process = prepare_debugee_process(SIGNALS_APP, &["multi_thread"]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("signals.rs", 42).unwrap();
@@ -67,7 +72,9 @@ fn test_signal_stop_multi_thread_multiple_signal() {
     let process = prepare_debugee_process(SIGNALS_APP, &["multi_thread_multi_signal"]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("signals.rs", 62).unwrap();
@@ -97,7 +104,9 @@ fn test_transparent_signals() {
     let process = prepare_debugee_process(SLEEPER_APP, &["-s", "1"]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     thread::spawn(move || {

@@ -1,0 +1,76 @@
+[package]
+name = "bs-replay-engine"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "BugStalker time-travel — Tier 3 deterministic record-and-replay engine (Phase 5)."
+
+# On-disk encoder: rkyv (events + segments + checkpoints).
+#
+# Why rkyv and not serde+bincode/postcard/bitcode/borsh:
+#   - Replay reads the trace top-to-bottom many times. rkyv's zero-
+#     copy archives mean "deserialize" is a pointer cast; replay
+#     mmap()s the segment and walks events without parsing.
+#   - Recording is bounded by seccomp-notify roundtrip + ptrace,
+#     not by encoding speed; every contender is fast enough on the
+#     write side. The win is on the read side.
+#   - Pure Rust, MIT, mature in 2026 (0.8.x stable line).
+#   - Deterministic with the `aligned` + `little_endian` features
+#     pinned, which matches the manifest's "replay-host CPU
+#     features must be a superset" rule.
+#
+# Manifest stays a tiny hand-rolled key/value text file: it's a
+# support-diagnostic surface where human-readability beats a
+# framework dep.
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+rkyv = { version = "0.8", default-features = false, features = [
+    "std",
+    "bytecheck",
+    "little_endian",
+    "pointer_width_64",
+] }
+# Compression: pure-Rust LZ4 frame format. See plan § "Pure-Rust
+# policy" for the lz4_flex-vs-ruzstd rationale.
+lz4_flex = { version = "0.13", default-features = false, features = [
+    "std",
+    "frame",
+    "safe-encode",
+    "safe-decode",
+    "checked-decode",
+] }
+# Syscall metadata. The record module's catch-all primitive
+# dispatches on (nr, ParamKind) to decide what to read out of the
+# tracee. Pure data — no run-time cost beyond the table lookup.
+bs-syscall-spec = { path = "../bs-syscall-spec" }
+
+[dev-dependencies]
+proptest.workspace = true
+
+# Linux-only deps for the seccomp-bpf user-notify recorder
+# (sub-phase 3B step 6) and the ptrace driver (step 7). Pure
+# wrappers — libc gives us the syscall numbers and the
+# `seccomp_data` / `sock_filter` layouts; rustix wraps fork +
+# wait + signal control with a safer surface. No C link beyond
+# libc itself which is already in the dep tree.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+rustix = { workspace = true, features = ["fs", "process", "thread"] }
+# x86 disassembly for sub-phase 3D — the supervisor needs to
+# look at the instruction at a SIGSEGV/SIGILL PC and decide
+# whether it's a non-deterministic instruction (RDTSC, RDTSCP,
+# RDRAND, RDSEED, CPUID). iced-x86 is pure Rust, MIT, no C
+# linkage. Plan §Pure-Rust policy lists it explicitly.
+iced-x86 = { version = "1.21", default-features = false, features = [
+    "std",
+    "decoder",
+    "intel",
+] }
+# ELF parsing for the vDSO entry-point detector (sub-phase 3D
+# follow-up). The workspace pins object 0.32 with default
+# features; we mirror the version exactly to keep the lockfile
+# single-resolved.
+object = "0.32.2"

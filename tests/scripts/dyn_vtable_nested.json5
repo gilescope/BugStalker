@@ -1,0 +1,22 @@
+// Locks in the depth-aware dyn render. The outer `Vec` puts each
+// `Box<dyn Greeter>` at depth 1, where the renderer collapses the
+// trait-object view to a single line carrying the concrete value
+// and a method count. Vtable details and method bodies disappear
+// at this depth — the user clicked into a list of dyn, they want
+// each entry to fit on one row.
+
+{ jsonrpc: "2.0", id: 1, method: "break.set", params: { at: "main.rs:167" } }
+{ jsonrpc: "2.0", id: 2, method: "run" }
+{ jsonrpc: "2.0", id: 3, method: "assert.var", params: { name: "dyn_vec",
+expect: {
+  items: [
+    {
+      name: "dyn_vec",
+      type: "Vec<alloc::boxed::Box<dyn showcase::main::Greeter, alloc::alloc::Global>, alloc::alloc::Global>",
+      value_text: "Vec<Box<dyn Greeter, _>, _> [Box<dyn Greeter, _> [→ Point] (Point { x: 10, y: 20 }) {1 method}, Box<dyn Greeter, _> [→ Point] (Point { x: 30, y: 40 }) {1 method}]"
+    }
+  ],
+  total: 1,
+  truncated: false
+}
+} }

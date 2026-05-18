@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::dap::transport::DapTransport;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -49,6 +50,14 @@ pub enum InternalEvent {
         reason: String,
         thread_id: Option<i64>,
         description: Option<String>,
+        /// DAP `preserveFocusHint`: when true, asks the client not
+        /// to grab editor focus on this stop. We set it for stops
+        /// that happen *while the user is editing* (e.g. an
+        /// auto-resume after `bs/applyPatch` lands the user back at
+        /// their original breakpoint) — VSCode otherwise yanks the
+        /// text-editor cursor away from where they're typing onto
+        /// the stop line, which is jarring.
+        preserve_focus_hint: bool,
     },
     Continued {
         thread_id: Option<i64>,

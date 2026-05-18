@@ -685,4 +685,232 @@ pub fn main() {
         "one".to_string(),
         vec!["two".to_string(), "three".to_string()],
     );
+    phase1_specs();
+    phase1_specs_b(); phase3_dyn_trait(); phase3_niche_options(); phase3_rc_cycle();
+}
+
+fn phase1_specs() {
+    use std::ptr::NonNull;
+    let mut x: i32 = 42;
+    let nn: NonNull<i32> = NonNull::from(&mut x);
+    let _y = unsafe { nn.as_ref() };
+
+    let nop: Option<u8> = None;
+}
+
+fn phase1_specs_b() {
+    use std::pin::Pin;
+    let pinned_box: Pin<Box<i32>> = Box::pin(7);
+    let mut x: i32 = 13;
+    let pinned_ref: Pin<&mut i32> = Pin::new(&mut x);
+
+    let r1 = 0i32..10;
+    let r2 = 0i32..=10;
+    let r3 = 5i32..;
+    let r4 = ..10i32;
+
+    use std::time::Duration;
+    let d_zero = Duration::new(0, 0);
+    let d_ms = Duration::from_millis(1500);
+    let d_s = Duration::from_secs(7);
+    let d_h = Duration::new(3661, 500_000_000);
+
+    use std::ffi::CString;
+    let cs_hello: CString = CString::new("hello").unwrap();
+    let cs_empty: CString = CString::new("").unwrap();
+    let cs_bytes: CString = CString::new(vec![0x68u8, 0x69, 0x80, 0xff]).unwrap();
+
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    let os_str: OsString = OsString::from("hello");
+    let pb: PathBuf = PathBuf::from("/tmp/foo");
+
+    use std::mem::MaybeUninit;
+    let mu_init: MaybeUninit<i32> = MaybeUninit::new(99);
+
+    use std::sync::{Mutex, RwLock};
+    let mtx: Mutex<i32> = Mutex::new(123);
+    let rwl: RwLock<i32> = RwLock::new(456);
+    let mtx_guard = mtx.lock().unwrap();
+    let rwl_read = rwl.read().unwrap();
+
+    // DST companions to S12/S13/S14: &CStr, &OsStr, &Path.
+    use std::ffi::{CStr, OsStr};
+    use std::path::Path;
+    let dst_cs: &CStr = CStr::from_bytes_with_nul(b"hi\0").unwrap();
+    let dst_os: &OsStr = OsStr::new("hi");
+    let dst_pa: &Path = Path::new("/etc");
+    // Keep them live across the breakpoint by using them in
+    // observable side effects.
+    std::hint::black_box(dst_cs);
+    std::hint::black_box(dst_os);
+    std::hint::black_box(dst_pa);
+
+    let nop: Option<u8> = None;
+}
+
+/// Phase 3 Feature A — `dyn Trait` recovery fixtures. The debugger
+/// should resolve each fat-pointer trait object back to its concrete
+/// type via the vtable symbol.
+fn phase3_dyn_trait() {
+    use std::error::Error;
+
+    // Concrete error type the trait object holds — we expect the
+    // debugger to recover this name from the vtable symbol.
+    #[derive(Debug)]
+    struct MyError {
+        code: i32,
+        msg: &'static str,
+    }
+    impl std::fmt::Display for MyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "MyError(code={}, msg={:?})", self.code, self.msg)
+        }
+    }
+    impl Error for MyError {}
+
+    let boxed_err: Box<dyn Error> = Box::new(MyError {
+        code: 42,
+        msg: "boom",
+    });
+
+    // &dyn Iterator over a small concrete iterator type.
+    let owned: Vec<u32> = vec![10, 20, 30];
+    let iter_obj: &dyn Iterator<Item = u32> = &owned.iter().copied();
+    // Force iter_obj to actually live across the breakpoint.
+    std::hint::black_box(iter_obj);
+
+    // Arc<dyn Send + Sync> — multi-bound trait object, distinct
+    // dyn-bound layout.
+    use std::sync::Arc;
+    struct Counter(u32);
+    let arc_obj: Arc<dyn std::fmt::Debug + Send + Sync> = Arc::new(Counter(7));
+    impl std::fmt::Debug for Counter {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Counter({})", self.0)
+        }
+    }
+    std::hint::black_box(&arc_obj);
+    std::hint::black_box(&boxed_err);
+
+    let nop: Option<u8> = None;
+}
+
+/// Phase 3 Feature B — niche-encoded Option / Result fixtures.
+/// Rust uses the inner type's invalid bit-patterns (null pointer,
+/// zero `NonZero*`, byte ≥ 2 for `bool`, …) to encode `None`
+/// without an extra discriminant byte. DWARF can't unambiguously
+/// describe these enums; the debugger applies the language rules
+/// directly.
+fn phase3_niche_options() {
+    use std::num::NonZeroU32;
+    use std::ptr::NonNull;
+
+    // Option<&T>: null pointer = None, anything else = Some(&T).
+    let host: i32 = 99;
+    let opt_ref_some: Option<&i32> = Some(&host);
+    let opt_ref_none: Option<&i32> = None;
+
+    // Option<Box<T>>: same niche — null inner pointer = None.
+    let opt_box_some: Option<Box<i32>> = Some(Box::new(7));
+    let opt_box_none: Option<Box<i32>> = None;
+
+    // Option<NonNull<T>>: same niche.
+    let mut x: i32 = 13;
+    let opt_nn_some: Option<NonNull<i32>> = NonNull::new(&mut x);
+    let opt_nn_none: Option<NonNull<i32>> = None;
+
+    // Option<NonZeroU32>: zero = None, anything else = Some(N).
+    let opt_nz_some: Option<NonZeroU32> = NonZeroU32::new(42);
+    let opt_nz_none: Option<NonZeroU32> = None;
+
+    // Option<bool>: niche is `byte ≥ 2 = None`.
+    let opt_bool_some: Option<bool> = Some(true);
+    let opt_bool_none: Option<bool> = None;
+
+    // Option<fn(i32) -> i32>: null fn pointer = None.
+    fn double_it(x: i32) -> i32 {
+        x.wrapping_mul(2)
+    }
+    let opt_fn_some: Option<fn(i32) -> i32> = Some(double_it);
+    let opt_fn_none: Option<fn(i32) -> i32> = None;
+
+    // Result<&T, ()>: ZST error arm; the niche of `&T` doubles as
+    // the discriminant for `Err(())`.
+    let res_ok: Result<&i32, ()> = Ok(&host);
+    let res_err: Result<&i32, ()> = Err(());
+
+    // Result<NonZeroU32, ()>: same shape, ZST error arm.
+    let res_nz_ok: Result<NonZeroU32, ()> = Ok(NonZeroU32::new(7).unwrap());
+    let res_nz_err: Result<NonZeroU32, ()> = Err(());
+
+    std::hint::black_box(&opt_ref_some);
+    std::hint::black_box(&opt_ref_none);
+    std::hint::black_box(&opt_box_some);
+    std::hint::black_box(&opt_box_none);
+    std::hint::black_box(&opt_nn_some);
+    std::hint::black_box(&opt_nn_none);
+    std::hint::black_box(&opt_nz_some);
+    std::hint::black_box(&opt_nz_none);
+    std::hint::black_box(&opt_bool_some);
+    std::hint::black_box(&opt_bool_none);
+    std::hint::black_box(&opt_fn_some);
+    std::hint::black_box(&opt_fn_none);
+    std::hint::black_box(&res_ok);
+    std::hint::black_box(&res_err);
+    std::hint::black_box(&res_nz_ok);
+    std::hint::black_box(&res_nz_err);
+
+    let nop: Option<u8> = None;
+}
+
+/// Phase 3 Feature C — cyclic Rc<RefCell<…>> graph and a deep
+/// non-cyclic Rc chain. The debugger should terminate gracefully on
+/// each instead of stack-overflowing the renderer.
+fn phase3_rc_cycle() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Tiny doubly-linked-ish node. `next` is owned; `peer` is a
+    /// back-edge that closes the cycle when populated.
+    struct Node {
+        data: i32,
+        peer: RefCell<Option<Rc<Node>>>,
+    }
+
+    // Build a 2-node cycle: a ↔ b.
+    let a = Rc::new(Node {
+        data: 1,
+        peer: RefCell::new(None),
+    });
+    let b = Rc::new(Node {
+        data: 2,
+        peer: RefCell::new(Some(a.clone())),
+    });
+    *a.peer.borrow_mut() = Some(b.clone());
+    let cycle_root = a.clone();
+
+    // Acyclic single-strong-count Rc — the [strong=1] diagnostic
+    // candidate (see plan: "not shared, so why is it `Rc`?").
+    let lonely_rc: Rc<i32> = Rc::new(99);
+
+    // Deep but acyclic chain. 100 levels is enough to verify the
+    // depth cap fires before stack-overflowing the renderer; the
+    // cap is configurable but defaults to 64.
+    let mut deep: Rc<Node> = Rc::new(Node {
+        data: 0,
+        peer: RefCell::new(None),
+    });
+    for i in 1..100 {
+        deep = Rc::new(Node {
+            data: i,
+            peer: RefCell::new(Some(deep)),
+        });
+    }
+
+    std::hint::black_box(&cycle_root);
+    std::hint::black_box(&lonely_rc);
+    std::hint::black_box(&deep);
+
+    let nop: Option<u8> = None;
 }

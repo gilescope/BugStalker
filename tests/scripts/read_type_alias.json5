@@ -1,0 +1,13 @@
+// Migrated from tests/integration/test_variables.py::test_read_type_alias.
+// `type I32Alias = i32;` should surface as the underlying primitive.
+
+{ method: "break.set", params: { at: "vars.rs:126" } }
+{ method: "run" }
+
+{ method: "assert.var", params: { name: "a_alias", hint: "i32 behind alias",
+expect: {
+  items: [{ name: "a_alias", type: "i32", value_text: "i32(1)" }],
+  total: 1,
+  truncated: false
+}
+} }

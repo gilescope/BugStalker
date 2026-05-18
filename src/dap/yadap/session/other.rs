@@ -1,9 +1,11 @@
+// SPDX-License-Identifier: MIT
 use crate::dap::yadap::protocol::DapRequest;
 use crate::dap::yadap::session::ThreadFocusByPid;
+use crate::debugger::r#async::{AsyncFnFutureState, Future, TaskBacktrace};
 use anyhow::{Context, anyhow};
 use nix::unistd::Pid;
 use regex::escape as regex_escape;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::process::{Command, Stdio};
 
@@ -285,6 +287,299 @@ impl super::DebugSession {
 
         self.send_success_body(req, json!({ "targets": targets }))
     }
+
+    /// Phase 3 Feature D batch D3 — `bs/awaitTrace` custom DAP request.
+    ///
+    /// Returns the awaitee chain for the requested thread's task as a
+    /// list of frames. Optional `threadId` argument selects a specific
+    /// task; absent ⇒ the currently-focused task.
+    ///
+    /// Frame shape:
+    ///
+    /// ```jsonc
+    /// {
+    ///   "kind": "asyncFn" | "sleep" | "joinHandle" | "custom" | "unknown",
+    ///   "name": "<function or type name>",
+    ///   "source": { "path": "..." },   // present iff D1 recovered (file, line)
+    ///   "line": 42,                     //  "
+    ///   "state": "suspend"|"unresumed"|"returned"|"panicked"|"ok",  // asyncFn only
+    ///   "awaitPoint": 3,                // asyncFn Suspend only
+    ///   "concrete": "MyConcreteFuture", // custom only — Phase 3 D2b
+    ///   "waitingForTaskId": 12          // joinHandle only
+    /// }
+    /// ```
+    /// `bs/visualiserList` — enumerate every Phase 4 Tier-A
+    /// visualiser spec the loader recovered from the debuggee
+    /// binary. Lets an IDE settings panel surface "what's
+    /// registered" without having to hit a value first; also
+    /// useful for debugging the macro / loader plumbing
+    /// itself.
+    ///
+    /// Response shape:
+    ///
+    /// ```json
+    /// {
+    ///   "visualisers": [
+    ///     {
+    ///       "typeName": "viz_demo::Person",
+    ///       "summary":  "Person({name}, age {age})",
+    ///       "origin":   "tier-a",
+    ///       "fields":   [{ "name": ..., "rename": ..., ... }],
+    ///       "variants": [{ "name": ..., "summary": ..., "tag": ..., "fields": [...] }]
+    ///     },
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// `origin` is currently always `"tier-a"`; when Tier B
+    /// (wasm) ships it will distinguish wasm-loaded visualisers
+    /// and built-in stdlib specialisations.
+    pub(super) fn handle_visualiser_list(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let dbg = self
+            .debugger
+            .as_ref()
+            .ok_or_else(|| anyhow!("bs/visualiserList: debugger not initialized"))?;
+        let viz = dbg.view_registry();
+        let visualisers: Vec<Value> = viz
+            .iter()
+            .map(|(name, spec)| {
+                json!({
+                    "typeName": name,
+                    "summary":  spec.summary,
+                    "origin":   "tier-a",
+                    "enabled":  !viz.is_disabled(name),
+                    "fields":   spec.fields.iter().map(serialize_field).collect::<Vec<_>>(),
+                    "variants": spec.variants.iter().map(|v| json!({
+                        "name":    v.name,
+                        "summary": v.summary,
+                        "tag":     v.tag,
+                        "fields":  v.fields.iter().map(serialize_field).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        self.send_success_body(
+            req,
+            json!({
+                "visualisers": visualisers,
+            }),
+        )
+    }
+
+    /// `bs/visualiserToggle` — turn a registered Tier-A
+    /// visualiser on or off for this debug session. Useful when
+    /// a user wants to compare the rendered summary against the
+    /// raw struct/enum dump, or when debugging a misbehaving
+    /// visualiser itself.
+    ///
+    /// Request:
+    ///
+    /// ```json
+    /// { "typeName": "viz_demo::Person", "enabled": false }
+    /// ```
+    ///
+    /// `typeName` must match exactly an entry returned by
+    /// `bs/visualiserList`. Suffix-match isn't applied here —
+    /// the toggle is a precise per-spec control.
+    ///
+    /// Response on success:
+    ///
+    /// ```json
+    /// { "typeName": "viz_demo::Person", "enabled": false }
+    /// ```
+    ///
+    /// Response on unknown `typeName`: error reply with a
+    /// human-readable message naming the registered keys
+    /// (capped to keep messages reasonable).
+    pub(super) fn handle_visualiser_toggle(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let dbg = self
+            .debugger
+            .as_ref()
+            .ok_or_else(|| anyhow!("bs/visualiserToggle: debugger not initialized"))?;
+        let type_name = match req.arguments.get("typeName").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return self.send_err(req, "bs/visualiserToggle: missing arguments.typeName"),
+        };
+        let enabled = req
+            .arguments
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !dbg.view_registry().set_enabled(type_name, enabled) {
+            // Build a short list of registered keys so the user
+            // can spot a typo. Cap to keep the message
+            // reasonable on a binary with many derives.
+            let mut keys: Vec<&str> = dbg.view_registry().iter().map(|(n, _)| n).collect();
+            keys.sort();
+            let preview = keys.iter().take(8).copied().collect::<Vec<_>>().join(", ");
+            let suffix = if keys.len() > 8 {
+                format!(" (and {} more)", keys.len() - 8)
+            } else {
+                String::new()
+            };
+            return self.send_err(
+                req,
+                format!(
+                    "bs/visualiserToggle: no spec registered under {type_name:?}; \
+                     known: [{preview}]{suffix}"
+                ),
+            );
+        }
+
+        self.send_success_body(
+            req,
+            json!({
+                "typeName": type_name,
+                "enabled":  enabled,
+            }),
+        )
+    }
+
+    pub(super) fn handle_await_trace(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let dbg = self
+            .debugger
+            .as_mut()
+            .ok_or_else(|| anyhow!("bs/awaitTrace: debugger not initialized"))?;
+
+        let backtrace = dbg
+            .async_backtrace()
+            .map_err(|e| anyhow!("bs/awaitTrace: {e}"))?;
+
+        // Pick the task: explicit `threadId` selects the worker on
+        // that pid; otherwise fall back to the focused task. We keep
+        // both paths so external clients can poll any thread without
+        // having to focus it first.
+        let requested_thread_id = req.arguments.get("threadId").and_then(|v| v.as_i64());
+
+        let task: Option<&TaskBacktrace> = if let Some(thread_id) = requested_thread_id {
+            let pid = Pid::from_raw(thread_id as i32);
+            backtrace
+                .workers
+                .iter()
+                .find(|w| w.thread.pid == pid)
+                .and_then(|w| {
+                    w.active_task
+                        .and_then(|tid| backtrace.tasks.iter().find(|t| t.task_id == tid))
+                        .or(w.active_task_standby.as_ref())
+                })
+                .or_else(|| {
+                    backtrace
+                        .block_threads
+                        .iter()
+                        .find(|bt| bt.thread.pid == pid)
+                        .map(|bt| &bt.bt)
+                })
+        } else {
+            backtrace.current_task()
+        };
+
+        let Some(task) = task else {
+            return self.send_err(req, "bs/awaitTrace: no task on the requested thread");
+        };
+
+        let frames: Vec<Value> = task
+            .futures
+            .iter()
+            .map(|f| self.serialize_await_frame(&backtrace, f))
+            .collect();
+
+        self.send_success_body(
+            req,
+            json!({
+                "taskId": task.task_id,
+                "frames": frames,
+            }),
+        )
+    }
+
+    fn serialize_await_frame(
+        &self,
+        backtrace: &crate::debugger::r#async::AsyncBacktrace,
+        f: &Future,
+    ) -> Value {
+        match f {
+            Future::AsyncFn(af) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("kind".into(), json!("asyncFn"));
+                obj.insert("name".into(), json!(af.async_fn));
+                obj.insert(
+                    "state".into(),
+                    json!(match af.state {
+                        AsyncFnFutureState::Suspend(_) => "suspend",
+                        AsyncFnFutureState::Unresumed => "unresumed",
+                        AsyncFnFutureState::Returned => "returned",
+                        AsyncFnFutureState::Panicked => "panicked",
+                        AsyncFnFutureState::Ok => "ok",
+                    }),
+                );
+                if let AsyncFnFutureState::Suspend(n) = af.state {
+                    obj.insert("awaitPoint".into(), json!(n));
+                }
+                if let Some((file, line)) = &af.await_location {
+                    let target_path = file.to_string_lossy().to_string();
+                    let client_path = self.source_map.map_target_to_client(&target_path);
+                    obj.insert("source".into(), json!({ "path": client_path }));
+                    obj.insert("line".into(), json!(*line as i64));
+                }
+                Value::Object(obj)
+            }
+            Future::Custom(custom) => {
+                let mut obj = serde_json::Map::new();
+                obj.insert("kind".into(), json!("custom"));
+                obj.insert("name".into(), json!(custom.name.to_string()));
+                if let Some(concrete) = &custom.concrete {
+                    obj.insert("concrete".into(), json!(concrete));
+                }
+                Value::Object(obj)
+            }
+            Future::TokioSleep(s) => {
+                json!({
+                    "kind": "sleep",
+                    "name": s.name.to_string(),
+                    "deadlineSec": s.instant.0,
+                    "deadlineNsec": s.instant.1,
+                })
+            }
+            Future::TokioJoinHandleFuture(jh) => {
+                let waiting_id = backtrace
+                    .tasks
+                    .iter()
+                    .find(|t| t.raw_ptr == jh.wait_for_task)
+                    .map(|t| t.task_id);
+                let mut obj = serde_json::Map::new();
+                obj.insert("kind".into(), json!("joinHandle"));
+                obj.insert("name".into(), json!(jh.name.to_string()));
+                if let Some(id) = waiting_id {
+                    obj.insert("waitingForTaskId".into(), json!(id));
+                }
+                Value::Object(obj)
+            }
+            Future::UnknownFuture => json!({ "kind": "unknown" }),
+            Future::Multi(branches) => {
+                // Phase 3 Feature D step 5 — render parallel
+                // branches as a nested JSON array. Each branch is
+                // serialized via the same recursive helper so all
+                // frame kinds (asyncFn / sleep / joinHandle /
+                // custom / unknown / multi) compose uniformly.
+                let serialized_branches: Vec<Value> = branches
+                    .iter()
+                    .map(|branch| {
+                        let frames: Vec<Value> = branch
+                            .iter()
+                            .map(|f| self.serialize_await_frame(backtrace, f))
+                            .collect();
+                        Value::Array(frames)
+                    })
+                    .collect();
+                json!({
+                    "kind": "multi",
+                    "branches": serialized_branches,
+                })
+            }
+        }
+    }
 }
 
 fn completion_prefix(text: &str, column: Option<i64>) -> (String, i64, i64) {
@@ -305,4 +600,17 @@ fn completion_prefix(text: &str, column: Option<i64>) -> (String, i64, i64) {
     let length = (end_idx - start_idx) as i64;
     let start_column = start_idx as i64 + 1;
     (prefix, start_column, length)
+}
+
+/// Serialise one [`bs_viz_spec::FieldSpec`] into the JSON shape
+/// the `bs/visualiserList` response uses. Shared between the
+/// type-level fields list and the per-variant fields list so
+/// the structure stays in one place.
+fn serialize_field(f: &bs_viz_spec::FieldSpec) -> Value {
+    json!({
+        "name":   f.name,
+        "rename": f.rename,
+        "hidden": f.hidden,
+        "format": f.format.as_wire_str(),
+    })
 }

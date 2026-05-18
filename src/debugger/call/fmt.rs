@@ -1,8 +1,11 @@
+// SPDX-License-Identifier: MIT
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use crate::debugger::call::{CallArgs, CallContext, CallHelper, RegType};
 use crate::{
     debugger::{
         Debugger, Error, TypeDeclaration,
         address::RelocatedAddress,
-        call::{CallArgs, CallContext, CallError, CallHelper, RegType},
+        call::CallError,
         context::gcx,
         debugee::dwarf::unit::DieAddr,
         variable::{execute::QueryResult, render::RenderValue, value::Value},
@@ -12,6 +15,7 @@ use crate::{
 };
 use indexmap::IndexMap;
 use itertools::Itertools;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use log::debug;
 
 #[derive(Debug, thiserror::Error)]
@@ -400,6 +404,7 @@ fn make_formatter_bytes_1_81_1_85(string_header_ptr: usize, vtable_ptr: usize) -
 }
 
 /// Call a core::fmt::Debug::fmt function for a variable and return formatted string.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn call_debug_fmt(dbg: &Debugger, var: &QueryResult) -> Result<String, Error> {
     if !var.value().formattable() {
         return Err(FmtCallError::UnsupportedType.into());

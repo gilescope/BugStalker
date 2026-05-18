@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::weak_error;
 use itertools::Itertools;
 use object::{Object, ObjectSection};

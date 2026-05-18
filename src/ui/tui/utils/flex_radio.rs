@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use tuirealm::command::{Cmd, CmdResult, Direction};
 use tuirealm::props::{
     Alignment, AttrValue, Attribute, Borders, Color, PropPayload, PropValue, Props, Style,

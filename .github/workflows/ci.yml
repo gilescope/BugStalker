@@ -1,10 +1,25 @@
+# SPDX-License-Identifier: MIT
 on: [push, pull_request]
 
 name: CI
 
+# Cancel any in-flight CI run on the same PR / branch when a new
+# commit arrives. The group key is the PR number when the trigger
+# is a `pull_request`; otherwise it's the ref name (so pushes to
+# `master` only cancel earlier pushes to `master`, not parallel
+# PR runs whose `head_ref` happens to share a name).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   MSRV: 1.89.0
   LRV: 1.95.0
+  # 32 MB default stack for test threads. The debugger's recursive
+  # walkers (tokio runtime introspection, dyn-Future resolver,
+  # async-backtrace builder) occasionally overflow the default 2 MB
+  # thread stack on deep `tokio::join!`-style fixtures.
+  RUST_MIN_STACK: "33554432"
 
 jobs:
   test:
@@ -13,7 +28,7 @@ jobs:
         rustc_sup_version: [1.91.0, 1.92.0, 1.93.0, 1.94.0, 1.95.0]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Install debug symbols
         run: |
           sudo apt-get update
@@ -21,81 +36,151 @@ jobs:
       - name: Install rust toolchain
         run: |
           rustup toolchain install ${{ matrix.rustc_sup_version }}
-          rustup toolchain install $MSRV
+          rustup toolchain install "$MSRV"
       - name: Build test applications for functional testing
         run: make build-examples-for-func-test RUST_VERSION=${{ matrix.rustc_sup_version }}
       - name: Verify test applications rustc version
         run: |
           strings examples/target/debug/calc | grep "^rustc version" | grep ${{ matrix.rustc_sup_version }}
       - name: Run functional tests
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
+        run: cargo test
 
   integration-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Install rust
         run: |
-          rustup toolchain install $LRV
-          rustup toolchain install $MSRV
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: "3.13"
-      - name: Install pip and test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pip
-          if [ -f requirements.txt ]; then sudo pip install -r requirements.txt; fi
-      - name: Verify installation
-        run: |
-          python --version
-          pip --version
+          rustup toolchain install "$LRV"
+          rustup toolchain install "$MSRV"
       - name: Install debug symbols
         run: |
           sudo apt-get update
           sudo apt-get install libc6-dbg
-      - name: Build debugger and test applications
+      - name: Relax YAMA ptrace_scope
+        # Ubuntu CI runners ship `kernel.yama.ptrace_scope=1`, which
+        # blocks `bs -p <pid>` from attaching to non-descendant
+        # processes. The `test_external::*` tests spawn a `sleeper`
+        # inferior and then `bs -p` onto it, so they need scope 0
+        # (same as the Earthly container, which is unrestricted).
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
+      - name: Build release debugger + examples
+        # The integ tests spawn `./target/release/bs` (the Python
+        # harness did the same). Release strips debug overhead that
+        # would otherwise interleave with the per-test `expect`
+        # timing — debug builds emit extra auto-trap stops near
+        # library boundaries that throw expectations off.
         run: |
-          make build-rel
-          make build-examples RUST_VERSION=$LRV
-      - name: Verify test applications and debugger rustc versions
+          make build-test-rel
+          make build-examples RUST_VERSION="$LRV"
+      - name: Verify test applications rustc version
         run: |
-          strings ./target/release/bs | grep "rustc version" | grep $MSRV
-          strings ./examples/target/debug/calc | grep "^rustc version" | grep $LRV
+          strings ./target/release/bs | grep "rustc version" | grep "$MSRV"
+          strings ./examples/target/debug/calc | grep "^rustc version" | grep "$LRV"
       - name: Run integration tests
-        run: make int-test-rel
+        # `cargo test --test integ` replaces the legacy
+        # `tests/integration/*.py` unittest suite (retired alongside
+        # this commit). `--features int_test` strips ANSI colour
+        # codes from bs's output so the `expect_exact` calls in the
+        # Rust helper see plain text.
+        run: cargo test --test integ --features int_test -- --test-threads=1
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Install rust
         run: |
-          rustup toolchain install $MSRV
-          rustup component add --toolchain $MSRV rustfmt clippy
-          rustup override set $MSRV
+          rustup toolchain install "$MSRV"
+          rustup component add --toolchain "$MSRV" rustfmt clippy
+          rustup override set "$MSRV"
       - name: Build debugger and test programs
         run: make build-all
       - name: Verify msrv
         run: "grep \"^rust-version = .$MSRV.\" Cargo.toml"
       - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+        run: cargo fmt --all -- --check
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: -- -D warnings
+        run: cargo clippy -- -D warnings
 
   nix:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@ab739621df7a23f52766f9ccc97f38da6b7af14f  # v31.10.5
       - run: nix flake check
+
+  # Per `doc/plans/phase-0-preflight.md`: enforce the licence allow-list
+  # and surface upstream advisories on every PR. Config in `deny.toml`.
+  deny:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: EmbarkStudios/cargo-deny-action@a4d2d701318fdc1c6ae17ba8cea8f329c5110eb2  # v2.0.17
+        with:
+          command: check licenses bans sources advisories
+
+  # Linux/aarch64 build: catch regressions in the aarch64 port without
+  # needing local Earthly. We run the latest supported rustc only — full
+  # rustc-matrix coverage already exists for x86_64 above; aarch64 is
+  # there to catch arch-specific breakages (register file, BRK opcode,
+  # PC adjust, hardware-watchpoint regset, AAPCS64 inferior calls, …).
+  # Hardware-watchpoint integration tests (`watchpoint::*`) are
+  # `#[cfg]`-excluded on aarch64 because GitHub's hosted ARM runners do
+  # not virtualise debug-exception delivery — see
+  # `tests/debugger/main.rs` for the reasoning.
+  test-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install debug symbols
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libc6-dbg
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install "$LRV"
+          rustup toolchain install "$MSRV"
+      - name: Build test applications for functional testing
+        run: make build-examples-for-func-test RUST_VERSION="$LRV"
+      - name: Run library + functional tests
+        run: cargo test
+      - name: Run debugger integration tests
+        run: cargo test --features int_test --test debugger -- --test-threads=1
+      - name: Run DAP integration tests
+        run: cargo test --features int_test --test dap
+
+  lint-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install rust
+        run: |
+          rustup toolchain install "$MSRV"
+          rustup component add --toolchain "$MSRV" rustfmt clippy
+          rustup override set "$MSRV"
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+      - name: Run cargo clippy
+        run: cargo clippy -- -D warnings
+
+  # Darwin/aarch64 smoke. The full debugger test suite needs codesign
+  # entitlements for `task_for_pid` (see `tests/darwin.entitlements`
+  # and `project_darwin_codesign` memory), so on hosted GHA macOS we
+  # restrict this job to a build + lib-tests pass. Codesign-gated
+  # functional tests run locally (and in `ci-nightly.yml`).
+  test-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install rust toolchain
+        run: |
+          rustup toolchain install "$LRV"
+          rustup default "$LRV"
+      - name: cargo check (workspace)
+        run: cargo check --workspace --all-targets
+      - name: cargo test (lib only)
+        run: cargo test --workspace --lib

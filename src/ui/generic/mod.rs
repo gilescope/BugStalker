@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Generic UI components
 
 /// Render async primitives

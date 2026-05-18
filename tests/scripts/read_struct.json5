@@ -1,0 +1,73 @@
+// Migrated from tests/integration/test_variables.py::test_read_struct.
+//
+// Reads rust structs and tuples at the bottom of `vars::structs()`. The
+// fixture file is examples/vars/src/vars.rs.
+//
+// Run with:
+//   bs --test tests/scripts/read_struct.json5 ./examples/target/debug/vars
+// Bless after intentional rendering changes:
+//   bs --test --bless tests/scripts/read_struct.json5 ./examples/target/debug/vars
+
+{ method: "break.set", params: { at: "vars.rs:53" } }
+{ method: "run" }
+
+{ method: "assert.var", params: {
+    name: "tuple_0",
+    expect: {
+      total: 1,
+      items: [{ name: "tuple_0", type: "()", value_text: "()" }]
+    },
+    hint: "unit tuple renders as ()"
+}}
+
+{ method: "assert.var", params: {
+    name: "tuple_1",
+    expect: {
+      total: 1,
+      items: [{
+        name: "tuple_1",
+        type: "(f64, f64)",
+        value_text: "(0, 1.1)"
+      }]
+    },
+    hint: "f64 pair renders positionally"
+}}
+
+{ method: "assert.var", params: {
+    name: "tuple_2",
+    expect: {
+      total: 1,
+      items: [{
+        name: "tuple_2",
+        type: "(u64, i64, char, bool)",
+        value_text: "(1, -1, a, false)"
+      }]
+    },
+    hint: "four-element tuple"
+}}
+
+{ method: "assert.var", params: {
+    name: "foo",
+    expect: {
+      total: 1,
+      items: [{
+        name: "foo",
+        type: "Foo",
+        value_text: { "$contains": "bar: i32(100)" }
+      }]
+    },
+    hint: "Foo carries bar: i32(100)"
+}}
+
+{ method: "assert.var", params: {
+    name: "foo2",
+    expect: {
+      total: 1,
+      items: [{
+        name: "foo2",
+        type: "Foo2",
+        value_text: { "$contains": "additional: bool(true)" }
+      }]
+    },
+    hint: "Foo2 carries the additional: bool(true) field"
+}}

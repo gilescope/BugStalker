@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger;
 use crate::debugger::Error;
 use crate::debugger::address::{GlobalAddress, RelocatedAddress};
@@ -6,6 +7,23 @@ use crate::debugger::debugee::Debugee;
 use crate::debugger::debugee::dwarf::DebugInformation;
 use crate::debugger::debugee::dwarf::unit::die_ref::{FatDieRef, Function};
 use capstone::prelude::*;
+
+#[cfg(target_arch = "x86_64")]
+fn new_capstone() -> Result<Capstone, capstone::Error> {
+    Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Att)
+        .build()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn new_capstone() -> Result<Capstone, capstone::Error> {
+    Capstone::new()
+        .arm64()
+        .mode(arch::arm64::ArchMode::Arm)
+        .build()
+}
 use lru::LruCache;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
@@ -31,12 +49,7 @@ impl Disassembler {
     /// Create a new [`Disassembler`].
     pub fn new() -> Result<Self, Error> {
         Ok(Self {
-            cs: Capstone::new()
-                .x86()
-                .mode(arch::x86::ArchMode::Mode64)
-                .syntax(arch::x86::ArchSyntax::Att)
-                .build()
-                .map_err(Error::DisAsmInit)?,
+            cs: new_capstone().map_err(Error::DisAsmInit)?,
             cache: RefCell::new(LruCache::new(NonZeroUsize::new(1000).expect("infallible"))),
         })
     }
@@ -78,7 +91,21 @@ impl Disassembler {
                 .filter(|brkpt| brkpt.addr >= fn_reloc_pc_start && brkpt.addr <= fn_reloc_pc_end)
                 .for_each(|brkpt| {
                     let byte_idx = usize::from(brkpt.addr) - usize::from(fn_reloc_pc_start);
-                    text[byte_idx] = brkpt.saved_data.get();
+                    // Restore the original instruction bytes that were
+                    // overwritten by the breakpoint opcode. The width is
+                    // arch-specific: 1 byte (INT3) on x86_64, 4 bytes
+                    // (BRK #0) on aarch64.
+                    let saved = brkpt.saved_data.get();
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        text[byte_idx] = saved as u8;
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let bytes = (saved as u32).to_le_bytes();
+                        let end = (byte_idx + bytes.len()).min(text.len());
+                        text[byte_idx..end].copy_from_slice(&bytes[..end - byte_idx]);
+                    }
                 });
 
             let instructions = self

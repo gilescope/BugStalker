@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: MIT
+#
+# Nightly full-matrix CI per `doc/plans/phase-0-preflight.md`.
+# Per-PR `ci.yml` runs a curated 10–12-cell subset for fast feedback;
+# this workflow exercises the broader axes (OS × rustc channel × linker
+# × mangling × intel-pt × cargo features) on a schedule. The matrix
+# starts small in Phase 0 and expands as later phases land features
+# that need their own coverage cell.
+name: CI / nightly
+
+on:
+  schedule:
+    # 03:17 UTC, daily. Off the hour to avoid GHA scheduling cliffs.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  MSRV: 1.89.0
+  LRV: 1.95.0
+
+jobs:
+  matrix:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14]
+        channel: [stable, beta, nightly]
+        # Linker axis is exercised on x86 only — aarch64 uses lld
+        # everywhere. Phase 7 wires gold/mold/lld variants in.
+        include:
+          - os: ubuntu-latest
+            channel: stable
+            features: "int_test"
+          - os: ubuntu-latest
+            channel: nightly
+            features: "int_test"
+          - os: ubuntu-24.04-arm
+            channel: stable
+            features: "int_test"
+          - os: macos-14
+            channel: stable
+            features: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install rust toolchain
+        run: rustup toolchain install ${{ matrix.channel }}
+      - name: cargo check
+        run: cargo +${{ matrix.channel }} check --workspace --all-targets
+      - name: cargo test
+        run: cargo +${{ matrix.channel }} test --workspace --lib

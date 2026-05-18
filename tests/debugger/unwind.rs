@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::CALLS_APP;
 use crate::common::{TestHooks, TestInfo};
 use crate::{assert_no_proc, prepare_debugee_process};
@@ -78,7 +79,9 @@ fn test_unwind_restores_registers_for_caller_frame() {
     let process = prepare_debugee_process(CALLS_APP, &[]);
     let debugee_pid = process.pid();
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.set_breakpoint_at_line("calls.rs", 30).unwrap();
@@ -113,6 +116,14 @@ fn test_unwind_restores_registers_for_caller_frame() {
 
 #[test]
 #[serial]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "uses GNU objcopy + ELF section names; Mach-O equivalents \
+              (`__eh_frame` removal, `__debug_frame` synthesis) require a \
+              completely different build pipeline. The unwinder itself \
+              already supports `.debug_frame` regardless of platform — \
+              this test just can't construct a Mach-O fixture for it."
+)]
 fn test_unwind_uses_debug_frame_when_eh_frame_missing() {
     let binary_path = build_debug_frame_only_binary();
     let binary_str = binary_path
@@ -123,7 +134,9 @@ fn test_unwind_uses_debug_frame_when_eh_frame_missing() {
     let debugee_pid = process.pid();
 
     let info = TestInfo::default();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::new(info.clone()));
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
     let mut debugger = builder.build(process).unwrap();
 
     debugger.start_debugee().unwrap();

@@ -8,3 +8,5 @@ publish = false
 tokio = { package = "tokio", version = "=1.44.0", features = ["full"] }
 rand = "0.8"
 log = "0.4.20"
+
+[workspace]

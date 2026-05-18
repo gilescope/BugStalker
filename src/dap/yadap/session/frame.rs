@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use anyhow::{Context, anyhow};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
@@ -23,6 +24,25 @@ impl super::DebugSession {
             .get("threadId")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow!("stackTrace: missing arguments.threadId"))?;
+
+        if self.has_replay_session() {
+            if thread_id != super::replay::REPLAY_THREAD_ID {
+                return self.send_err(req, "stackTrace: unknown replay thread");
+            }
+            let event_index = self.replay_position().unwrap_or_default();
+            let pc = self.replay_current_pc()?;
+            let name = match pc {
+                Some(pc) => format!("replay event {event_index} @ 0x{pc:x}"),
+                None => format!("replay event {event_index}"),
+            };
+            let frame = json!({
+                "id": super::replay::REPLAY_FRAME_ID,
+                "name": name,
+                "line": 0,
+                "column": 0,
+            });
+            return self.send_success_body(req, json!({"stackFrames": [frame], "totalFrames": 1}));
+        }
 
         let pid = self
             .thread_cache
@@ -101,6 +121,10 @@ impl super::DebugSession {
     }
 
     pub(super) fn handle_scopes(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        if self.has_replay_session() {
+            return self.send_success_body(req, json!({ "scopes": [] }));
+        }
+
         let dbg = self
             .debugger
             .as_mut()
@@ -193,8 +217,18 @@ impl super::DebugSession {
             return self.send_err(req, "restartFrame: function start address is unavailable");
         };
 
-        dbg.set_register_value("rip", start_ip.as_u64())
-            .context("restartFrame: set rip")?;
+        // Full state restoration on aarch64: SP, LR, callee-saved
+        // regs all reset to function-entry values. On x86_64 this
+        // currently falls back to set_pc only (writing the return
+        // address to the new stack slot is a Phase-2 follow-up).
+        if let Err(e) = dbg.restart_top_frame(pid, start_ip.as_u64()) {
+            log::warn!(
+                target: "restart_frame",
+                "full state restore failed ({e}); falling back to PC-only"
+            );
+            dbg.set_pc(start_ip.as_u64())
+                .context("restartFrame: set pc fallback")?;
+        }
         let _ = dbg.set_frame_into_focus(0);
 
         self.send_success(req)?;
@@ -202,6 +236,22 @@ impl super::DebugSession {
     }
 
     pub fn refresh_threads_with_events(&mut self) -> anyhow::Result<Vec<Value>> {
+        if self.has_replay_session() && self.debugger.is_none() {
+            let id = super::replay::REPLAY_THREAD_ID;
+            let existing_ids: HashSet<i64> = self.thread_cache.keys().copied().collect();
+            if !existing_ids.contains(&id) {
+                self.enqueue_thread_event("started", id);
+            }
+            for old in existing_ids.into_iter().filter(|old| *old != id) {
+                self.enqueue_thread_event("exited", old);
+            }
+            self.thread_cache = HashMap::from([(id, Pid::from_raw(id as i32))]);
+            return Ok(vec![json!({
+                "id": id,
+                "name": "replay trace",
+            })]);
+        }
+
         let dbg = self
             .debugger
             .as_ref()

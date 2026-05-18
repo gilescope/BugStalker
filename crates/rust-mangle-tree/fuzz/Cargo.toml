@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "rust-mangle-tree-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# cargo-fuzz convention: this directory is *not* part of the
+# parent workspace (libfuzzer-sys would conflict with normal cargo
+# builds). Phase 8's `ci-fuzz.yml` runs `cargo fuzz run parse_random`
+# from this directory on nightly.
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rust-mangle-tree = { path = ".." }
+
+[[bin]]
+name = "parse_random"
+path = "fuzz_targets/parse_random.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+# Empty members list; this is a standalone crate.

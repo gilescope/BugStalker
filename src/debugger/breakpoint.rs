@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::Debugger;
 use crate::debugger::address::{Address, RelocatedAddress};
 use crate::debugger::debugee::Debugee;
@@ -5,7 +6,10 @@ use crate::debugger::debugee::dwarf::DebugInformation;
 use crate::debugger::debugee::dwarf::unit::PlaceDescriptorOwned;
 use crate::debugger::error::Error;
 use crate::debugger::error::Error::{NoDebugInformation, NoSuitablePlace, PlaceNotFound};
+use log::debug;
+#[cfg(target_os = "linux")]
 use nix::libc::c_void;
+#[cfg(target_os = "linux")]
 use nix::sys;
 use nix::unistd::Pid;
 use std::borrow::Cow;
@@ -68,8 +72,8 @@ impl Debugger {
     ///
     /// # Errors
     ///
-    /// Return [`SetupError::PlaceNotFound`] if no place found for address,
-    /// return [`BreakpointError::DebugInformation`] if errors occur while fetching debug information.
+    /// Return [`Error::PlaceNotFound`] if no place found for address,
+    /// return [`Error::NoDebugInformation`] if errors occur while fetching debug information.
     pub fn set_breakpoint_at_addr(
         &mut self,
         addr: RelocatedAddress,
@@ -272,8 +276,8 @@ impl Debugger {
     ///
     /// # Errors
     ///
-    /// Return [`SetupError::PlaceNotFound`] if function not found,
-    /// return [`BreakpointError::DebugInformation`] if errors occur while fetching debug information.
+    /// Return [`Error::PlaceNotFound`] if function not found,
+    /// return [`Error::NoDebugInformation`] if errors occur while fetching debug information.
     pub fn set_breakpoint_at_fn(
         &mut self,
         template: &str,
@@ -337,8 +341,8 @@ impl Debugger {
     ///
     /// # Errors
     ///
-    /// Return [`SetupError::PlaceNotFound`] if line or file not exist,
-    /// return [`BreakpointError::DebugInformation`] if errors occur while fetching debug information.
+    /// Return [`Error::PlaceNotFound`] if line or file not exist,
+    /// return [`Error::NoDebugInformation`] if errors occur while fetching debug information.
     pub fn set_breakpoint_at_line(
         &mut self,
         fine_path_tpl: &str,
@@ -351,6 +355,45 @@ impl Debugger {
 
         let brkpts = self.create_breakpoint_at_places(places)?;
         self.add_breakpoints(brkpts)
+    }
+
+    /// Same as `set_breakpoint_at_line` but also returns the line-
+    /// resolution diagnostics so callers (e.g. the structured
+    /// `break.set` front-end) can surface what choices the chooser
+    /// made when the source line maps to multiple addresses across
+    /// inlined / monomorphized copies.
+    pub fn set_breakpoint_at_line_with_diagnostics(
+        &mut self,
+        fine_path_tpl: &str,
+        line: u64,
+    ) -> Result<
+        (
+            Vec<BreakpointView<'_>>,
+            Vec<crate::debugger::debugee::dwarf::LineDiagnostics>,
+        ),
+        Error,
+    > {
+        let dwarfs = self.debugee.debug_info_all();
+        let mut per_dwarf_places: Vec<(&DebugInformation, Vec<PlaceDescriptorOwned>)> = vec![];
+        let mut diagnostics: Vec<crate::debugger::debugee::dwarf::LineDiagnostics> = vec![];
+
+        for dwarf in dwarfs.iter().filter(|d| d.has_debug_info()) {
+            let (places, diag) = dwarf.find_closest_place_with_diagnostics(fine_path_tpl, line)?;
+            if !diag.candidates.is_empty() {
+                diagnostics.push(diag);
+            }
+            let owned: Vec<PlaceDescriptorOwned> =
+                places.into_iter().map(|p| p.to_owned()).collect();
+            per_dwarf_places.push((*dwarf, owned));
+        }
+
+        if per_dwarf_places.iter().all(|(_, p)| p.is_empty()) {
+            return Err(NoSuitablePlace);
+        }
+
+        let brkpts = self.create_breakpoint_at_places(per_dwarf_places)?;
+        let views = self.add_breakpoints(brkpts)?;
+        Ok((views, diagnostics))
     }
 
     /// Disable and remove breakpoint at the following file and line number.
@@ -446,6 +489,99 @@ impl Debugger {
         self.breakpoints
             .deferred_breakpoints
             .push(DeferredBreakpoint::at_line(file, line));
+    }
+
+    /// Install auto-trap breakpoints — one at the panic-runtime entry,
+    /// one at libc's exit handler — so the user gets a final chance to
+    /// inspect locals / take a backtrace before the world goes away.
+    ///
+    /// Both traps are best-effort: a symbol the linker stripped or a
+    /// runtime that doesn't use the canonical names (no_std, custom
+    /// libc, …) is skipped silently. They install as ordinary
+    /// breakpoints so the user can `break.remove` them by number if
+    /// they're in the way.
+    ///
+    /// Returns `(panic_traps_set, exit_traps_set)`.
+    pub fn install_auto_traps(&mut self) -> (usize, usize) {
+        // Candidate symbols — broad on purpose; the same Rust binary
+        // may carry any subset depending on toolchain version, panic
+        // strategy, and whether the unwind runtime is statically
+        // linked. We try them all, deduplicating in practice because
+        // `set_breakpoint_at_fn` only fires once per resolved place.
+        const PANIC_FNS: &[&str] = &[
+            // Rust 1.83+ panic handler (the runtime hook entry).
+            "std::panicking::rust_panic_with_hook",
+            // Older Rust handler.
+            "std::panicking::begin_panic_handler",
+            // Formatted-arg panic entry from core::panicking.
+            "core::panicking::panic_fmt",
+            // The catch-all `_Unwind_RaiseException` rust-shim.
+            "rust_panic",
+        ];
+        const EXIT_FNS: &[&str] = &[
+            // Rust-side explicit exit.
+            "std::process::exit",
+            // libc's exit (runs atexit handlers, then _exit).
+            "exit",
+            // glibc-internal exit entry, sometimes the only one visible.
+            "__GI_exit",
+        ];
+
+        let mut panic_traps = 0usize;
+        for name in PANIC_FNS {
+            if self.set_breakpoint_at_fn(name).is_ok() {
+                panic_traps += 1;
+                debug!(target: "auto-trap", "installed panic trap at `{name}`");
+            }
+        }
+        let mut exit_traps = 0usize;
+        for name in EXIT_FNS {
+            if self.set_breakpoint_at_fn(name).is_ok() {
+                exit_traps += 1;
+                debug!(target: "auto-trap", "installed exit trap at `{name}`");
+            }
+        }
+
+        // Libc's `exit` lives in `libc.so.6` and is reachable via the
+        // dynamic-linker symbol table, but it usually carries no DWARF
+        // — `set_breakpoint_at_fn` won't find it. Walk every loaded
+        // module's symbol table directly. We set the breakpoint at
+        // the raw address (no `place` info) — when the trap fires the
+        // bt walks up into the caller's DWARF as usual, so the user
+        // still sees a useful stack.
+        const LIBC_EXIT_FNS: &[&str] = &["exit", "_exit", "__GI_exit", "__libc_exit"];
+        let modules: Vec<_> = self
+            .debugee
+            .debug_info_all()
+            .into_iter()
+            .map(|d| (d.pathname().to_path_buf(), d as *const _ as usize))
+            .collect();
+        let _ = modules; // we only re-fetch fresh refs in the loop body
+        // Iterate by name to avoid hanging onto borrows of `self.debugee`
+        // across `self.breakpoints.add_and_enable`.
+        let info_count = self.debugee.debug_info_all().len();
+        for idx in 0..info_count {
+            for name in LIBC_EXIT_FNS {
+                let (runtime, pathname) = {
+                    let infos = self.debugee.debug_info_all();
+                    let Some(info) = infos.get(idx) else { continue };
+                    let Some(global) = info.symbol_address(name) else {
+                        continue;
+                    };
+                    let Ok(runtime) = global.relocate_to_segment(&self.debugee, info) else {
+                        continue;
+                    };
+                    (runtime, info.pathname().to_path_buf())
+                };
+                let bp = Breakpoint::new(pathname, runtime, self.process.pid(), None);
+                if self.breakpoints.add_and_enable(bp).is_ok() {
+                    exit_traps += 1;
+                    debug!(target: "auto-trap", "installed libc exit trap at `{name}` @ {runtime}");
+                    break; // first match in this module wins
+                }
+            }
+        }
+        (panic_traps, exit_traps)
     }
 
     /// Refresh deferred breakpoints. Trying to set breakpoint if success - remove
@@ -553,7 +689,7 @@ pub struct Breakpoint {
     number: u32,
     /// Place information, None if brkpt is a temporary or entry point
     place: Option<PlaceDescriptorOwned>,
-    pub saved_data: Cell<u8>,
+    pub saved_data: Cell<u64>,
     enabled: Cell<bool>,
     r#type: BrkptType,
     pub debug_info_file: PathBuf,
@@ -566,7 +702,28 @@ impl Breakpoint {
 }
 
 impl Breakpoint {
-    const INT3: u64 = 0xCC_u64;
+    /// Software-breakpoint opcode.
+    ///
+    /// x86_64: `INT3` = `0xCC` (1 byte).
+    /// aarch64: `BRK #0` = `0xD4200000` (4 bytes, little-endian).
+    #[cfg(target_arch = "x86_64")]
+    const BRK_OPCODE: u64 = 0xCC;
+    #[cfg(target_arch = "x86_64")]
+    const BRK_MASK: u64 = 0xff;
+
+    #[cfg(target_arch = "aarch64")]
+    const BRK_OPCODE: u64 = 0xD420_0000;
+    #[cfg(target_arch = "aarch64")]
+    const BRK_MASK: u64 = 0xFFFF_FFFF;
+
+    /// Adjustment from the signalled PC back to the breakpoint address.
+    ///
+    /// x86_64 reports PC *after* the 1-byte `INT3` trap, so we rewind by 1.
+    /// aarch64 reports PC *at* the 4-byte `BRK #0`, so no rewind is needed.
+    #[cfg(target_arch = "x86_64")]
+    pub const PC_ADJUST: u64 = 1;
+    #[cfg(target_arch = "aarch64")]
+    pub const PC_ADJUST: u64 = 0;
 
     #[inline(always)]
     fn new_inner(
@@ -765,11 +922,12 @@ impl Breakpoint {
         matches!(self.r#type, BrkptType::TemporaryAsync)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn enable(&self) -> Result<(), Error> {
         let addr = self.addr.as_usize() as *mut c_void;
-        let data = sys::ptrace::read(self.pid, addr).map_err(Error::Ptrace)?;
-        self.saved_data.set((data & 0xff) as u8);
-        let data_with_pb = (data & !0xff) as u64 | Self::INT3;
+        let data = sys::ptrace::read(self.pid, addr).map_err(Error::Ptrace)? as u64;
+        self.saved_data.set(data & Self::BRK_MASK);
+        let data_with_pb = (data & !Self::BRK_MASK) | Self::BRK_OPCODE;
         unsafe {
             sys::ptrace::write(self.pid, addr, data_with_pb as *mut c_void)
                 .map_err(Error::Ptrace)?;
@@ -779,15 +937,71 @@ impl Breakpoint {
         Ok(())
     }
 
+    /// Darwin path: same `BRK_OPCODE` / `BRK_MASK` / `PC_ADJUST`
+    /// the linux/aarch64 path uses; only the kernel call shape
+    /// changes — we route through `darwin_mach::vm_read_n` /
+    /// `vm_write_word` (which itself widens the page to RW with
+    /// `mach_vm_protect(VM_PROT_COPY|READ|WRITE)` first, so the
+    /// CoW'd text page becomes writable for the duration).
+    #[cfg(not(target_os = "linux"))]
+    pub fn enable(&self) -> Result<(), Error> {
+        use crate::debugger::darwin_mach;
+        // `self.pid` may be a synthetic per-thread pid
+        // (proc_pid + 1_000_000) when the breakpoint comes from a
+        // step-over computed at a stop on a worker thread. Synthetic
+        // pids aren't real kernel pids — task_for_pid rejects them
+        // with KERN_FAILURE. `task_for_pid_or_proc` falls back to
+        // the proc's task port (same task for all threads in the
+        // process), which is what we want for memory ops here.
+        let task = darwin_mach::task_for_pid_or_proc(self.pid)?;
+        let addr = self.addr.as_usize();
+        let bytes = darwin_mach::vm_read_n(task, addr, std::mem::size_of::<u64>())?;
+        let arr: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .expect("vm_read_n returns exactly 8 bytes");
+        let data = u64::from_ne_bytes(arr);
+        self.saved_data.set(data & Self::BRK_MASK);
+        let data_with_pb = (data & !Self::BRK_MASK) | Self::BRK_OPCODE;
+        darwin_mach::vm_write_word(task, addr, data_with_pb as usize)?;
+        self.enabled.set(true);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn disable(&self) -> Result<(), Error> {
         let addr = self.addr.as_usize() as *mut c_void;
         let data = sys::ptrace::read(self.pid, addr).map_err(Error::Ptrace)? as u64;
-        let restored: u64 = (data & !0xff) | self.saved_data.get() as u64;
+        let restored: u64 = (data & !Self::BRK_MASK) | self.saved_data.get();
         unsafe {
             sys::ptrace::write(self.pid, addr, restored as *mut c_void).map_err(Error::Ptrace)?;
         }
         self.enabled.set(false);
 
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn disable(&self) -> Result<(), Error> {
+        use crate::debugger::darwin_mach;
+        // `self.pid` may be a synthetic per-thread pid
+        // (proc_pid + 1_000_000) when the breakpoint comes from a
+        // step-over computed at a stop on a worker thread. Synthetic
+        // pids aren't real kernel pids — task_for_pid rejects them
+        // with KERN_FAILURE. `task_for_pid_or_proc` falls back to
+        // the proc's task port (same task for all threads in the
+        // process), which is what we want for memory ops here.
+        let task = darwin_mach::task_for_pid_or_proc(self.pid)?;
+        let addr = self.addr.as_usize();
+        let bytes = darwin_mach::vm_read_n(task, addr, std::mem::size_of::<u64>())?;
+        let arr: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .expect("vm_read_n returns exactly 8 bytes");
+        let data = u64::from_ne_bytes(arr);
+        let restored: u64 = (data & !Self::BRK_MASK) | self.saved_data.get();
+        darwin_mach::vm_write_word(task, addr, restored as usize)?;
+        self.enabled.set(false);
         Ok(())
     }
 }
@@ -1166,9 +1380,16 @@ impl BreakpointRegistry {
                 errors.push(e);
             }
 
-            let addr = Address::Global(brkpt.addr.into_global(debugee)?);
+            // Only compute the global address for breakpoints we
+            // actually re-save below — `LinkerMapFn` BPs sit in
+            // dyld/ld-linux pages whose mapping the registry may
+            // not track (notably on darwin, where dsymutil never
+            // covers system libraries), so converting them would
+            // fail with `MappingOffsetNotFound` and abort the whole
+            // restart. We're throwing those away anyway.
             match brkpt.r#type {
                 BrkptType::EntryPoint => {
+                    let addr = Address::Global(brkpt.addr.into_global(debugee)?);
                     self.add_uninit(UninitBreakpoint::new_entry_point(
                         Some(brkpt.debug_info_file),
                         addr,
@@ -1176,6 +1397,7 @@ impl BreakpointRegistry {
                     ));
                 }
                 BrkptType::UserDefined => {
+                    let addr = Address::Global(brkpt.addr.into_global(debugee)?);
                     self.add_uninit(UninitBreakpoint::new_inherited(addr, brkpt));
                 }
                 BrkptType::Temporary

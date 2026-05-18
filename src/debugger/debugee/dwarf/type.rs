@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::debugee::dwarf::eval::{AddressKind, EvaluationContext};
 use crate::debugger::debugee::dwarf::unit::DieAddr;
 use crate::debugger::debugee::dwarf::unit::die::Die;
@@ -69,6 +70,14 @@ impl TypeIdentity {
         self.name().unwrap_or("unknown")
     }
 
+    /// Replace the name in place — used by Phase 3 Feature A's
+    /// trait-object resolver to splice the recovered concrete type
+    /// into the displayed identity.
+    #[inline(always)]
+    pub fn set_name(&mut self, name: String) {
+        self.name = Some(name);
+    }
+
     /// Create address type name.
     #[inline(always)]
     pub fn as_address_type(&self) -> TypeIdentity {
@@ -138,6 +147,13 @@ pub struct StructureMember {
     pub in_struct_location: Option<MemberLocation>,
     pub name: Option<String>,
     pub type_ref: Option<TypeId>,
+    /// Phase 3 Feature D — `(file_index, line)` pair from the member's
+    /// `DW_AT_decl_file`/`DW_AT_decl_line` attributes, when present.
+    /// rustc emits these on the member fields of a coroutine state-
+    /// machine enum's variants, where they encode the source location
+    /// of the corresponding `.await` point. The renderer uses them to
+    /// drive Phase 3 D's await-trace.
+    pub decl_file_line: Option<(u64, u64)>,
 }
 
 impl StructureMember {
@@ -336,6 +352,13 @@ pub enum TypeDeclaration {
         byte_size: Option<u64>,
         members: Vec<StructureMember>,
         type_params: IndexMap<String, Option<TypeId>>,
+        /// Phase 3 Feature A — true when this struct is the
+        /// fat-pointer representation of a `dyn Trait`. Detected
+        /// by name pattern (`<… dyn …>`) plus the canonical
+        /// `pointer`/`vtable` member shape rustc emits. Used by
+        /// the renderer to annotate the value and (eventually)
+        /// drive vtable → concrete-type resolution.
+        is_trait_object: bool,
     },
     Union {
         namespaces: NamespaceHierarchy,
@@ -623,6 +646,17 @@ impl TypeParser {
                 gimli::DW_TAG_array_type => Some(self.parse_array(die_ref)),
                 gimli::DW_TAG_enumeration_type => Some(self.parse_enum(die_ref)),
                 gimli::DW_TAG_pointer_type => Some(self.parse_pointer(die_ref)),
+                // F1 (Phase 1): reference and rvalue-reference type DIEs are
+                // pointer-shaped. rustc currently emits `DW_TAG_pointer_type`
+                // for `&T` / `&mut T`, but reference-type DIEs surface from
+                // C++ debug info reachable via FFI, from non-default rustc
+                // codegen flavours, and from custom DWARF producers.
+                // Treating them as pointers keeps the parser silent and the
+                // rendered type name (`&T` / `&mut T`) preserved as written
+                // by the producer in `DW_AT_name`.
+                gimli::DW_TAG_reference_type | gimli::DW_TAG_rvalue_reference_type => {
+                    Some(self.parse_pointer(die_ref))
+                }
                 gimli::DW_TAG_union_type => Some(self.parse_union(die_ref)),
                 gimli::DW_TAG_subrange_type => Some(self.parse_subroutine(die_ref)),
                 gimli::DW_TAG_typedef => Some(self.parse_typedef(die_ref)),
@@ -763,12 +797,14 @@ impl TypeParser {
             .into_iter()
             .collect::<IndexMap<_, _>>();
 
+        let is_trait_object = looks_like_trait_object(name.as_deref(), &members);
         TypeDeclaration::Structure {
             namespaces: die_ref.namespace(),
             name,
             byte_size: die.byte_size(),
             members,
             type_params,
+            is_trait_object,
         }
     }
 
@@ -794,6 +830,7 @@ impl TypeParser {
             in_struct_location,
             name: die.name(),
             type_ref: mb_type_ref,
+            decl_file_line: die.decl_file_line(),
         }
     }
 
@@ -1001,3 +1038,114 @@ impl TypeParser {
 /// A cache structure for types.
 /// Every type identified by its `TypeId` and DWARF unit uuid.
 pub type TypeCache = HashMap<(Uuid, TypeId), Rc<ComplexType>>;
+
+/// Phase 3 Feature A — heuristic detector for the rustc
+/// fat-pointer representation of a `dyn Trait`.
+///
+/// Two independent signals; either is sufficient:
+///
+/// * **Name pattern** — rustc emits the wrapping struct's
+///   `DW_AT_name` containing `dyn ` (e.g.
+///   `alloc::boxed::Box<dyn core::error::Error, alloc::alloc::Global>`).
+/// * **Member shape** — exactly two members named `pointer` and
+///   `vtable` (or `data_ptr` and `vtable` in some versions).
+///
+/// The two-signal approach is robust against rustc renaming the
+/// struct on us — if the name changes, the member shape still
+/// catches it; if the member shape changes, the name still does.
+fn looks_like_trait_object(name: Option<&str>, members: &[StructureMember]) -> bool {
+    if name.is_some_and(|n| n.contains("dyn ")) {
+        return true;
+    }
+    if members.len() == 2 {
+        let m0 = members[0].name.as_deref();
+        let m1 = members[1].name.as_deref();
+        let pair = (m0, m1);
+        return matches!(
+            pair,
+            (Some("pointer"), Some("vtable"))
+                | (Some("data_ptr"), Some("vtable"))
+                | (Some("vtable"), Some("pointer"))
+                | (Some("vtable"), Some("data_ptr"))
+        );
+    }
+    false
+}
+
+/// Phase 3 Feature D step 1 — heuristic detector for the rustc
+/// coroutine state-machine type. The synthesised type name for the
+/// body of an `async fn` (or any generator/coroutine) carries one of
+/// three suffixes depending on rustc version:
+///
+/// * `{async_fn_env#N}` — historical
+/// * `{coroutine_env#N}` — current (post `coroutine` rename)
+/// * `{generator_env#N}` — pre-`coroutine` legacy
+///
+/// where `N` is a per-compilation-unit disambiguator. This helper is
+/// used for intent-clear prefilters and richer diagnostics — the
+/// existing `AsyncFnFuture::try_from` already pattern-matches on the
+/// active variant's *state* name (`Suspend{N}` / `Unresumed` / …),
+/// which is what actually drives correctness; the type-name check
+/// is the diagnostics layer that lets the renderer say "this is a
+/// coroutine but its state name didn't decode" rather than
+/// silently returning a parse error.
+pub fn looks_like_coroutine_type_name(name: &str) -> bool {
+    name.contains("{async_fn_env#")
+        || name.contains("{coroutine_env#")
+        || name.contains("{generator_env#")
+}
+
+#[cfg(test)]
+mod coroutine_type_name_tests {
+    use super::looks_like_coroutine_type_name;
+
+    #[test]
+    fn matches_async_fn_env_pattern() {
+        assert!(looks_like_coroutine_type_name(
+            "tokio_simple_await::worker_task::{async_fn_env#0}"
+        ));
+        assert!(looks_like_coroutine_type_name(
+            "my_app::nested::module::deep::handler::{async_fn_env#7}"
+        ));
+    }
+
+    #[test]
+    fn matches_coroutine_env_pattern() {
+        // Current rustc post the `coroutine` rename.
+        assert!(looks_like_coroutine_type_name(
+            "my_app::handler::{coroutine_env#0}"
+        ));
+    }
+
+    #[test]
+    fn matches_generator_env_legacy_pattern() {
+        // Pre-`coroutine` rustc.
+        assert!(looks_like_coroutine_type_name(
+            "my_app::handler::{generator_env#0}"
+        ));
+    }
+
+    #[test]
+    fn rejects_ordinary_enum_names() {
+        assert!(!looks_like_coroutine_type_name("Option<i32>"));
+        assert!(!looks_like_coroutine_type_name(
+            "core::result::Result<u32, std::io::Error>"
+        ));
+        // Closure environment, not a coroutine — must not match.
+        assert!(!looks_like_coroutine_type_name(
+            "my_app::handler::{closure_env#0}"
+        ));
+    }
+
+    #[test]
+    fn rejects_partial_substring_matches() {
+        // The marker uses braces; a stray substring without them
+        // (very unlikely but cheap to guard against) should not
+        // light up. Note: this is a sanity check; the contains()
+        // check is intentionally permissive about surrounding
+        // context because rustc may decorate the name (generic
+        // instantiation, monomorphisation suffixes, …).
+        assert!(!looks_like_coroutine_type_name("async_fn_env"));
+        assert!(!looks_like_coroutine_type_name("coroutine_env_v2"));
+    }
+}

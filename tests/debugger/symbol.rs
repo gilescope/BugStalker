@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::common::TestHooks;
 use crate::prepare_debugee_process;
 use crate::{HW_APP, assert_no_proc};
@@ -10,7 +11,9 @@ use serial_test::serial;
 fn test_symbol() {
     let process = prepare_debugee_process(HW_APP, &[]);
     let debugee_pid = process.pid();
-    let builder = DebuggerBuilder::new().with_hooks(TestHooks::default());
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::default());
     let mut debugger = builder.build(process).unwrap();
 
     let symbols = debugger.get_symbols("^main$").unwrap();

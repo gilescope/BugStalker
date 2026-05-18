@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Debug Adapter Protocol implementations for BugStalker.
 
 pub mod tracer;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::{CreateTransparentBreakpointRequest, Debugger};
 use crate::oracle::builtin::nop::tui::NopComponent;
 use crate::oracle::{ConsolePlugin, Oracle, TuiPlugin};

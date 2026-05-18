@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -30,6 +31,10 @@ impl super::DebugSession {
         self.debugger
             .as_ref()
             .map(|d| d.ecx().pid_on_focus().as_raw() as i64)
+            .or_else(|| {
+                self.has_replay_session()
+                    .then_some(super::replay::REPLAY_THREAD_ID)
+            })
     }
 
     fn literal_truthy(literal: &Literal) -> bool {
@@ -269,7 +274,23 @@ impl super::DebugSession {
     }
 
     pub fn emit_stop_reason(&mut self, stop: debugger::StopReason) -> anyhow::Result<()> {
+        self.emit_stop_reason_with_options(stop, false)
+    }
+
+    /// `emit_stop_reason` variant with the DAP `preserveFocusHint`
+    /// flag. Set the flag on stops that fire while the user is
+    /// editing — VSCode otherwise grabs the text-editor cursor away
+    /// from where they're typing onto the stop line. Used by
+    /// `bs/applyPatch`'s auto-resume path: when a frame restart
+    /// lands the user back at their original breakpoint, we don't
+    /// want their typing focus snatched.
+    pub fn emit_stop_reason_with_options(
+        &mut self,
+        stop: debugger::StopReason,
+        preserve_focus_hint: bool,
+    ) -> anyhow::Result<()> {
         let mut stop = stop;
+        let _focus_hint_for_event = preserve_focus_hint;
         loop {
             while !self.should_stop_on_exception(&stop) {
                 let dbg = self
@@ -356,6 +377,7 @@ impl super::DebugSession {
 
         self.begin_stop_epoch();
         let _ = self.refresh_threads_with_events();
+        self.capture_live_reverse_stop();
 
         let (source_path, line, column, stack_trace) = self
             .debugger
@@ -413,6 +435,7 @@ impl super::DebugSession {
             reason,
             thread_id,
             description,
+            preserve_focus_hint: _focus_hint_for_event,
         });
         self.drain_events()?;
         Ok(())
@@ -457,6 +480,7 @@ impl super::DebugSession {
                     reason: "pause".to_string(),
                     thread_id,
                     description: Some("Paused".to_string()),
+                    preserve_focus_hint: false,
                 });
             }
             Err(e) => {
@@ -504,6 +528,7 @@ impl super::DebugSession {
                 });
                 self.send_success_body(req, json!({"allThreadsContinued": true}))?;
                 self.begin_stop_epoch();
+                self.capture_live_reverse_stop();
 
                 self.last_stop = Some(LastStop {
                     reason: "pause".to_string(),
@@ -520,6 +545,7 @@ impl super::DebugSession {
                     reason: "step".to_string(),
                     thread_id,
                     description: None,
+                    preserve_focus_hint: false,
                 });
                 self.drain_events()
             }
@@ -554,12 +580,14 @@ impl super::DebugSession {
                 });
                 self.send_success_body(req, json!({"allThreadsContinued": true}))?;
                 self.begin_stop_epoch();
+                self.capture_live_reverse_stop();
 
                 let thread_id = self.current_thread_id();
                 self.enqueue_event(InternalEvent::Stopped {
                     reason: "step".to_string(),
                     thread_id,
                     description: None,
+                    preserve_focus_hint: false,
                 });
                 self.drain_events()
             }
@@ -594,12 +622,14 @@ impl super::DebugSession {
                 });
                 self.send_success_body(req, json!({"allThreadsContinued": true}))?;
                 self.begin_stop_epoch();
+                self.capture_live_reverse_stop();
 
                 let thread_id = self.current_thread_id();
                 self.enqueue_event(InternalEvent::Stopped {
                     reason: "step".to_string(),
                     thread_id,
                     description: None,
+                    preserve_focus_hint: false,
                 });
                 self.drain_events()
             }
@@ -617,7 +647,9 @@ impl super::DebugSession {
         }
     }
 
-    fn current_stop_snapshot(&self) -> (Option<String>, Option<i64>, Option<i64>, Option<String>) {
+    pub(super) fn current_stop_snapshot(
+        &self,
+    ) -> (Option<String>, Option<i64>, Option<i64>, Option<String>) {
         self.debugger
             .as_ref()
             .and_then(|dbg| {
@@ -667,6 +699,7 @@ impl super::DebugSession {
     ) -> anyhow::Result<()> {
         self.begin_stop_epoch();
         let _ = self.refresh_threads_with_events();
+        self.capture_live_reverse_stop();
 
         let (source_path, line, column, stack_trace) = self.current_stop_snapshot();
 
@@ -685,6 +718,7 @@ impl super::DebugSession {
             reason: reason.to_string(),
             thread_id,
             description,
+            preserve_focus_hint: false,
         });
         self.drain_events()
     }
@@ -744,8 +778,7 @@ impl super::DebugSession {
             let _ = dbg.set_thread_into_focus_by_pid(pid);
         }
 
-        dbg.set_register_value("rip", addr as u64)
-            .context("goto: set rip")?;
+        dbg.set_pc(addr as u64).context("goto: set pc")?;
         let _ = dbg.set_frame_into_focus(0);
 
         self.send_success(req)?;
@@ -936,6 +969,9 @@ impl super::DebugSession {
     }
 
     pub(super) fn handle_step_back(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        if self.has_replay_session() {
+            return self.handle_replay_step_back(req);
+        }
         let args = req
             .arguments
             .as_object()
@@ -952,13 +988,13 @@ impl super::DebugSession {
             return self.send_err(req, "stepBack: threadId must be non-negative");
         }
         let _ = i32::try_from(thread_id).map_err(|_| anyhow!("stepBack: threadId out of range"))?;
-        self.send_err(
-            req,
-            "stepBack: reverse execution is not supported by the current engine",
-        )
+        self.handle_live_step_back(req, thread_id)
     }
 
     pub(super) fn handle_reverse_continue(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        if self.has_replay_session() {
+            return self.handle_replay_reverse_continue(req);
+        }
         let args = req
             .arguments
             .as_object()

@@ -1,8 +1,11 @@
 #![allow(dead_code)]
+// SPDX-License-Identifier: MIT
 
 use crate::debugger::address::RelocatedAddress;
+#[cfg(target_os = "linux")]
 use nix::libc;
 use nix::unistd::Pid;
+#[cfg(target_os = "linux")]
 use object::elf::DT_DEBUG;
 use std::collections::HashMap;
 
@@ -25,11 +28,27 @@ pub enum RendezvousError {
 /// Rendezvous structure maintained by dynamic linker.
 /// This structure maintains a list of shared library descriptors.
 pub struct Rendezvous {
+    #[allow(dead_code)]
     pid: Pid,
+    #[cfg(target_os = "linux")]
     inner: ffi::r_debug,
+    /// Snapshot of dyld's loaded-image list, captured at
+    /// `Rendezvous::new` time. The image array is refreshed by
+    /// re-walking `dyld_all_image_infos.infoArray` whenever the
+    /// dyld notification BP fires (see `notification_addr`).
+    #[cfg(not(target_os = "linux"))]
+    images: Vec<crate::debugger::darwin_mach::ImageInfo>,
+    /// Address of dyld's image-add/remove notification function in
+    /// the debuggee. The macOS analogue of `r_debug.r_brk` — a
+    /// software BP installed here fires on every `dlopen` /
+    /// `dlclose`. Captured at `Rendezvous::new` time; zero if
+    /// dyld hasn't published it yet (transient, just after exec).
+    #[cfg(not(target_os = "linux"))]
+    notification_addr: u64,
 }
 
 impl Rendezvous {
+    #[cfg(target_os = "linux")]
     pub fn new(
         proc_pid: Pid,
         mapping_offset: usize,
@@ -61,10 +80,12 @@ impl Rendezvous {
         Err(RendezvousError::NotFound)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn link_map_main(&self) -> RelocatedAddress {
         RelocatedAddress::from(self.inner.link_map as usize)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn link_maps(&self) -> Result<Vec<LinkMap>, RendezvousError> {
         let mut result = vec![];
         let mut next_link_map_addr = usize::from(self.link_map_main()) as *const libc::c_void;
@@ -87,11 +108,102 @@ impl Rendezvous {
     /// Return an address of a function internal to the run-time linker,
     /// that will always be called when the linker begins to map in a
     /// library or unmap it, and again when the mapping change is complete.
+    #[cfg(target_os = "linux")]
     pub fn r_brk(&self) -> RelocatedAddress {
         RelocatedAddress::from(self.inner.r_brk)
     }
+
+    /// Darwin path: build a `Rendezvous` from
+    /// `task_info(TASK_DYLD_INFO)` — that gives us a debuggee VA
+    /// pointing at dyld's `dyld_all_image_infos`, which we walk to
+    /// snapshot the loaded-image list. The `mapping_offset` and
+    /// `sections` arguments come from the GNU ELF rendezvous flow
+    /// and have no darwin equivalent — kept in the signature so
+    /// the cross-platform call site (in `Debugee::new_*`) doesn't
+    /// have to cfg-branch.
+    #[cfg(not(target_os = "linux"))]
+    pub fn new(
+        proc_pid: Pid,
+        _mapping_offset: usize,
+        _sections: &HashMap<String, u64>,
+    ) -> Result<Self, RendezvousError> {
+        use crate::debugger::darwin_mach;
+        let task = darwin_mach::task_for_pid(proc_pid).map_err(|_| RendezvousError::NotFound)?;
+        let images = darwin_mach::dyld_image_list(task).map_err(|_| RendezvousError::NotFound)?;
+        if images.is_empty() {
+            return Err(RendezvousError::NotFound);
+        }
+        // Best-effort: dyld may not have populated `notification`
+        // yet — that's fine, callers retry once the inferior has
+        // taken at least one stop.
+        let notification_addr = darwin_mach::dyld_notification_addr(task).unwrap_or(0);
+        Ok(Self {
+            pid: proc_pid,
+            images,
+            notification_addr,
+        })
+    }
+
+    /// Darwin: the first dyld image is the main executable's
+    /// `mach_header`; that's the cross-platform equivalent of
+    /// linux's `link_map` head pointer.
+    #[cfg(not(target_os = "linux"))]
+    pub fn link_map_main(&self) -> RelocatedAddress {
+        let load = self.images.first().map(|i| i.load_addr).unwrap_or(0);
+        RelocatedAddress::from(load)
+    }
+
+    /// Darwin: one `LinkMap` per loaded dyld image. We use each
+    /// image's `mach_header` load address as the `addr` field
+    /// (analogous to linux's `link_map` node address) and the
+    /// path string as the name.
+    ///
+    /// Re-walks `dyld_all_image_infos.infoArray` on every call so
+    /// callers always see the inferior's *current* image list. The
+    /// snapshot taken at `Rendezvous::new` time is stale the moment
+    /// the inferior dlopens anything, and the deferred-BP refresh
+    /// path depends on this method seeing newly-loaded dylibs.
+    #[cfg(not(target_os = "linux"))]
+    pub fn link_maps(&self) -> Result<Vec<LinkMap>, RendezvousError> {
+        use crate::debugger::darwin_mach;
+        let task = darwin_mach::task_for_pid(self.pid).map_err(|_| RendezvousError::NotFound)?;
+        let images = darwin_mach::dyld_image_list(task).map_err(|_| RendezvousError::NotFound)?;
+        Ok(images
+            .into_iter()
+            .map(|i| LinkMap {
+                addr: RelocatedAddress::from(i.load_addr),
+                name: i.path,
+            })
+            .collect())
+    }
+
+    /// Darwin: dyld publishes a `notification` function in
+    /// `dyld_all_image_infos`; it's called on every image
+    /// load/unload with the mode + count + info-array pointer.
+    /// Installing a software BP here gives us the macOS analogue
+    /// of `r_brk` — same shape, same use ("re-walk images on
+    /// every fire") that the linux side already implements. If
+    /// dyld hasn't filled the field in yet (transient, just after
+    /// exec), we fall back to the main image's load address so
+    /// the caller's "set a BP here" code lands somewhere benign;
+    /// the next `Rendezvous::new` call after dyld is up will
+    /// resolve to the real notification address.
+    #[cfg(not(target_os = "linux"))]
+    pub fn r_brk(&self) -> RelocatedAddress {
+        if self.notification_addr != 0 {
+            RelocatedAddress::from(self.notification_addr as usize)
+        } else {
+            self.link_map_main()
+        }
+    }
 }
 
+// The rendezvous protocol read here is GNU ld.so's `r_debug` /
+// `link_map` linked list, accessed via `process_vm_readv` (linux-only).
+// Darwin has a completely different image-list discovery path:
+// `task_info(TASK_DYLD_INFO)` returns a `dyld_image_info_array` —
+// that's what the macOS port will plumb in when we get there.
+#[cfg(target_os = "linux")]
 mod ffi {
     #![allow(non_camel_case_types)]
 

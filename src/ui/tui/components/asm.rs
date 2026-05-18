@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::register::debug::BreakCondition;
 use crate::ui;
 use crate::ui::proto::ClientExchanger;

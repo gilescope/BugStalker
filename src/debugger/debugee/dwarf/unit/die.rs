@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::{
     debugger::{
         Error,
@@ -7,9 +8,10 @@ use crate::{
 };
 use gimli::{
     Attribute, AttributeValue, DW_AT_byte_size, DW_AT_const_value, DW_AT_count,
-    DW_AT_data_member_location, DW_AT_discr, DW_AT_discr_value, DW_AT_encoding, DW_AT_frame_base,
-    DW_AT_location, DW_AT_lower_bound, DW_AT_name, DW_AT_type, DW_AT_upper_bound,
-    DebuggingInformationEntry, DwAt, DwTag, Dwarf, Range, Reader, Unit, UnitOffset,
+    DW_AT_data_member_location, DW_AT_decl_file, DW_AT_decl_line, DW_AT_discr, DW_AT_discr_value,
+    DW_AT_encoding, DW_AT_frame_base, DW_AT_linkage_name, DW_AT_location, DW_AT_lower_bound,
+    DW_AT_name, DW_AT_type, DW_AT_upper_bound, DebuggingInformationEntry, DwAt, DwTag, Dwarf,
+    Range, Reader, Unit, UnitOffset,
 };
 use std::collections::VecDeque;
 
@@ -69,6 +71,14 @@ impl<'a> Die<'a> {
     impl_no_virt!(name, Option<String>, |dcx: &DerefContext, die: GimliDie| {
         Self::attr_to_string(dcx.dwarf, dcx.unit, die, DW_AT_name).ok()?
     });
+
+    impl_no_virt!(
+        linkage_name,
+        Option<String>,
+        |dcx: &DerefContext, die: GimliDie| {
+            Self::attr_to_string(dcx.dwarf, dcx.unit, die, DW_AT_linkage_name).ok()?
+        }
+    );
 
     impl_no_virt!(ranges, Box<[Range]>, |dcx: &DerefContext, die: GimliDie| {
         dcx.dwarf
@@ -149,6 +159,30 @@ impl<'a> Die<'a> {
         Option<Attribute<EndianArcSlice>>,
         |_, die: GimliDie| { die.attr(DW_AT_frame_base).cloned() }
     );
+
+    /// `(file_index, line)` pair read from this DIE's
+    /// `DW_AT_decl_file` / `DW_AT_decl_line` attributes (returns
+    /// `None` if either is absent).
+    ///
+    /// Resolve `file_index` against
+    /// [`super::BsUnit::files`] to get a `PathBuf`.
+    ///
+    /// Phase 3 Feature D uses this on the captured-locals member DIEs
+    /// of a coroutine state-machine enum's `Suspend` variants, where
+    /// rustc emits the source position of the corresponding `.await`
+    /// (the technique demonstrated in Cliff Biffle's `lildb`).
+    ///
+    /// Panics on virtual DIEs.
+    pub fn decl_file_line(&self) -> Option<(u64, u64)> {
+        match self {
+            Die::Virtual { .. } => unimplemented!(),
+            Die::Dwarf { die, .. } => {
+                let file_idx = die.attr(DW_AT_decl_file).and_then(|a| a.udata_value())?;
+                let line = die.attr(DW_AT_decl_line).and_then(|a| a.udata_value())?;
+                Some((file_idx, line))
+            }
+        }
+    }
 
     pub fn for_each_children_t<T>(&self, mut f: impl FnMut(Die<'a>) -> Option<T>) -> Option<T> {
         match self {

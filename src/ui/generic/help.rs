@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::Debugger;
 use crate::ui::command;
 use command::parser;
@@ -12,7 +13,7 @@ argd <name or expression>|all               -- show arguments of current stack f
 bt, backtrace <>|all                        -- print backtrace of all stack frames in current thread or from all threads
 f, frame info|switch <number>               -- print current stack frame information or change frame
 c, continue                                 -- continue program being debugged, after signal or breakpoint
-r, run                                      -- start or restart debugged programm 
+r, run                                      -- start or restart debugged programm
 stepi                                       -- step one instruction
 step, stepinto                              -- step program until it reaches a different source line
 finish, stepout                             -- execute program until selected stack frame returns
@@ -26,19 +27,25 @@ thread info|current|switch <number>         -- show list of threads or current (
 sharedlib info                              -- show list of shared libraries
 source asm|fn|<bounds>                      -- show source code or assembly instructions for current (in focus) function
 async backtrace|backtrace all|task          -- commands for async rust
+async await-trace, async at                 -- print current task's awaitee chain with .await source coords
 trigger info|any|<>|b <number>|w <number>   -- define a list of commands that will be executed when a certain event is triggered
 call <function name> <arguments>            -- call a function from debuggee program
 oracle <oracle> <>|<subcommand>             -- execute a specific oracle
+replay load|unload|status                   -- manage Phase 5 reverse-step session against a recorded trace
+rs, rstep                                   -- step the loaded trace's playhead back one event
+rsf, rstep-fwd                              -- step the loaded trace's playhead forward one event
+rc, rcontinue                               -- run playhead back to the previous replay breakpoint
+rbreak, rbreak-clear <event_index>          -- add or remove a replay breakpoint at an event index
 h, help <>|<command>                        -- show help
 tui                                         -- change ui mode to tui
-q, quit                                     -- exit the BugStalker 
+q, quit                                     -- exit the BugStalker
 "#;
 
 pub const DQE_DESCRIPTION: &str = "
 \x1b[;1mData query expression\x1b[0m
-To analyze data in a program, you often need a tool for introspection of variables, which allows, 
-for example, dereference a pointer or taking an array element by index. BugStalker provides a data 
-query expressions as such a tool. 
+To analyze data in a program, you often need a tool for introspection of variables, which allows,
+for example, dereference a pointer or taking an array element by index. BugStalker provides a data
+query expressions as such a tool.
 
 Available operators:
 `*` - dereference, available for references, pointers and smart pointers (Rc and Arc)
@@ -48,8 +55,8 @@ Available operators:
 `.` - get field, available for structs, enums and hashmaps (with string keys)
 `(` and `)` - parentheses to prioritize operations
 `({ptr/ref type})` - cast constant address to typed pointer or reference
-`[{literal}]` - index operator, available for arrays, enums, vectors, veqdequeues, hashmaps, hashsets, btreemaps and btreesets. 
-Literal is a json-like object (with wildcards feature), that can be used for matching with real data. 
+`[{literal}]` - index operator, available for arrays, enums, vectors, veqdequeues, hashmaps, hashsets, btreemaps and btreesets.
+Literal is a json-like object (with wildcards feature), that can be used for matching with real data.
 See `help dqe literal` for more information
 
 Examples:
@@ -59,19 +66,19 @@ Examples:
 `(~vec1).len` - print lenght field of vector header structure
 `&vec1[1]` - print address of second element in vector `vec1`
 `(**var1).field1` - print field `field1` in struct pointed to by the pointer `*var1`
-`*(*const i32)0x1234AA332` - cast memory address to `*const i32` pointer, then dereference it 
-`hashmap[0x1337]` - get value by pointer key 0x1337 from hashmap 
+`*(*const i32)0x1234AA332` - cast memory address to `*const i32` pointer, then dereference it
+`hashmap[0x1337]` - get value by pointer key 0x1337 from hashmap
 `hashmap[{\"a\", \"b\"}]` - get value by array key {\"a\", \"b\"} from hashmap
-`*(*(var1.field1)).field2[1][2]` - get `field1` from struct `var1`, dereference it, 
+`*(*(var1.field1)).field2[1][2]` - get `field1` from struct `var1`, dereference it,
 then get `field2` from dereference result, then get element by index 1, and get element 2 from it,
 finally print dereference of this value
 ";
 
 pub const DQE_LITERAL_DESCRIPTION: &str = "
 \x1b[;1mLiterals in data query expression\x1b[0m
-For advanced search of elements in containers (hashmaps, hashsets, etc.), debugger provides an index 
-operator that accepts a literal object. This object is very similar to a regular json object, 
-but, among other things, it supports wildcards (*) in arrays and associated arrays. 
+For advanced search of elements in containers (hashmaps, hashsets, etc.), debugger provides an index
+operator that accepts a literal object. This object is very similar to a regular json object,
+but, among other things, it supports wildcards (*) in arrays and associated arrays.
 
 Scalar literal objects:
 - numbers (`123`) - matches with any rust integer values
@@ -87,7 +94,7 @@ Complex literal objects:
 - enum variants with values (`Some({true, 12})`) - matches with enums identifiers with items
 
 Example of usage of literal objects:
-`map[1]` - get value by int key `1` from hashmap 
+`map[1]` - get value by int key `1` from hashmap
 `map[\"key_1\"]` - get value by string key `key_1` from hashmap
 `set[{*, *, *}]` - checks that there is a vector of any three elements in set
 `map[{field_1: 1, field_2: Some({true}), field_3: *}]` - get value by key that matches 3-field structure with
@@ -104,7 +111,7 @@ var <name or expression> - print local and global variables with selected name
 
 Examples of usage:
 var locals - print current stack frame local variables
-var some_variable - print all variables with given name, variables can be in local or global scope 
+var some_variable - print all variables with given name, variables can be in local or global scope
 var *some_variable - dereference and print value if `some_variable` is a pointer or RC/ARC
 var some_array[0] - print first element if `some_array` is a vector, array, vecdeque or enum
 var some_array[2..5] - print 3 elements, starts from index 2
@@ -127,7 +134,7 @@ var <name or expression> - print local and global variables with selected name
 
 Examples of usage:
 var locals - print current stack frame local variables
-var some_variable - print all variables with given name, variables can be in local or global scope 
+var some_variable - print all variables with given name, variables can be in local or global scope
 var *some_variable - dereference and print value if `some_variable` is a pointer or RC/ARC
 var some_array[0] - print first element if `some_array` is a vector, array, vecdeque or enum
 var some_array[2..5] - print 3 elements, starts from index 2
@@ -273,10 +280,10 @@ break info - show all breakpoints
 
 Possible location format:
 - at instruction. Example: break 0x55555555BD30
-- at function start. A function can be defined by its full name (with namespace) 
-or by function name (in case of possible collisions, breakpoints will be set in 
-all matching functions). Examples: 
-    * break fn1 
+- at function start. A function can be defined by its full name (with namespace)
+or by function name (in case of possible collisions, breakpoints will be set in
+all matching functions). Examples:
+    * break fn1
     * break module1::fn1
 - at code line. Example: break hello_world.rs:15
 - a breakpoint number (only for `remove` subcommand)
@@ -288,8 +295,8 @@ Deactivate and delete selected breakpoint
 
 Possible location format:
 - at instruction. Example: break 0x55555555BD30
-- at function start. A function can be defined by its full name (with namespace) 
-or by function name (in case of possible collisions, breakpoints will be set in 
+- at function start. A function can be defined by its full name (with namespace)
+or by function name (in case of possible collisions, breakpoints will be set in
 all matching functions). Examples:
     * break fn1
     * break module1::fn1
@@ -353,7 +360,7 @@ Read or write into debugged program memory.
 
 Available subcommands:
 memory read <address> - print 8-byte block at address in debuggee memory
-memory write <address> <value> - writes 8-byte value to address in debuggee memory. 
+memory write <address> <value> - writes 8-byte value to address in debuggee memory.
 Note that little endian byte order will be used when writing, so the last byte of <value> will be written at the first byte of the address
 ";
 
@@ -365,7 +372,7 @@ Note that little endian byte order will be used when writing, so the last byte o
 
 pub const HELP_MEMORY_WRITE_SUBCOMMAND: &str = "\
 \x1b[32;1mmemory write <address> <value>\x1b[0m
-Writes 8-byte value to address in debuggee memory. 
+Writes 8-byte value to address in debuggee memory.
 Note that little endian byte order will be used when writing, so the last byte of <value> will be written at the first byte of the address
 ";
 
@@ -439,8 +446,8 @@ pub const HELP_SOURCE: &str = "\
 Show source code or assembly instructions for current (in focus) function.
 
 Available subcommands:
-source fn - show code of function in focus 
-source asm - show assembly of function in focus 
+source fn - show code of function in focus
+source asm - show assembly of function in focus
 source <bounds> - show line in focus with <bounds> lines up and down of this line
 ";
 
@@ -460,11 +467,21 @@ Commands for async rust (currently for tokio runtime only).
 
 Available subcommands:
 async backtrace - show state of async workers and blocking threads
-async backtrace all - show state of async workers and blocking threads, show info about all running tasks 
+async backtrace all - show state of async workers and blocking threads, show info about all running tasks
 async task <async_fn_regex> - show active task (active task means a task that is running on the thread that is currently in focus) if `async_fn_regex` parameter is empty,
 or show task list with async functions matched by regular expression
 async next, async stepover - perform a stepover within the context of the current task. If the task moves into a completed state, the application will stop too
 async finish, async stepout - execute the program until the current task moves into the completed state
+async at, async await-trace - print the current task's awaitee chain with .await source coords (file:line per frame)
+";
+
+pub const HELP_ASYNC_AWAIT_TRACE_SUBCOMMAND: &str = "\
+\x1b[32;1masync await-trace, async at\x1b[0m
+Print the current task's awaitee chain as a stack-frame list, source-coords-first.
+Each frame shows `<async fn> at <file>:<line>` for `.await` points where rustc
+emitted DW_AT_decl_file/decl_line on the captured-locals fields of the active
+Suspend variant. Falls back to function name + state when source coords are
+unrecoverable (e.g. stripped binaries, pre-await states).
 ";
 
 pub const HELP_ASYNC_BACKTRACE_SUBCOMMAND: &str = "\
@@ -472,7 +489,7 @@ pub const HELP_ASYNC_BACKTRACE_SUBCOMMAND: &str = "\
 Show state of async workers and blocking threads (currently for tokio runtime only).
 
 Available subcommands:
-async backtrace all - show info about all running tasks 
+async backtrace all - show info about all running tasks
 ";
 
 pub const HELP_ASYNC_TASK_SUBCOMMAND: &str = "\
@@ -526,7 +543,7 @@ Shows the list of triggers
 
 pub const HELP_CALL: &str = "\
 \x1b[32;1mcall\x1b[0m
-Call a function with given arguments. 
+Call a function with given arguments.
 
 Format:
 call <function_name> <arg1> ... <arg6>
@@ -702,6 +719,10 @@ impl Helper {
                     HELP_ASYNC_NEXT_STEPOVER_SUBCOMMANDS
                 }
                 Some(parser::ASYNC_COMMAND_TASK_SUBCOMMAND) => HELP_ASYNC_TASK_SUBCOMMAND,
+                Some(parser::ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND)
+                | Some(parser::ASYNC_COMMAND_AWAIT_TRACE_SUBCOMMAND_SHORT) => {
+                    HELP_ASYNC_AWAIT_TRACE_SUBCOMMAND
+                }
                 _ => HELP_UNKNOWN_SUBCOMMAND,
             },
             Some(parser::TRIGGER_COMMAND) => match sub_command {

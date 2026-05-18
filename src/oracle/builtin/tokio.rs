@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::CreateTransparentBreakpointRequest;
 use crate::debugger::unwind::{Backtrace, FrameSpan};
 use crate::debugger::variable::dqe::{Dqe, PointerCast, Selector};

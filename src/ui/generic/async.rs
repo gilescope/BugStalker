@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::debugger::r#async::AsyncBacktrace;
 use crate::debugger::r#async::AsyncFnFutureState;
 use crate::debugger::r#async::Future;
@@ -23,7 +24,16 @@ fn print_future(backtrace: &AsyncBacktrace, num: u32, future: &Future, printer: 
             ));
             match fn_fut.state {
                 AsyncFnFutureState::Suspend(await_num) => {
-                    printer.println(format!("\tsuspended at await point {await_num}"));
+                    // Phase 3 Feature D — append source coords when the
+                    // active variant carried DW_AT_decl_file/decl_line.
+                    // Falls back to "await point N" alone for stripped
+                    // binaries or pre-await states.
+                    let loc = fn_fut
+                        .await_location
+                        .as_ref()
+                        .map(|(file, line)| format!(" at {}:{line}", file.display()))
+                        .unwrap_or_default();
+                    printer.println(format!("\tsuspended at await point {await_num}{loc}"));
                 }
                 AsyncFnFutureState::Panicked => {
                     printer.println("\tpanicked!");
@@ -40,10 +50,24 @@ fn print_future(backtrace: &AsyncBacktrace, num: u32, future: &Future, printer: 
             }
         }
         Future::Custom(custom_fut) => {
-            printer.println(format!(
-                "#{num} future {}",
-                FutureTypeView::from(custom_fut.name.to_string())
-            ));
+            // Phase 3 Feature D batch D2b — when the awaitee is a
+            // `dyn Future` fat pointer, append the recovered concrete
+            // type. Phase 3A's annotation already lives on the inner
+            // trait-object's name, so we don't double-print it; we
+            // only show the concrete tag when it differs from the
+            // outer name (i.e. there's a layer like `Pin<Box<...>>`
+            // between the awaitee and the dyn struct).
+            let outer = custom_fut.name.to_string();
+            let line = match &custom_fut.concrete {
+                Some(concrete) if concrete != &outer => {
+                    format!(
+                        "#{num} future {} [→ {concrete}]",
+                        FutureTypeView::from(outer)
+                    )
+                }
+                _ => format!("#{num} future {}", FutureTypeView::from(outer)),
+            };
+            printer.println(line);
         }
         Future::TokioJoinHandleFuture(jh_fut) => {
             let wait_for = backtrace
@@ -95,6 +119,21 @@ fn print_future(backtrace: &AsyncBacktrace, num: u32, future: &Future, printer: 
         }
         Future::UnknownFuture => {
             printer.println(format!("#{num} undefined future",));
+        }
+        Future::Multi(branches) => {
+            // Phase 3 Feature D step 5 — the active variant carries
+            // multiple parallel branches (e.g. tokio::join!). Render
+            // each branch as a sub-trace, indented one level.
+            printer.println(format!(
+                "#{num} parallel branches ({} active):",
+                branches.len()
+            ));
+            for (b, branch) in branches.iter().enumerate() {
+                printer.println(format!("  branch {b}:"));
+                for (i, fut) in branch.iter().enumerate() {
+                    print_future(backtrace, i as u32, fut, printer);
+                }
+            }
         }
     }
 }
@@ -171,6 +210,156 @@ pub fn print_backtrace_full(backtrace: &AsyncBacktrace, printer: &ExternalPrinte
 
     for task in backtrace.tasks.iter() {
         print_task(backtrace, task, printer);
+    }
+}
+
+/// Phase 3 Feature D batch D2a — render the current task's awaitee
+/// chain as a stack-frame list, source-coords-first. Mirrors how
+/// `bt`/`backtrace` reads for synchronous frames so the user can
+/// transfer their mental model directly.
+///
+/// Layout:
+///
+/// ```text
+/// await-trace (task id: 7):
+///   #0 my_app::handler at src/handler.rs:42
+///   #1 my_app::middleware::auth::check at src/auth.rs:18
+///   #2 tokio::time::Sleep (sleeping for 3s)
+/// ```
+///
+/// Each frame is one element of the futures stack. Source coords
+/// come from D1's `await_location`. When unavailable (Unresumed /
+/// Returned / Panicked / Ok states, or stripped binaries) the frame
+/// shows just the function name and the state.
+pub fn print_await_trace(backtrace: &AsyncBacktrace, printer: &ExternalPrinter) {
+    let Some(task) = backtrace.current_task() else {
+        printer.println(ErrorView::from(
+            "no active task found for current worker, or no active worker found",
+        ));
+        return;
+    };
+
+    printer.println(format!("await-trace (task id: {}):", task.task_id).bold());
+
+    if task.futures.is_empty() {
+        printer.println("\t<empty future stack>");
+        return;
+    }
+
+    for (i, fut) in task.futures.iter().enumerate() {
+        match fut {
+            Future::AsyncFn(af) => {
+                let fn_view = FutureFunctionView::from(&af.async_fn).to_string();
+                let line = match (&af.state, &af.await_location) {
+                    (AsyncFnFutureState::Suspend(n), Some((file, line))) => {
+                        format!(
+                            "  #{i} {fn_view} at {}:{line} (await point {n})",
+                            file.display()
+                        )
+                    }
+                    (AsyncFnFutureState::Suspend(n), None) => {
+                        format!("  #{i} {fn_view} (await point {n}, no source coords)")
+                    }
+                    (AsyncFnFutureState::Unresumed, _) => {
+                        format!("  #{i} {fn_view} (just created, not yet polled)")
+                    }
+                    (AsyncFnFutureState::Returned, _) => {
+                        format!("  #{i} {fn_view} (already resolved)")
+                    }
+                    (AsyncFnFutureState::Panicked, _) => format!("  #{i} {fn_view} (panicked)"),
+                    (AsyncFnFutureState::Ok, _) => format!("  #{i} {fn_view} (completed)"),
+                };
+                printer.println(line);
+            }
+            Future::Custom(custom) => {
+                // Phase 3 Feature D batch D2b — append the recovered
+                // concrete type when the awaitee is a `dyn Future`
+                // fat pointer wrapped inside (e.g.) `Pin<Box<...>>`.
+                let outer = custom.name.to_string();
+                let line = match &custom.concrete {
+                    Some(concrete) if concrete != &outer => format!(
+                        "  #{i} {} [→ {concrete}] (custom future)",
+                        FutureTypeView::from(outer)
+                    ),
+                    _ => format!("  #{i} {} (custom future)", FutureTypeView::from(outer)),
+                };
+                printer.println(line);
+            }
+            Future::TokioJoinHandleFuture(jh) => {
+                let wait_for = backtrace
+                    .tasks
+                    .iter()
+                    .find(|t| t.raw_ptr == jh.wait_for_task)
+                    .map(|t| format!(" (waiting for task id={})", t.task_id))
+                    .unwrap_or_default();
+                printer.println(format!(
+                    "  #{i} {}{}",
+                    FutureTypeView::from(jh.name.to_string()),
+                    wait_for,
+                ));
+            }
+            Future::TokioSleep(sleep) => {
+                printer.println(format!(
+                    "  #{i} {} (tokio::time::Sleep, deadline {}s.{:09})",
+                    FutureTypeView::from(sleep.name.to_string()),
+                    sleep.instant.0,
+                    sleep.instant.1,
+                ));
+            }
+            Future::UnknownFuture => {
+                printer.println(format!("  #{i} <unknown future>"));
+            }
+            Future::Multi(branches) => {
+                // Phase 3 Feature D step 5 — render parallel
+                // branches as a numbered sub-trace under the join /
+                // select frame's slot.
+                printer.println(format!(
+                    "  #{i} parallel branches ({} active):",
+                    branches.len()
+                ));
+                for (b, branch) in branches.iter().enumerate() {
+                    printer.println(format!("    branch {b}:"));
+                    for (j, fut) in branch.iter().enumerate() {
+                        // Indent the inner frames a further two
+                        // spaces so the visual hierarchy reads.
+                        match fut {
+                            Future::AsyncFn(af) => {
+                                let fn_view = FutureFunctionView::from(&af.async_fn).to_string();
+                                let line = match (&af.state, &af.await_location) {
+                                    (AsyncFnFutureState::Suspend(n), Some((file, line))) => {
+                                        format!(
+                                            "      #{j} {fn_view} at {}:{line} (await point {n})",
+                                            file.display()
+                                        )
+                                    }
+                                    (AsyncFnFutureState::Suspend(n), None) => {
+                                        format!(
+                                            "      #{j} {fn_view} (await point {n}, no source coords)"
+                                        )
+                                    }
+                                    (AsyncFnFutureState::Unresumed, _) => {
+                                        format!("      #{j} {fn_view} (just created)")
+                                    }
+                                    (AsyncFnFutureState::Returned, _) => {
+                                        format!("      #{j} {fn_view} (returned)")
+                                    }
+                                    (AsyncFnFutureState::Panicked, _) => {
+                                        format!("      #{j} {fn_view} (panicked)")
+                                    }
+                                    (AsyncFnFutureState::Ok, _) => {
+                                        format!("      #{j} {fn_view} (completed)")
+                                    }
+                                };
+                                printer.println(line);
+                            }
+                            other => {
+                                printer.println(format!("      #{j} {other:?}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
