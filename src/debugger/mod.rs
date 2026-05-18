@@ -1610,17 +1610,15 @@ impl Debugger {
         // enough to reach `enc_checkpoints` directly without any
         // RefCell dance.
         let cb_fn_start = fn_start_u64;
-        let request = CreateTransparentBreakpointRequest::address(
-            fn_start,
-            move |dbg: &mut Debugger| {
+        let request =
+            CreateTransparentBreakpointRequest::address(fn_start, move |dbg: &mut Debugger| {
                 let pid = dbg.ecx().pid_on_focus();
                 let regions = dbg.enc_checkpoints.capture_at(cb_fn_start, pid);
                 log::trace!(
                     target: "enc_checkpoint",
                     "snap-bp fired at fn_start=0x{cb_fn_start:x}; captured {regions} regions",
                 );
-            },
-        );
+            });
         match self.set_transparent_breakpoint(request) {
             Ok(()) => {
                 self.enc_checkpoints.mark_armed(fn_start_u64);
