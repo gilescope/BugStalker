@@ -1603,6 +1603,43 @@ impl Debugger {
             return;
         }
 
+        // Refuse to arm if the snap-bp would collide with the very
+        // user bp that triggered the arming. Short closures and
+        // single-statement function bodies often have
+        // `prolog_start_place() == line_table_entry_for_user_bp`, so
+        // `fn_start_u64 == user_bp_addr.as_u64()`. Installing a
+        // transparent bp at that address goes through
+        // `BreakpointRegistry::add_and_enable`, which disables and
+        // replaces any existing breakpoint at the same address —
+        // silently consuming the user bp via the transparent
+        // callback's auto-continue, so the user's `continue_debugee`
+        // never surfaces. Skip cleanly; the inner-call safety gate
+        // in `restart_top_frame` will refuse a Tier-2 restart for
+        // this function but the user bp itself works correctly.
+        if fn_start_u64 == user_bp_addr.as_u64() {
+            log::debug!(
+                target: "enc_checkpoint",
+                "user bp at 0x{:x} sits at the function entry; skipping snap-bp arm to avoid collision",
+                usize::from(user_bp_addr),
+            );
+            return;
+        }
+
+        // Same risk as the user-bp collision above, just one step
+        // removed: a *different* breakpoint already lives at
+        // `fn_start` (left over from a previous arm cycle, a manual
+        // user bp at the fn entry, or a transparent bp from another
+        // subsystem). Replacing it would either swallow that bp's
+        // semantics or have ours swallowed when the user adds
+        // theirs next. Leave the slot untouched.
+        if self.breakpoints.get_enabled(fn_start).is_some() {
+            log::debug!(
+                target: "enc_checkpoint",
+                "existing breakpoint at fn_start=0x{fn_start_u64:x}; skipping snap-bp arm",
+            );
+            return;
+        }
+
         // The callback captures the function-entry address as a
         // plain `u64`. It runs on the supervisor thread inside the
         // transparent-bp dispatch path (see `BrkptType::Transparent`
