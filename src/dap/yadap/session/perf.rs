@@ -671,6 +671,7 @@ impl super::DebugSession {
         }
         let summary = bs_perf::dap::stopped_summary(&self.perf_overlay.data)?;
         Some(json!({
+            "mode": perf_mode_label(&self.perf_overlay),
             "runCycles": summary.run_cycles,
             "runWallNs": summary.run_wall_ns,
             "runCpuTimeNs": summary.run_cpu_time_ns,
@@ -972,6 +973,47 @@ fn kperf_probe_body() -> Value {
 #[cfg(all(feature = "perf", not(target_os = "macos")))]
 fn kperf_probe_body() -> Value {
     Value::Null
+}
+
+/// Label describing which collection tier produced the latest
+/// summary. The VSCode client renders this in its tooltip so users
+/// can tell at a glance whether the gutter heat-map should be
+/// expected (Linux cycles, macOS poll) or always-empty (macOS
+/// rusage-only fallback).
+///
+/// Values:
+/// - `linux-cycles` — Linux PMU cycles+IP via perf_event_open.
+/// - `macos-poll` — macOS Tier 1b polling sampler is active.
+/// - `macos-rusage-only` — macOS Tier 2 only (sampler unavailable
+///   or disabled); body carries CPU time but no per-line samples.
+/// - `disabled` — overlay not enabled.
+#[cfg(all(feature = "perf", target_os = "linux"))]
+fn perf_mode_label(session: &PerfOverlaySession) -> &'static str {
+    if !session.enabled {
+        "disabled"
+    } else {
+        "linux-cycles"
+    }
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn perf_mode_label(session: &PerfOverlaySession) -> &'static str {
+    if !session.enabled {
+        "disabled"
+    } else if session
+        .darwin_run
+        .as_ref()
+        .is_some_and(|run| run.sampler.is_some())
+    {
+        "macos-poll"
+    } else {
+        "macos-rusage-only"
+    }
+}
+
+#[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
+fn perf_mode_label(_session: &PerfOverlaySession) -> &'static str {
+    "disabled"
 }
 
 #[cfg(all(feature = "perf", any(target_os = "linux", target_os = "macos")))]
