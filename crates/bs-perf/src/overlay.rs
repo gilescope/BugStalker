@@ -72,6 +72,9 @@ pub struct StopStatusView {
     pub run_cycles: u64,
     /// Wall-clock duration for the run-to-stop window.
     pub run_wall_ns: u64,
+    /// Whole-process CPU time (user + system, ns) for the run, when
+    /// the collector reports time rather than cycles (macOS Tier 2).
+    pub run_cpu_time_ns: Option<u64>,
     /// Hottest resolved source line, if any.
     pub hot: Option<HotLineView>,
     /// Samples that did not resolve to a source line.
@@ -87,6 +90,9 @@ pub struct HistoryRow {
     pub run_cycles: u64,
     /// Wall-clock duration for the run-to-stop window.
     pub run_wall_ns: u64,
+    /// Whole-process CPU time (user + system, ns) for the run, when
+    /// the collector reports time rather than cycles.
+    pub run_cpu_time_ns: Option<u64>,
     /// Hottest resolved source line for this stop, if any.
     pub hot: Option<HotLineView>,
     /// Samples that did not resolve to source in this stop.
@@ -161,6 +167,7 @@ pub fn history_rows(data: &PerfData) -> Vec<HistoryRow> {
                 stop_number: first_stop + idx as u64,
                 run_cycles: status.run_cycles,
                 run_wall_ns: status.run_wall_ns,
+                run_cpu_time_ns: status.run_cpu_time_ns,
                 hot: status.hot,
                 unresolved_samples: status.unresolved_samples,
             }
@@ -196,7 +203,7 @@ pub fn format_duration_ns(ns: u64) -> String {
 pub fn render_stop_status(status: &StopStatusView) -> String {
     let mut out = format!(
         "run cost {} / {}",
-        format_cycles(status.run_cycles),
+        format_cost(status.run_cycles, status.run_cpu_time_ns),
         format_duration_ns(status.run_wall_ns),
     );
     if let Some(hot) = &status.hot {
@@ -226,9 +233,22 @@ pub fn render_history_row(row: &HistoryRow) -> String {
     format!(
         "stop #{}: {}   {}   {hot}{unresolved}",
         row.stop_number,
-        format_cycles(row.run_cycles),
+        format_cost(row.run_cycles, row.run_cpu_time_ns),
         format_duration_ns(row.run_wall_ns),
     )
+}
+
+/// Prefer cycles when the collector measured them; fall back to CPU
+/// time (e.g. macOS rusage tier). Returns "-" when neither is set,
+/// so the column never disappears.
+fn format_cost(run_cycles: u64, run_cpu_time_ns: Option<u64>) -> String {
+    if run_cycles != 0 {
+        return format_cycles(run_cycles);
+    }
+    if let Some(ns) = run_cpu_time_ns {
+        return format!("{} cpu", format_duration_ns(ns));
+    }
+    "-".to_owned()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +299,7 @@ fn stop_status_view(data: &PerfData, summary: &StopSummary) -> StopStatusView {
     StopStatusView {
         run_cycles: summary.run_cycles,
         run_wall_ns: summary.run_wall_ns,
+        run_cpu_time_ns: summary.run_cpu_time_ns,
         hot: summary
             .top_lines
             .first()
@@ -423,6 +444,7 @@ mod tests {
         let status = StopStatusView {
             run_cycles: 3_200_000,
             run_wall_ns: 1_400_000,
+            run_cpu_time_ns: None,
             hot: Some(HotLineView {
                 file: PathBuf::from("src/main.rs"),
                 line: 45,
@@ -440,12 +462,30 @@ mod tests {
             stop_number: 7,
             run_cycles: 280_000,
             run_wall_ns: 130_000,
+            run_cpu_time_ns: None,
             hot: status.hot,
             unresolved_samples: 0,
         };
         assert_eq!(
             render_history_row(&row),
             "stop #7: 280k cy   130 us   hot=src/main.rs:45"
+        );
+    }
+
+    /// Tier 2 macOS path: cycles == 0 but rusage gave us CPU time.
+    /// Status line should show CPU time instead of "0 cy".
+    #[test]
+    fn cpu_time_falls_back_when_cycles_absent() {
+        let status = StopStatusView {
+            run_cycles: 0,
+            run_wall_ns: 1_400_000,
+            run_cpu_time_ns: Some(1_200_000),
+            hot: None,
+            unresolved_samples: 0,
+        };
+        assert_eq!(
+            render_stop_status(&status),
+            "run cost 1.2 ms cpu / 1.4 ms"
         );
     }
 }

@@ -85,6 +85,10 @@ pub struct PerfStoppedSummary {
     pub run_cycles: u64,
     /// Wall-clock duration for the run-to-stop window.
     pub run_wall_ns: u64,
+    /// Whole-process CPU time (user + system, ns) for the run, when
+    /// the collector reports time rather than cycles. macOS Tier 2
+    /// fills this from `proc_pid_rusage`. `None` on Linux cycles+IP.
+    pub run_cpu_time_ns: Option<u64>,
     /// Hottest resolved source line, if one exists.
     pub hot: Option<PerfHotLine>,
     /// Samples that did not resolve to source in this stop.
@@ -153,6 +157,7 @@ pub fn stopped_summary(data: &PerfData) -> Option<PerfStoppedSummary> {
     overlay::latest_stop_status(data).map(|status| PerfStoppedSummary {
         run_cycles: status.run_cycles,
         run_wall_ns: status.run_wall_ns,
+        run_cpu_time_ns: status.run_cpu_time_ns,
         hot: status.hot.map(|hot| PerfHotLine {
             source: hot.file.display().to_string(),
             line: hot.line,

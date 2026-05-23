@@ -49,10 +49,19 @@ pub struct HotLine {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopSummary {
     /// Cycle count for the run-to-stop window. Step 117 callers
-    /// may pass zero until the PMU counter wiring lands.
+    /// may pass zero until the PMU counter wiring lands; the macOS
+    /// rusage tier passes zero and instead populates
+    /// `run_cpu_time_ns` because Apple's per-process counters
+    /// expose user/system *time*, not raw cycles.
     pub run_cycles: u64,
     /// Wall-clock duration for the run-to-stop window.
     pub run_wall_ns: u64,
+    /// Whole-process user + system CPU time in nanoseconds for the
+    /// run-to-stop window, when the collector cannot return a true
+    /// cycle count. Tier 2 macOS collection sets this from
+    /// `proc_pid_rusage(RUSAGE_INFO_V4)`. `None` on collectors that
+    /// report cycles directly (Linux cycles+IP).
+    pub run_cpu_time_ns: Option<u64>,
     /// Hottest lines in this stop, sorted by sample count
     /// descending and then by source key for deterministic output.
     pub top_lines: Vec<HotLine>,
@@ -176,6 +185,17 @@ impl PerfData {
 
     /// Finish a run-to-stop window and retain a summary.
     pub fn finish_stop(&mut self, run_cycles: u64, run_wall_ns: u64) -> StopSummary {
+        self.finish_stop_with_cpu_time(run_cycles, run_wall_ns, None)
+    }
+
+    /// Finish a run-to-stop window, including a CPU-time figure for
+    /// collectors that cannot return cycles (macOS rusage tier).
+    pub fn finish_stop_with_cpu_time(
+        &mut self,
+        run_cycles: u64,
+        run_wall_ns: u64,
+        run_cpu_time_ns: Option<u64>,
+    ) -> StopSummary {
         let mut top_lines = self
             .last_run
             .iter()
@@ -190,6 +210,7 @@ impl PerfData {
         let summary = StopSummary {
             run_cycles,
             run_wall_ns,
+            run_cpu_time_ns,
             top_lines,
             unresolved_samples: self.unresolved_last_run,
         };

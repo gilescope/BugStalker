@@ -35,7 +35,8 @@
 //! | --------------------- | -------------- | -------------------------------------------------------------------- |
 //! | Linux x86_64          | scaffold       | cycles+IP via `PERF_TYPE_HARDWARE`                                   |
 //! | Linux aarch64         | scaffold       | identical event setup; PMU differs                                   |
-//! | Darwin (cycles+IP)    | unavailable    | private kperf API not yet bound; M4-or-higher silicon floor          |
+//! | Darwin (rusage Tier 2)| scaffold       | per-stop user+sys CPU time via `proc_pid_rusage(RUSAGE_INFO_V4)`     |
+//! | Darwin (kperf Tier 1) | deferred       | private kperf API bind via `dlsym`; cycles+IP heat-map               |
 //! | Intel PT              | decode boundary | raw capture plus feature-gated libipt instruction decode              |
 //! | AMD Processor Trace   | future feature | Phase 11 provider; AMD LBR Stack first, packet PT if exposed         |
 //! | ARM CoreSight ETM     | future feature | precise aarch64-linux tier under `coresight-etm`; needs              |
@@ -70,6 +71,8 @@
 
 pub mod aggregator;
 pub mod dap;
+#[cfg(target_os = "macos")]
+pub mod darwin;
 pub mod decoder;
 #[cfg(target_os = "linux")]
 pub mod linux;

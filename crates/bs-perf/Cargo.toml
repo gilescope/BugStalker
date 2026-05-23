@@ -25,10 +25,16 @@ description = "BugStalker performance overlay — PMU cycles+IP sampling (Phase 
 #   exact gating: "A user running `cargo build` with no flags gets
 #   zero C dependencies from Phase 6."
 #
+# - **Darwin Tier 2 (rusage).** `proc_pid_rusage(RUSAGE_INFO_V4)`
+#   gives per-stop whole-process user+system CPU time. No PMU
+#   sampling, no per-line heat-map — just enough to fill the
+#   `body.bs_perf` summary so the per-stop "cost" figure is real on
+#   macOS instead of zero.
+#
 # - **Darwin kperf tier deferred.** Apple's private API requires
-#   version-specific dlsym binding work; surfaces no functionality
-#   the Linux tier doesn't already have. Darwin builds compile but
-#   the perf monitor returns Unsupported.
+#   version-specific dlsym binding work; surfaces the gutter
+#   heat-map shape on macOS. Tier 2 unblocks the status-bar surface
+#   in the meantime; Tier 1 (kperf) lands separately.
 #
 # - **ARM SPE tier (future).** Stubbed: aarch64-linux currently
 #   uses cycles+IP sampling like x86. SPE adds branch-record
@@ -52,6 +58,11 @@ thiserror = { workspace = true }
 # doesn't yet expose perf_event_open.
 [target.'cfg(target_os = "linux")'.dependencies]
 perf-event-open-sys = "6.0"
+libc = "0.2"
+
+# Darwin Tier 2: proc_pid_rusage(2) per-stop snapshots. No PMU, no
+# kperf — just libc bindings for the rusage_info_v4 syscall surface.
+[target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))'.dependencies]

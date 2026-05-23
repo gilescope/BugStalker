@@ -42,6 +42,12 @@ pub(super) struct PerfOverlaySession {
     pt_last_unresolved_instructions: u64,
     #[cfg(target_os = "linux")]
     active: Vec<ActivePerfRun>,
+    /// Darwin Tier 2: rusage snapshot taken when the most recent run
+    /// began. Diffed at `finish_perf_stop` to populate the per-stop
+    /// CPU-time figure. None when no run is active or the snapshot
+    /// itself failed (which is also recorded in `unavailable`).
+    #[cfg(target_os = "macos")]
+    darwin_run_start: Option<bs_perf::darwin::ProcessSnapshot>,
 }
 
 #[cfg(all(feature = "perf", target_os = "linux"))]
@@ -178,11 +184,37 @@ impl super::DebugSession {
         }
     }
 
-    #[cfg(all(feature = "perf", not(target_os = "linux")))]
+    /// Darwin Tier 2: capture a `proc_pid_rusage` snapshot when the
+    /// run starts. No PMU sampling — the per-line heat-map stays
+    /// empty on macOS until the kperf tier lands — but the per-stop
+    /// CPU-time figure becomes real instead of zero.
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    pub(super) fn begin_perf_run(&mut self) {
+        if !self.perf_overlay.enabled {
+            return;
+        }
+        self.perf_overlay.data.begin_run();
+        self.perf_overlay.unavailable = None;
+        self.perf_overlay.darwin_run_start = None;
+
+        let Some(proc_pid) = self.debugger.as_ref().map(|dbg| dbg.process().pid()) else {
+            self.perf_overlay.unavailable = Some("debugger not initialized".to_owned());
+            return;
+        };
+        match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
+            Ok(snap) => self.perf_overlay.darwin_run_start = Some(snap),
+            Err(err) => {
+                self.perf_overlay.unavailable =
+                    Some(format!("rusage snapshot at run start unavailable: {err}"));
+            }
+        }
+    }
+
+    #[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
     pub(super) fn begin_perf_run(&mut self) {
         if self.perf_overlay.enabled {
             self.perf_overlay.unavailable =
-                Some("perf overlay live collection is Linux-only in this phase".to_owned());
+                Some("perf overlay live collection unavailable on this platform".to_owned());
         }
     }
 
@@ -313,7 +345,44 @@ impl super::DebugSession {
         self.perf_overlay.data.finish_stop(0, wall_ns);
     }
 
-    #[cfg(all(feature = "perf", not(target_os = "linux")))]
+    /// Darwin Tier 2: take a second rusage snapshot and diff against
+    /// the one captured at run start. Writes the resulting (wall_ns,
+    /// cpu_ns) pair into `PerfData` so the per-stop summary surfaces
+    /// real numbers in `body.bs_perf`.
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    pub(super) fn finish_perf_stop(&mut self) {
+        let Some(start) = self.perf_overlay.darwin_run_start.take() else {
+            return;
+        };
+        let Some(proc_pid) = self.debugger.as_ref().map(|dbg| dbg.process().pid()) else {
+            return;
+        };
+        match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
+            Ok(end) => {
+                let (wall_ns, cpu_ns) = end.delta_since(start);
+                self.perf_overlay
+                    .data
+                    .finish_stop_with_cpu_time(0, wall_ns, Some(cpu_ns));
+            }
+            Err(err) => {
+                // Process exited or the syscall failed. Close the
+                // run with what we have so history still advances,
+                // and record the cause in `unavailable`.
+                let wall_ns = start
+                    .wall
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+                self.perf_overlay
+                    .data
+                    .finish_stop_with_cpu_time(0, wall_ns, None);
+                self.perf_overlay.unavailable =
+                    Some(format!("rusage snapshot at run end unavailable: {err}"));
+            }
+        }
+    }
+
+    #[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
     pub(super) fn finish_perf_stop(&mut self) {}
 
     #[cfg(not(feature = "perf"))]
@@ -375,11 +444,22 @@ impl super::DebugSession {
         self.perf_overlay.enabled = true;
         self.perf_overlay.intel_pt_requested = enable_req.intel_pt;
         self.perf_overlay.unavailable = None;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        if enable_req.intel_pt {
+            // Tier 2 macOS collects whole-process CPU time only; PMU
+            // sampling isn't bound until the kperf tier. Honour the
+            // base enable, surface the PT degradation, and continue.
+            self.perf_overlay.unavailable = Some(
+                "Intel PT requested on macOS; rusage Tier 2 is the only macOS path today \
+                 (kperf tier pending)"
+                    .to_owned(),
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             self.perf_overlay.enabled = false;
             self.perf_overlay.unavailable =
-                Some("perf overlay live collection is Linux-only in this phase".to_owned());
+                Some("perf overlay live collection unavailable on this platform".to_owned());
         }
         let response = bs_perf::dap::enable(&enable_req);
         self.send_success_body(
@@ -424,6 +504,10 @@ impl super::DebugSession {
             self.perf_overlay.pt_last_resolved_instructions = 0;
             self.perf_overlay.pt_last_unresolved_instructions = 0;
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.perf_overlay.darwin_run_start = None;
+        }
         let response = bs_perf::dap::disable(&bs_perf::dap::PerfOverlayDisableRequest {});
         self.send_success_body(
             req,
@@ -452,6 +536,7 @@ impl super::DebugSession {
         Some(json!({
             "runCycles": summary.run_cycles,
             "runWallNs": summary.run_wall_ns,
+            "runCpuTimeNs": summary.run_cpu_time_ns,
             "hot": summary.hot.map(|hot| json!({
                 "source": hot.source,
                 "line": hot.line,
