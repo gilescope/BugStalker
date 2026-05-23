@@ -483,9 +483,6 @@ mod tests {
             hot: None,
             unresolved_samples: 0,
         };
-        assert_eq!(
-            render_stop_status(&status),
-            "run cost 1.2 ms cpu / 1.4 ms"
-        );
+        assert_eq!(render_stop_status(&status), "run cost 1.2 ms cpu / 1.4 ms");
     }
 }

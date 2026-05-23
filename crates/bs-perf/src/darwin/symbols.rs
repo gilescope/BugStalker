@@ -192,7 +192,9 @@ impl KperfLibrary {
                 } else {
                     // SAFETY: pointer non-null and points at a NUL-
                     // terminated C string owned by libdl.
-                    unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned()
+                    unsafe { CStr::from_ptr(err) }
+                        .to_string_lossy()
+                        .into_owned()
                 };
                 return Err(KperfSymbolError::MissingSymbol {
                     path: path.clone(),

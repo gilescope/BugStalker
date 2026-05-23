@@ -140,12 +140,7 @@ impl PollSampler {
     pub fn sample_once(&self) -> usize {
         // SAFETY: mach_thread_self always returns a valid send right.
         let own_thread = unsafe { mach_thread_self() };
-        let pushed = sample_pass(
-            self.task,
-            own_thread,
-            &self.samples,
-            &self.failed_snapshots,
-        );
+        let pushed = sample_pass(self.task, own_thread, &self.samples, &self.failed_snapshots);
         // SAFETY: own_thread came from mach_thread_self; balance.
         let _ = unsafe { mach_port_deallocate(mach_task_self(), own_thread) };
         pushed
@@ -282,13 +277,7 @@ fn collect_task_threads(task: mach_port_t) -> Result<Vec<thread_act_t>, i32> {
     // copied above and individually deallocated by the caller.
     let array_bytes = (n * std::mem::size_of::<thread_act_t>()) as mach_vm_size_t;
     // SAFETY: `list` came from the kernel with the byte size above.
-    let _ = unsafe {
-        mach_vm_deallocate(
-            mach_task_self(),
-            list as mach_vm_address_t,
-            array_bytes,
-        )
-    };
+    let _ = unsafe { mach_vm_deallocate(mach_task_self(), list as mach_vm_address_t, array_bytes) };
     Ok(out)
 }
 
@@ -314,8 +303,7 @@ fn read_thread_pc(thread: thread_act_t) -> Option<RawPc> {
     // SAFETY: zeroed init is valid for arm_thread_state64_t; the
     // kernel fills it on success.
     let mut state: arm_thread_state64_t = unsafe { std::mem::zeroed() };
-    let mut count =
-        (std::mem::size_of::<arm_thread_state64_t>() / 4) as mach_msg_type_number_t;
+    let mut count = (std::mem::size_of::<arm_thread_state64_t>() / 4) as mach_msg_type_number_t;
     // SAFETY: state outlives the call; the kernel writes exactly
     // `count` u32s of state.
     let kr = unsafe {
@@ -340,8 +328,7 @@ fn read_thread_pc(thread: thread_act_t) -> Option<RawPc> {
 
     // SAFETY: zeroed init is valid for x86_thread_state64_t.
     let mut state: x86_thread_state64_t = unsafe { std::mem::zeroed() };
-    let mut count =
-        (std::mem::size_of::<x86_thread_state64_t>() / 4) as mach_msg_type_number_t;
+    let mut count = (std::mem::size_of::<x86_thread_state64_t>() / 4) as mach_msg_type_number_t;
     // SAFETY: state outlives the call.
     let kr = unsafe {
         thread_get_state(

@@ -27,6 +27,6 @@ pub mod poll_sampler;
 pub mod rusage;
 pub mod symbols;
 
-pub use kperf::{probe_kperf, KperfMonitor, KperfStatus, KperfUnavailableReason};
-pub use poll_sampler::{PollDrain, PollSampler, DEFAULT_POLL_PERIOD};
+pub use kperf::{KperfMonitor, KperfStatus, KperfUnavailableReason, probe_kperf};
+pub use poll_sampler::{DEFAULT_POLL_PERIOD, PollDrain, PollSampler};
 pub use rusage::ProcessSnapshot;

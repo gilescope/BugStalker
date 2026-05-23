@@ -135,9 +135,7 @@ pub fn probe_kperf() -> KperfStatus {
     // SAFETY: function pointer was resolved at library load.
     let force_attempt = unsafe { (lib.kpc_force_all_ctrs_set)(1) };
     if force_attempt != 0 {
-        let errno = std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(0);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         return KperfStatus::PermissionLikelyRequired {
             library_path: lib.path().to_owned(),
             configurable_counters: counter_count,
@@ -203,17 +201,24 @@ mod tests {
         // Exhaustive match keeps this honest: if we add a new
         // variant the test fails until we acknowledge it here.
         match status {
-            KperfStatus::Available { configurable_counters, .. } => {
+            KperfStatus::Available {
+                configurable_counters,
+                ..
+            } => {
                 eprintln!("kperf available; {configurable_counters} configurable counter(s)");
             }
-            KperfStatus::PermissionLikelyRequired { force_set_errno, .. } => {
+            KperfStatus::PermissionLikelyRequired {
+                force_set_errno, ..
+            } => {
                 eprintln!("kperf permission-blocked; errno={force_set_errno}");
             }
             KperfStatus::Unavailable(KperfUnavailableReason::LibraryNotFound { dlerror }) => {
                 eprintln!("kperf dylib not found: {dlerror}");
             }
             KperfStatus::Unavailable(KperfUnavailableReason::MissingSymbol {
-                path, symbol, dlerror,
+                path,
+                symbol,
+                dlerror,
             }) => {
                 eprintln!("kperf missing {symbol} in {path}: {dlerror}");
             }

@@ -223,12 +223,11 @@ impl super::DebugSession {
         self.perf_overlay.unavailable = None;
         self.perf_overlay.darwin_run = None;
 
-        let Some((proc_pid, program)) = self.debugger.as_ref().map(|dbg| {
-            (
-                dbg.process().pid(),
-                PathBuf::from(dbg.process().program()),
-            )
-        }) else {
+        let Some((proc_pid, program)) = self
+            .debugger
+            .as_ref()
+            .map(|dbg| (dbg.process().pid(), PathBuf::from(dbg.process().program())))
+        else {
             self.perf_overlay.unavailable = Some("debugger not initialized".to_owned());
             return;
         };
