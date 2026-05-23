@@ -60,10 +60,13 @@ thiserror = { workspace = true }
 perf-event-open-sys = "6.0"
 libc = "0.2"
 
-# Darwin Tier 2: proc_pid_rusage(2) per-stop snapshots. No PMU, no
-# kperf — just libc bindings for the rusage_info_v4 syscall surface.
+# Darwin Tier 2 (rusage) + Tier 1 (poll sampler) deps. libc for
+# proc_pid_rusage and the rusage_info_v4 ABI; mach2 for task /
+# thread_act syscalls used by the polling sampler. mach2 is the
+# maintained fork of the original `mach` crate — workspace pins it.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+mach2 = "0.6"
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))'.dependencies]
 libipt = { version = "0.4.0", optional = true }

@@ -42,12 +42,34 @@ pub(super) struct PerfOverlaySession {
     pt_last_unresolved_instructions: u64,
     #[cfg(target_os = "linux")]
     active: Vec<ActivePerfRun>,
-    /// Darwin Tier 2: rusage snapshot taken when the most recent run
-    /// began. Diffed at `finish_perf_stop` to populate the per-stop
-    /// CPU-time figure. None when no run is active or the snapshot
-    /// itself failed (which is also recorded in `unavailable`).
+    /// Darwin per-run state: rusage start snapshot (Tier 2) and
+    /// the polling sampler (Tier 1b). Both populated at
+    /// `begin_perf_run`; both consumed at `finish_perf_stop`.
+    /// `None` when no run is active or setup failed (cause is
+    /// always also recorded in `unavailable`).
     #[cfg(target_os = "macos")]
-    darwin_run_start: Option<bs_perf::darwin::ProcessSnapshot>,
+    darwin_run: Option<DarwinPerfRun>,
+}
+
+/// macOS in-flight run state. Owns the rusage start snapshot, the
+/// optional poll sampler, and the source resolver used to map
+/// sampled PCs to (file, line).
+#[cfg(all(feature = "perf", target_os = "macos"))]
+struct DarwinPerfRun {
+    rusage_start: bs_perf::darwin::ProcessSnapshot,
+    sampler: Option<bs_perf::darwin::PollSampler>,
+    resolver: Option<bs_perf::decoder::SourceResolver>,
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+impl std::fmt::Debug for DarwinPerfRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DarwinPerfRun")
+            .field("rusage_start", &self.rusage_start)
+            .field("sampler", &self.sampler.is_some())
+            .field("resolver", &self.resolver.is_some())
+            .finish()
+    }
 }
 
 #[cfg(all(feature = "perf", target_os = "linux"))]
@@ -184,30 +206,104 @@ impl super::DebugSession {
         }
     }
 
-    /// Darwin Tier 2: capture a `proc_pid_rusage` snapshot when the
-    /// run starts. No PMU sampling — the per-line heat-map stays
-    /// empty on macOS until the kperf tier lands — but the per-stop
-    /// CPU-time figure becomes real instead of zero.
+    /// Darwin perf-run start. Pieces together Tier 2 (rusage
+    /// snapshot for CPU time) + Tier 1b (poll sampler for the
+    /// gutter heat-map). Both are best-effort: failures fall back
+    /// to whichever sub-tier still works, and the reason is
+    /// recorded in `unavailable`.
     #[cfg(all(feature = "perf", target_os = "macos"))]
     pub(super) fn begin_perf_run(&mut self) {
+        use crate::debugger::darwin_mach;
+        use std::path::PathBuf;
+
         if !self.perf_overlay.enabled {
             return;
         }
         self.perf_overlay.data.begin_run();
         self.perf_overlay.unavailable = None;
-        self.perf_overlay.darwin_run_start = None;
+        self.perf_overlay.darwin_run = None;
 
-        let Some(proc_pid) = self.debugger.as_ref().map(|dbg| dbg.process().pid()) else {
+        let Some((proc_pid, program)) = self.debugger.as_ref().map(|dbg| {
+            (
+                dbg.process().pid(),
+                PathBuf::from(dbg.process().program()),
+            )
+        }) else {
             self.perf_overlay.unavailable = Some("debugger not initialized".to_owned());
             return;
         };
-        match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
-            Ok(snap) => self.perf_overlay.darwin_run_start = Some(snap),
+
+        // Tier 2: rusage snapshot. The status-bar CPU-time figure
+        // depends on this even when the sampler fails.
+        let rusage_start = match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
+            Ok(snap) => snap,
             Err(err) => {
                 self.perf_overlay.unavailable =
                     Some(format!("rusage snapshot at run start unavailable: {err}"));
+                return;
             }
-        }
+        };
+
+        // Tier 1b: poll sampler. Needs the debuggee's mach task
+        // and the dyld load slide for source resolution.
+        let task = match darwin_mach::task_for_pid(proc_pid) {
+            Ok(task) => task,
+            Err(err) => {
+                append_unavailable(
+                    &mut self.perf_overlay.unavailable,
+                    format!("task_for_pid failed for sampler: {err}"),
+                );
+                self.perf_overlay.darwin_run = Some(DarwinPerfRun {
+                    rusage_start,
+                    sampler: None,
+                    resolver: None,
+                });
+                return;
+            }
+        };
+
+        let resolver = match bs_perf::decoder::SourceResolver::from_object_path(&program) {
+            Ok(mut resolver) => {
+                if let Some(load_addr) = darwin_main_image_load_addr(task) {
+                    resolver = resolver.with_load_bias(load_addr);
+                } else {
+                    append_unavailable(
+                        &mut self.perf_overlay.unavailable,
+                        "dyld load slide unavailable; sampled PCs will be unresolved".to_owned(),
+                    );
+                }
+                Some(resolver)
+            }
+            Err(err) => {
+                append_unavailable(
+                    &mut self.perf_overlay.unavailable,
+                    format!(
+                        "source resolver unavailable for {}: {err}",
+                        program.display()
+                    ),
+                );
+                None
+            }
+        };
+
+        let mut sampler =
+            bs_perf::darwin::PollSampler::new(task, bs_perf::darwin::DEFAULT_POLL_PERIOD);
+        let sampler = match sampler.start() {
+            Ok(()) => Some(sampler),
+            Err(err) => {
+                append_unavailable(
+                    &mut self.perf_overlay.unavailable,
+                    format!("poll sampler start failed: {err}"),
+                );
+                None
+            }
+        };
+
+        self.perf_overlay.darwin_run = Some(DarwinPerfRun {
+            rusage_start,
+            sampler,
+            resolver,
+        });
     }
 
     #[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
@@ -345,30 +441,66 @@ impl super::DebugSession {
         self.perf_overlay.data.finish_stop(0, wall_ns);
     }
 
-    /// Darwin Tier 2: take a second rusage snapshot and diff against
-    /// the one captured at run start. Writes the resulting (wall_ns,
-    /// cpu_ns) pair into `PerfData` so the per-stop summary surfaces
-    /// real numbers in `body.bs_perf`.
+    /// Darwin perf-run stop. Drains the poll sampler (Tier 1b),
+    /// attributes each PC to source, then closes the run-to-stop
+    /// window with a CPU-time figure from the rusage delta
+    /// (Tier 2). Samples must be pushed before `finish_stop_*`
+    /// because that call snapshots `last_run` into history.
     #[cfg(all(feature = "perf", target_os = "macos"))]
     pub(super) fn finish_perf_stop(&mut self) {
-        let Some(start) = self.perf_overlay.darwin_run_start.take() else {
+        let Some(run) = self.perf_overlay.darwin_run.take() else {
             return;
         };
+
+        // 1) Drain poll-sampler samples and attribute them. Even
+        // if the resolver is missing (no load slide / no .debug_line),
+        // we count the samples as unresolved so the user sees that
+        // sampling happened.
+        if let Some(sampler) = run.sampler {
+            let drain = sampler.stop_and_drain();
+            let mut resolver = run.resolver;
+            for pc in drain.samples {
+                if let Some(resolver) = resolver.as_mut() {
+                    if let Some(resolved) = resolver.resolve(pc) {
+                        self.perf_overlay.data.record_resolved_pc(&resolved);
+                    } else {
+                        self.perf_overlay.data.record_unresolved_pc();
+                    }
+                } else {
+                    self.perf_overlay.data.record_unresolved_pc();
+                }
+            }
+            if drain.failed_snapshots != 0 {
+                self.perf_overlay
+                    .data
+                    .record_unresolved_samples(drain.failed_snapshots);
+            }
+        }
+
+        // 2) Take the rusage end snapshot and close the window.
         let Some(proc_pid) = self.debugger.as_ref().map(|dbg| dbg.process().pid()) else {
+            // Debugger gone — finalise with what we have.
+            let wall_ns = run
+                .rusage_start
+                .wall
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64;
+            self.perf_overlay
+                .data
+                .finish_stop_with_cpu_time(0, wall_ns, None);
             return;
         };
         match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
             Ok(end) => {
-                let (wall_ns, cpu_ns) = end.delta_since(start);
+                let (wall_ns, cpu_ns) = end.delta_since(run.rusage_start);
                 self.perf_overlay
                     .data
                     .finish_stop_with_cpu_time(0, wall_ns, Some(cpu_ns));
             }
             Err(err) => {
-                // Process exited or the syscall failed. Close the
-                // run with what we have so history still advances,
-                // and record the cause in `unavailable`.
-                let wall_ns = start
+                let wall_ns = run
+                    .rusage_start
                     .wall
                     .elapsed()
                     .as_nanos()
@@ -376,8 +508,10 @@ impl super::DebugSession {
                 self.perf_overlay
                     .data
                     .finish_stop_with_cpu_time(0, wall_ns, None);
-                self.perf_overlay.unavailable =
-                    Some(format!("rusage snapshot at run end unavailable: {err}"));
+                append_unavailable(
+                    &mut self.perf_overlay.unavailable,
+                    format!("rusage snapshot at run end unavailable: {err}"),
+                );
             }
         }
     }
@@ -507,8 +641,10 @@ impl super::DebugSession {
             self.perf_overlay.pt_last_unresolved_instructions = 0;
         }
         #[cfg(target_os = "macos")]
+        if let Some(run) = self.perf_overlay.darwin_run.take()
+            && let Some(sampler) = run.sampler
         {
-            self.perf_overlay.darwin_run_start = None;
+            let _ = sampler.stop_and_drain();
         }
         let response = bs_perf::dap::disable(&bs_perf::dap::PerfOverlayDisableRequest {});
         self.send_success_body(
@@ -839,7 +975,7 @@ fn kperf_probe_body() -> Value {
     Value::Null
 }
 
-#[cfg(all(feature = "perf", target_os = "linux"))]
+#[cfg(all(feature = "perf", any(target_os = "linux", target_os = "macos")))]
 fn append_unavailable(slot: &mut Option<String>, msg: String) {
     if let Some(existing) = slot {
         existing.push_str("; ");
@@ -847,6 +983,17 @@ fn append_unavailable(slot: &mut Option<String>, msg: String) {
     } else {
         *slot = Some(msg);
     }
+}
+
+/// First-image (main executable) load address from dyld. Used as
+/// the load bias for the source resolver — sampled PCs are runtime
+/// addresses, DWARF rows are file-relative, the slide is what
+/// turns the former into the latter.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn darwin_main_image_load_addr(task: mach2::port::mach_port_t) -> Option<u64> {
+    use crate::debugger::darwin_mach;
+    let images = darwin_mach::dyld_image_list(task).ok()?;
+    images.first().map(|image| image.load_addr as u64)
 }
 
 #[cfg(all(feature = "perf", target_os = "linux"))]

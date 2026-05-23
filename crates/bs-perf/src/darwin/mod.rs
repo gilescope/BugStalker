@@ -23,8 +23,10 @@
 //! lands. The status-bar item, however, becomes real.
 
 pub mod kperf;
+pub mod poll_sampler;
 pub mod rusage;
 pub mod symbols;
 
 pub use kperf::{probe_kperf, KperfMonitor, KperfStatus, KperfUnavailableReason};
+pub use poll_sampler::{PollDrain, PollSampler, DEFAULT_POLL_PERIOD};
 pub use rusage::ProcessSnapshot;
