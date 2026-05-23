@@ -399,7 +399,55 @@ mod tests {
         assert!(drain.samples.is_empty());
     }
 
-    /// Real sample target: spawn `sleep 1`, take a snapshot,
+    /// End-to-end pipeline test using our own task as the target.
+    /// Spins up an in-process hot loop on a worker thread, runs
+    /// the sampler against `mach_task_self()`, asserts at least
+    /// one PC came back. The self-filter ensures the sampler
+    /// doesn't suspend itself; the hot-loop thread is the prime
+    /// target for samples.
+    ///
+    /// This is the closest unit-test approximation of "sampler
+    /// captures real PCs from a real running thread" we can do
+    /// without codesigning the test binary.
+    #[test]
+    fn sampler_against_in_process_hot_loop_captures_pcs() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let worker = std::thread::spawn(move || {
+            // A simple side-effect-free hot loop. `black_box` keeps
+            // the optimiser from collapsing this into a no-op.
+            let mut sink: u64 = 0;
+            while !stop_clone.load(Ordering::Relaxed) {
+                for i in 0..10_000_u64 {
+                    sink = sink.wrapping_add(i);
+                }
+                std::hint::black_box(&sink);
+            }
+        });
+
+        // Give the worker a moment to be scheduled on a CPU.
+        std::thread::sleep(Duration::from_millis(5));
+
+        // SAFETY: mach_task_self always returns a valid task port.
+        let task = unsafe { mach_task_self() };
+        let mut sampler = PollSampler::new(task, Duration::from_millis(1));
+        sampler.start().expect("start sampler");
+        std::thread::sleep(Duration::from_millis(40));
+        let drain = sampler.stop_and_drain();
+
+        stop.store(true, Ordering::Relaxed);
+        worker.join().expect("worker join");
+
+        assert!(
+            !drain.samples.is_empty(),
+            "expected at least one PC from the hot-loop thread; drained {} samples, \
+             {} failed snapshots",
+            drain.samples.len(),
+            drain.failed_snapshots
+        );
+    }
+
+    /// Real cross-process target: spawn `sleep 1`, take a snapshot,
     /// expect at least one PC. Requires `task_for_pid` access —
     /// skipped (with an explanatory message) if the test binary
     /// isn't codesigned with the debugger entitlement.
