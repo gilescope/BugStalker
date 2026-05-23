@@ -418,6 +418,7 @@ impl super::DebugSession {
                 "activeThreadCount": active_thread_count(&self.perf_overlay),
                 "unsampledThreadCount": unsampled_thread_count(&self.perf_overlay),
                 "intelPt": intel_pt_probe_body(&self.perf_overlay),
+                "kperf": kperf_probe_body(),
             }),
         )
     }
@@ -468,6 +469,7 @@ impl super::DebugSession {
                 "enabled": self.perf_overlay.enabled && response.enabled,
                 "unavailable": self.perf_overlay.unavailable.clone(),
                 "intelPt": intel_pt_probe_body(&self.perf_overlay),
+                "kperf": kperf_probe_body(),
             }),
         )
     }
@@ -772,6 +774,68 @@ fn intel_pt_unavailable_reason_body(reason: &bs_perf::linux::IntelPtUnavailableR
 
 #[cfg(all(feature = "perf", not(target_os = "linux")))]
 fn intel_pt_probe_body(_session: &PerfOverlaySession) -> Value {
+    Value::Null
+}
+
+/// macOS Tier 1 kperf probe body. Available on every host that
+/// links against the perf feature; on macOS reports library load +
+/// PMU permission state, elsewhere `null`. Clients can use it to
+/// distinguish "kperf permission-blocked" (signing missing) from
+/// "kperf dylib missing" (wrong macOS).
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn kperf_probe_body() -> Value {
+    use bs_perf::darwin::{KperfStatus, KperfUnavailableReason, probe_kperf};
+    match probe_kperf() {
+        KperfStatus::Available {
+            library_path,
+            configurable_counters,
+        } => json!({
+            "status": "available",
+            "libraryPath": library_path,
+            "configurableCounters": configurable_counters,
+            "reason": Value::Null,
+        }),
+        KperfStatus::PermissionLikelyRequired {
+            library_path,
+            configurable_counters,
+            force_set_errno,
+        } => json!({
+            "status": "permissionLikelyRequired",
+            "libraryPath": library_path,
+            "configurableCounters": configurable_counters,
+            "reason": json!({
+                "kind": "kpcForceAllCtrsSetRefused",
+                "errno": force_set_errno,
+                "hint": "kpc_force_all_ctrs_set returned EPERM/EBUSY — the bs binary likely \
+                        needs the com.apple.private.kpc.read-or-trace entitlement or to run \
+                        with elevated privileges.",
+            }),
+        }),
+        KperfStatus::Unavailable(KperfUnavailableReason::LibraryNotFound { dlerror }) => json!({
+            "status": "unavailable",
+            "reason": json!({
+                "kind": "libraryNotFound",
+                "dlerror": dlerror,
+            }),
+        }),
+        KperfStatus::Unavailable(KperfUnavailableReason::MissingSymbol {
+            path,
+            symbol,
+            dlerror,
+        }) => json!({
+            "status": "unavailable",
+            "reason": json!({
+                "kind": "missingSymbol",
+                "path": path,
+                "symbol": symbol,
+                "dlerror": dlerror,
+            }),
+        }),
+    }
+}
+
+#[cfg(all(feature = "perf", not(target_os = "macos")))]
+fn kperf_probe_body() -> Value {
     Value::Null
 }
 

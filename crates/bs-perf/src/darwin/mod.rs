@@ -22,6 +22,9 @@
 //! The gutter heat-map stays empty on macOS until the `kperf` tier
 //! lands. The status-bar item, however, becomes real.
 
+pub mod kperf;
 pub mod rusage;
+pub mod symbols;
 
+pub use kperf::{probe_kperf, KperfMonitor, KperfStatus, KperfUnavailableReason};
 pub use rusage::ProcessSnapshot;
