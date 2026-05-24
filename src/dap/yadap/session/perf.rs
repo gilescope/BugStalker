@@ -49,6 +49,11 @@ pub(super) struct PerfOverlaySession {
     /// always also recorded in `unavailable`).
     #[cfg(target_os = "macos")]
     darwin_run: Option<DarwinPerfRun>,
+    /// Diagnostic counters captured from the last completed run —
+    /// page-ins, disk I/O bytes — used to flag the per-stop
+    /// diagnosis line.
+    #[cfg(target_os = "macos")]
+    darwin_last_delta: DarwinLastDelta,
 }
 
 /// macOS in-flight run state. Owns the rusage start snapshot, the
@@ -59,6 +64,17 @@ struct DarwinPerfRun {
     rusage_start: bs_perf::darwin::ProcessSnapshot,
     sampler: Option<bs_perf::darwin::PollSampler>,
     resolver: Option<bs_perf::decoder::SourceResolver>,
+}
+
+/// Cached macOS diagnostic counters from the most recent stop —
+/// page-ins, disk I/O bytes, etc. Drives the emoji-coded
+/// `diagnosis` field in `body.bs_perf`.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+#[derive(Debug, Default, Clone, Copy)]
+struct DarwinLastDelta {
+    pageins: u64,
+    disk_bytes_read: u64,
+    disk_bytes_written: u64,
 }
 
 #[cfg(all(feature = "perf", target_os = "macos"))]
@@ -487,15 +503,29 @@ impl super::DebugSession {
                 .min(u128::from(u64::MAX)) as u64;
             self.perf_overlay
                 .data
-                .finish_stop_with_cpu_time(0, wall_ns, None);
+                .finish_stop_full(0, wall_ns, None, None);
+            self.perf_overlay.darwin_last_delta = DarwinLastDelta::default();
             return;
         };
         match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
             Ok(end) => {
-                let (wall_ns, cpu_ns) = end.delta_since(run.rusage_start);
-                self.perf_overlay
-                    .data
-                    .finish_stop_with_cpu_time(0, wall_ns, Some(cpu_ns));
+                let delta = end.delta_since(run.rusage_start);
+                let instructions = if delta.instructions != 0 {
+                    Some(delta.instructions)
+                } else {
+                    None
+                };
+                self.perf_overlay.data.finish_stop_full(
+                    delta.cycles,
+                    delta.wall_ns,
+                    Some(delta.cpu_time_ns),
+                    instructions,
+                );
+                self.perf_overlay.darwin_last_delta = DarwinLastDelta {
+                    pageins: delta.pageins,
+                    disk_bytes_read: delta.disk_bytes_read,
+                    disk_bytes_written: delta.disk_bytes_written,
+                };
             }
             Err(err) => {
                 let wall_ns = run
@@ -506,7 +536,8 @@ impl super::DebugSession {
                     .min(u128::from(u64::MAX)) as u64;
                 self.perf_overlay
                     .data
-                    .finish_stop_with_cpu_time(0, wall_ns, None);
+                    .finish_stop_full(0, wall_ns, None, None);
+                self.perf_overlay.darwin_last_delta = DarwinLastDelta::default();
                 append_unavailable(
                     &mut self.perf_overlay.unavailable,
                     format!("rusage snapshot at run end unavailable: {err}"),
@@ -670,11 +701,16 @@ impl super::DebugSession {
             return None;
         }
         let summary = bs_perf::dap::stopped_summary(&self.perf_overlay.data)?;
+        let ipc = ipc_for(&summary);
+        let diagnosis = diagnose(&summary, &self.perf_overlay);
         Some(json!({
             "mode": perf_mode_label(&self.perf_overlay),
             "runCycles": summary.run_cycles,
             "runWallNs": summary.run_wall_ns,
             "runCpuTimeNs": summary.run_cpu_time_ns,
+            "runInstructions": summary.run_instructions,
+            "ipc": ipc,
+            "diagnosis": diagnosis,
             "hot": summary.hot.map(|hot| json!({
                 "source": hot.source,
                 "line": hot.line,
@@ -1014,6 +1050,148 @@ fn perf_mode_label(session: &PerfOverlaySession) -> &'static str {
 #[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
 fn perf_mode_label(_session: &PerfOverlaySession) -> &'static str {
     "disabled"
+}
+
+/// Instructions-per-cycle, the most diagnostic single perf number.
+/// `None` when either counter is missing or zero (can't divide).
+#[cfg(feature = "perf")]
+fn ipc_for(summary: &bs_perf::dap::PerfStoppedSummary) -> Option<f64> {
+    let instructions = summary.run_instructions?;
+    if summary.run_cycles == 0 || instructions == 0 {
+        return None;
+    }
+    Some(instructions as f64 / summary.run_cycles as f64)
+}
+
+/// Emoji-coded root-cause hint, in the rustc-helpful-error tradition.
+/// Looks at IPC and any platform-specific diagnostic counters
+/// (page-ins, disk I/O on macOS; cache/branch misses on Linux once
+/// those land) to suggest what bottleneck the last run hit.
+///
+/// Returns `null` when there's no useful signal — better silence
+/// than misleading guesses on tiny runs with single-digit cycles.
+#[cfg(feature = "perf")]
+fn diagnose(
+    summary: &bs_perf::dap::PerfStoppedSummary,
+    #[allow(unused_variables)] session: &PerfOverlaySession,
+) -> Value {
+    // Need a meaningful window — under ~10µs the counters are too
+    // noisy to read causality from. Stop tries that happen on stop-
+    // on-entry, instant breakpoints, etc. would otherwise dominate
+    // the diagnosis output with garbage.
+    if summary.run_wall_ns < 10_000 {
+        return Value::Null;
+    }
+
+    let cpu_share = if summary.run_wall_ns != 0 {
+        summary
+            .run_cpu_time_ns
+            .map(|cpu| cpu as f64 / summary.run_wall_ns as f64)
+    } else {
+        None
+    };
+    let ipc = ipc_for(summary);
+
+    // Platform-specific diagnostic signals.
+    #[cfg(target_os = "macos")]
+    let diag = session.darwin_last_delta;
+    #[cfg(target_os = "macos")]
+    {
+        if diag.disk_bytes_read >= 64 * 1024 {
+            return diagnosis_body(
+                "📀",
+                "disk-read",
+                &format!(
+                    "{} read from disk during this run",
+                    format_bytes(diag.disk_bytes_read)
+                ),
+                "hot data is being demand-paged or freshly opened; consider memory-mapping or warming the cache",
+            );
+        }
+        if diag.disk_bytes_written >= 64 * 1024 {
+            return diagnosis_body(
+                "💿",
+                "disk-write",
+                &format!(
+                    "{} written to disk during this run",
+                    format_bytes(diag.disk_bytes_written)
+                ),
+                "consider batching writes or moving them off the hot path",
+            );
+        }
+        if diag.pageins >= 16 {
+            return diagnosis_body(
+                "💾",
+                "page-ins",
+                &format!("{} page-in(s) — memory paged from disk", diag.pageins),
+                "working set may exceed RAM, or you're hitting a freshly-mapped region",
+            );
+        }
+    }
+
+    // Generic CPU-bound vs wait-bound classification, available on
+    // both Linux and macOS once CPU time is reported.
+    if let Some(share) = cpu_share
+        && share < 0.25
+    {
+        return diagnosis_body(
+            "💤",
+            "mostly-waiting",
+            &format!("CPU active for {:.0}% of wall time", share * 100.0),
+            "blocked on I/O, sleep, lock contention, or syscall — sampling won't help; check thread state",
+        );
+    }
+
+    // IPC-based classification.
+    if let Some(ipc) = ipc {
+        if ipc < 0.5 {
+            return diagnosis_body(
+                "🐌",
+                "low-ipc",
+                &format!("IPC {ipc:.2} — CPU stalls dominate"),
+                "likely memory-bound or branch-mispredict; try smaller hot structs, better locality, or `perf record` for confirmation",
+            );
+        }
+        if ipc > 2.5 {
+            return diagnosis_body(
+                "🚀",
+                "high-ipc",
+                &format!("IPC {ipc:.2} — CPU running healthy"),
+                "compute-bound; optimisation gains come from doing fewer instructions, not making them cheaper",
+            );
+        }
+        return diagnosis_body(
+            "⚖️",
+            "balanced",
+            &format!("IPC {ipc:.2} — no single bottleneck"),
+            "neither CPU-bound nor wait-bound; profile a longer window if you need more signal",
+        );
+    }
+
+    Value::Null
+}
+
+#[cfg(feature = "perf")]
+fn diagnosis_body(emoji: &str, label: &str, summary: &str, hint: &str) -> Value {
+    json!({
+        "emoji": emoji,
+        "label": label,
+        "summary": summary,
+        "hint": hint,
+    })
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn format_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024 * 1024 {
+        format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0))
+    } else if b >= 1024 {
+        format!("{:.1} KiB", b as f64 / 1024.0)
+    } else {
+        format!("{b} B")
+    }
 }
 
 #[cfg(all(feature = "perf", any(target_os = "linux", target_os = "macos")))]

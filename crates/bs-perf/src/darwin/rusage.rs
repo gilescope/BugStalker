@@ -1,17 +1,18 @@
 // SPDX-License-Identifier: MIT
 //! `proc_pid_rusage(2)` snapshots for the macOS Tier 2 perf path.
 //!
-//! Captures wall-clock `Instant` + cumulative `ri_user_time +
-//! ri_system_time` (nanoseconds since process start) for a given
-//! pid; diff two snapshots to get a per-window CPU-time figure for
-//! the per-stop summary. No PMU access, no kperf, no entitlements.
+//! Captures wall + cumulative per-process counters (CPU time,
+//! retired instructions, cycles, page-ins, disk I/O bytes) for a
+//! given pid; diff two snapshots to get a per-window figure.
+//! No PMU access, no kperf, no entitlements — just the public
+//! `proc_pid_rusage` syscall.
 //!
-//! v4 is the safest flavor to pin to: it's been part of the macOS
-//! ABI since 10.9 and every newer flavor (v5/v6) is a strict
-//! superset of it. If a future revision changes the v4 layout we
-//! catch the mismatch at compile time, because libc's
-//! `rusage_info_v4` is the canonical Rust binding for the same
-//! kernel header.
+//! `RUSAGE_INFO_V4` is the flavor we ask for. libc's
+//! `rusage_info_v4` carries the modern superset including
+//! `ri_instructions`, `ri_cycles`, `ri_diskio_*`, and `ri_pageins`.
+//! On macOS 13+ the kernel populates all of these; on older
+//! releases the trailing fields remain zero, which we treat as
+//! "unavailable" through `Option<u64>` accessors.
 
 use std::io;
 use std::mem::MaybeUninit;
@@ -19,47 +20,88 @@ use std::time::Instant;
 
 use crate::PerfError;
 
-/// Whole-process CPU + wall snapshot.
-///
-/// `cpu_time_ns` is `ri_user_time + ri_system_time` for the
-/// debuggee at sample time. `wall` is bs's monotonic clock at the
-/// same instant — both are captured close together so the diff is
-/// representative of the run-to-stop window.
+/// Whole-process counter snapshot. All counters are cumulative
+/// since the process started — diff two snapshots to get a
+/// per-window figure.
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessSnapshot {
     /// Monotonic wall-clock instant when the snapshot was taken.
     pub wall: Instant,
-    /// Cumulative user + system CPU time, in nanoseconds, since the
-    /// debuggee process started.
+    /// Cumulative user + system CPU time, in nanoseconds.
     pub cpu_time_ns: u64,
+    /// Cumulative retired instructions (`ri_instructions`). Zero
+    /// on macOS releases that don't populate this field.
+    pub instructions: u64,
+    /// Cumulative cycles (`ri_cycles`). Zero when unpopulated.
+    pub cycles: u64,
+    /// Cumulative page-ins (`ri_pageins`). High deltas suggest the
+    /// run was waiting on page-in I/O.
+    pub pageins: u64,
+    /// Cumulative bytes read from disk (`ri_diskio_bytesread`).
+    pub disk_bytes_read: u64,
+    /// Cumulative bytes written to disk (`ri_diskio_byteswritten`).
+    pub disk_bytes_written: u64,
+}
+
+/// Per-window deltas produced by [`ProcessSnapshot::delta_since`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProcessDelta {
+    /// Wall-clock duration of the window, in nanoseconds.
+    pub wall_ns: u64,
+    /// User + system CPU time spent in the window, in nanoseconds.
+    pub cpu_time_ns: u64,
+    /// Retired instructions during the window. Zero when the host
+    /// doesn't populate `ri_instructions`.
+    pub instructions: u64,
+    /// Cycles during the window. Zero when unpopulated.
+    pub cycles: u64,
+    /// Page-ins during the window.
+    pub pageins: u64,
+    /// Bytes read from disk during the window.
+    pub disk_bytes_read: u64,
+    /// Bytes written to disk during the window.
+    pub disk_bytes_written: u64,
 }
 
 impl ProcessSnapshot {
-    /// Capture user+system CPU time for `pid` and the matching wall
-    /// instant. Returns `PerfError::Open` (wrapping `errno`) if the
-    /// kernel rejects the call — typically `ESRCH` (process gone)
-    /// or `EPERM` on a process the caller doesn't own.
+    /// Capture per-process counters for `pid` and the matching
+    /// wall instant. Returns `PerfError::Open` (wrapping `errno`)
+    /// if the kernel rejects the call — typically `ESRCH`
+    /// (process gone) or `EPERM` on a foreign-uid pid.
     pub fn capture(pid: i32) -> Result<Self, PerfError> {
         let wall = Instant::now();
         let info = read_rusage_v4(pid)?;
         Ok(ProcessSnapshot {
             wall,
             cpu_time_ns: info.ri_user_time.saturating_add(info.ri_system_time),
+            instructions: info.ri_instructions,
+            cycles: info.ri_cycles,
+            pageins: info.ri_pageins,
+            disk_bytes_read: info.ri_diskio_bytesread,
+            disk_bytes_written: info.ri_diskio_byteswritten,
         })
     }
 
-    /// `(wall_ns, cpu_ns)` for `self` measured against an earlier
-    /// snapshot. Saturates to zero if `self` is somehow earlier —
-    /// clocks should be monotonic, but the saturating arithmetic
-    /// means a clock anomaly can't underflow into garbage.
-    pub fn delta_since(self, earlier: ProcessSnapshot) -> (u64, u64) {
+    /// Compute per-window deltas relative to an earlier snapshot.
+    /// Every field saturates to zero on underflow so a transient
+    /// clock or counter anomaly can't produce garbage.
+    pub fn delta_since(self, earlier: ProcessSnapshot) -> ProcessDelta {
         let wall_ns = self
             .wall
             .saturating_duration_since(earlier.wall)
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
-        let cpu_ns = self.cpu_time_ns.saturating_sub(earlier.cpu_time_ns);
-        (wall_ns, cpu_ns)
+        ProcessDelta {
+            wall_ns,
+            cpu_time_ns: self.cpu_time_ns.saturating_sub(earlier.cpu_time_ns),
+            instructions: self.instructions.saturating_sub(earlier.instructions),
+            cycles: self.cycles.saturating_sub(earlier.cycles),
+            pageins: self.pageins.saturating_sub(earlier.pageins),
+            disk_bytes_read: self.disk_bytes_read.saturating_sub(earlier.disk_bytes_read),
+            disk_bytes_written: self
+                .disk_bytes_written
+                .saturating_sub(earlier.disk_bytes_written),
+        }
     }
 }
 
@@ -103,14 +145,15 @@ mod tests {
         }
         std::hint::black_box(sink);
         let b = ProcessSnapshot::capture(pid).expect("snapshot");
-        let (wall_ns, cpu_ns) = b.delta_since(a);
-        assert!(wall_ns > 0, "wall should advance between snapshots");
-        // CPU time is a noisy fast counter; on quiet machines it
-        // usually advances, but on a heavily loaded host the
-        // kernel may not have updated the per-process accounting
-        // between two back-to-back syscalls. Allow zero, but
-        // require it to never go backwards (delta_since saturates).
-        let _ = cpu_ns;
+        let delta = b.delta_since(a);
+        assert!(delta.wall_ns > 0, "wall should advance between snapshots");
+        // On macOS 13+ the rusage v4 surface populates instructions
+        // and cycles. We tolerate zeros (older kernels, idle process)
+        // but assert never-negative — `saturating_sub` enforces it.
+        // The hot loop above retires ~100k instructions on most hosts;
+        // if the field is populated we expect to see at least *some*
+        // forward motion, but we don't hard-fail on a quiet kernel.
+        let _ = (delta.instructions, delta.cycles, delta.pageins);
     }
 
     /// Non-existent pid → error, not panic.
@@ -120,5 +163,31 @@ mod tests {
         // returns ESRCH or EPERM. Either way we get an error.
         let r = ProcessSnapshot::capture(-1);
         assert!(r.is_err());
+    }
+
+    /// Hot-loop test: snapshot, burn a known amount of CPU, snapshot.
+    /// If the kernel populates `ri_instructions`, we should see a
+    /// non-zero delta. Skipped silently if `ri_instructions` reads
+    /// as zero — older macOS or sandboxed test environments.
+    #[test]
+    fn instructions_advance_under_hot_loop_when_populated() {
+        let pid = std::process::id() as i32;
+        let a = ProcessSnapshot::capture(pid).expect("snapshot");
+        let mut sink: u64 = 0;
+        for i in 0_u64..5_000_000 {
+            sink = sink.wrapping_add(i.wrapping_mul(3));
+        }
+        std::hint::black_box(sink);
+        let b = ProcessSnapshot::capture(pid).expect("snapshot");
+        let delta = b.delta_since(a);
+        if a.instructions != 0 || b.instructions != 0 {
+            assert!(
+                delta.instructions > 1_000_000,
+                "5M-iteration loop should retire ≫1M instructions, got {}",
+                delta.instructions
+            );
+        } else {
+            eprintln!("ri_instructions reads as zero on this host; skipping advancement check");
+        }
     }
 }

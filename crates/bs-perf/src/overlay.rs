@@ -75,6 +75,9 @@ pub struct StopStatusView {
     /// Whole-process CPU time (user + system, ns) for the run, when
     /// the collector reports time rather than cycles (macOS Tier 2).
     pub run_cpu_time_ns: Option<u64>,
+    /// Retired instructions during the run-to-stop window. Pairs
+    /// with `run_cycles` to give IPC.
+    pub run_instructions: Option<u64>,
     /// Hottest resolved source line, if any.
     pub hot: Option<HotLineView>,
     /// Samples that did not resolve to a source line.
@@ -93,6 +96,8 @@ pub struct HistoryRow {
     /// Whole-process CPU time (user + system, ns) for the run, when
     /// the collector reports time rather than cycles.
     pub run_cpu_time_ns: Option<u64>,
+    /// Retired instructions during the run-to-stop window.
+    pub run_instructions: Option<u64>,
     /// Hottest resolved source line for this stop, if any.
     pub hot: Option<HotLineView>,
     /// Samples that did not resolve to source in this stop.
@@ -168,6 +173,7 @@ pub fn history_rows(data: &PerfData) -> Vec<HistoryRow> {
                 run_cycles: status.run_cycles,
                 run_wall_ns: status.run_wall_ns,
                 run_cpu_time_ns: status.run_cpu_time_ns,
+                run_instructions: status.run_instructions,
                 hot: status.hot,
                 unresolved_samples: status.unresolved_samples,
             }
@@ -300,6 +306,7 @@ fn stop_status_view(data: &PerfData, summary: &StopSummary) -> StopStatusView {
         run_cycles: summary.run_cycles,
         run_wall_ns: summary.run_wall_ns,
         run_cpu_time_ns: summary.run_cpu_time_ns,
+        run_instructions: summary.run_instructions,
         hot: summary
             .top_lines
             .first()
@@ -445,6 +452,7 @@ mod tests {
             run_cycles: 3_200_000,
             run_wall_ns: 1_400_000,
             run_cpu_time_ns: None,
+            run_instructions: None,
             hot: Some(HotLineView {
                 file: PathBuf::from("src/main.rs"),
                 line: 45,
@@ -463,6 +471,7 @@ mod tests {
             run_cycles: 280_000,
             run_wall_ns: 130_000,
             run_cpu_time_ns: None,
+            run_instructions: None,
             hot: status.hot,
             unresolved_samples: 0,
         };
@@ -480,6 +489,7 @@ mod tests {
             run_cycles: 0,
             run_wall_ns: 1_400_000,
             run_cpu_time_ns: Some(1_200_000),
+            run_instructions: None,
             hot: None,
             unresolved_samples: 0,
         };

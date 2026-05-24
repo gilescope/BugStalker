@@ -48,20 +48,21 @@ pub struct HotLine {
 /// Per-stop summary retained for `perf history`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopSummary {
-    /// Cycle count for the run-to-stop window. Step 117 callers
-    /// may pass zero until the PMU counter wiring lands; the macOS
-    /// rusage tier passes zero and instead populates
-    /// `run_cpu_time_ns` because Apple's per-process counters
-    /// expose user/system *time*, not raw cycles.
+    /// Cycle count for the run-to-stop window. Linux cycles+IP and
+    /// macOS rusage (when `ri_cycles` is populated) both fill this;
+    /// older collectors may pass zero.
     pub run_cycles: u64,
     /// Wall-clock duration for the run-to-stop window.
     pub run_wall_ns: u64,
     /// Whole-process user + system CPU time in nanoseconds for the
-    /// run-to-stop window, when the collector cannot return a true
-    /// cycle count. Tier 2 macOS collection sets this from
-    /// `proc_pid_rusage(RUSAGE_INFO_V4)`. `None` on collectors that
-    /// report cycles directly (Linux cycles+IP).
+    /// run-to-stop window. Filled by collectors that report time as
+    /// well as / instead of raw cycles (macOS Tier 2). `None` on
+    /// Linux cycles+IP, which reports cycles only.
     pub run_cpu_time_ns: Option<u64>,
+    /// Retired instructions during the run-to-stop window. `None`
+    /// on collectors that don't yet count them. Pairs with
+    /// `run_cycles` to give IPC, the single most useful perf number.
+    pub run_instructions: Option<u64>,
     /// Hottest lines in this stop, sorted by sample count
     /// descending and then by source key for deterministic output.
     pub top_lines: Vec<HotLine>,
@@ -185,7 +186,7 @@ impl PerfData {
 
     /// Finish a run-to-stop window and retain a summary.
     pub fn finish_stop(&mut self, run_cycles: u64, run_wall_ns: u64) -> StopSummary {
-        self.finish_stop_with_cpu_time(run_cycles, run_wall_ns, None)
+        self.finish_stop_full(run_cycles, run_wall_ns, None, None)
     }
 
     /// Finish a run-to-stop window, including a CPU-time figure for
@@ -195,6 +196,20 @@ impl PerfData {
         run_cycles: u64,
         run_wall_ns: u64,
         run_cpu_time_ns: Option<u64>,
+    ) -> StopSummary {
+        self.finish_stop_full(run_cycles, run_wall_ns, run_cpu_time_ns, None)
+    }
+
+    /// Finish a run-to-stop window with the full counter set:
+    /// cycles, wall, CPU time, and retired instructions. Each
+    /// optional figure is reported in `body.bs_perf` when present
+    /// and contributes to IPC + diagnostic computations.
+    pub fn finish_stop_full(
+        &mut self,
+        run_cycles: u64,
+        run_wall_ns: u64,
+        run_cpu_time_ns: Option<u64>,
+        run_instructions: Option<u64>,
     ) -> StopSummary {
         let mut top_lines = self
             .last_run
@@ -211,6 +226,7 @@ impl PerfData {
             run_cycles,
             run_wall_ns,
             run_cpu_time_ns,
+            run_instructions,
             top_lines,
             unresolved_samples: self.unresolved_last_run,
         };
