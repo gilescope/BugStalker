@@ -97,6 +97,12 @@ struct ActivePerfRun {
     pt_capture: Option<bs_perf::linux::IntelPtCapture>,
     resolver: Option<bs_perf::decoder::SourceResolver>,
     started_at: Instant,
+    /// Optional pure-counter `PERF_COUNT_HW_INSTRUCTIONS` event,
+    /// opened alongside the cycles+IP sampler. Read at stop to
+    /// produce `runInstructions` in body.bs_perf. None when the
+    /// kernel refused the open (typically the same perf_event_paranoid
+    /// path that already let cycles through, so this is rare).
+    instructions: Option<bs_perf::PerfMonitor>,
 }
 
 impl super::DebugSession {
@@ -345,6 +351,8 @@ impl super::DebugSession {
             .collect::<Vec<_>>();
 
         let mut wall_ns = 0_u64;
+        let mut total_instructions: u64 = 0;
+        let mut instructions_seen = false;
         for mut active in active_runs {
             if let Err(err) = active.monitor.disable() {
                 append_unavailable(
@@ -354,6 +362,22 @@ impl super::DebugSession {
                         active.tid
                     ),
                 );
+            }
+            if let Some(mut counter) = active.instructions.take() {
+                let _ = counter.disable();
+                match counter.read_count() {
+                    Ok(n) => {
+                        total_instructions = total_instructions.saturating_add(n);
+                        instructions_seen = true;
+                    }
+                    Err(err) => append_unavailable(
+                        &mut self.perf_overlay.unavailable,
+                        format!(
+                            "instructions counter read failed for tid {}: {err}",
+                            active.tid
+                        ),
+                    ),
+                }
             }
             match active.ring.drain() {
                 Ok((records, stats)) => {
@@ -453,7 +477,14 @@ impl super::DebugSession {
             ),
             None => {}
         }
-        self.perf_overlay.data.finish_stop(0, wall_ns);
+        let instructions_arg = if instructions_seen {
+            Some(total_instructions)
+        } else {
+            None
+        };
+        self.perf_overlay
+            .data
+            .finish_stop_full(0, wall_ns, None, instructions_arg);
     }
 
     /// Darwin perf-run stop. Drains the poll sampler (Tier 1b),
@@ -659,6 +690,9 @@ impl super::DebugSession {
             if let Some(mut capture) = active.pt_capture.take() {
                 let _ = capture.stop_and_drain();
             }
+            if let Some(mut counter) = active.instructions.take() {
+                let _ = counter.disable();
+            }
             let _ = active.monitor.disable();
         }
         #[cfg(target_os = "linux")]
@@ -736,6 +770,24 @@ fn open_active_perf_run(
     let mut monitor = bs_perf::open_cycles_for_pid(tid.as_raw())?;
     let ring = monitor.mmap_ring(bs_perf::linux::ring::DEFAULT_RING_DATA_PAGES)?;
     monitor.reset().and_then(|_| monitor.enable())?;
+    // Best-effort instructions counter alongside the sampler. If
+    // the kernel refuses (perf_event_paranoid changed mid-flight,
+    // rare), we still get cycles+IP — runInstructions stays None.
+    let instructions = match bs_perf::linux::open_instructions_for_pid(tid.as_raw()) {
+        Ok(mut counter) => {
+            let init = counter.reset().and_then(|_| counter.enable());
+            if let Err(err) = init {
+                log::debug!(target: "perf", "instructions counter enable failed for tid {tid}: {err}");
+                None
+            } else {
+                Some(counter)
+            }
+        }
+        Err(err) => {
+            log::debug!(target: "perf", "instructions counter open failed for tid {tid}: {err}");
+            None
+        }
+    };
     Ok(ActivePerfRun {
         tid,
         monitor,
@@ -743,6 +795,7 @@ fn open_active_perf_run(
         pt_capture: None,
         resolver,
         started_at: Instant::now(),
+        instructions,
     })
 }
 

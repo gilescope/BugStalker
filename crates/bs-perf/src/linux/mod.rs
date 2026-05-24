@@ -30,7 +30,7 @@ pub use intel_pt::{
     default_intel_pt_data_pages, open_intel_pt_for_pid, open_intel_pt_for_pid_with_pmu_type,
     probe_intel_pt, probe_intel_pt_at,
 };
-pub use perf_event::{PerfMonitor, open_cycles_for_pid};
+pub use perf_event::{PerfMonitor, open_cycles_for_pid, open_instructions_for_pid};
 pub use ring::{
     DEFAULT_RING_DATA_PAGES, DrainStats, PerfAuxLayout, PerfAuxSnapshot, PerfRecord,
     PerfRingBuffer, PerfSample,
