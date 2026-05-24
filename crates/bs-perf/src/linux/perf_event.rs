@@ -443,13 +443,18 @@ mod tests {
         assert_eq!(attr.size, core::mem::size_of::<perf_event_attr>() as u32);
     }
 
-    /// Open the instructions counter on our own pid, run a hot
-    /// loop, read the count. Should be far above zero. Skips on
-    /// hosts where `perf_event_open` is denied.
+    /// Open the instructions counter on the *calling thread*
+    /// (`pid = 0`), run a hot loop, read the count. Should be far
+    /// above zero. Skips on hosts where `perf_event_open` is denied.
+    ///
+    /// `pid = 0` (calling thread) is the right choice here because
+    /// cargo test runs each test on a worker thread. Passing
+    /// `getpid()` (the TGID) measures the main thread, which is
+    /// idle during the test, and the counter reads as zero —
+    /// learned this the hard way.
     #[test]
     fn instructions_counter_advances_under_hot_loop() {
-        let pid = unsafe { libc::getpid() };
-        let mut m = match open_instructions_for_pid(pid) {
+        let mut m = match open_instructions_for_pid(0) {
             Ok(m) => m,
             Err(PerfError::Open(e)) => {
                 let raw = e.raw_os_error();
