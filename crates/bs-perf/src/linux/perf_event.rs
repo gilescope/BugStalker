@@ -421,4 +421,63 @@ mod tests {
         let attr = build_cycles_attr(1000);
         assert_eq!(attr.precise_ip(), 2);
     }
+
+    /// Instructions attribute: HW type, INSTRUCTIONS config, no
+    /// sampling fields, disabled until enable().
+    #[test]
+    fn instructions_attr_is_pure_counter() {
+        let attr = build_instructions_attr();
+        assert_eq!(attr.type_, bindings::PERF_TYPE_HARDWARE);
+        assert_eq!(attr.config, u64::from(bindings::PERF_COUNT_HW_INSTRUCTIONS));
+        assert_eq!(attr.sample_type, 0);
+        // sample_freq lives in the union; freq() bit unset means
+        // the field is interpreted as sample_period — which we
+        // also leave zero.
+        assert_eq!(attr.freq(), 0);
+        unsafe {
+            assert_eq!(attr.__bindgen_anon_1.sample_freq, 0);
+        }
+        assert_eq!(attr.exclude_kernel(), 1);
+        assert_eq!(attr.exclude_hv(), 1);
+        assert_eq!(attr.disabled(), 1);
+        assert_eq!(attr.size, core::mem::size_of::<perf_event_attr>() as u32);
+    }
+
+    /// Open the instructions counter on our own pid, run a hot
+    /// loop, read the count. Should be far above zero. Skips on
+    /// hosts where `perf_event_open` is denied.
+    #[test]
+    fn instructions_counter_advances_under_hot_loop() {
+        let pid = unsafe { libc::getpid() };
+        let mut m = match open_instructions_for_pid(pid) {
+            Ok(m) => m,
+            Err(PerfError::Open(e)) => {
+                let raw = e.raw_os_error();
+                if matches!(
+                    raw,
+                    Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EOPNOTSUPP),
+                ) {
+                    eprintln!("skipping: perf_event_open denied — {e}");
+                    return;
+                }
+                panic!("open failed: {e:?}");
+            }
+            Err(e) => panic!("open failed: {e:?}"),
+        };
+        m.reset().expect("reset");
+        m.enable().expect("enable");
+        // Burn a known amount of work. Volatile sink stops the
+        // optimiser from collapsing the loop into a constant.
+        let mut sink: u64 = 0;
+        for i in 0_u64..1_000_000 {
+            sink = sink.wrapping_add(i.wrapping_mul(7));
+        }
+        std::hint::black_box(sink);
+        m.disable().expect("disable");
+        let count = m.read_count().expect("read_count");
+        assert!(
+            count > 500_000,
+            "1M-iteration loop should retire ≫500k instructions, got {count}"
+        );
+    }
 }
