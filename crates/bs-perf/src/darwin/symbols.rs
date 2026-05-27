@@ -2,41 +2,38 @@
 //! `libkperf.dylib` symbol shim for the Phase 6 Darwin Tier 1
 //! (cycles + IP sampling) path.
 //!
-//! Apple's `kperf` is a private system framework. There is no
-//! header, no docs, no stability promise — the symbol set drifts
-//! between macOS releases. The plan (`doc/plans/phase-6-perf-overlay.md`)
-//! pins us to [`mstange/samply`](https://github.com/mstange/samply)
-//! for the binding shape, on the principle that samply already
-//! tracks the API churn for everyone.
+//! Apple's `kperf` is a private system framework: no header, no
+//! docs, no stability promise — the symbol set drifts between macOS
+//! releases. We therefore bind it at **runtime** via `libloading`
+//! (`dlopen` + `dlsym` under the hood) rather than link-time, so a
+//! host missing a symbol gives us a clean `Err` to surface in the
+//! probe instead of a `dyld` load fault.
 //!
-//! This module is the dlsym shim. It tries the documented library
-//! paths (`/usr/lib/system/libkperf.dylib` first, falling back to
-//! the framework path), loads the function pointers we care about,
-//! and reports missing symbols by name so a future macOS version
-//! removal is debuggable rather than a black-box "kperf
-//! unavailable".
+//! References for the symbol shapes are XNU's `osfmk/kperf/` and the
+//! community `kpc_demo.c` — **not** samply, which deliberately
+//! samples by polling (`thread_suspend` + `thread_get_state`) and
+//! binds no kperf at all. That polling path is our Tier 1b sampler;
+//! this kperf shim is the entitled/root Tier 1a probe.
 //!
-//! ### Scope of this commit
+//! ### Scope
 //!
-//! Scaffold only. The struct holds typed function pointers and
-//! [`KperfLibrary::open`] does the lookup; [`super::kperf`] uses it
-//! through a probe today. **No sampling is wired in.** The
-//! `KperfMonitor::open_for_pid` entry point still returns
-//! `PerfError::Unsupported` until the periodic-timer + action
-//! programming lands in a follow-up.
+//! Probe surface only. The struct holds typed function pointers and
+//! [`KperfLibrary::open`] resolves them; [`super::kperf`] uses them
+//! to report availability/permission. **No sampling is wired in** —
+//! `KperfMonitor::open_for_pid` returns `Unsupported`, and the
+//! cross-process sampler is out of scope (root-only + the
+//! undocumented kdebug buffer; see `doc/plans/phase-6-perf-overlay.md`).
 
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
-use std::ptr;
+use std::os::raw::c_int;
 use std::sync::OnceLock;
 
+use libloading::{Library, Symbol};
 use thiserror::Error;
 
 /// Paths to try, in order. The framework path is the fallback
 /// because some macOS releases ship the dylib only under the
-/// framework bundle. samply tries the framework path first; we
-/// flip the order because Apple's own subsystems link against the
-/// `/usr/lib/system/...` path and so it tends to be the cached one.
+/// framework bundle; the `/usr/lib/system/...` path is what Apple's
+/// own subsystems link against and so tends to be the cached one.
 const LIBKPERF_PATHS: &[&str] = &[
     "/usr/lib/system/libkperf.dylib",
     "/System/Library/PrivateFrameworks/kperf.framework/kperf",
@@ -65,7 +62,7 @@ pub mod kperf_sampler {
     pub const TH_SNAPSHOT: u32 = 1 << 1;
     /// Kernel-side call stack at sample time.
     pub const KSTACK: u32 = 1 << 2;
-    /// User-side call stack — what samply uses to build flame graphs.
+    /// User-side call stack — what flame-graph profilers build from.
     pub const USTACK: u32 = 1 << 3;
     /// Per-thread PMC values at sample time — cycles+IP heat-map source.
     pub const PMC_THREAD: u32 = 1 << 4;
@@ -77,33 +74,36 @@ pub mod kperf_sampler {
     pub const MEMINFO: u32 = 1 << 7;
 }
 
-/// One handle to the loaded `libkperf.dylib` plus the typed function
-/// pointers we use. Dropped on shutdown; `dlclose` is best-effort.
+/// Loaded `libkperf.dylib` plus the typed function pointers we use.
+///
+/// `_lib` keeps the library mapped for as long as the bare function
+/// pointers extracted from it live — both are in this struct, the
+/// struct lives in a process-lifetime `OnceLock`, and we never move
+/// the library out, so the pointers stay valid. `libloading::Library`
+/// is `Send + Sync` and bare `extern "C" fn` pointers are too, so the
+/// whole struct is auto-`Send + Sync` — no hand-written `unsafe impl`.
 pub struct KperfLibrary {
-    handle: *mut c_void,
+    _lib: Library,
     path: String,
-    /// `int kpc_get_counter_count(uint32_t classes)` — number of
-    /// counters reported by the kernel for the requested class
-    /// mask. Useful sanity check (CONFIGURABLE > 0 means the PMU
-    /// is exposed at all).
+    /// `int kpc_get_counter_count(uint32_t classes)` — counters the
+    /// kernel reports for the class mask (CONFIGURABLE > 0 means the
+    /// PMU is exposed at all).
     pub kpc_get_counter_count: unsafe extern "C" fn(u32) -> c_int,
-    /// `int kpc_set_counting(uint32_t classes)` — enable PMU
-    /// counting for the given class mask process-wide.
+    /// `int kpc_set_counting(uint32_t classes)` — enable PMU counting
+    /// for the class mask process-wide.
     pub kpc_set_counting: unsafe extern "C" fn(u32) -> c_int,
     /// `int kpc_set_thread_counting(uint32_t classes)` — enable
     /// counting on the calling thread.
     pub kpc_set_thread_counting: unsafe extern "C" fn(u32) -> c_int,
     /// `int kpc_force_all_ctrs_set(int val)` — force-take the PMU.
-    /// Requires entitlement on modern macOS.
+    /// Requires the kpc entitlement or root on modern macOS.
     pub kpc_force_all_ctrs_set: unsafe extern "C" fn(c_int) -> c_int,
     /// `int kperf_action_count_set(uint32_t count)` — allocate N
-    /// action slots. samply uses 1 (one action covering all
-    /// samplers).
+    /// action slots.
     pub kperf_action_count_set: unsafe extern "C" fn(u32) -> c_int,
     /// `int kperf_action_samplers_set(uint32_t action, uint32_t samplers)`
     pub kperf_action_samplers_set: unsafe extern "C" fn(u32, u32) -> c_int,
-    /// `int kperf_timer_count_set(uint32_t count)` — allocate N
-    /// timer slots.
+    /// `int kperf_timer_count_set(uint32_t count)` — allocate N timer slots.
     pub kperf_timer_count_set: unsafe extern "C" fn(u32) -> c_int,
     /// `int kperf_timer_period_set(uint32_t timer, uint64_t period_ticks)`
     pub kperf_timer_period_set: unsafe extern "C" fn(u32, u64) -> c_int,
@@ -111,10 +111,10 @@ pub struct KperfLibrary {
     pub kperf_timer_action_set: unsafe extern "C" fn(u32, u32) -> c_int,
     /// `int kperf_sample_set(uint32_t enable)` — flip the sampler on/off.
     pub kperf_sample_set: unsafe extern "C" fn(u32) -> c_int,
-    /// `int kperf_reset(void)` — clear all kperf state. Called on teardown.
+    /// `int kperf_reset(void)` — clear all kperf state. Teardown.
     pub kperf_reset: unsafe extern "C" fn() -> c_int,
-    /// `uint64_t kperf_ns_to_ticks(uint64_t ns)` — convert sampling
-    /// period from a wall-clock figure to mach absolute ticks.
+    /// `uint64_t kperf_ns_to_ticks(uint64_t ns)` — sampling period in
+    /// nanoseconds → mach absolute ticks.
     pub kperf_ns_to_ticks: unsafe extern "C" fn(u64) -> u64,
 }
 
@@ -126,40 +126,32 @@ impl std::fmt::Debug for KperfLibrary {
     }
 }
 
-// SAFETY: the inner function pointers point into a dylib we never
-// unload until process exit; calling them from multiple threads is
-// kperf's own responsibility (most calls are documented to require
-// kperf_lock, which the library serialises internally).
-unsafe impl Send for KperfLibrary {}
-unsafe impl Sync for KperfLibrary {}
-
 /// Failure modes when loading `libkperf.dylib` or resolving its
 /// symbols. Surfaced through [`KperfStatus::Unavailable`].
 #[derive(Debug, Error)]
 pub enum KperfSymbolError {
-    /// `dlopen` failed for every candidate path. `last_dlerror`
-    /// holds the `dlerror()` string from the final attempt.
+    /// Loading the dylib failed for every candidate path. `last_dlerror`
+    /// holds the loader error from the final attempt.
     #[error("dlopen failed for libkperf.dylib: {last_dlerror}")]
     Dlopen {
-        /// `dlerror()` text from the last failed attempt.
+        /// Loader error text from the last failed attempt.
         last_dlerror: String,
     },
     /// A symbol we need was missing from the loaded library.
     /// This typically means Apple removed it in a macOS update.
-    #[error("dlsym(\"{symbol}\") returned NULL in {path}: {dlerror}")]
+    #[error("symbol \"{symbol}\" not found in {path}: {dlerror}")]
     MissingSymbol {
         /// Library path that loaded successfully.
         path: String,
         /// Name of the symbol that was missing.
         symbol: &'static str,
-        /// `dlerror()` text from the failed lookup.
+        /// Loader error text from the failed lookup.
         dlerror: String,
     },
 }
 
-/// Process-wide loaded library handle. We cache it so probes and
-/// later samplers share the same dlopen result — repeated dlopens
-/// of system frameworks aren't free.
+/// Process-wide loaded library handle. Cached so probes and any
+/// later callers share the one `dlopen` result.
 static LIBRARY: OnceLock<Result<KperfLibrary, KperfSymbolError>> = OnceLock::new();
 
 /// Load (or return the cached) `libkperf.dylib`. First call wins.
@@ -169,123 +161,69 @@ pub fn library() -> Result<&'static KperfLibrary, &'static KperfSymbolError> {
 
 impl KperfLibrary {
     fn open() -> Result<Self, KperfSymbolError> {
-        let (handle, path) = open_first_available()?;
+        let (lib, path) = open_first_available()?;
 
-        // Helper to resolve one symbol or surface a structured
-        // failure with the dlerror text. dlerror() returns the
-        // last error; we clear it before each call so the message
-        // we report is the one from *this* dlsym.
-        let resolve = |name: &'static str| -> Result<*mut c_void, KperfSymbolError> {
-            // SAFETY: `dlerror()` has thread-local storage and is
-            // safe to call from any thread.
-            unsafe { libc::dlerror() };
-            let c_name = CString::new(name).expect("kperf symbol names are static ASCII");
-            // SAFETY: handle is a valid dlopen result; name is a
-            // null-terminated C string.
-            let sym = unsafe { libc::dlsym(handle, c_name.as_ptr()) };
-            if sym.is_null() {
-                // SAFETY: dlerror returns a thread-local C string
-                // pointer that's stable until the next dlerror call.
-                let err = unsafe { libc::dlerror() };
-                let msg = if err.is_null() {
-                    String::from("symbol not found")
-                } else {
-                    // SAFETY: pointer non-null and points at a NUL-
-                    // terminated C string owned by libdl.
-                    unsafe { CStr::from_ptr(err) }
-                        .to_string_lossy()
-                        .into_owned()
-                };
-                return Err(KperfSymbolError::MissingSymbol {
-                    path: path.clone(),
-                    symbol: name,
-                    dlerror: msg,
-                });
-            }
-            Ok(sym)
-        };
-
-        // SAFETY for all transmutes below: the C ABIs match the
-        // declared `extern "C" fn` signatures one-for-one against
-        // `<kperf/*.h>` (Apple private). If Apple changes a
-        // signature, we'd only catch it at runtime, not here —
-        // hence the version-tracked samply pin.
-        let kpc_get_counter_count = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> c_int>(resolve(
-                "kpc_get_counter_count",
-            )?)
-        };
-        let kpc_set_counting = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> c_int>(resolve(
-                "kpc_set_counting",
-            )?)
-        };
-        let kpc_set_thread_counting = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> c_int>(resolve(
-                "kpc_set_thread_counting",
-            )?)
-        };
-        let kpc_force_all_ctrs_set = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(c_int) -> c_int>(resolve(
-                "kpc_force_all_ctrs_set",
-            )?)
-        };
-        let kperf_action_count_set = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> c_int>(resolve(
-                "kperf_action_count_set",
-            )?)
-        };
-        let kperf_action_samplers_set = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, u32) -> c_int>(resolve(
-                "kperf_action_samplers_set",
-            )?)
-        };
-        let kperf_timer_count_set = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> c_int>(resolve(
-                "kperf_timer_count_set",
-            )?)
-        };
-        let kperf_timer_period_set = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, u64) -> c_int>(resolve(
-                "kperf_timer_period_set",
-            )?)
-        };
-        let kperf_timer_action_set = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32, u32) -> c_int>(resolve(
-                "kperf_timer_action_set",
-            )?)
-        };
-        let kperf_sample_set = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u32) -> c_int>(resolve(
-                "kperf_sample_set",
-            )?)
-        };
-        let kperf_reset = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn() -> c_int>(resolve(
-                "kperf_reset",
-            )?)
-        };
-        let kperf_ns_to_ticks = unsafe {
-            std::mem::transmute::<*mut c_void, unsafe extern "C" fn(u64) -> u64>(resolve(
-                "kperf_ns_to_ticks",
-            )?)
-        };
+        // Resolve one symbol into a bare `extern "C" fn` pointer.
+        //
+        // SAFETY: each use asserts that the named symbol has the C
+        // ABI type given — the type comes from XNU's <kperf/*.h>.
+        // This type assertion is the irreducible unsafety of binding
+        // an undocumented C API; everything around it (dlsym, the
+        // missing-symbol `Err` instead of a crash) is libloading's
+        // job. The bare pointer copied out by `*symbol` stays valid
+        // as long as `lib` — stored in the returned struct — lives.
+        macro_rules! sym {
+            ($name:literal, $ty:ty) => {{
+                let nul = concat!($name, "\0").as_bytes();
+                let symbol: Symbol<$ty> =
+                    unsafe { lib.get(nul) }.map_err(|e| KperfSymbolError::MissingSymbol {
+                        path: path.clone(),
+                        symbol: $name,
+                        dlerror: e.to_string(),
+                    })?;
+                *symbol
+            }};
+        }
 
         Ok(Self {
-            handle,
+            kpc_get_counter_count: sym!(
+                "kpc_get_counter_count",
+                unsafe extern "C" fn(u32) -> c_int
+            ),
+            kpc_set_counting: sym!("kpc_set_counting", unsafe extern "C" fn(u32) -> c_int),
+            kpc_set_thread_counting: sym!(
+                "kpc_set_thread_counting",
+                unsafe extern "C" fn(u32) -> c_int
+            ),
+            kpc_force_all_ctrs_set: sym!(
+                "kpc_force_all_ctrs_set",
+                unsafe extern "C" fn(c_int) -> c_int
+            ),
+            kperf_action_count_set: sym!(
+                "kperf_action_count_set",
+                unsafe extern "C" fn(u32) -> c_int
+            ),
+            kperf_action_samplers_set: sym!(
+                "kperf_action_samplers_set",
+                unsafe extern "C" fn(u32, u32) -> c_int
+            ),
+            kperf_timer_count_set: sym!(
+                "kperf_timer_count_set",
+                unsafe extern "C" fn(u32) -> c_int
+            ),
+            kperf_timer_period_set: sym!(
+                "kperf_timer_period_set",
+                unsafe extern "C" fn(u32, u64) -> c_int
+            ),
+            kperf_timer_action_set: sym!(
+                "kperf_timer_action_set",
+                unsafe extern "C" fn(u32, u32) -> c_int
+            ),
+            kperf_sample_set: sym!("kperf_sample_set", unsafe extern "C" fn(u32) -> c_int),
+            kperf_reset: sym!("kperf_reset", unsafe extern "C" fn() -> c_int),
+            kperf_ns_to_ticks: sym!("kperf_ns_to_ticks", unsafe extern "C" fn(u64) -> u64),
+            _lib: lib,
             path,
-            kpc_get_counter_count,
-            kpc_set_counting,
-            kpc_set_thread_counting,
-            kpc_force_all_ctrs_set,
-            kperf_action_count_set,
-            kperf_action_samplers_set,
-            kperf_timer_count_set,
-            kperf_timer_period_set,
-            kperf_timer_action_set,
-            kperf_sample_set,
-            kperf_reset,
-            kperf_ns_to_ticks,
         })
     }
 
@@ -295,47 +233,19 @@ impl KperfLibrary {
     }
 }
 
-fn open_first_available() -> Result<(*mut c_void, String), KperfSymbolError> {
+fn open_first_available() -> Result<(Library, String), KperfSymbolError> {
     let mut last_dlerror = String::from("no candidate paths attempted");
     for &candidate in LIBKPERF_PATHS {
-        let c_path = CString::new(candidate).expect("static ASCII path");
-        // SAFETY: dlopen accepts NULL or a valid NUL-terminated path.
-        let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_LAZY) };
-        if !handle.is_null() {
-            return Ok((handle, candidate.to_owned()));
+        // SAFETY: `Library::new` runs the dylib's initialisers on
+        // load. libkperf is a system framework with no hostile init,
+        // so loading it is sound; a missing file is a returned `Err`.
+        match unsafe { Library::new(candidate) } {
+            Ok(lib) => return Ok((lib, candidate.to_owned())),
+            Err(e) => last_dlerror = format!("{candidate}: {e}"),
         }
-        // SAFETY: dlerror() returns thread-local storage; ptr stable
-        // until next dlerror call.
-        let err = unsafe { libc::dlerror() };
-        last_dlerror = if err.is_null() {
-            format!("{candidate}: dlopen returned NULL but dlerror was empty")
-        } else {
-            let msg = unsafe { CStr::from_ptr(err) }
-                .to_string_lossy()
-                .into_owned();
-            format!("{candidate}: {msg}")
-        };
     }
     Err(KperfSymbolError::Dlopen { last_dlerror })
 }
-
-impl Drop for KperfLibrary {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            // SAFETY: handle was a successful dlopen result. We're
-            // the only owner because this lives in OnceLock and is
-            // never moved.
-            let _ = unsafe { libc::dlclose(self.handle) };
-            self.handle = ptr::null_mut();
-        }
-    }
-}
-
-// Force unused warnings to stay quiet on the c_char import even if
-// the file's first build doesn't reference it directly. The CString
-// path takes &CStr → *const c_char internally.
-#[allow(dead_code)]
-fn _force_c_char_used(_: c_char) {}
 
 #[cfg(test)]
 mod tests {

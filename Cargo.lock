@@ -291,6 +291,7 @@ dependencies = [
  "gimli",
  "libc",
  "libipt",
+ "libloading",
  "mach2 0.6.0",
  "object 0.32.2",
  "perf-event-open-sys",

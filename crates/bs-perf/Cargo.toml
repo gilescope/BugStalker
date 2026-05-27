@@ -67,6 +67,10 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 mach2 = "0.6"
+# Runtime dlopen/dlsym of the private libkperf.dylib. Already in the
+# workspace lock; binds at runtime so a missing symbol is a graceful
+# Err, not a dyld load fault. Replaces a hand-rolled transmute shim.
+libloading = "0.8"
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86", target_arch = "x86_64")))'.dependencies]
 libipt = { version = "0.4.0", optional = true }

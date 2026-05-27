@@ -269,8 +269,15 @@ fn collect_task_threads(task: mach_port_t) -> Result<Vec<thread_act_t>, i32> {
         return Err(kr);
     }
     let n = count as usize;
-    // SAFETY: kernel returned KERN_SUCCESS with `list`/`count`
-    // pointing at an allocation of `count` send rights.
+    if n == 0 {
+        // No threads (or the kernel returned a null/zero array).
+        // `slice::from_raw_parts` requires a non-null, aligned
+        // pointer even for len 0, so we must not build a slice from
+        // a possibly-null `list` here. Nothing to free either.
+        return Ok(Vec::new());
+    }
+    // SAFETY: kernel returned KERN_SUCCESS with `n > 0`, so `list`
+    // points at an allocation of `n` send rights.
     let slice = unsafe { std::slice::from_raw_parts(list, n) };
     let out = slice.to_vec();
     // Free the kernel-allocated array. The send rights inside are
@@ -281,6 +288,21 @@ fn collect_task_threads(task: mach_port_t) -> Result<Vec<thread_act_t>, i32> {
     Ok(out)
 }
 
+/// Resumes a suspended thread on drop, so the debuggee thread is
+/// never left parked — even if the code between suspend and resume
+/// panics and unwinds. `read_thread_pc` can't panic today, but this
+/// makes the suspend/resume pairing robust to future edits rather
+/// than relying on that staying true.
+struct ResumeOnDrop(thread_act_t);
+
+impl Drop for ResumeOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: balances the thread_suspend that created this
+        // guard; `self.0` is the same valid send right.
+        let _ = unsafe { thread_resume(self.0) };
+    }
+}
+
 fn sample_one_thread(thread: thread_act_t) -> Option<RawPc> {
     // SAFETY: thread_suspend takes a valid send right; the kernel
     // tells us if it isn't, via a non-success kr.
@@ -288,10 +310,10 @@ fn sample_one_thread(thread: thread_act_t) -> Option<RawPc> {
     if kr != KERN_SUCCESS {
         return None;
     }
-    let pc = read_thread_pc(thread);
-    // SAFETY: thread_resume balances the thread_suspend above.
-    let _ = unsafe { thread_resume(thread) };
-    pc
+    // From here, resume is guaranteed on every exit path (including
+    // a panic) by the guard's Drop.
+    let _resume = ResumeOnDrop(thread);
+    read_thread_pc(thread)
 }
 
 #[cfg(target_arch = "aarch64")]
