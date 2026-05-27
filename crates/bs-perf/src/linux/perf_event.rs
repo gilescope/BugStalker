@@ -131,6 +131,31 @@ impl PerfMonitor {
         }
         Ok(())
     }
+
+    /// Read the cumulative counter value via `read(fd, ...)`. With
+    /// no `read_format` flags set (our default) the kernel returns
+    /// a single 8-byte u64. Works on sampling and counter-only
+    /// events alike — the read surface is the same.
+    pub fn read_count(&self) -> Result<u64, PerfError> {
+        let mut buf = [0u8; 8];
+        // SAFETY: read into an 8-byte stack buffer with the fd we own.
+        let n = unsafe {
+            libc::read(
+                self.fd.as_raw_fd(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
+        };
+        if n < 0 {
+            return Err(PerfError::Ioctl(io::Error::last_os_error()));
+        }
+        if n != buf.len() as isize {
+            return Err(PerfError::MalformedRecord(
+                "perf_event counter read returned short buffer",
+            ));
+        }
+        Ok(u64::from_ne_bytes(buf))
+    }
 }
 
 impl Drop for PerfMonitor {
@@ -227,6 +252,58 @@ fn open_cycles_with_attr(
 
 fn should_retry_without_precise_ip(error: &io::Error, precise_ip: u64) -> bool {
     precise_ip != 0 && matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP))
+}
+
+/// Open a pure-counter instructions-retired event on `pid`. No
+/// sampling, no ring buffer — just an 8-byte cumulative count we
+/// read at each stop. Pairs with the cycles+IP sampler to give the
+/// DAP body an `runInstructions` figure (and, divided by cycles,
+/// IPC).
+///
+/// Same permission story as [`open_cycles_for_pid`]: `EACCES` /
+/// `EPERM` on `perf_event_paranoid >= 2` without `CAP_SYS_ADMIN`;
+/// callers downgrade the feature rather than fail the session.
+pub fn open_instructions_for_pid(pid: i32) -> Result<PerfMonitor, PerfError> {
+    let mut attr = build_instructions_attr();
+    // SAFETY: standard perf_event_open boilerplate; same shape as
+    // open_cycles_for_pid above.
+    let raw = unsafe {
+        perf_event_open(
+            &mut attr as *mut perf_event_attr,
+            pid,
+            /* cpu */ -1,
+            /* group_fd */ -1,
+            /* flags */ 0,
+        )
+    };
+    if raw < 0 {
+        return Err(PerfError::Open(io::Error::last_os_error()));
+    }
+    // SAFETY: positive raw fd is owned now.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    Ok(PerfMonitor {
+        fd,
+        pid,
+        sample_freq_hz: 0,
+        precise_ip: 0,
+    })
+}
+
+/// Build a `perf_event_attr` for the instructions-retired counter.
+/// No sampling — `sample_freq` / `sample_type` left zero. Disabled
+/// by default; the caller `enable()`s before the run.
+pub fn build_instructions_attr() -> perf_event_attr {
+    // SAFETY: zeroed perf_event_attr is the documented blank slate.
+    let mut attr: perf_event_attr = unsafe { core::mem::zeroed() };
+    attr.size = core::mem::size_of::<perf_event_attr>() as u32;
+    attr.type_ = bindings::PERF_TYPE_HARDWARE;
+    attr.config = u64::from(bindings::PERF_COUNT_HW_INSTRUCTIONS);
+    attr.set_exclude_kernel(1);
+    attr.set_exclude_hv(1);
+    attr.set_disabled(1);
+    // `inherit = 0` (default) — the kernel doesn't auto-create
+    // child events on fork/clone. Matches the cycles sampler.
+    attr
 }
 
 /// Build the `perf_event_attr` for cycles + IP sampling. Public
@@ -343,5 +420,76 @@ mod tests {
     fn cycles_attr_requests_pebs_precision() {
         let attr = build_cycles_attr(1000);
         assert_eq!(attr.precise_ip(), 2);
+    }
+
+    /// Instructions attribute: HW type, INSTRUCTIONS config, no
+    /// sampling fields, disabled until enable().
+    #[test]
+    fn instructions_attr_is_pure_counter() {
+        let attr = build_instructions_attr();
+        assert_eq!(attr.type_, bindings::PERF_TYPE_HARDWARE);
+        assert_eq!(attr.config, u64::from(bindings::PERF_COUNT_HW_INSTRUCTIONS));
+        assert_eq!(attr.sample_type, 0);
+        // sample_freq lives in the union; freq() bit unset means
+        // the field is interpreted as sample_period — which we
+        // also leave zero.
+        assert_eq!(attr.freq(), 0);
+        unsafe {
+            assert_eq!(attr.__bindgen_anon_1.sample_freq, 0);
+        }
+        assert_eq!(attr.exclude_kernel(), 1);
+        assert_eq!(attr.exclude_hv(), 1);
+        assert_eq!(attr.disabled(), 1);
+        assert_eq!(attr.size, core::mem::size_of::<perf_event_attr>() as u32);
+    }
+
+    /// Open the instructions counter on the *calling thread*
+    /// (`pid = 0`), run a hot loop, read the count. Should be far
+    /// above zero. Skips on hosts where `perf_event_open` is denied.
+    ///
+    /// `pid = 0` (calling thread) is the right choice here because
+    /// cargo test runs each test on a worker thread. Passing
+    /// `getpid()` (the TGID) measures the main thread, which is
+    /// idle during the test, and the counter reads as zero —
+    /// learned this the hard way.
+    #[test]
+    fn instructions_counter_advances_under_hot_loop() {
+        let mut m = match open_instructions_for_pid(0) {
+            Ok(m) => m,
+            Err(PerfError::Open(e)) => {
+                let raw = e.raw_os_error();
+                if matches!(
+                    raw,
+                    Some(libc::EPERM | libc::EACCES | libc::ENOSYS | libc::EOPNOTSUPP),
+                ) {
+                    eprintln!("skipping: perf_event_open denied — {e}");
+                    return;
+                }
+                panic!("open failed: {e:?}");
+            }
+            Err(e) => panic!("open failed: {e:?}"),
+        };
+        m.reset().expect("reset");
+        m.enable().expect("enable");
+        // Burn work. `black_box` inside the loop body stops the
+        // optimiser from closed-forming the sum — without it, even
+        // debug builds will fold a counted accumulator into a
+        // constant, leaving the counter measuring only test
+        // scaffolding (we hit that and lowered the bar accordingly).
+        let mut sink: u64 = 0;
+        for i in 0_u64..100_000 {
+            sink = std::hint::black_box(sink.wrapping_add(i.wrapping_mul(7)));
+        }
+        std::hint::black_box(sink);
+        m.disable().expect("disable");
+        let count = m.read_count().expect("read_count");
+        // 100k iterations × even just one retired instruction each
+        // gives 100k. We assert > 10k so the test stays green even
+        // under aggressive inlining of `black_box`, while still
+        // catching a counter that's stuck at zero.
+        assert!(
+            count > 10_000,
+            "expected ≫10k instructions from a 100k-iter loop, got {count}"
+        );
     }
 }

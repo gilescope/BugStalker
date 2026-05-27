@@ -42,6 +42,50 @@ pub(super) struct PerfOverlaySession {
     pt_last_unresolved_instructions: u64,
     #[cfg(target_os = "linux")]
     active: Vec<ActivePerfRun>,
+    /// Darwin per-run state: rusage start snapshot (Tier 2) and
+    /// the polling sampler (Tier 1b). Both populated at
+    /// `begin_perf_run`; both consumed at `finish_perf_stop`.
+    /// `None` when no run is active or setup failed (cause is
+    /// always also recorded in `unavailable`).
+    #[cfg(target_os = "macos")]
+    darwin_run: Option<DarwinPerfRun>,
+    /// Diagnostic counters captured from the last completed run —
+    /// page-ins, disk I/O bytes — used to flag the per-stop
+    /// diagnosis line.
+    #[cfg(target_os = "macos")]
+    darwin_last_delta: DarwinLastDelta,
+}
+
+/// macOS in-flight run state. Owns the rusage start snapshot, the
+/// optional poll sampler, and the source resolver used to map
+/// sampled PCs to (file, line).
+#[cfg(all(feature = "perf", target_os = "macos"))]
+struct DarwinPerfRun {
+    rusage_start: bs_perf::darwin::ProcessSnapshot,
+    sampler: Option<bs_perf::darwin::PollSampler>,
+    resolver: Option<bs_perf::decoder::SourceResolver>,
+}
+
+/// Cached macOS diagnostic counters from the most recent stop —
+/// page-ins, disk I/O bytes, etc. Drives the emoji-coded
+/// `diagnosis` field in `body.bs_perf`.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+#[derive(Debug, Default, Clone, Copy)]
+struct DarwinLastDelta {
+    pageins: u64,
+    disk_bytes_read: u64,
+    disk_bytes_written: u64,
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+impl std::fmt::Debug for DarwinPerfRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DarwinPerfRun")
+            .field("rusage_start", &self.rusage_start)
+            .field("sampler", &self.sampler.is_some())
+            .field("resolver", &self.resolver.is_some())
+            .finish()
+    }
 }
 
 #[cfg(all(feature = "perf", target_os = "linux"))]
@@ -53,6 +97,12 @@ struct ActivePerfRun {
     pt_capture: Option<bs_perf::linux::IntelPtCapture>,
     resolver: Option<bs_perf::decoder::SourceResolver>,
     started_at: Instant,
+    /// Optional pure-counter `PERF_COUNT_HW_INSTRUCTIONS` event,
+    /// opened alongside the cycles+IP sampler. Read at stop to
+    /// produce `runInstructions` in body.bs_perf. None when the
+    /// kernel refused the open (typically the same perf_event_paranoid
+    /// path that already let cycles through, so this is rare).
+    instructions: Option<bs_perf::PerfMonitor>,
 }
 
 impl super::DebugSession {
@@ -178,11 +228,110 @@ impl super::DebugSession {
         }
     }
 
-    #[cfg(all(feature = "perf", not(target_os = "linux")))]
+    /// Darwin perf-run start. Pieces together Tier 2 (rusage
+    /// snapshot for CPU time) + Tier 1b (poll sampler for the
+    /// gutter heat-map). Both are best-effort: failures fall back
+    /// to whichever sub-tier still works, and the reason is
+    /// recorded in `unavailable`.
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    pub(super) fn begin_perf_run(&mut self) {
+        use crate::debugger::darwin_mach;
+        use std::path::PathBuf;
+
+        if !self.perf_overlay.enabled {
+            return;
+        }
+        self.perf_overlay.data.begin_run();
+        self.perf_overlay.unavailable = None;
+        self.perf_overlay.darwin_run = None;
+
+        let Some((proc_pid, program)) = self
+            .debugger
+            .as_ref()
+            .map(|dbg| (dbg.process().pid(), PathBuf::from(dbg.process().program())))
+        else {
+            self.perf_overlay.unavailable = Some("debugger not initialized".to_owned());
+            return;
+        };
+
+        // Tier 2: rusage snapshot. The status-bar CPU-time figure
+        // depends on this even when the sampler fails.
+        let rusage_start = match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
+            Ok(snap) => snap,
+            Err(err) => {
+                self.perf_overlay.unavailable =
+                    Some(format!("rusage snapshot at run start unavailable: {err}"));
+                return;
+            }
+        };
+
+        // Tier 1b: poll sampler. Needs the debuggee's mach task
+        // and the dyld load slide for source resolution.
+        let task = match darwin_mach::task_for_pid(proc_pid) {
+            Ok(task) => task,
+            Err(err) => {
+                append_unavailable(
+                    &mut self.perf_overlay.unavailable,
+                    format!("task_for_pid failed for sampler: {err}"),
+                );
+                self.perf_overlay.darwin_run = Some(DarwinPerfRun {
+                    rusage_start,
+                    sampler: None,
+                    resolver: None,
+                });
+                return;
+            }
+        };
+
+        let resolver = match bs_perf::decoder::SourceResolver::from_object_path(&program) {
+            Ok(mut resolver) => {
+                if let Some(load_addr) = darwin_main_image_load_addr(task) {
+                    resolver = resolver.with_load_bias(load_addr);
+                } else {
+                    append_unavailable(
+                        &mut self.perf_overlay.unavailable,
+                        "dyld load slide unavailable; sampled PCs will be unresolved".to_owned(),
+                    );
+                }
+                Some(resolver)
+            }
+            Err(err) => {
+                append_unavailable(
+                    &mut self.perf_overlay.unavailable,
+                    format!(
+                        "source resolver unavailable for {}: {err}",
+                        program.display()
+                    ),
+                );
+                None
+            }
+        };
+
+        let mut sampler =
+            bs_perf::darwin::PollSampler::new(task, bs_perf::darwin::DEFAULT_POLL_PERIOD);
+        let sampler = match sampler.start() {
+            Ok(()) => Some(sampler),
+            Err(err) => {
+                append_unavailable(
+                    &mut self.perf_overlay.unavailable,
+                    format!("poll sampler start failed: {err}"),
+                );
+                None
+            }
+        };
+
+        self.perf_overlay.darwin_run = Some(DarwinPerfRun {
+            rusage_start,
+            sampler,
+            resolver,
+        });
+    }
+
+    #[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
     pub(super) fn begin_perf_run(&mut self) {
         if self.perf_overlay.enabled {
             self.perf_overlay.unavailable =
-                Some("perf overlay live collection is Linux-only in this phase".to_owned());
+                Some("perf overlay live collection unavailable on this platform".to_owned());
         }
     }
 
@@ -202,6 +351,8 @@ impl super::DebugSession {
             .collect::<Vec<_>>();
 
         let mut wall_ns = 0_u64;
+        let mut total_instructions: u64 = 0;
+        let mut instructions_seen = false;
         for mut active in active_runs {
             if let Err(err) = active.monitor.disable() {
                 append_unavailable(
@@ -211,6 +362,22 @@ impl super::DebugSession {
                         active.tid
                     ),
                 );
+            }
+            if let Some(mut counter) = active.instructions.take() {
+                let _ = counter.disable();
+                match counter.read_count() {
+                    Ok(n) => {
+                        total_instructions = total_instructions.saturating_add(n);
+                        instructions_seen = true;
+                    }
+                    Err(err) => append_unavailable(
+                        &mut self.perf_overlay.unavailable,
+                        format!(
+                            "instructions counter read failed for tid {}: {err}",
+                            active.tid
+                        ),
+                    ),
+                }
             }
             match active.ring.drain() {
                 Ok((records, stats)) => {
@@ -310,10 +477,107 @@ impl super::DebugSession {
             ),
             None => {}
         }
-        self.perf_overlay.data.finish_stop(0, wall_ns);
+        let instructions_arg = if instructions_seen {
+            Some(total_instructions)
+        } else {
+            None
+        };
+        self.perf_overlay
+            .data
+            .finish_stop_full(0, wall_ns, None, instructions_arg);
     }
 
-    #[cfg(all(feature = "perf", not(target_os = "linux")))]
+    /// Darwin perf-run stop. Drains the poll sampler (Tier 1b),
+    /// attributes each PC to source, then closes the run-to-stop
+    /// window with a CPU-time figure from the rusage delta
+    /// (Tier 2). Samples must be pushed before `finish_stop_*`
+    /// because that call snapshots `last_run` into history.
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    pub(super) fn finish_perf_stop(&mut self) {
+        let Some(run) = self.perf_overlay.darwin_run.take() else {
+            return;
+        };
+
+        // 1) Drain poll-sampler samples and attribute them. Even
+        // if the resolver is missing (no load slide / no .debug_line),
+        // we count the samples as unresolved so the user sees that
+        // sampling happened.
+        if let Some(sampler) = run.sampler {
+            let drain = sampler.stop_and_drain();
+            let mut resolver = run.resolver;
+            for pc in drain.samples {
+                if let Some(resolver) = resolver.as_mut() {
+                    if let Some(resolved) = resolver.resolve(pc) {
+                        self.perf_overlay.data.record_resolved_pc(&resolved);
+                    } else {
+                        self.perf_overlay.data.record_unresolved_pc();
+                    }
+                } else {
+                    self.perf_overlay.data.record_unresolved_pc();
+                }
+            }
+            if drain.failed_snapshots != 0 {
+                self.perf_overlay
+                    .data
+                    .record_unresolved_samples(drain.failed_snapshots);
+            }
+        }
+
+        // 2) Take the rusage end snapshot and close the window.
+        let Some(proc_pid) = self.debugger.as_ref().map(|dbg| dbg.process().pid()) else {
+            // Debugger gone — finalise with what we have.
+            let wall_ns = run
+                .rusage_start
+                .wall
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64;
+            self.perf_overlay
+                .data
+                .finish_stop_full(0, wall_ns, None, None);
+            self.perf_overlay.darwin_last_delta = DarwinLastDelta::default();
+            return;
+        };
+        match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
+            Ok(end) => {
+                let delta = end.delta_since(run.rusage_start);
+                let instructions = if delta.instructions != 0 {
+                    Some(delta.instructions)
+                } else {
+                    None
+                };
+                self.perf_overlay.data.finish_stop_full(
+                    delta.cycles,
+                    delta.wall_ns,
+                    Some(delta.cpu_time_ns),
+                    instructions,
+                );
+                self.perf_overlay.darwin_last_delta = DarwinLastDelta {
+                    pageins: delta.pageins,
+                    disk_bytes_read: delta.disk_bytes_read,
+                    disk_bytes_written: delta.disk_bytes_written,
+                };
+            }
+            Err(err) => {
+                let wall_ns = run
+                    .rusage_start
+                    .wall
+                    .elapsed()
+                    .as_nanos()
+                    .min(u128::from(u64::MAX)) as u64;
+                self.perf_overlay
+                    .data
+                    .finish_stop_full(0, wall_ns, None, None);
+                self.perf_overlay.darwin_last_delta = DarwinLastDelta::default();
+                append_unavailable(
+                    &mut self.perf_overlay.unavailable,
+                    format!("rusage snapshot at run end unavailable: {err}"),
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
     pub(super) fn finish_perf_stop(&mut self) {}
 
     #[cfg(not(feature = "perf"))]
@@ -349,6 +613,7 @@ impl super::DebugSession {
                 "activeThreadCount": active_thread_count(&self.perf_overlay),
                 "unsampledThreadCount": unsampled_thread_count(&self.perf_overlay),
                 "intelPt": intel_pt_probe_body(&self.perf_overlay),
+                "kperf": kperf_probe_body(),
             }),
         )
     }
@@ -375,11 +640,22 @@ impl super::DebugSession {
         self.perf_overlay.enabled = true;
         self.perf_overlay.intel_pt_requested = enable_req.intel_pt;
         self.perf_overlay.unavailable = None;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        if enable_req.intel_pt {
+            // Tier 2 macOS collects whole-process CPU time only; PMU
+            // sampling isn't bound until the kperf tier. Honour the
+            // base enable, surface the PT degradation, and continue.
+            self.perf_overlay.unavailable = Some(
+                "Intel PT requested on macOS; rusage Tier 2 is the only macOS path today \
+                 (kperf tier pending)"
+                    .to_owned(),
+            );
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             self.perf_overlay.enabled = false;
             self.perf_overlay.unavailable =
-                Some("perf overlay live collection is Linux-only in this phase".to_owned());
+                Some("perf overlay live collection unavailable on this platform".to_owned());
         }
         let response = bs_perf::dap::enable(&enable_req);
         self.send_success_body(
@@ -388,6 +664,7 @@ impl super::DebugSession {
                 "enabled": self.perf_overlay.enabled && response.enabled,
                 "unavailable": self.perf_overlay.unavailable.clone(),
                 "intelPt": intel_pt_probe_body(&self.perf_overlay),
+                "kperf": kperf_probe_body(),
             }),
         )
     }
@@ -413,6 +690,9 @@ impl super::DebugSession {
             if let Some(mut capture) = active.pt_capture.take() {
                 let _ = capture.stop_and_drain();
             }
+            if let Some(mut counter) = active.instructions.take() {
+                let _ = counter.disable();
+            }
             let _ = active.monitor.disable();
         }
         #[cfg(target_os = "linux")]
@@ -423,6 +703,12 @@ impl super::DebugSession {
             self.perf_overlay.pt_last_decoded_instructions = 0;
             self.perf_overlay.pt_last_resolved_instructions = 0;
             self.perf_overlay.pt_last_unresolved_instructions = 0;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(run) = self.perf_overlay.darwin_run.take()
+            && let Some(sampler) = run.sampler
+        {
+            let _ = sampler.stop_and_drain();
         }
         let response = bs_perf::dap::disable(&bs_perf::dap::PerfOverlayDisableRequest {});
         self.send_success_body(
@@ -449,9 +735,16 @@ impl super::DebugSession {
             return None;
         }
         let summary = bs_perf::dap::stopped_summary(&self.perf_overlay.data)?;
+        let ipc = ipc_for(&summary);
+        let diagnosis = diagnose(&summary, &self.perf_overlay);
         Some(json!({
+            "mode": perf_mode_label(&self.perf_overlay),
             "runCycles": summary.run_cycles,
             "runWallNs": summary.run_wall_ns,
+            "runCpuTimeNs": summary.run_cpu_time_ns,
+            "runInstructions": summary.run_instructions,
+            "ipc": ipc,
+            "diagnosis": diagnosis,
             "hot": summary.hot.map(|hot| json!({
                 "source": hot.source,
                 "line": hot.line,
@@ -477,6 +770,24 @@ fn open_active_perf_run(
     let mut monitor = bs_perf::open_cycles_for_pid(tid.as_raw())?;
     let ring = monitor.mmap_ring(bs_perf::linux::ring::DEFAULT_RING_DATA_PAGES)?;
     monitor.reset().and_then(|_| monitor.enable())?;
+    // Best-effort instructions counter alongside the sampler. If
+    // the kernel refuses (perf_event_paranoid changed mid-flight,
+    // rare), we still get cycles+IP — runInstructions stays None.
+    let instructions = match bs_perf::linux::open_instructions_for_pid(tid.as_raw()) {
+        Ok(mut counter) => {
+            let init = counter.reset().and_then(|_| counter.enable());
+            if let Err(err) = init {
+                log::debug!(target: "perf", "instructions counter enable failed for tid {tid}: {err}");
+                None
+            } else {
+                Some(counter)
+            }
+        }
+        Err(err) => {
+            log::debug!(target: "perf", "instructions counter open failed for tid {tid}: {err}");
+            None
+        }
+    };
     Ok(ActivePerfRun {
         tid,
         monitor,
@@ -484,6 +795,7 @@ fn open_active_perf_run(
         pt_capture: None,
         resolver,
         started_at: Instant::now(),
+        instructions,
     })
 }
 
@@ -690,7 +1002,252 @@ fn intel_pt_probe_body(_session: &PerfOverlaySession) -> Value {
     Value::Null
 }
 
+/// macOS Tier 1 kperf probe body. Available on every host that
+/// links against the perf feature; on macOS reports library load +
+/// PMU permission state, elsewhere `null`. Clients can use it to
+/// distinguish "kperf permission-blocked" (signing missing) from
+/// "kperf dylib missing" (wrong macOS).
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn kperf_probe_body() -> Value {
+    use bs_perf::darwin::{KperfStatus, KperfUnavailableReason, probe_kperf};
+    match probe_kperf() {
+        KperfStatus::Available {
+            library_path,
+            configurable_counters,
+        } => json!({
+            "status": "available",
+            "libraryPath": library_path,
+            "configurableCounters": configurable_counters,
+            "reason": Value::Null,
+        }),
+        KperfStatus::PermissionLikelyRequired {
+            library_path,
+            configurable_counters,
+            force_set_errno,
+        } => json!({
+            "status": "permissionLikelyRequired",
+            "libraryPath": library_path,
+            "configurableCounters": configurable_counters,
+            "reason": json!({
+                "kind": "kpcForceAllCtrsSetRefused",
+                "errno": force_set_errno,
+                "hint": "kpc_force_all_ctrs_set returned EPERM/EBUSY — the bs binary likely \
+                        needs the com.apple.private.kpc.read-or-trace entitlement or to run \
+                        with elevated privileges.",
+            }),
+        }),
+        KperfStatus::Unavailable(KperfUnavailableReason::LibraryNotFound { dlerror }) => json!({
+            "status": "unavailable",
+            "reason": json!({
+                "kind": "libraryNotFound",
+                "dlerror": dlerror,
+            }),
+        }),
+        KperfStatus::Unavailable(KperfUnavailableReason::MissingSymbol {
+            path,
+            symbol,
+            dlerror,
+        }) => json!({
+            "status": "unavailable",
+            "reason": json!({
+                "kind": "missingSymbol",
+                "path": path,
+                "symbol": symbol,
+                "dlerror": dlerror,
+            }),
+        }),
+    }
+}
+
+#[cfg(all(feature = "perf", not(target_os = "macos")))]
+fn kperf_probe_body() -> Value {
+    Value::Null
+}
+
+/// Label describing which collection tier produced the latest
+/// summary. The VSCode client renders this in its tooltip so users
+/// can tell at a glance whether the gutter heat-map should be
+/// expected (Linux cycles, macOS poll) or always-empty (macOS
+/// rusage-only fallback).
+///
+/// Values:
+/// - `linux-cycles` — Linux PMU cycles+IP via perf_event_open.
+/// - `macos-poll` — macOS Tier 1b polling sampler is active.
+/// - `macos-rusage-only` — macOS Tier 2 only (sampler unavailable
+///   or disabled); body carries CPU time but no per-line samples.
+/// - `disabled` — overlay not enabled.
 #[cfg(all(feature = "perf", target_os = "linux"))]
+fn perf_mode_label(session: &PerfOverlaySession) -> &'static str {
+    if !session.enabled {
+        "disabled"
+    } else {
+        "linux-cycles"
+    }
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn perf_mode_label(session: &PerfOverlaySession) -> &'static str {
+    if !session.enabled {
+        "disabled"
+    } else if session
+        .darwin_run
+        .as_ref()
+        .is_some_and(|run| run.sampler.is_some())
+    {
+        "macos-poll"
+    } else {
+        "macos-rusage-only"
+    }
+}
+
+#[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
+fn perf_mode_label(_session: &PerfOverlaySession) -> &'static str {
+    "disabled"
+}
+
+/// Instructions-per-cycle, the most diagnostic single perf number.
+/// `None` when either counter is missing or zero (can't divide).
+#[cfg(feature = "perf")]
+fn ipc_for(summary: &bs_perf::dap::PerfStoppedSummary) -> Option<f64> {
+    let instructions = summary.run_instructions?;
+    if summary.run_cycles == 0 || instructions == 0 {
+        return None;
+    }
+    Some(instructions as f64 / summary.run_cycles as f64)
+}
+
+/// Emoji-coded root-cause hint, in the rustc-helpful-error tradition.
+/// Looks at IPC and any platform-specific diagnostic counters
+/// (page-ins, disk I/O on macOS; cache/branch misses on Linux once
+/// those land) to suggest what bottleneck the last run hit.
+///
+/// Returns `null` when there's no useful signal — better silence
+/// than misleading guesses on tiny runs with single-digit cycles.
+#[cfg(feature = "perf")]
+fn diagnose(
+    summary: &bs_perf::dap::PerfStoppedSummary,
+    #[allow(unused_variables)] session: &PerfOverlaySession,
+) -> Value {
+    // Need a meaningful window — under ~10µs the counters are too
+    // noisy to read causality from. Stop tries that happen on stop-
+    // on-entry, instant breakpoints, etc. would otherwise dominate
+    // the diagnosis output with garbage.
+    if summary.run_wall_ns < 10_000 {
+        return Value::Null;
+    }
+
+    let cpu_share = if summary.run_wall_ns != 0 {
+        summary
+            .run_cpu_time_ns
+            .map(|cpu| cpu as f64 / summary.run_wall_ns as f64)
+    } else {
+        None
+    };
+    let ipc = ipc_for(summary);
+
+    // Platform-specific diagnostic signals.
+    #[cfg(target_os = "macos")]
+    let diag = session.darwin_last_delta;
+    #[cfg(target_os = "macos")]
+    {
+        if diag.disk_bytes_read >= 64 * 1024 {
+            return diagnosis_body(
+                "📀",
+                "disk-read",
+                &format!(
+                    "{} read from disk during this run",
+                    format_bytes(diag.disk_bytes_read)
+                ),
+                "hot data is being demand-paged or freshly opened; consider memory-mapping or warming the cache",
+            );
+        }
+        if diag.disk_bytes_written >= 64 * 1024 {
+            return diagnosis_body(
+                "💿",
+                "disk-write",
+                &format!(
+                    "{} written to disk during this run",
+                    format_bytes(diag.disk_bytes_written)
+                ),
+                "consider batching writes or moving them off the hot path",
+            );
+        }
+        if diag.pageins >= 16 {
+            return diagnosis_body(
+                "💾",
+                "page-ins",
+                &format!("{} page-in(s) — memory paged from disk", diag.pageins),
+                "working set may exceed RAM, or you're hitting a freshly-mapped region",
+            );
+        }
+    }
+
+    // Generic CPU-bound vs wait-bound classification, available on
+    // both Linux and macOS once CPU time is reported.
+    if let Some(share) = cpu_share
+        && share < 0.25
+    {
+        return diagnosis_body(
+            "💤",
+            "mostly-waiting",
+            &format!("CPU active for {:.0}% of wall time", share * 100.0),
+            "blocked on I/O, sleep, lock contention, or syscall — sampling won't help; check thread state",
+        );
+    }
+
+    // IPC-based classification.
+    if let Some(ipc) = ipc {
+        if ipc < 0.5 {
+            return diagnosis_body(
+                "🐌",
+                "low-ipc",
+                &format!("IPC {ipc:.2} — CPU stalls dominate"),
+                "likely memory-bound or branch-mispredict; try smaller hot structs, better locality, or `perf record` for confirmation",
+            );
+        }
+        if ipc > 2.5 {
+            return diagnosis_body(
+                "🚀",
+                "high-ipc",
+                &format!("IPC {ipc:.2} — CPU running healthy"),
+                "compute-bound; optimisation gains come from doing fewer instructions, not making them cheaper",
+            );
+        }
+        return diagnosis_body(
+            "⚖️",
+            "balanced",
+            &format!("IPC {ipc:.2} — no single bottleneck"),
+            "neither CPU-bound nor wait-bound; profile a longer window if you need more signal",
+        );
+    }
+
+    Value::Null
+}
+
+#[cfg(feature = "perf")]
+fn diagnosis_body(emoji: &str, label: &str, summary: &str, hint: &str) -> Value {
+    json!({
+        "emoji": emoji,
+        "label": label,
+        "summary": summary,
+        "hint": hint,
+    })
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn format_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if b >= 1024 * 1024 {
+        format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0))
+    } else if b >= 1024 {
+        format!("{:.1} KiB", b as f64 / 1024.0)
+    } else {
+        format!("{b} B")
+    }
+}
+
+#[cfg(all(feature = "perf", any(target_os = "linux", target_os = "macos")))]
 fn append_unavailable(slot: &mut Option<String>, msg: String) {
     if let Some(existing) = slot {
         existing.push_str("; ");
@@ -698,6 +1255,17 @@ fn append_unavailable(slot: &mut Option<String>, msg: String) {
     } else {
         *slot = Some(msg);
     }
+}
+
+/// First-image (main executable) load address from dyld. Used as
+/// the load bias for the source resolver — sampled PCs are runtime
+/// addresses, DWARF rows are file-relative, the slide is what
+/// turns the former into the latter.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn darwin_main_image_load_addr(task: mach2::port::mach_port_t) -> Option<u64> {
+    use crate::debugger::darwin_mach;
+    let images = darwin_mach::dyld_image_list(task).ok()?;
+    images.first().map(|image| image.load_addr as u64)
 }
 
 #[cfg(all(feature = "perf", target_os = "linux"))]
