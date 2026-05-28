@@ -8,7 +8,7 @@ use bugstalker::debugger::call::fmt::call_debug_fmt;
 use bugstalker::debugger::variable::dqe::{Dqe, Literal, LiteralOrWildcard, PointerCast, Selector};
 use bugstalker::debugger::variable::render::RenderValue;
 use bugstalker::debugger::stack_health;
-use bugstalker::debugger::variable::execute::FileScopeFilter;
+use bugstalker::debugger::variable::execute::{FileScopeFilter, LayoutBreakdown};
 use bugstalker::debugger::variable::mutability::{self, Mutability};
 use bugstalker::debugger::variable::storage::StorageClass;
 use bugstalker::debugger::variable::value::specialization::LockState;
@@ -1182,6 +1182,71 @@ fn test_bulk_enumerate_thread_locals() {
             "{forbidden} leaked into thread-locals: {names:?}"
         );
     }
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.6 — payload/padding breakdown for a struct
+/// type. The fixture's `Foo { bar: i32, baz: [i32; 2], foo: &i32 }`
+/// at vars.rs:107 has 4 + 8 + 8 = 20 bytes of payload. The total
+/// size depends on rustc field reordering + alignment, but for
+/// any layout: `total - sum(member_sizes) = padding`, and our
+/// classifier reports exactly those numbers.
+///
+/// We assert structural invariants (payload+padding=total,
+/// payload=20, padding≥0) rather than pinning specific numbers
+/// — rustc may reorder fields between versions but the
+/// arithmetic identity always holds.
+#[test]
+#[serial]
+fn test_layout_payload_padding_breakdown() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 119).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(119));
+
+    let locals = debugger.read_local_variables().unwrap();
+    let f = locals
+        .iter()
+        .find(|qr| qr.identity().to_string() == "f")
+        .expect("`f` not in locals");
+
+    let layout: LayoutBreakdown = f.layout().expect("Foo should report a layout");
+
+    // Identity: payload + padding == total.
+    assert_eq!(
+        layout.payload + layout.padding,
+        layout.total,
+        "payload+padding must equal total: {layout:?}"
+    );
+    // Payload is the sum of member sizes (i32 + [i32;2] + &i32 =
+    // 4 + 8 + 8 = 20) regardless of layout reordering.
+    assert_eq!(
+        layout.payload, 20,
+        "Foo's payload should sum to 20 bytes (i32 + [i32;2] + &i32)"
+    );
+    // padding_pct is well-defined for nonzero total.
+    let pct = layout.padding_pct().expect("nonzero total → pct defined");
+    assert!(pct <= 100);
+
+    // A non-struct (i32) reports None — only Structure types
+    // have meaningful payload/padding splits in this design.
+    let a = locals
+        .iter()
+        .find(|qr| qr.identity().to_string() == "a")
+        .expect("`a` not in locals");
+    assert!(
+        a.layout().is_none(),
+        "i32 (Scalar) should not produce a LayoutBreakdown"
+    );
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);

@@ -28,6 +28,84 @@ pub enum QueryResultKind {
     Expression,
 }
 
+/// Variables-view §5.6 — shallow payload / padding breakdown of
+/// a struct type. `total = payload + padding`; the vscode-
+/// extension uses the proportion to paint an HSL lightness split
+/// on the row background (payload at base lightness, padding at
+/// `base ± Δ`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutBreakdown {
+    /// `DW_AT_byte_size` of the struct.
+    pub total: u64,
+    /// Sum of member sizes — the bytes doing real work.
+    pub payload: u64,
+    /// `total - payload` — interior + trailing alignment slack.
+    pub padding: u64,
+}
+
+impl LayoutBreakdown {
+    /// Padding as a percentage of total (0–100). Returns `None`
+    /// when `total` is zero (a zero-sized type can't have
+    /// meaningful padding).
+    pub fn padding_pct(&self) -> Option<u8> {
+        if self.total == 0 {
+            return None;
+        }
+        Some(
+            (self.padding.saturating_mul(100) / self.total)
+                .min(100) as u8,
+        )
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn padding_pct_zero_total_is_none() {
+        let l = LayoutBreakdown {
+            total: 0,
+            payload: 0,
+            padding: 0,
+        };
+        assert_eq!(l.padding_pct(), None);
+    }
+
+    #[test]
+    fn padding_pct_basic_arithmetic() {
+        // 24-byte struct with 14 bytes of padding (58%).
+        let l = LayoutBreakdown {
+            total: 24,
+            payload: 10,
+            padding: 14,
+        };
+        assert_eq!(l.padding_pct(), Some(58));
+    }
+
+    #[test]
+    fn padding_pct_caps_at_100() {
+        // Pathological: padding exceeds total (shouldn't happen
+        // in practice but defensive saturation).
+        let l = LayoutBreakdown {
+            total: 8,
+            payload: 0,
+            padding: 16,
+        };
+        assert_eq!(l.padding_pct(), Some(100));
+    }
+
+    #[test]
+    fn padding_pct_zero_padding() {
+        let l = LayoutBreakdown {
+            total: 16,
+            payload: 16,
+            padding: 0,
+        };
+        assert_eq!(l.padding_pct(), Some(0));
+    }
+}
+
 /// Result of DQE evaluation.
 #[derive(Clone)]
 pub struct QueryResult<'a> {
@@ -113,6 +191,43 @@ impl QueryResult<'_> {
     pub fn byte_size(&self) -> Option<u64> {
         let graph = self.type_graph();
         self.with_evcx(|evcx| graph.type_size_in_bytes(evcx, graph.root()))
+    }
+
+    /// Variables-view §5.6 — shallow payload-vs-padding breakdown
+    /// of this value's type. `payload` is the sum of the member
+    /// types' sizes; `padding = total - payload`. Computed only
+    /// for `Structure` types (where `Σ(members) < total` indicates
+    /// interior padding for alignment); `None` for primitives,
+    /// arrays, slices, pointers, and any type the evaluator can't
+    /// fully size. The vscode-extension uses this to paint the
+    /// HSL lightness split on the row background.
+    ///
+    /// Shallow only — nested structs' own padding is not summed.
+    /// Deep waste is harder to act on; the design doc defers it
+    /// to a follow-up.
+    pub fn layout(&self) -> Option<LayoutBreakdown> {
+        use crate::debugger::debugee::dwarf::r#type::TypeDeclaration;
+        let graph = self.type_graph();
+        let root = graph.root();
+        let decl = graph.types.get(&root)?;
+        let members: &[_] = match decl {
+            TypeDeclaration::Structure { members, .. } => members.as_slice(),
+            _ => return None,
+        };
+        self.with_evcx(|evcx| {
+            let total = graph.type_size_in_bytes(evcx, root)?;
+            let mut payload: u64 = 0;
+            for m in members {
+                let t = m.type_ref?;
+                payload = payload.saturating_add(graph.type_size_in_bytes(evcx, t)?);
+            }
+            let padding = total.saturating_sub(payload);
+            Some(LayoutBreakdown {
+                total,
+                payload,
+                padding,
+            })
+        })
     }
 
     /// Evaluate any function with evaluation context.

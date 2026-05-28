@@ -76,6 +76,14 @@ pub struct VarItem {
     /// the amber (>1 KB) / red (>16 KB) tinting. Serialised as
     /// `bugstalker.byte_size` (u64). `None` is omitted from the JSON.
     pub byte_size: Option<u64>,
+    /// Variables-view §5.6 — shallow payload / padding breakdown
+    /// (struct types only). Drives the HSL lightness split on the
+    /// row background in the vscode-extension. Serialised as
+    /// `bugstalker.layout = { totalBytes, payloadBytes, paddingBytes }`
+    /// only when padding ≥ 5% of total (the
+    /// `paddingSplit.showThresholdPct` from variables-view §4) —
+    /// below that the split is visual noise.
+    pub layout: Option<debugger::variable::execute::LayoutBreakdown>,
 }
 
 impl super::DebugSession {
@@ -170,6 +178,19 @@ impl super::DebugSession {
             // trailing size column + threshold tinting.
             if let Some(bytes) = v.byte_size {
                 entry["bugstalker.byte_size"] = json!(bytes);
+            }
+            // Variables-view §5.6 — payload/padding split. Only
+            // emit when padding ≥ 5% of total (the
+            // showThresholdPct from §4) — below that the HSL
+            // split is visual noise.
+            if let Some(layout) = v.layout
+                && layout.padding_pct().is_some_and(|pct| pct >= 5)
+            {
+                entry["bugstalker.layout"] = json!({
+                    "totalBytes": layout.total,
+                    "payloadBytes": layout.payload,
+                    "paddingBytes": layout.padding,
+                });
             }
             out.push(entry);
         }
@@ -1267,6 +1288,7 @@ fn value_children(
                     storage: None,
                     points_to_heap: false,
                     byte_size: None,
+                    layout: None,
                 });
             }
             Some(out)
@@ -1290,6 +1312,7 @@ fn value_children(
                     storage: None,
                     points_to_heap: false,
                     byte_size: None,
+                    layout: None,
                 });
             }
             Some(out)
@@ -1313,6 +1336,7 @@ fn value_children(
                     storage: None,
                     points_to_heap: false,
                     byte_size: None,
+                    layout: None,
                 });
             }
             Some(out)
@@ -1339,6 +1363,7 @@ fn value_children(
                     storage: None,
                     points_to_heap: false,
                     byte_size: None,
+                    layout: None,
                 });
             }
             Some(out)
@@ -1366,6 +1391,7 @@ fn value_children(
                     storage: None,
                     points_to_heap: false,
                     byte_size: None,
+                    layout: None,
                 }];
                 Some(out)
             } else {
@@ -1388,6 +1414,7 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
         let storage = storage_hint(&r);
         let points_to_heap = points_to_heap_hint(&r, dbg);
         let byte_size = r.byte_size();
+        let layout = r.layout();
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1399,6 +1426,7 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             storage,
             points_to_heap,
             byte_size,
+            layout,
         });
     }
     Ok(out)
@@ -1451,6 +1479,7 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
         let storage = storage_hint(&r);
         let points_to_heap = points_to_heap_hint(&r, dbg);
         let byte_size = r.byte_size();
+        let layout = r.layout();
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1462,6 +1491,7 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             storage,
             points_to_heap,
             byte_size,
+            layout,
         });
     }
     Ok(out)
@@ -1508,6 +1538,7 @@ fn file_scope_var_items(
         let storage = storage_hint(&r);
         let points_to_heap = points_to_heap_hint(&r, dbg);
         let byte_size = r.byte_size();
+        let layout = r.layout();
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1519,6 +1550,7 @@ fn file_scope_var_items(
             storage,
             points_to_heap,
             byte_size,
+            layout,
         });
     }
     Ok(out)

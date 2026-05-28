@@ -7,6 +7,29 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- payload/padding layout breakdown per variable (variables-view §5.6):
+  - New `LayoutBreakdown { total, payload, padding }` carried on
+    `QueryResult` with a `padding_pct()` helper that saturates at
+    100 to handle pathological inputs defensively.
+  - `QueryResult::layout()` shallow-classifies `Structure` types:
+    walks members, sums `type_size_in_bytes(member.type_ref)` for
+    payload, computes `padding = total − payload`. Returns `None`
+    for non-struct types and for any layout-walk that fails (a
+    member with no resolvable type, evaluator failure).
+  - DAP `handle_variables` emits `bugstalker.layout =
+    { totalBytes, payloadBytes, paddingBytes }` per top-level
+    row, gated on `padding_pct ≥ 5` (the `showThresholdPct`
+    from variables-view §4) so trivial slop doesn't clutter
+    the pane.
+  - 4 unit tests for the `padding_pct` arithmetic +
+    1 live-debuggee integration test pinning the structural
+    identity `payload + padding == total` and `payload == 20`
+    for the fixture's `Foo { i32, [i32; 2], &i32 }`. The sum
+    is invariant under rustc field reordering; the total isn't
+    (so we don't pin it).
+  - Enum layout breakdown deferred — see variables-view.md §7.
+    Structs alone cover most "row is wasting space" cases.
+
 - stack-health snapshot + per-local byte size (variables-view §5.5):
   - New `stack_health` module: `StackHealth` struct carries
     `thread_stack_size`, `thread_stack_used`, `frame_count`, and
