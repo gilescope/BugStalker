@@ -1060,6 +1060,31 @@ impl DebugInformation {
             .get_offset_stripped(mangled_name)
     }
 
+    /// Enumerate every file-scope `DW_TAG_variable` across every
+    /// compilation unit in this debug-info — i.e. all `static`s and
+    /// `thread_local!`s, regardless of whether they're in user code
+    /// or std / dependencies (variables-view §5.4).
+    ///
+    /// Each entry is paired with its [`FatDieRef<Variable>`] so the
+    /// caller can drive [`crate::debugger::variable::execute`] over
+    /// it. TLS-vs-static classification and crate-scope filtering
+    /// are the caller's responsibility — this is just enumeration.
+    pub fn enumerate_file_scope_variables(
+        &self,
+    ) -> Result<Vec<(&unit::FileScopeVariable, FatDieRef<'_, Variable>)>, Error> {
+        let units = self.get_units()?;
+        let mut out: Vec<(&unit::FileScopeVariable, FatDieRef<'_, Variable>)> = Vec::new();
+        for unit in units {
+            let entries = resolve_unit_call!(self.dwarf(), unit, file_scope_variables);
+            for entry in entries {
+                let die_ref: FatDieRef<'_, _> =
+                    FatDieRef::new_no_hint(self, unit.idx(), entry.offset);
+                out.push((entry, die_ref.with_new_hint::<Variable>()));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn find_variables(
         &self,
         location: Location,

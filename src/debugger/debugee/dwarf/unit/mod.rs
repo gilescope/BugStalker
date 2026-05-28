@@ -238,6 +238,22 @@ struct UnitProperties {
     address_size: u8,
 }
 
+/// File-scope `DW_TAG_variable` entry — a `static` (any segment) or
+/// thread-local. Captured separately from `variable_index` so the
+/// variables-pane `Statics` / `Thread-locals` scopes (variables-view
+/// §5.4) can enumerate without walking the full DIE tree.
+///
+/// TLS classification by name is left to the consumer; the rustc
+/// `thread_local!` macro lowers to a `DW_TAG_variable` named
+/// `__KEY`, `VAL`, or `__RUST_STD_INTERNAL_VAL` nested under the
+/// user-visible identifier's namespace.
+#[derive(Debug, Clone)]
+pub struct FileScopeVariable {
+    pub name_sym: string_interner::DefaultSymbol,
+    pub namespace: NamespaceHierarchy,
+    pub offset: UnitOffset,
+}
+
 /// This fields is a part of a compilation unit but
 /// loaded on first call, for reduce memory consumption.
 #[derive(Debug, Clone)]
@@ -254,6 +270,11 @@ struct UnitLazyPart {
     function_name_index: PathSearchIndex<UnitOffset>,
     /// {die ; die parent} pairs
     parent_index: IndexMap<UnitOffset, UnitOffset>,
+    /// `DW_TAG_variable` DIEs that are NOT nested inside a
+    /// `DW_TAG_subprogram` — i.e. file-scope variables: `static`s
+    /// and `thread_local!`s. Populated in a second pass after the
+    /// main DIE walk so all subprogram offsets are known.
+    file_scope_variables: Vec<FileScopeVariable>,
 }
 
 /// Some of the compilation unit methods may return UnitResult
@@ -552,6 +573,17 @@ impl BsUnit {
         match self.lazy_part.get() {
             None => UnitResult::Reload,
             Some(additional) => UnitResult::Ok(&additional.parent_index),
+        }
+    }
+
+    /// Return every file-scope `DW_TAG_variable` in this unit —
+    /// `static`s and `thread_local!`s, in DIE-walk order. Excludes
+    /// locals (variables nested inside any `DW_TAG_subprogram`).
+    /// Note: this method requires a full unit.
+    pub fn file_scope_variables(&self) -> UnitResult<&[FileScopeVariable]> {
+        match self.lazy_part.get() {
+            None => UnitResult::Reload,
+            Some(additional) => UnitResult::Ok(&additional.file_scope_variables),
         }
     }
 

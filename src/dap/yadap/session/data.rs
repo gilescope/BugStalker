@@ -1339,6 +1339,55 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     Ok(out)
 }
 
+/// Variables-view §5.4 — populate the `Statics` DAP scope.
+/// Defaults to the user's crate (filtering out std / dep statics)
+/// so the pane stays useful.
+pub fn read_statics(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
+    file_scope_var_items(
+        dbg,
+        debugger::variable::execute::FileScopeKind::Statics,
+        debugger::variable::execute::FileScopeFilter::CurrentCrate,
+    )
+}
+
+/// Variables-view §5.4 — populate the `Thread-locals` DAP scope.
+/// Same filter rationale as [`read_statics`].
+pub fn read_thread_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
+    file_scope_var_items(
+        dbg,
+        debugger::variable::execute::FileScopeKind::ThreadLocals,
+        debugger::variable::execute::FileScopeFilter::CurrentCrate,
+    )
+}
+
+fn file_scope_var_items(
+    dbg: &debugger::Debugger,
+    kind: debugger::variable::execute::FileScopeKind,
+    filter: debugger::variable::execute::FileScopeFilter,
+) -> anyhow::Result<Vec<VarItem>> {
+    use debugger::variable::execute::FileScopeKind;
+    use debugger::variable::render::RenderValue;
+    let entries = match kind {
+        FileScopeKind::Statics => dbg.read_static_variables(filter)?,
+        FileScopeKind::ThreadLocals => dbg.read_thread_local_variables(filter)?,
+    };
+    let viz = Some(dbg.view_registry());
+    let mut out = Vec::new();
+    for r in entries {
+        let type_graph = Rc::new(r.type_graph().clone());
+        let name = r.identity().to_string();
+        out.push(VarItem {
+            name,
+            value: render_value_to_string_with_viz(r.value(), viz),
+            type_name: Some(r.value().r#type().to_string()),
+            child: value_children(&r, type_graph.clone(), viz),
+            write: value_write_meta(r.value(), type_graph.clone()),
+            source: Some(r.value().clone()),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tuple_rendering_tests {
     use super::*;

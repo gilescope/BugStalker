@@ -1480,6 +1480,32 @@ impl Debugger {
         executor.query_arguments_names(&select_expr)
     }
 
+    /// Read every file-scope `static` reachable in the debugee,
+    /// filtered by `scope` (variables-view §5.4). Excludes
+    /// `thread_local!`s — those go through
+    /// [`Debugger::read_thread_local_variables`].
+    pub fn read_static_variables(
+        &self,
+        scope: variable::execute::FileScopeFilter,
+    ) -> Result<Vec<variable::execute::QueryResult<'_>>, Error> {
+        disable_when_not_stared!(self);
+        let executor = variable::execute::DqeExecutor::new(self);
+        executor.query_file_scope(variable::execute::FileScopeKind::Statics, scope)
+    }
+
+    /// Read every `thread_local!` reachable in the debugee,
+    /// filtered by `scope` (variables-view §5.4). Excludes
+    /// non-TLS statics — those go through
+    /// [`Debugger::read_static_variables`].
+    pub fn read_thread_local_variables(
+        &self,
+        scope: variable::execute::FileScopeFilter,
+    ) -> Result<Vec<variable::execute::QueryResult<'_>>, Error> {
+        disable_when_not_stared!(self);
+        let executor = variable::execute::DqeExecutor::new(self);
+        executor.query_file_scope(variable::execute::FileScopeKind::ThreadLocals, scope)
+    }
+
     /// Return following register value.
     ///
     /// # Arguments

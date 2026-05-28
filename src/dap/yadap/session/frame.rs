@@ -12,6 +12,13 @@ use crate::dap::yadap::protocol::DapRequest;
 pub enum ScopeKind {
     Locals,
     Arguments,
+    /// File-scope `static`s — variables-view §5.4. Filtered by
+    /// `variablesView.statics.scope` (default: current crate only,
+    /// to avoid flooding the pane with std / dep statics).
+    Statics,
+    /// `thread_local!`s — variables-view §5.4. Same filter as
+    /// `Statics`.
+    ThreadLocals,
 }
 
 impl super::DebugSession {
@@ -175,9 +182,44 @@ impl super::DebugSession {
             r
         };
 
+        // Variables-view §5.4: file-scope statics and TLS as
+        // first-class DAP scopes. Both default to "current crate"
+        // filtering to keep the pane signal-to-noise high — the
+        // user's crate is usually what they want, not std/dep
+        // internals. Cached per (thread, frame) since the values
+        // can change between steps.
+        let statics_ref = if let Some(r) = self
+            .scope_cache
+            .get(&(thread_id, frame_num, ScopeKind::Statics))
+            .copied()
+        {
+            r
+        } else {
+            let v = super::data::read_statics(dbg).unwrap_or_default();
+            let r = self.vars.alloc(v);
+            self.scope_cache
+                .insert((thread_id, frame_num, ScopeKind::Statics), r);
+            r
+        };
+        let tls_ref = if let Some(r) = self
+            .scope_cache
+            .get(&(thread_id, frame_num, ScopeKind::ThreadLocals))
+            .copied()
+        {
+            r
+        } else {
+            let v = super::data::read_thread_locals(dbg).unwrap_or_default();
+            let r = self.vars.alloc(v);
+            self.scope_cache
+                .insert((thread_id, frame_num, ScopeKind::ThreadLocals), r);
+            r
+        };
+
         let scopes = vec![
             json!({"name": "Locals", "variablesReference": locals_ref, "expensive": false}),
             json!({"name": "Arguments", "variablesReference": args_ref, "expensive": false}),
+            json!({"name": "Statics", "variablesReference": statics_ref, "expensive": false}),
+            json!({"name": "Thread-locals", "variablesReference": tls_ref, "expensive": false}),
         ];
 
         self.send_success_body(req, json!({"scopes": scopes}))

@@ -7,6 +7,7 @@ use bugstalker::debugger::DebuggerBuilder;
 use bugstalker::debugger::call::fmt::call_debug_fmt;
 use bugstalker::debugger::variable::dqe::{Dqe, Literal, LiteralOrWildcard, PointerCast, Selector};
 use bugstalker::debugger::variable::render::RenderValue;
+use bugstalker::debugger::variable::execute::FileScopeFilter;
 use bugstalker::debugger::variable::value::specialization::LockState;
 use bugstalker::debugger::variable::value::{Member, SpecializedValue, SupportedScalar, Value};
 use bugstalker::version::Version;
@@ -1069,6 +1070,115 @@ fn test_read_static_variables() {
     read_var_dqe!(debugger, Dqe::Variable(Selector::by_name("GLOB_2", false)) => glob_2);
     assert_idents!(glob_2 => "vars::GLOB_2");
     assert_scalar(glob_2.value(), "i32", Some(SupportedScalar::I32(2)));
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.4 — bulk enumeration of file-scope statics
+/// via the new `Debugger::read_static_variables` API powers the
+/// DAP `Statics` scope. The user-crate filter must include the
+/// fixture's `GLOB_1`/`GLOB_2`/`GLOB_3` (declared in the `vars`
+/// crate) and exclude TLS internals which belong in the
+/// `Thread-locals` scope.
+#[test]
+#[serial]
+fn test_bulk_enumerate_statics() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 168).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(168));
+
+    let statics = debugger
+        .read_static_variables(FileScopeFilter::CurrentCrate)
+        .unwrap();
+    let names: Vec<String> = statics.iter().map(|r| r.identity().to_string()).collect();
+
+    // Sanity: the three fixture-declared file-scope statics in
+    // the user (`vars`) crate must be enumerated.
+    for needle in ["GLOB_1", "GLOB_2", "GLOB_3"] {
+        assert!(
+            names.iter().any(|n| n.contains(needle)),
+            "expected {needle} in current-crate statics; got: {names:?}"
+        );
+    }
+    // And TLS internals must NOT appear here — they're a separate
+    // scope. Detection is by the rustc-lowered TLS name.
+    for forbidden in ["__KEY", "__RUST_STD_INTERNAL_VAL"] {
+        assert!(
+            names.iter().all(|n| !n.contains(forbidden)),
+            "{forbidden} leaked into statics: {names:?}"
+        );
+    }
+    // Current-crate filter must keep std out — pick one common
+    // std static that's always linked in a binary that uses stdio.
+    assert!(
+        names.iter().all(|n| !n.starts_with("std::")),
+        "current-crate filter let std::* through: {names:?}"
+    );
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.4 — bulk enumeration of TLS via
+/// `Debugger::read_thread_local_variables`. The fixture declares
+/// `THREAD_LOCAL_VAR_1` and `THREAD_LOCAL_VAR_2`; rustc lowers
+/// each to a `DW_TAG_variable` named `__KEY` / `VAL` /
+/// `__RUST_STD_INTERNAL_VAL` (the precise name depends on the
+/// rustc version) nested under the user identifier's namespace.
+#[test]
+#[serial]
+fn test_bulk_enumerate_thread_locals() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 168).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(168));
+
+    let tls = debugger
+        .read_thread_local_variables(FileScopeFilter::CurrentCrate)
+        .unwrap();
+    let names: Vec<String> = tls.iter().map(|r| r.identity().to_string()).collect();
+
+    // §5.4 known limit: `root_from_die` succeeds only when the TLS
+    // slot's *value* is readable from the current thread. For
+    // non-const-init thread_locals (THREAD_LOCAL_VAR_1, _2 here)
+    // the slot isn't initialised on the main thread at the time
+    // of the breakpoint, so the value-parse step returns None and
+    // the entry is dropped. const-init thread_locals like
+    // CONSTANT_THREAD_LOCAL *are* always readable.
+    //
+    // Asserting the const-init case proves the path works
+    // end-to-end. The runtime-init case will start surfacing
+    // entries once §5.4 gains the "<unavailable>" placeholder
+    // fallback for unreadable values (see variables-view.md §7).
+    assert!(
+        names.iter().any(|n| n.contains("CONSTANT_THREAD_LOCAL")),
+        "expected at least one TLS entry; got: {names:?}"
+    );
+    // And the non-TLS statics must NOT appear here even when
+    // their values are perfectly readable — the kind filter must
+    // exclude them by name-symbol regardless of parse success.
+    for forbidden in ["GLOB_1", "GLOB_2", "GLOB_3"] {
+        assert!(
+            names.iter().all(|n| !n.contains(forbidden)),
+            "{forbidden} leaked into thread-locals: {names:?}"
+        );
+    }
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);

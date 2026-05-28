@@ -7,6 +7,30 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- `Statics` + `Thread-locals` as new DAP scopes (variables-view §5.4):
+  - `DqeExecutor::query_file_scope(kind, filter)` enumerates every
+    file-scope `DW_TAG_variable` across loaded debug-info. `kind`
+    picks `Statics` vs `ThreadLocals` (TLS classification by the
+    rustc-lowered names `__KEY` / `VAL` / `__RUST_STD_INTERNAL_VAL`);
+    `filter` is one of `CurrentCrate` (default), `CurrentUnit`, `All`.
+  - New parser pass classifies each `DW_TAG_variable` as file-scope
+    vs local using a `subprogram_offsets` set + `parent_index`
+    ancestor walk. TLS internals are unconditionally file-scope —
+    rustc nests them under closures but the user thinks of them as
+    living at the surrounding namespace.
+  - `Debugger::read_static_variables` and
+    `Debugger::read_thread_local_variables` are the public APIs;
+    DAP `handle_scopes` adds `Statics` and `Thread-locals` to the
+    scope list (joining the existing `Locals` and `Arguments`).
+  - Default `CurrentCrate` filter matches on the namespace root, so
+    `std::*` and dependency statics don't drown out user code.
+  - 1 new unit test for the TLS-name classifier + 2 integration
+    tests on a live `vars` debuggee.
+  - Known limit: non-const-init thread_locals whose slot isn't
+    initialised on the current thread are silently dropped during
+    value-parse (no entry in the `Thread-locals` scope). Const-init
+    thread_locals always surface. Tracked in variables-view.md §7.
+
 - sharing-mode glyphs for `RwLock` and `RefCell` (variables-view §5.1):
   - `SpecializedValue::Mutex` (shared by `Mutex` and `RwLock`) gains a
     `state: LockState` field replacing the older `locked: bool`. The
