@@ -7,6 +7,28 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- sharing-mode glyphs for `RwLock` and `RefCell` (variables-view §5.1):
+  - `SpecializedValue::Mutex` (shared by `Mutex` and `RwLock`) gains a
+    `state: LockState` field replacing the older `locked: bool`. The
+    new `LockState` enum carries `Free` / `Exclusive` / `Shared(N)`.
+  - On the Linux/FreeBSD futex backend, `RwLock`'s state field is now
+    decoded per libstd's `MASK = (1 << 30) - 1` constant: `state &
+    MASK == 0` ⇒ `Free`; `== MASK` ⇒ `Exclusive` (write-held); any
+    other value `N` ⇒ `Shared(N)` readers. Mutex still reduces to
+    `Free` / `Exclusive`. macOS pthread probe handles Mutex only;
+    RwLock on macOS is a TODO.
+  - `SpecializedValue::RefCell` rendering now reads the inner
+    `borrow: Cell<BorrowFlag>` to decode the same `LockState` shape:
+    `0` ⇒ `Free`; `N > 0` ⇒ `Shared(N)`; `N < 0` ⇒ `Exclusive`
+    (a `borrow_mut` is outstanding).
+  - Renderer maps `LockState` to glyph: `🔑` (free) / `🔒` (exclusive) /
+    `👥N` (with `N` saturating at `9+` so the row stays narrow).
+    `☠️` poison trailer unchanged for Mutex/RwLock.
+  - 8 new unit tests in `render::lock_state_tests` cover the glyph
+    formatter and `RefCell` borrow-flag decoder. The existing
+    `test_read_mutex_rwlock` integration test now asserts the
+    `Shared(1)` case for a live `RwLock` held by a single reader.
+
 - physical-function range filter for line breakpoints (macOS):
   - On macOS arm64 with `-C symbol-mangling-version=v0` + LTO, the
     DWARF subprogram for `showcase::main` claims it spans

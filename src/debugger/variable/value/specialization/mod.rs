@@ -378,18 +378,23 @@ pub enum SpecializedValue {
     /// Phase 1 S1: `std::sync::Mutex<T>` / `std::sync::RwLock<T>`.
     /// `inner` is the `data: UnsafeCell<T>` field peeled to `T`.
     /// `poisoned` is read out of the `poison: poison::Flag` field
-    /// (an `AtomicBool` peeled by S3). `locked` is read off the
-    /// futex backend's `Futex { v: AtomicU32 }` (Linux, FreeBSD,
-    /// OpenBSD, DragonFly, Hermit, modern Windows, wasm-atomics).
-    /// On macOS / iOS / Win7 the layout is a `OnceBox<pthread_mutex_t>`
-    /// or `SRWLOCK` and we conservatively report `locked = false`.
-    /// The renderer surfaces `[locked]` and `[poisoned]` trailers
-    /// when set. We never acquire the lock; this may show torn
-    /// state if another thread is mid-write, expected for a peek.
+    /// (an `AtomicBool` peeled by S3). `state` is decoded from the
+    /// futex backend (Linux, FreeBSD, OpenBSD, DragonFly, Hermit,
+    /// modern Windows, wasm-atomics): for `Mutex`, the inner u32 is
+    /// 0 ⇒ `Free`, non-zero ⇒ `Exclusive`; for `RwLock`, the inner
+    /// `state` u32 (masked with libstd's `MASK = (1 << 30) - 1`) is
+    /// 0 ⇒ `Free`, `MASK` ⇒ `Exclusive` (write-held), any other
+    /// value N ⇒ `Shared(N)`. On macOS / iOS the Mutex pthread
+    /// owner probe maps to `Free`/`Exclusive` (RwLock unsupported);
+    /// on Win7 SRWLOCK we fall back to `Free`. The renderer
+    /// surfaces a 🔑 / 🔒 / 👥N glyph from `state` plus a `☠️`
+    /// trailer from `poisoned`. We never acquire the lock; this may
+    /// show torn state if another thread is mid-write, expected for
+    /// a peek.
     Mutex {
         inner: Box<Value>,
         poisoned: bool,
-        locked: bool,
+        state: LockState,
     },
     /// Phase 1 S2: `MutexGuard<T>` / `RwLockReadGuard<T>` /
     /// `RwLockWriteGuard<T>`. The guard carries a reference to the
@@ -408,6 +413,30 @@ pub enum SpecializedValue {
         strong: u64,
         weak: u64,
     },
+}
+
+/// Current observable access state of a synchronisation wrapper —
+/// `Mutex`, `RwLock`, or `RefCell`. Surfaced as a glyph by the
+/// variables-pane renderer (see `variables-view.md §1.1`).
+///
+/// `Shared(0)` is invariantly impossible — a wrapper with zero
+/// readers is `Free` — so the renderer can safely treat `Shared`
+/// as "at least one reader".
+///
+/// Backends that cannot probe the state (Win7 SRWLOCK; foreign
+/// pthread types on macOS that fail the sig check) report `Free`
+/// to preserve historical "always show a key" behaviour rather
+/// than introducing a third "unknown" rendering.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LockState {
+    /// Nobody holds it.
+    Free,
+    /// Exclusively held — `Mutex` locked, `RwLock` write-held, or
+    /// `RefCell` `borrow_mut` outstanding.
+    Exclusive,
+    /// Held by N shared readers — `RwLock` read-locked, or
+    /// `RefCell` with N outstanding immutable borrows.
+    Shared(u32),
 }
 
 /// Phase 1 S6 — the six concrete `core::ops::Range*` shapes.
@@ -1682,32 +1711,61 @@ impl<'a> VariableParserExtension<'a> {
                 })
             })
             .unwrap_or(false);
-        // Phase 1 S1 (locked) — futex backend only. Mutex stores
+        // Phase 1 S1 (state) — futex backend only. Mutex stores
         // `inner: sys::Mutex { futex: SmallFutex }` and RwLock stores
         // `inner: sys::RwLock { state: Futex, writer_notify: Futex }`.
-        // The futex itself is an atomic u32 (peeled by S3). Locked
-        // iff the first u32 in the inner member is non-zero. Other
-        // backends (pthread on macOS, SRWLOCK on Win7) don't have
-        // the `futex`/`state` field so this defaults to false.
+        // The futex itself is an atomic u32 (peeled by S3). We read
+        // the first u32 found in the inner member; semantics differ:
+        //
+        //   * Mutex futex: 0 ⇒ Free, anything else ⇒ Exclusive.
+        //   * RwLock state: low 30 bits encode either the reader
+        //     count or the sentinel `WRITE_LOCKED = MASK` (the libstd
+        //     constant from sys/sync/rwlock/futex.rs). The top two
+        //     bits are `READERS_WAITING` / `WRITERS_WAITING` and are
+        //     queue hints, not access state — masked off here.
+        //
+        // Distinguishing Mutex from RwLock is by outer type name
+        // (the parser dispatcher already routes both here, see
+        // parser.rs starts_with("Mutex") || starts_with("RwLock")).
+        // Other backends (pthread on macOS, SRWLOCK on Win7) don't
+        // have the `futex`/`state` field so this defaults to `Free`.
+        let is_rwlock = outer
+            .type_ident
+            .name()
+            .map(|n| n.starts_with("RwLock"))
+            .unwrap_or(false);
         let inner_member = outer
             .members
             .iter()
             .find(|m| m.field_name.as_deref() == Some("inner"));
+        let raw_state = inner_member.and_then(|m| {
+            m.value.bfs_iterator().find_map(|(_, child)| match child {
+                Value::Scalar(s) => match s.value {
+                    Some(SupportedScalar::U32(v)) => Some(v),
+                    _ => None,
+                },
+                _ => None,
+            })
+        });
         // Mutated only inside the cfg(target_os = "macos") branch
         // below; `mut` is unused on other targets, so silence the
         // lint there.
         #[allow(unused_mut)]
-        let mut locked = inner_member
-            .and_then(|m| {
-                m.value.bfs_iterator().find_map(|(_, child)| match child {
-                    Value::Scalar(s) => match s.value {
-                        Some(SupportedScalar::U32(v)) => Some(v != 0),
-                        _ => None,
-                    },
-                    _ => None,
-                })
-            })
-            .unwrap_or(false);
+        let mut state = match raw_state {
+            None => LockState::Free,
+            Some(v) if is_rwlock => {
+                // libstd: MASK = (1 << 30) - 1; WRITE_LOCKED = MASK.
+                const MASK: u32 = (1 << 30) - 1;
+                const WRITE_LOCKED: u32 = MASK;
+                match v & MASK {
+                    0 => LockState::Free,
+                    WRITE_LOCKED => LockState::Exclusive,
+                    n => LockState::Shared(n),
+                }
+            }
+            Some(0) => LockState::Free,
+            Some(_) => LockState::Exclusive,
+        };
 
         // macOS Mutex lock-state probe. On Darwin libstd uses the
         // pthread backend, but since Rust 1.78 `sys::Mutex` is no
@@ -1733,7 +1791,7 @@ impl<'a> VariableParserExtension<'a> {
         // Apple keeps the actual `opaque[]` private; we treat the
         // sig + owner pair as a soft contract. If the leading sig
         // doesn't match (different libpthread version, foreign mutex
-        // type), we fall through to `locked = false` rather than
+        // type), we fall through to `state = Free` rather than
         // guess from arbitrary bytes.
         //
         // Note: the older `_pthread_lock` at +0x08 holds an opaque
@@ -1742,12 +1800,19 @@ impl<'a> VariableParserExtension<'a> {
         // current state. A previous version of this probe used +8
         // for that reason.
         //
+        // The pthread probe distinguishes only held vs free — it
+        // cannot recover a reader-count, so RwLock on macOS falls
+        // through to the futex branch's default (`Free`). Live
+        // RwLock state on macOS is a TODO.
+        //
         // Best-effort: any read failure (KERN_INVALID_ADDRESS,
         // region not mapped, garbage AtomicPtr value) keeps
-        // `locked = false` rather than poisoning the render.
+        // `state = Free` rather than poisoning the render.
         // `vm_read_n`'s 16 MiB sanity cap is the backstop.
         #[cfg(target_os = "macos")]
-        if let Some(inner_addr) = inner_member.and_then(|m| m.value.in_memory_location()) {
+        if !is_rwlock
+            && let Some(inner_addr) = inner_member.and_then(|m| m.value.in_memory_location())
+        {
             let pid = pcx.evcx.ecx.pid_on_focus();
             // Read the OnceBox<pal::Mutex> pointer at offset 0 of
             // `sys::Mutex`. 8 bytes on 64-bit Darwin.
@@ -1758,7 +1823,7 @@ impl<'a> VariableParserExtension<'a> {
                 if pal_ptr == 0 {
                     // OnceBox uninitialised: mutex has never been
                     // locked, therefore not held.
-                    locked = false;
+                    state = LockState::Free;
                 } else if let Ok(buf) = debugger::read_memory_by_pid(pid, pal_ptr, 0x24)
                     && buf.len() == 0x24
                 {
@@ -1771,7 +1836,11 @@ impl<'a> VariableParserExtension<'a> {
                         // zeroes one of the two still works.
                         let owner = u32::from_ne_bytes(buf[0x18..0x1c].try_into().unwrap());
                         let count = u32::from_ne_bytes(buf[0x20..0x24].try_into().unwrap());
-                        locked = owner != 0 || count != 0;
+                        state = if owner != 0 || count != 0 {
+                            LockState::Exclusive
+                        } else {
+                            LockState::Free
+                        };
                     }
                 }
             }
@@ -1798,7 +1867,7 @@ impl<'a> VariableParserExtension<'a> {
         Ok(SpecializedValue::Mutex {
             inner: Box::new(inner.value),
             poisoned,
-            locked,
+            state,
         })
     }
 

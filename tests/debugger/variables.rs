@@ -7,6 +7,7 @@ use bugstalker::debugger::DebuggerBuilder;
 use bugstalker::debugger::call::fmt::call_debug_fmt;
 use bugstalker::debugger::variable::dqe::{Dqe, Literal, LiteralOrWildcard, PointerCast, Selector};
 use bugstalker::debugger::variable::render::RenderValue;
+use bugstalker::debugger::variable::value::specialization::LockState;
 use bugstalker::debugger::variable::value::{Member, SpecializedValue, SupportedScalar, Value};
 use bugstalker::version::Version;
 use bugstalker::version_switch;
@@ -2407,12 +2408,14 @@ fn assert_mutex_poisoned(val: &Value, exp_poisoned: bool) {
     assert_eq!(*poisoned, exp_poisoned);
 }
 
-/// Phase 1 S1 (locked) helper: assert lock-state matches expectation.
-/// Note: the futex backend (Linux, modern Windows, etc.) reports
-/// accurate state; macOS / Win7 always report `false`.
-fn assert_mutex_locked(val: &Value, exp_locked: bool) {
+/// Phase 1 S1 (state) helper: assert lock-state matches expectation.
+/// The futex backend (Linux, modern Windows, etc.) reports accurate
+/// state including reader counts for RwLock; macOS pthread handles
+/// Mutex held/free but reports `Free` for RwLock; Win7 SRWLOCK
+/// always reports `Free`.
+fn assert_mutex_state(val: &Value, exp_state: LockState) {
     let Value::Specialized {
-        value: Some(SpecializedValue::Mutex { locked, .. }),
+        value: Some(SpecializedValue::Mutex { state, .. }),
         ..
     } = val
     else {
@@ -2421,7 +2424,7 @@ fn assert_mutex_locked(val: &Value, exp_locked: bool) {
             val.r#type().name_fmt()
         );
     };
-    assert_eq!(*locked, exp_locked);
+    assert_eq!(*state, exp_state);
 }
 
 /// Phase 1 S1 — `Mutex<T>` and `RwLock<T>` peel through their `data:
@@ -2459,15 +2462,20 @@ fn test_read_mutex_rwlock() {
     // locks would assert `true` here.
     assert_mutex_poisoned(pick("mtx").value(), false);
     assert_mutex_poisoned(pick("rwl").value(), false);
-    // Phase 1 S1 (locked): the fixture *does* hold both locks at
+    // Phase 1 S1 (state): the fixture *does* hold both locks at
     // the breakpoint — `mtx.lock()` runs at vars.rs:734 and
     // `rwl.read()` at vars.rs:735, both before the bp at 749. The
-    // probe correctly reports `locked = true`. On macOS the futex
-    // backend isn't used so the probe reports `false` there even
-    // when held; gate that platform out below if/when this test is
-    // re-enabled on darwin.
-    assert_mutex_locked(pick("mtx").value(), true);
-    assert_mutex_locked(pick("rwl").value(), true);
+    // probe behaviour splits by platform:
+    //   * Linux / futex backend: Mutex⇒Exclusive, RwLock with one
+    //     reader ⇒ Shared(1) — full decoding via libstd's MASK.
+    //   * macOS pthread: Mutex⇒Exclusive (owner-field probe), but
+    //     RwLock has no probe yet (TODO) so reports Free.
+    //   * Win7 SRWLOCK: always Free (no probe).
+    assert_mutex_state(pick("mtx").value(), LockState::Exclusive);
+    #[cfg(not(target_os = "macos"))]
+    assert_mutex_state(pick("rwl").value(), LockState::Shared(1));
+    #[cfg(target_os = "macos")]
+    assert_mutex_state(pick("rwl").value(), LockState::Free);
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);

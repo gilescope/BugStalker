@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 use crate::debugger::debugee::dwarf::r#type::TypeIdentity;
-use crate::debugger::variable::value::{ArrayItem, Member, SpecializedValue, Value};
+use crate::debugger::variable::value::specialization::LockState;
+use crate::debugger::variable::value::{
+    ArrayItem, Member, SpecializedValue, SupportedScalar, Value,
+};
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::time::TimeSpec;
@@ -1420,26 +1423,41 @@ impl RenderValue for Value {
                 SpecializedValue::Cell(cell) => cell.value_layout()?,
                 SpecializedValue::RefCell(cell) => {
                     // `parse_refcell` builds a 2-member wrapper struct
-                    // `{ borrow, <value member> }`. Rendering that
-                    // struct's layout directly gives `{...}` — the
-                    // user can't tell what the RefCell actually
-                    // contains without expanding it. Skip past the
-                    // wrapper and surface the inner value's layout
-                    // for the top-level display; the second member
-                    // is the payload by construction in
-                    // `parse_refcell_inner`. Tree-expand still walks
-                    // into the inner value's children, which is
-                    // usually what the user wants (e.g. for
-                    // `RefCell<Vec<i32>>` they get the array
-                    // elements). If they want to see the borrow
-                    // flag they can use `:debug` against the
-                    // original struct.
-                    if let Value::Struct(s) = cell.as_ref()
-                        && let Some(value_member) = s.members.get(1)
-                    {
-                        value_member.value.value_layout()?
-                    } else {
-                        cell.value_layout()?
+                    // `{ borrow, <value member> }`. The first member
+                    // carries the `borrow: Cell<BorrowFlag>` scalar
+                    // — an isize whose sign encodes runtime borrow
+                    // state (see std::cell::BorrowFlag):
+                    //   0  ⇒  idle           (LockState::Free, 🔑)
+                    //   N>0 ⇒  N shared       (LockState::Shared(N), 👥N)
+                    //   N<0 ⇒  borrow_mut    (LockState::Exclusive, 🔒)
+                    // We prefix the rendered inner value with that
+                    // glyph for parity with Mutex/RwLock (variables-
+                    // view.md §1.1). If the payload doesn't pre-
+                    // render to a flat string, fall back to the
+                    // inner layout unprefixed — same compromise as
+                    // the Mutex branch above.
+                    let Value::Struct(s) = cell.as_ref() else {
+                        return cell.value_layout();
+                    };
+                    let state = s
+                        .members
+                        .first()
+                        .and_then(refcell_borrow_state)
+                        .unwrap_or(LockState::Free);
+                    let Some(value_member) = s.members.get(1) else {
+                        return cell.value_layout();
+                    };
+                    let inner_layout = value_member.value.value_layout();
+                    match inner_layout {
+                        Some(ValueLayout::PreRendered(s)) => {
+                            let glyph = lock_state_glyph(state);
+                            ValueLayout::PreRendered(Cow::Owned(format!(
+                                "{glyph} {}",
+                                s.as_ref()
+                            )))
+                        }
+                        Some(other) => other,
+                        None => return None,
                     }
                 }
                 SpecializedValue::Rc(ptr) | SpecializedValue::Arc(ptr) => {
@@ -1510,12 +1528,12 @@ impl RenderValue for Value {
                 // when displaying the value.
                 SpecializedValue::MaybeUninit(inner) => inner.value_layout()?,
                 // Phase 1 S1: Mutex/RwLock — surface the guarded
-                // payload with a status emoji prefix so the lock
-                // state is visible at a glance:
-                //   🔒  taken (someone holds the lock)
-                //   🔑  free (nobody holds the lock — the key is
-                //        sitting on the table, anyone may take it)
-                //   ☠️  poisoned (held by a thread that panicked)
+                // payload with a status glyph so the access state
+                // is visible at a glance (see variables-view.md §1.1):
+                //   🔒    exclusive — Mutex locked, RwLock write-held
+                //   🔑    free — nobody holds it
+                //   👥N   shared by N readers (RwLock read-locked)
+                //   ☠️    poisoned (held by a thread that panicked)
                 //
                 // Key vs padlock has distinct silhouettes (long
                 // thin key vs boxy padlock), unlike the open-vs-
@@ -1523,13 +1541,13 @@ impl RenderValue for Value {
                 // identical at the font sizes DAP clients use.
                 //
                 // Lock-state detection works on the futex backend
-                // and on Darwin pthread (via the os_unfair_lock
-                // owner probe in parse_mutex_inner). Win7 SRWLOCK
-                // still reports locked=false unconditionally.
+                // and on Darwin pthread (Mutex only — RwLock on
+                // macOS falls through to `Free`). Win7 SRWLOCK
+                // still reports `Free` unconditionally.
                 SpecializedValue::Mutex {
                     inner,
                     poisoned,
-                    locked,
+                    state,
                 } => {
                     let inner_text = match inner.value_layout() {
                         Some(ValueLayout::PreRendered(s)) => s.into_owned(),
@@ -1547,10 +1565,10 @@ impl RenderValue for Value {
                             return inner.value_layout();
                         }
                     };
-                    let lock_emoji = if *locked { "🔒" } else { "🔑" };
+                    let state_glyph = lock_state_glyph(*state);
                     let poison_marker = if *poisoned { " ☠️" } else { "" };
                     ValueLayout::PreRendered(Cow::Owned(format!(
-                        "{lock_emoji} {inner_text}{poison_marker}"
+                        "{state_glyph} {inner_text}{poison_marker}"
                     )))
                 }
                 // Phase 1 S2: lock guards — render the guarded
@@ -1594,4 +1612,113 @@ fn now_timespec() -> Result<TimeSpec, Errno> {
     }
     let t = unsafe { t.assume_init() };
     Ok(TimeSpec::new(t.tv_sec, t.tv_nsec))
+}
+
+/// Map a sync wrapper's [`LockState`] to its display glyph.
+///
+/// `Shared(N)` packs the reader count next to the people glyph;
+/// N ≥ 10 collapses to `9+` so the row stays narrow.
+fn lock_state_glyph(state: LockState) -> Cow<'static, str> {
+    match state {
+        LockState::Free => Cow::Borrowed("🔑"),
+        LockState::Exclusive => Cow::Borrowed("🔒"),
+        LockState::Shared(n) if n < 10 => Cow::Owned(format!("👥{n}")),
+        LockState::Shared(_) => Cow::Borrowed("👥9+"),
+    }
+}
+
+/// Decode a `RefCell`'s `borrow: Cell<BorrowFlag>` member into a
+/// [`LockState`]. `BorrowFlag` is `isize` in std; the wrapper
+/// here may have been peeled to any signed integer scalar. Returns
+/// `None` when the member isn't a recognisable signed scalar so
+/// the renderer can fall back gracefully.
+fn refcell_borrow_state(borrow_member: &Member) -> Option<LockState> {
+    let scalar = match &borrow_member.value {
+        Value::Scalar(s) => s.value.as_ref()?,
+        _ => return None,
+    };
+    let raw: i64 = match *scalar {
+        SupportedScalar::I8(v) => v.into(),
+        SupportedScalar::I16(v) => v.into(),
+        SupportedScalar::I32(v) => v.into(),
+        SupportedScalar::I64(v) => v,
+        SupportedScalar::Isize(v) => v as i64,
+        _ => return None,
+    };
+    Some(match raw {
+        0 => LockState::Free,
+        n if n < 0 => LockState::Exclusive,
+        n => LockState::Shared(n as u32),
+    })
+}
+
+#[cfg(test)]
+mod lock_state_tests {
+    use super::*;
+    use crate::debugger::debugee::dwarf::r#type::TypeIdentity;
+    use crate::debugger::variable::value::ScalarValue;
+
+    fn borrow_member(scalar: SupportedScalar) -> Member {
+        Member {
+            field_name: Some("borrow".to_string()),
+            value: Value::Scalar(ScalarValue {
+                type_id: None,
+                type_ident: TypeIdentity::no_namespace("isize"),
+                raw_address: None,
+                value: Some(scalar),
+            }),
+        }
+    }
+
+    #[test]
+    fn glyph_free_is_key() {
+        assert_eq!(lock_state_glyph(LockState::Free).as_ref(), "🔑");
+    }
+
+    #[test]
+    fn glyph_exclusive_is_padlock() {
+        assert_eq!(lock_state_glyph(LockState::Exclusive).as_ref(), "🔒");
+    }
+
+    #[test]
+    fn glyph_shared_packs_count_up_to_nine() {
+        assert_eq!(lock_state_glyph(LockState::Shared(1)).as_ref(), "👥1");
+        assert_eq!(lock_state_glyph(LockState::Shared(9)).as_ref(), "👥9");
+    }
+
+    #[test]
+    fn glyph_shared_saturates_at_nine_plus() {
+        assert_eq!(lock_state_glyph(LockState::Shared(10)).as_ref(), "👥9+");
+        assert_eq!(lock_state_glyph(LockState::Shared(u32::MAX)).as_ref(), "👥9+");
+    }
+
+    #[test]
+    fn refcell_zero_is_free() {
+        let m = borrow_member(SupportedScalar::Isize(0));
+        assert_eq!(refcell_borrow_state(&m), Some(LockState::Free));
+    }
+
+    #[test]
+    fn refcell_negative_is_exclusive() {
+        // std uses -1 specifically, but any negative encodes borrow_mut.
+        let m = borrow_member(SupportedScalar::Isize(-1));
+        assert_eq!(refcell_borrow_state(&m), Some(LockState::Exclusive));
+        let m = borrow_member(SupportedScalar::I32(-42));
+        assert_eq!(refcell_borrow_state(&m), Some(LockState::Exclusive));
+    }
+
+    #[test]
+    fn refcell_positive_is_shared_n() {
+        let m = borrow_member(SupportedScalar::Isize(3));
+        assert_eq!(refcell_borrow_state(&m), Some(LockState::Shared(3)));
+    }
+
+    #[test]
+    fn refcell_non_signed_scalar_falls_back() {
+        // BorrowFlag is always signed; an unsigned scalar means
+        // we're looking at the wrong member, so return None and
+        // let the renderer default to Free.
+        let m = borrow_member(SupportedScalar::U32(0));
+        assert_eq!(refcell_borrow_state(&m), None);
+    }
 }
