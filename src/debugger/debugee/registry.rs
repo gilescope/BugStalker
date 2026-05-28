@@ -29,6 +29,33 @@ pub struct ReloadPlan {
     pub to_add: Vec<PathBuf>,
 }
 
+/// Writability of a runtime memory region, derived from the loader's
+/// PT_LOAD / __DATA / __TEXT permission bits. Drives the
+/// variables-pane mutability hue for `static`s (variables-view §5.2):
+/// a `static` in a read-only segment can never be mutated through
+/// normal Rust code, so it renders with the grey hue; a `static`
+/// in a writable segment may be mutated (via `static mut`, interior
+/// mutability, or atomic ops) and renders orange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SegmentWritability {
+    /// Containing segment has the loader-write bit clear — the
+    /// hardware refuses writes.
+    ReadOnly,
+    /// Containing segment has the loader-write bit set — writes
+    /// are permitted (even if Rust's type system would forbid
+    /// them through this binding).
+    ReadWrite,
+}
+
+/// Address-range entry in the segment-writability index. Stored
+/// half-open: `[from, to)`.
+#[derive(Debug, Clone, Copy)]
+struct SegmentEntry {
+    from: RelocatedAddress,
+    to: RelocatedAddress,
+    writability: SegmentWritability,
+}
+
 /// Registry contains debug information about main executable object and loaded shared libraries.
 pub struct DwarfRegistry {
     /// process pid
@@ -41,6 +68,13 @@ pub struct DwarfRegistry {
     ranges: Vec<(PathBuf, RegionRange)>,
     /// regions map addresses, each region is a shared lib or debugee program
     mappings: HashMap<PathBuf, usize>,
+    /// All loaded VM segments tagged with their writability, sorted
+    /// by `from` for O(log N) lookup. Rebuilt in `update_mappings`
+    /// from `proc_maps` which already exposes per-region r/w/x bits
+    /// on every supported OS (Linux, macOS, Windows). Built once per
+    /// mapping refresh — small (10s–100s of entries) so the cost is
+    /// negligible.
+    segment_writability: Vec<SegmentEntry>,
 }
 
 impl DwarfRegistry {
@@ -62,6 +96,7 @@ impl DwarfRegistry {
             files: HashMap::from([(program_path, program_dwarf)]),
             ranges: vec![],
             mappings: HashMap::new(),
+            segment_writability: Vec::new(),
         }
     }
 
@@ -195,7 +230,46 @@ impl DwarfRegistry {
         ranges.sort_unstable_by(|(_, r1), (_, r2)| r1.from.cmp(&r2.from));
         self.ranges = ranges;
 
+        // Variables-view §5.2: rebuild the segment-writability index
+        // from the just-fetched proc_maps. We use EVERY mapping (not
+        // just file-backed PT_LOAD segments) so that the [heap] /
+        // [stack] / anon-mmap regions are also classifiable — useful
+        // for the heap-overlay glyph in §5.3 too. Sorted by `from`
+        // for binary-search lookup.
+        let mut segs: Vec<SegmentEntry> = proc_maps
+            .iter()
+            .map(|m| SegmentEntry {
+                from: RelocatedAddress::from(m.start()),
+                to: RelocatedAddress::from(m.start() + m.size()),
+                writability: if m.is_write() {
+                    SegmentWritability::ReadWrite
+                } else {
+                    SegmentWritability::ReadOnly
+                },
+            })
+            .collect();
+        segs.sort_unstable_by_key(|e| e.from);
+        self.segment_writability = segs;
+
         Ok(errors)
+    }
+
+    /// Look up the writability of the segment containing `addr`.
+    /// Returns `None` if the address isn't in any currently-mapped
+    /// region (e.g. it's stale across a `munmap` or never was a
+    /// valid load address). O(log N) over the loaded segment count.
+    /// See variables-view.md §5.2 for the user-facing semantics.
+    pub fn address_writability(&self, addr: RelocatedAddress) -> Option<SegmentWritability> {
+        let segs = &self.segment_writability;
+        // Binary search for the rightmost entry whose `from <= addr`;
+        // then check that `addr < entry.to`.
+        let idx = match segs.binary_search_by_key(&addr, |e| e.from) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let entry = segs.get(idx)?;
+        (addr < entry.to).then_some(entry.writability)
     }
 
     /// Add new debug information into registry.
@@ -355,9 +429,11 @@ impl DwarfRegistry {
             pid: new_pid,
             program_path: self.program_path.clone(),
             files: self.files.clone(),
-            // mappings and ranges must be redefined
+            // mappings, ranges, and segment writability must all be
+            // redefined for the new pid — they're per-process state.
             ranges: vec![],
             mappings: HashMap::default(),
+            segment_writability: Vec::new(),
         }
     }
 
@@ -386,5 +462,133 @@ impl DwarfRegistry {
             i1.path.cmp(&i2.path)
         });
         regions
+    }
+
+    #[cfg(test)]
+    /// Test seam — directly seed the segment-writability index so
+    /// the lookup logic can be exercised without spinning up a real
+    /// debuggee or proc_maps reader.
+    fn set_segment_writability_for_test(
+        &mut self,
+        entries: Vec<(usize, usize, SegmentWritability)>,
+    ) {
+        let mut segs: Vec<SegmentEntry> = entries
+            .into_iter()
+            .map(|(from, to, w)| SegmentEntry {
+                from: RelocatedAddress::from(from),
+                to: RelocatedAddress::from(to),
+                writability: w,
+            })
+            .collect();
+        segs.sort_unstable_by_key(|e| e.from);
+        self.segment_writability = segs;
+    }
+}
+
+#[cfg(test)]
+mod segment_writability_tests {
+    use super::*;
+    use crate::debugger::debugee::dwarf::{DebugInformation, EndianArcSlice};
+
+    /// Make a registry with no real debug info. We bypass the
+    /// constructor's `program_dwarf` requirement by reaching past
+    /// the public API — only the segment-writability index is
+    /// exercised here.
+    fn empty_registry() -> DwarfRegistry {
+        DwarfRegistry {
+            pid: Pid::from_raw(0),
+            program_path: PathBuf::new(),
+            files: HashMap::new(),
+            ranges: vec![],
+            mappings: HashMap::new(),
+            segment_writability: vec![],
+        }
+    }
+
+    // Silence "unused import" — keep the trait in scope so future
+    // tests that need DebugInformation can use it without re-import.
+    #[allow(dead_code)]
+    fn _keep_imports_alive(_: &DebugInformation<EndianArcSlice>) {}
+
+    #[test]
+    fn lookup_in_writable_segment_returns_rw() {
+        let mut r = empty_registry();
+        r.set_segment_writability_for_test(vec![
+            (0x1000, 0x2000, SegmentWritability::ReadOnly),
+            (0x2000, 0x3000, SegmentWritability::ReadWrite),
+        ]);
+        assert_eq!(
+            r.address_writability(RelocatedAddress::from(0x2500usize)),
+            Some(SegmentWritability::ReadWrite)
+        );
+    }
+
+    #[test]
+    fn lookup_in_readonly_segment_returns_ro() {
+        let mut r = empty_registry();
+        r.set_segment_writability_for_test(vec![
+            (0x1000, 0x2000, SegmentWritability::ReadOnly),
+        ]);
+        assert_eq!(
+            r.address_writability(RelocatedAddress::from(0x1234usize)),
+            Some(SegmentWritability::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn lookup_at_segment_boundaries() {
+        let mut r = empty_registry();
+        r.set_segment_writability_for_test(vec![
+            (0x1000, 0x2000, SegmentWritability::ReadOnly),
+        ]);
+        // Inclusive lower bound, exclusive upper.
+        assert_eq!(
+            r.address_writability(RelocatedAddress::from(0x1000usize)),
+            Some(SegmentWritability::ReadOnly)
+        );
+        assert_eq!(
+            r.address_writability(RelocatedAddress::from(0x1fffusize)),
+            Some(SegmentWritability::ReadOnly)
+        );
+        assert_eq!(
+            r.address_writability(RelocatedAddress::from(0x2000usize)),
+            None,
+            "upper bound is exclusive"
+        );
+    }
+
+    #[test]
+    fn lookup_below_lowest_segment_returns_none() {
+        let mut r = empty_registry();
+        r.set_segment_writability_for_test(vec![
+            (0x1000, 0x2000, SegmentWritability::ReadOnly),
+        ]);
+        assert_eq!(
+            r.address_writability(RelocatedAddress::from(0x0500usize)),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_in_gap_between_segments_returns_none() {
+        let mut r = empty_registry();
+        r.set_segment_writability_for_test(vec![
+            (0x1000, 0x2000, SegmentWritability::ReadOnly),
+            (0x4000, 0x5000, SegmentWritability::ReadWrite),
+        ]);
+        // 0x3000 sits in the gap.
+        assert_eq!(
+            r.address_writability(RelocatedAddress::from(0x3000usize)),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_index_returns_none_for_any_address() {
+        let r = empty_registry();
+        assert_eq!(
+            r.address_writability(RelocatedAddress::from(0x1234usize)),
+            None
+        );
     }
 }

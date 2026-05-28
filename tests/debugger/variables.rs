@@ -8,6 +8,7 @@ use bugstalker::debugger::call::fmt::call_debug_fmt;
 use bugstalker::debugger::variable::dqe::{Dqe, Literal, LiteralOrWildcard, PointerCast, Selector};
 use bugstalker::debugger::variable::render::RenderValue;
 use bugstalker::debugger::variable::execute::FileScopeFilter;
+use bugstalker::debugger::variable::mutability::{self, Mutability};
 use bugstalker::debugger::variable::value::specialization::LockState;
 use bugstalker::debugger::variable::value::{Member, SpecializedValue, SupportedScalar, Value};
 use bugstalker::version::Version;
@@ -1178,6 +1179,67 @@ fn test_bulk_enumerate_thread_locals() {
             names.iter().all(|n| !n.contains(forbidden)),
             "{forbidden} leaked into thread-locals: {names:?}"
         );
+    }
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.2 — the mutability classifier should run
+/// without panicking on every variable produced by the bulk
+/// enumeration APIs, and the GLOB_2 static (a plain `static i32`)
+/// should classify as ReadOnly because the linker puts it in
+/// `.rodata` regardless of the rustc / LLVM version. Other GLOB_*
+/// statics may land in `.data.rel.ro` (read-only after relocation)
+/// or similar — we don't assert on them to stay portable across
+/// linker quirks.
+#[test]
+#[serial]
+fn test_mutability_classifier_runs_on_live_variables() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 168).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(168));
+
+    // Every static must classify into some Mutability variant
+    // without panicking. The exact bucket depends on the linker
+    // (`.rodata` vs `.data.rel.ro`); we just ensure the path
+    // returns something for every entry.
+    let statics = debugger
+        .read_static_variables(FileScopeFilter::CurrentCrate)
+        .unwrap();
+    assert!(!statics.is_empty(), "no statics enumerated");
+    for qr in &statics {
+        let _ = mutability::classify(qr, &debugger);
+    }
+
+    // GLOB_2 is `static GLOB_2: i32 = 2;` — pure integer literal,
+    // no relocations, lands in `.rodata` on every supported
+    // toolchain. Assert it classifies as ReadOnly to lock that in.
+    let glob_2 = statics
+        .iter()
+        .find(|qr| qr.identity().to_string().contains("GLOB_2"))
+        .expect("GLOB_2 not enumerated");
+    assert_eq!(
+        mutability::classify(glob_2, &debugger),
+        Mutability::ReadOnly,
+        "static GLOB_2 should be ReadOnly (in .rodata)"
+    );
+
+    // Local variables go through the type-based classifier. We
+    // don't assert specifics (the fixture's locals are mostly
+    // owned types which default-RW per the let-mut DWARF gap) —
+    // just exercise the path and verify it doesn't panic.
+    let locals = debugger.read_local_variables().unwrap();
+    for qr in &locals {
+        let _ = mutability::classify(qr, &debugger);
     }
 
     debugger.continue_debugee().unwrap();

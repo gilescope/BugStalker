@@ -52,6 +52,14 @@ pub struct VarItem {
     pub child: Option<Vec<VarItem>>,
     pub write: Option<WriteMeta>,
     pub source: Option<debugger::variable::value::Value>,
+    /// Variables-view §5.2: serialised as the DAP custom field
+    /// `bugstalker.mutability = "ro" | "rw" | "unknown"`. The
+    /// vscode-extension uses this to pick the row-background hue
+    /// (grey for `ro`, orange for `rw`, none for `unknown`).
+    /// `"ro"` additionally emits `presentationHint.attributes =
+    /// ["readOnly"]` so stock DAP clients (default VSCode pane)
+    /// italicise the row even without our extension.
+    pub mutability: Option<&'static str>,
 }
 
 impl super::DebugSession {
@@ -113,12 +121,28 @@ impl super::DebugSession {
                 Some(t) if !t.is_empty() => format!("{} : {t}", v.name),
                 _ => v.name.clone(),
             };
-            out.push(json!({
+            // Variables-view §5.2: emit the mutability hint as
+            // (a) the standard `presentationHint.attributes =
+            // ["readOnly"]` for `ro` rows (so stock DAP clients
+            // italicise without needing our extension), and
+            // (b) a custom `bugstalker.mutability` field carrying
+            // the raw "ro"/"rw" string so the vscode-extension can
+            // paint the row-background hue.
+            let mut entry = json!({
                 "name": name_with_type,
                 "value": v.value,
                 "type": v.type_name,
                 "variablesReference": child_ref,
-            }));
+            });
+            if let Some(m) = v.mutability {
+                entry["bugstalker.mutability"] = json!(m);
+                if m == "ro" {
+                    entry["presentationHint"] = json!({
+                        "attributes": ["readOnly"],
+                    });
+                }
+            }
+            out.push(entry);
         }
 
         self.send_success_body(req, json!({"variables": out}))
@@ -1205,6 +1229,13 @@ fn value_children(
                     child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
+                    // Variables-view §5.2: child mutability inherits
+                    // logically from the parent (a field of a `ro`
+                    // struct is `ro` for the user's purposes), but
+                    // computing it here would need the parent's
+                    // mutability propagated through the recursion.
+                    // Deferred — top-level row already shows the hint.
+                    mutability: None,
                 });
             }
             Some(out)
@@ -1224,6 +1255,7 @@ fn value_children(
                     child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
+                    mutability: None,
                 });
             }
             Some(out)
@@ -1243,6 +1275,7 @@ fn value_children(
                     child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
+                    mutability: None,
                 });
             }
             Some(out)
@@ -1265,6 +1298,7 @@ fn value_children(
                         .and_then(|qr| value_children(qr, type_graph.clone(), viz)),
                     write: None,
                     source: cell_qr.map(|qr| qr.value().clone()),
+                    mutability: None,
                 });
             }
             Some(out)
@@ -1288,6 +1322,7 @@ fn value_children(
                     child: value_children(&deref_qr, type_graph.clone(), viz),
                     write: value_write_meta(deref_qr.value(), type_graph.clone()),
                     source: Some(deref_qr.value().clone()),
+                    mutability: None,
                 }];
                 Some(out)
             } else {
@@ -1306,6 +1341,7 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     for r in locals {
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
+        let mutability = mutability_hint(&r, dbg);
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1313,9 +1349,25 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             child: value_children(&r, type_graph.clone(), viz),
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
+            mutability,
         });
     }
     Ok(out)
+}
+
+/// Variables-view §5.2: classify the variable's mutability and
+/// stringify it for the DAP custom field. Returns `None` when the
+/// classifier reports `Unknown` so we omit the field rather than
+/// emit an unhelpful `"unknown"` in the JSON.
+fn mutability_hint(
+    qr: &debugger::variable::execute::QueryResult<'_>,
+    dbg: &debugger::Debugger,
+) -> Option<&'static str> {
+    let m = debugger::variable::mutability::classify(qr, dbg);
+    match m {
+        debugger::variable::mutability::Mutability::Unknown => None,
+        other => Some(other.as_dap_str()),
+    }
 }
 
 pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
@@ -1327,6 +1379,7 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     for r in args {
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
+        let mutability = mutability_hint(&r, dbg);
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1334,6 +1387,7 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             child: value_children(&r, type_graph.clone(), viz),
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
+            mutability,
         });
     }
     Ok(out)
@@ -1376,6 +1430,7 @@ fn file_scope_var_items(
     for r in entries {
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
+        let mutability = mutability_hint(&r, dbg);
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1383,6 +1438,7 @@ fn file_scope_var_items(
             child: value_children(&r, type_graph.clone(), viz),
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
+            mutability,
         });
     }
     Ok(out)

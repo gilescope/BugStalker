@@ -7,6 +7,38 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- mutability classifier + DAP hint per variable (variables-view §5.2):
+  - New `DwarfRegistry::address_writability(addr)` builds a sorted
+    index of all `PT_LOAD` mappings (with their PF_R/W/X bits, read
+    out of `proc_maps` during `update_mappings`) and answers
+    "writable or read-only?" in O(log N). Index covers heap / stack /
+    anon-mmap regions too — §5.3 will reuse it for the storage-class
+    glyph's heap overlay.
+  - New `variable::mutability` module: `Mutability { ReadOnly, ReadWrite,
+    Unknown }` plus `classify(&QueryResult, &Debugger)` that combines
+    segment writability (ground truth for statics + TLS) with
+    type-based fallback for locals/args. Type fallback uses the rustc
+    DWARF convention: `&T` is `Pointer { target: ModifiedType { Const,
+    inner } }`, `&mut T` has no const qualifier — distinguishable
+    without parsing the type name. Owned types and any type containing
+    `UnsafeCell` (recursive, cycle-broken) are `ReadWrite`.
+  - DAP `handle_variables` now emits two new fields per top-level
+    variable:
+    * standard `presentationHint.attributes = ["readOnly"]` for `ro`
+      rows so stock DAP clients (default VSCode pane) italicise the
+      row even without our extension.
+    * custom `bugstalker.mutability = "ro" | "rw"` for the
+      vscode-extension to paint the grey/orange row-background hue
+      (per variables-view §1.2). The string vocabulary is stable —
+      bumping the enum without coordinating with the extension is
+      caught by `dap_str_round_trips_via_match`.
+  - 6 segment-index unit tests + 2 classifier unit tests + 1 live-
+    debuggee integration test (`test_mutability_classifier_runs_on_live_variables`,
+    pins `static GLOB_2: i32 = 2` to ReadOnly via the segment
+    lookup since it's always in `.rodata` on any Linux toolchain).
+  - Known limits documented in variables-view.md §7: child-row
+    mutability inheritance, vscode-extension CSS not wired up yet.
+
 - `Statics` + `Thread-locals` as new DAP scopes (variables-view §5.4):
   - `DqeExecutor::query_file_scope(kind, filter)` enumerates every
     file-scope `DW_TAG_variable` across loaded debug-info. `kind`
