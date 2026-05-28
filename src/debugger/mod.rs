@@ -756,6 +756,18 @@ impl Debugger {
         self.debugee.dwarf_registry()
     }
 
+    /// Variables-view §5.3: re-read `proc_maps` and rebuild the
+    /// segment-writability + segment-kind index. Use from DAP
+    /// variables-pane handlers before address lookups so that
+    /// runtime allocations (`Box::new`, mmap'd allocator chunks,
+    /// thread stacks spawned since the last refresh) participate
+    /// in the storage glyph + heap-overlay classification. Cheap —
+    /// one `/proc/PID/maps` read on Linux.
+    pub fn refresh_segment_index(&mut self) -> Result<(), Error> {
+        disable_when_not_stared!(self);
+        self.debugee.dwarf_registry_mut().refresh_segment_index()
+    }
+
     /// Update current program counters for current in focus thread.
     fn ecx_update_location(&mut self) -> Result<&ExplorationContext, Error> {
         let old_ecx = self.ecx();

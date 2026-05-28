@@ -263,11 +263,34 @@ impl DwarfRegistry {
         self.ranges = ranges;
 
         // Variables-view §5.2 + §5.3: rebuild the segment-writability
-        // + segment-kind index from the just-fetched proc_maps. We
-        // use EVERY mapping (not just file-backed PT_LOAD segments)
-        // so heap / stack / anon-mmap regions are classifiable —
-        // §5.3 storage glyph + heap overlay both consume this.
-        // Sorted by `from` for binary-search lookup.
+        // + segment-kind index from the just-fetched proc_maps. See
+        // `rebuild_segment_index_from`.
+        self.rebuild_segment_index_from(&proc_maps);
+
+        Ok(errors)
+    }
+
+    /// Variables-view §5.3: re-read `proc_maps` and rebuild ONLY the
+    /// segment-writability + segment-kind index. Cheap (one read of
+    /// `/proc/PID/maps` on Linux + a sort) and safe to call
+    /// frequently. Use this from the DAP variables-pane handlers
+    /// before any address lookup so that `[heap]` / anon-rw
+    /// mappings created since the last `update_mappings` (i.e.
+    /// since startup — `Box::new`, etc.) participate in the
+    /// segment classification.
+    ///
+    /// The heavier `update_mappings` also rebuilds the per-file
+    /// DWARF `mappings` + `ranges`; we keep those untouched here
+    /// because they only change on shared-library load/unload,
+    /// which we already handle via the rendezvous-breakpoint
+    /// hook elsewhere.
+    pub fn refresh_segment_index(&mut self) -> Result<(), Error> {
+        let proc_maps: Vec<MapRange> = proc_maps::get_process_maps(self.pid.as_raw())?;
+        self.rebuild_segment_index_from(&proc_maps);
+        Ok(())
+    }
+
+    fn rebuild_segment_index_from(&mut self, proc_maps: &[MapRange]) {
         let mut segs: Vec<SegmentEntry> = proc_maps
             .iter()
             .map(|m| SegmentEntry {
@@ -283,8 +306,6 @@ impl DwarfRegistry {
             .collect();
         segs.sort_unstable_by_key(|e| e.from);
         self.segment_writability = segs;
-
-        Ok(errors)
     }
 
     /// Look up the writability of the segment containing `addr`.

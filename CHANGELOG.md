@@ -7,6 +7,26 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- segment-index refresh-on-stop (variables-view §5.3 follow-up):
+  - New `DwarfRegistry::refresh_segment_index()` re-reads
+    `proc_maps` and rebuilds just the segment-writability +
+    segment-kind index (the heavier `update_mappings` also
+    rebuilds the per-file DWARF `mappings` + `ranges`, which
+    only change on dylib load/unload). Cheap — one
+    /proc/PID/maps read on Linux.
+  - `Debugger::refresh_segment_index()` exposes it; DAP
+    `handle_scopes` calls it once per query so post-startup
+    heap allocations (`Box::new`, `Vec::with_capacity`,
+    spawned-thread stacks) appear in the index by the time the
+    variables pane's storage classifier + heap-overlay lookup
+    run. Best-effort — failure is logged but doesn't block the
+    response.
+  - The `test_storage_classifier_runs_on_live_variables` test
+    is now a hard assertion that `box_d` (a `Box<i32>` allocated
+    after debugger startup) reports `points_to_heap == true`.
+    Pre-fix this was a lenient comment; the assertion now
+    catches regressions in the refresh path.
+
 - payload/padding layout breakdown per variable (variables-view §5.6):
   - New `LayoutBreakdown { total, payload, padding }` carried on
     `QueryResult` with a `padding_pct()` helper that saturates at

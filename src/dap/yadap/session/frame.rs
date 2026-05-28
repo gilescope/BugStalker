@@ -182,6 +182,16 @@ impl super::DebugSession {
             .as_mut()
             .ok_or_else(|| anyhow!("scopes: debugger not initialized"))?;
 
+        // Variables-view §5.3 refresh-on-stop: re-read proc_maps so
+        // post-startup heap allocations (Box::new etc.) appear in
+        // the segment index by the time the per-variable storage
+        // classifier and heap-overlay lookup run. The variables-
+        // pane query that follows this `scopes` request will hit
+        // the freshly-rebuilt index. Best-effort — failure is
+        // logged but doesn't block the scopes response (a stale
+        // index just means heap-overlay misses on a few rows).
+        let _ = dbg.refresh_segment_index();
+
         let frame_id = req
             .arguments
             .get("frameId")

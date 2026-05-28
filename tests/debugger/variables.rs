@@ -9,6 +9,7 @@ use bugstalker::debugger::variable::dqe::{Dqe, Literal, LiteralOrWildcard, Point
 use bugstalker::debugger::variable::render::RenderValue;
 use bugstalker::debugger::stack_health;
 use bugstalker::debugger::variable::execute::{FileScopeFilter, LayoutBreakdown};
+use bugstalker::debugger::variable::storage;
 use bugstalker::debugger::variable::mutability::{self, Mutability};
 use bugstalker::debugger::variable::storage::StorageClass;
 use bugstalker::debugger::variable::value::specialization::LockState;
@@ -1352,25 +1353,23 @@ fn test_storage_classifier_runs_on_live_variables() {
         "static GLOB_2 should classify as StaticReadOnly via the .rodata segment lookup"
     );
 
+    // §5.3 refresh-on-stop: the segment-writability index is now
+    // re-read from proc_maps before each variables-pane query in
+    // the DAP layer, so post-startup heap allocations (Box::new
+    // etc.) appear by the time the heap-overlay lookup runs.
+    // Integration tests don't go through the DAP layer, so call
+    // the refresh explicitly first — must happen before
+    // `read_local_variables` since the latter holds an
+    // immutable borrow that conflicts with the mutable refresh.
+    debugger
+        .refresh_segment_index()
+        .expect("refresh_segment_index should succeed");
     let locals = debugger.read_local_variables().unwrap();
 
     // Heap overlay: `box_d` is a `Box<i32>` whose pointee lives
     // on the heap (Rust's default allocator → anon RW mapping on
     // Linux). The overlay logic is independent of the storage
     // class — the binding itself is on the stack.
-    // §5.3 known limit: the segment-writability index is built
-    // ONCE at debugger startup from `proc_maps`. The `[heap]` /
-    // anon-rw mappings created by post-startup allocations
-    // (Box::new running between startup and the breakpoint)
-    // aren't in the index until `update_mappings` is re-run.
-    // For v0 we therefore don't assert the heap overlay fires —
-    // it works correctly for any pointee that lives in a mapping
-    // present at startup, but Box's runtime allocation may miss.
-    // Refresh-on-stop is a documented §7 follow-up.
-    //
-    // We still verify the binding's OWN storage (stack), since
-    // the stack mapping IS established at startup and present
-    // in the index.
     let box_d = locals
         .iter()
         .find(|qr| qr.identity().to_string().contains("box_d"))
@@ -1379,6 +1378,11 @@ fn test_storage_classifier_runs_on_live_variables() {
         box_d.storage(),
         Some(StorageClass::Stack),
         "the Box binding itself lives on the stack"
+    );
+    assert!(
+        storage::value_points_to_heap(box_d.value(), &debugger),
+        "Box<i32>'s pointee should land in [heap] or anon-rw — \
+         refresh-on-stop must have picked up the post-startup allocation"
     );
 
     // Some local should be on the stack — `a: i32` at this bp is

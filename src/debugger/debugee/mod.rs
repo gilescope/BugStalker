@@ -259,6 +259,16 @@ impl Debugee {
         &self.dwarf_registry
     }
 
+    /// Mutable access to the DWARF/load-mapping registry. Used by
+    /// the variables-view §5.3 refresh-on-stop path
+    /// (`Debugger::refresh_segment_index`) to rebuild the
+    /// proc_maps-derived segment index just before a variables-pane
+    /// query reads addresses, so post-startup heap allocations
+    /// participate in the storage classification.
+    pub fn dwarf_registry_mut(&mut self) -> &mut DwarfRegistry {
+        &mut self.dwarf_registry
+    }
+
     /// Translate a file offset within the main executable (the kind
     /// `wild --emit-patch` outputs) into the runtime virtual address
     /// it ended up at in the running process. Returns `None` if the
