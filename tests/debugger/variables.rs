@@ -7,6 +7,7 @@ use bugstalker::debugger::DebuggerBuilder;
 use bugstalker::debugger::call::fmt::call_debug_fmt;
 use bugstalker::debugger::variable::dqe::{Dqe, Literal, LiteralOrWildcard, PointerCast, Selector};
 use bugstalker::debugger::variable::render::RenderValue;
+use bugstalker::debugger::stack_health;
 use bugstalker::debugger::variable::execute::FileScopeFilter;
 use bugstalker::debugger::variable::mutability::{self, Mutability};
 use bugstalker::debugger::variable::storage::StorageClass;
@@ -1181,6 +1182,65 @@ fn test_bulk_enumerate_thread_locals() {
             "{forbidden} leaked into thread-locals: {names:?}"
         );
     }
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.5 — stack health is computed against the
+/// live thread's SP + the backtrace. We assert observable
+/// invariants without depending on rustc-version-sensitive
+/// numbers:
+///   * `thread_stack_size` is reported (the main thread is
+///     always present in `proc_maps` with a `[stack]` mapping).
+///   * `thread_stack_used` is ≤ `thread_stack_size`.
+///   * `used_pct()` falls in the valid 0–100 range.
+///   * `frame_count ≥ 1` (we're definitely in `main`).
+/// Per-local byte size: every QueryResult should report a size
+/// (every scalar / struct has a known `DW_AT_byte_size`).
+#[test]
+#[serial]
+fn test_stack_health_and_byte_size_on_live_thread() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 119).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(119));
+
+    // Stack health
+    let bt = debugger.backtrace(debugger.ecx().pid_on_focus()).unwrap();
+    let health = stack_health::compute(&debugger, debugger.ecx().pid_on_focus(), &bt);
+    assert!(
+        health.thread_stack_size.is_some(),
+        "main thread should have a known stack size from proc_maps"
+    );
+    let total = health.thread_stack_size.unwrap();
+    let used = health
+        .thread_stack_used
+        .expect("used reported when size is");
+    assert!(
+        used <= total,
+        "used ({used}) must not exceed total ({total})"
+    );
+    let pct = health.used_pct().expect("pct reported when both are");
+    assert!(pct <= 100, "pct {pct} out of range");
+    assert!(health.frame_count >= 1, "we're in main at minimum");
+
+    // Per-local byte size — pick a known scalar (a: i32 → 4 bytes)
+    // and assert. The classifier should resolve DW_AT_byte_size
+    // through the existing type pipeline.
+    let locals = debugger.read_local_variables().unwrap();
+    let a = locals
+        .iter()
+        .find(|qr| qr.identity().to_string() == "a")
+        .expect("`a` not in locals");
+    assert_eq!(a.byte_size(), Some(4), "i32 should report 4 bytes");
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);

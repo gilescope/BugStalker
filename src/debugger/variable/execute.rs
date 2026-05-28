@@ -103,6 +103,18 @@ impl QueryResult<'_> {
         self.storage
     }
 
+    /// Variables-view §5.5 — total byte size of this value's type,
+    /// resolved from `DW_AT_byte_size` via the existing
+    /// `ComplexType::type_size_in_bytes` path. Returns `None` for
+    /// types whose size depends on dynamic runtime data the
+    /// evaluator can't determine (extremely rare for normal Rust
+    /// types — slices and dyn-trait fat pointers have a known
+    /// header size, the dynamic payload lives behind a pointer).
+    pub fn byte_size(&self) -> Option<u64> {
+        let graph = self.type_graph();
+        self.with_evcx(|evcx| graph.type_size_in_bytes(evcx, graph.root()))
+    }
+
     /// Evaluate any function with evaluation context.
     pub fn with_evcx<T, F: FnOnce(&EvaluationContext) -> T>(&self, cb: F) -> T {
         self.evcx_builder.with_evcx(cb)

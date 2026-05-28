@@ -71,6 +71,11 @@ pub struct VarItem {
     /// `bugstalker.points_to_heap = true` and omitted when false
     /// to keep DAP JSON tight.
     pub points_to_heap: bool,
+    /// Variables-view §5.5 — total byte size of this value's type
+    /// from `DW_AT_byte_size`. Drives the trailing size column +
+    /// the amber (>1 KB) / red (>16 KB) tinting. Serialised as
+    /// `bugstalker.byte_size` (u64). `None` is omitted from the JSON.
+    pub byte_size: Option<u64>,
 }
 
 impl super::DebugSession {
@@ -160,6 +165,11 @@ impl super::DebugSession {
             }
             if v.points_to_heap {
                 entry["bugstalker.points_to_heap"] = json!(true);
+            }
+            // Variables-view §5.5 — per-local byte size for the
+            // trailing size column + threshold tinting.
+            if let Some(bytes) = v.byte_size {
+                entry["bugstalker.byte_size"] = json!(bytes);
             }
             out.push(entry);
         }
@@ -1256,6 +1266,7 @@ fn value_children(
                     mutability: None,
                     storage: None,
                     points_to_heap: false,
+                    byte_size: None,
                 });
             }
             Some(out)
@@ -1278,6 +1289,7 @@ fn value_children(
                     mutability: None,
                     storage: None,
                     points_to_heap: false,
+                    byte_size: None,
                 });
             }
             Some(out)
@@ -1300,6 +1312,7 @@ fn value_children(
                     mutability: None,
                     storage: None,
                     points_to_heap: false,
+                    byte_size: None,
                 });
             }
             Some(out)
@@ -1325,6 +1338,7 @@ fn value_children(
                     mutability: None,
                     storage: None,
                     points_to_heap: false,
+                    byte_size: None,
                 });
             }
             Some(out)
@@ -1351,6 +1365,7 @@ fn value_children(
                     mutability: None,
                     storage: None,
                     points_to_heap: false,
+                    byte_size: None,
                 }];
                 Some(out)
             } else {
@@ -1372,6 +1387,7 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
         let mutability = mutability_hint(&r, dbg);
         let storage = storage_hint(&r);
         let points_to_heap = points_to_heap_hint(&r, dbg);
+        let byte_size = r.byte_size();
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1382,6 +1398,7 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             mutability,
             storage,
             points_to_heap,
+            byte_size,
         });
     }
     Ok(out)
@@ -1433,6 +1450,7 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
         let mutability = mutability_hint(&r, dbg);
         let storage = storage_hint(&r);
         let points_to_heap = points_to_heap_hint(&r, dbg);
+        let byte_size = r.byte_size();
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1443,6 +1461,7 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             mutability,
             storage,
             points_to_heap,
+            byte_size,
         });
     }
     Ok(out)
@@ -1488,6 +1507,7 @@ fn file_scope_var_items(
         let mutability = mutability_hint(&r, dbg);
         let storage = storage_hint(&r);
         let points_to_heap = points_to_heap_hint(&r, dbg);
+        let byte_size = r.byte_size();
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1498,6 +1518,7 @@ fn file_scope_var_items(
             mutability,
             storage,
             points_to_heap,
+            byte_size,
         });
     }
     Ok(out)

@@ -113,18 +113,63 @@ impl super::DebugSession {
             } else {
                 None
             };
-            frames.push(json!({
+            // Variables-view §5.5: tag this frame with its
+            // recursion count when its function name appears
+            // ≥ 2 times in the backtrace. The vscode-extension
+            // uses this to render `[rec N]` next to the frame
+            // name and to flag red when N exceeds the threshold.
+            let mut frame_obj = json!({
                 "id": frame_id,
                 "name": name,
                 "source": source,
                 "line": line.unwrap_or(0),
                 "column": col.unwrap_or(0),
-            }));
+            });
+            if let Some(rec_count) = f
+                .func_name
+                .as_ref()
+                .and_then(|n| {
+                    bt.iter()
+                        .filter(|s| s.func_name.as_ref() == Some(n))
+                        .count()
+                        .checked_sub(0)
+                        .filter(|c| *c >= 2)
+                })
+            {
+                frame_obj["bugstalker.recursionCount"] = json!(rec_count);
+            }
+            frames.push(frame_obj);
         }
-        self.send_success_body(
-            req,
-            json!({"stackFrames": frames, "totalFrames": frames.len()}),
-        )
+        // Variables-view §5.5: attach a stack-health snapshot to
+        // the response so the variables-pane header pill + the
+        // threads-pane budget bar can render without a separate
+        // round-trip. Computed once per stack-trace request from
+        // the just-fetched backtrace + proc_maps lookup.
+        let stack_health = self
+            .debugger
+            .as_ref()
+            .map(|dbg| crate::debugger::stack_health::compute(dbg, pid, &bt));
+        let mut body = json!({
+            "stackFrames": frames,
+            "totalFrames": frames.len(),
+        });
+        if let Some(h) = stack_health {
+            let mut sh = json!({
+                "frameCount": h.frame_count,
+                "maxRecursion": h.max_recursion,
+            });
+            if let Some(total) = h.thread_stack_size {
+                sh["threadStackSize"] = json!(total);
+            }
+            if let Some(used) = h.thread_stack_used {
+                sh["threadStackUsed"] = json!(used);
+            }
+            if let Some(pct) = h.used_pct() {
+                sh["threadStackUsedPct"] = json!(pct);
+            }
+            body["bugstalker.stackHealth"] = sh;
+        }
+        self.send_success_body(req, body)
     }
 
     pub(super) fn handle_scopes(&mut self, req: &DapRequest) -> anyhow::Result<()> {

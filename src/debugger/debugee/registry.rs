@@ -302,6 +302,17 @@ impl DwarfRegistry {
         self.find_segment(addr).map(|e| e.kind)
     }
 
+    /// Variables-view §5.5 — return the half-open `[from, to)`
+    /// runtime address range of the segment containing `addr`,
+    /// for thread-stack-budget computation. `None` when no
+    /// segment contains the address.
+    pub fn containing_range(&self, addr: RelocatedAddress) -> Option<RegionRange> {
+        self.find_segment(addr).map(|e| RegionRange {
+            from: e.from,
+            to: e.to,
+        })
+    }
+
     /// Shared binary-search helper for the two address lookups.
     fn find_segment(&self, addr: RelocatedAddress) -> Option<&SegmentEntry> {
         let segs = &self.segment_writability;

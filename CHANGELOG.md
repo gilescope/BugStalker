@@ -7,6 +7,35 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- stack-health snapshot + per-local byte size (variables-view §5.5):
+  - New `stack_health` module: `StackHealth` struct carries
+    `thread_stack_size`, `thread_stack_used`, `frame_count`, and
+    a per-function `recursion: HashMap<String, u32>` (only
+    functions appearing ≥ 2 times in the backtrace) plus
+    `max_recursion`. `used_pct()` saturates at 100 so a
+    guard-page-overflow mid-stop reads as 100% rather than
+    wrapping.
+  - `DwarfRegistry::containing_range(addr)` returns the half-open
+    `[from, to)` of the segment containing an address — used by
+    `stack_health` to look up the thread-stack mapping from the
+    SP register.
+  - `QueryResult::byte_size()` resolves `DW_AT_byte_size` via the
+    existing `ComplexType::type_size_in_bytes` path.
+  - DAP `handle_stack_trace` attaches `bugstalker.stackHealth`
+    (frameCount / maxRecursion / threadStackSize /
+    threadStackUsed / threadStackUsedPct) to the response and
+    `bugstalker.recursionCount` per frame when the function
+    repeats.
+  - DAP `handle_variables` emits `bugstalker.byte_size` per
+    top-level row.
+  - 4 unit tests for the `used_pct` arithmetic + 1 live-debuggee
+    integration test asserting `thread_stack_size`/`used`
+    invariants and `a: i32 → byte_size == 4`.
+  - Deferred for v0 (see variables-view.md §7): per-frame size
+    from CFA — needs extending the unwinder's `FrameSpan` with
+    `cfa` and computing `CFA(this) − CFA(parent)`. The other
+    three §5.5 signals already give actionable hints.
+
 - storage-class glyph data per variable (variables-view §5.3):
   - `DwarfRegistry` segment index now carries a `SegmentKind` enum
     (`Static`, `Stack`, `Heap`, `AnonRw`, `Other`) per mapping,

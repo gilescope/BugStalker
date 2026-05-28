@@ -14,6 +14,7 @@ pub(crate) mod platform_checkpoint;
 pub mod process;
 pub mod register;
 pub mod rust;
+pub mod stack_health;
 mod step;
 pub(crate) mod thread_db_compat;
 mod utils;
