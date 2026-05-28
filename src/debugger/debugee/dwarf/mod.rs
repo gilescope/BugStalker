@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pub mod eval;
 mod loader;
-mod location;
+pub mod location;
 mod symbol;
 pub mod r#type;
 pub mod unit;

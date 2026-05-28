@@ -47,6 +47,37 @@ pub enum SegmentWritability {
     ReadWrite,
 }
 
+/// What kind of mapping a runtime address sits in, classified
+/// from `proc_maps` metadata. Drives the variables-view §5.3
+/// storage-class glyph for variables whose evaluated location
+/// is an absolute address — also drives the `↗` heap overlay
+/// on pointer-typed bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SegmentKind {
+    /// File-backed mapping — a loaded object (main executable
+    /// or shared lib). Variables-pane storage class: Static
+    /// (combine with [`SegmentWritability`] for the RO/RW split).
+    Static,
+    /// `[stack]` — main thread stack on Linux, the analogous
+    /// mapping on other OSes. Per-thread stacks for spawned
+    /// threads typically show up as anon mappings (`AnonRw`).
+    Stack,
+    /// `[heap]` — the program-break-managed brk segment, the
+    /// classic C heap. Most Rust allocations go through anon
+    /// mmap and land in `AnonRw` rather than here.
+    Heap,
+    /// Anonymous read-write mapping (no file backing, no
+    /// special name). Covers thread stacks, mmap-allocated
+    /// heap chunks (jemalloc / glibc malloc large allocations),
+    /// TLS arena. For the variables pane's heap overlay we
+    /// treat AnonRw == possible-heap.
+    AnonRw,
+    /// `[vvar]`, `[vdso]`, `[vsyscall]`, or anything else
+    /// proc_maps doesn't classify into the above. Variables
+    /// don't normally live here; treated as a fallback.
+    Other,
+}
+
 /// Address-range entry in the segment-writability index. Stored
 /// half-open: `[from, to)`.
 #[derive(Debug, Clone, Copy)]
@@ -54,6 +85,7 @@ struct SegmentEntry {
     from: RelocatedAddress,
     to: RelocatedAddress,
     writability: SegmentWritability,
+    kind: SegmentKind,
 }
 
 /// Registry contains debug information about main executable object and loaded shared libraries.
@@ -230,12 +262,12 @@ impl DwarfRegistry {
         ranges.sort_unstable_by(|(_, r1), (_, r2)| r1.from.cmp(&r2.from));
         self.ranges = ranges;
 
-        // Variables-view §5.2: rebuild the segment-writability index
-        // from the just-fetched proc_maps. We use EVERY mapping (not
-        // just file-backed PT_LOAD segments) so that the [heap] /
-        // [stack] / anon-mmap regions are also classifiable — useful
-        // for the heap-overlay glyph in §5.3 too. Sorted by `from`
-        // for binary-search lookup.
+        // Variables-view §5.2 + §5.3: rebuild the segment-writability
+        // + segment-kind index from the just-fetched proc_maps. We
+        // use EVERY mapping (not just file-backed PT_LOAD segments)
+        // so heap / stack / anon-mmap regions are classifiable —
+        // §5.3 storage glyph + heap overlay both consume this.
+        // Sorted by `from` for binary-search lookup.
         let mut segs: Vec<SegmentEntry> = proc_maps
             .iter()
             .map(|m| SegmentEntry {
@@ -246,6 +278,7 @@ impl DwarfRegistry {
                 } else {
                     SegmentWritability::ReadOnly
                 },
+                kind: classify_map_kind(m),
             })
             .collect();
         segs.sort_unstable_by_key(|e| e.from);
@@ -260,16 +293,26 @@ impl DwarfRegistry {
     /// valid load address). O(log N) over the loaded segment count.
     /// See variables-view.md §5.2 for the user-facing semantics.
     pub fn address_writability(&self, addr: RelocatedAddress) -> Option<SegmentWritability> {
+        self.find_segment(addr).map(|e| e.writability)
+    }
+
+    /// Look up the segment-kind of the segment containing `addr`.
+    /// See variables-view.md §5.3.
+    pub fn address_segment_kind(&self, addr: RelocatedAddress) -> Option<SegmentKind> {
+        self.find_segment(addr).map(|e| e.kind)
+    }
+
+    /// Shared binary-search helper for the two address lookups.
+    fn find_segment(&self, addr: RelocatedAddress) -> Option<&SegmentEntry> {
         let segs = &self.segment_writability;
-        // Binary search for the rightmost entry whose `from <= addr`;
-        // then check that `addr < entry.to`.
+        // Rightmost entry whose `from <= addr`, then half-open check.
         let idx = match segs.binary_search_by_key(&addr, |e| e.from) {
             Ok(i) => i,
             Err(0) => return None,
             Err(i) => i - 1,
         };
         let entry = segs.get(idx)?;
-        (addr < entry.to).then_some(entry.writability)
+        (addr < entry.to).then_some(entry)
     }
 
     /// Add new debug information into registry.
@@ -478,10 +521,36 @@ impl DwarfRegistry {
                 from: RelocatedAddress::from(from),
                 to: RelocatedAddress::from(to),
                 writability: w,
+                kind: SegmentKind::Static, // not exercised here
             })
             .collect();
         segs.sort_unstable_by_key(|e| e.from);
         self.segment_writability = segs;
+    }
+}
+
+/// Classify a [`MapRange`] into a [`SegmentKind`]. proc_maps on
+/// Linux exposes `filename()` as `Some("[stack]")`/`Some("[heap]")`
+/// for the special anonymous regions and `Some(real_path)` for
+/// file-backed mappings; `None` is true anonymous. macOS / Windows
+/// proc_maps follow the same shape (special names in brackets,
+/// real paths otherwise).
+fn classify_map_kind(m: &MapRange) -> SegmentKind {
+    let Some(name) = m.filename() else {
+        // No filename → true anonymous mapping. Writable ones are
+        // the heap-ish bucket; read-only anon is unusual and we
+        // group it under Other.
+        return if m.is_write() {
+            SegmentKind::AnonRw
+        } else {
+            SegmentKind::Other
+        };
+    };
+    match name.to_str().unwrap_or("") {
+        "[stack]" => SegmentKind::Stack,
+        "[heap]" => SegmentKind::Heap,
+        s if s.starts_with('[') => SegmentKind::Other,
+        _ => SegmentKind::Static,
     }
 }
 

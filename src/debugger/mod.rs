@@ -746,6 +746,15 @@ impl Debugger {
         &self.expl_context
     }
 
+    /// Variables-view §5.2 + §5.3: public accessor for the
+    /// per-process address index. External callers (tests,
+    /// vscode-extension support) use this to query segment
+    /// writability and segment kind without going through a
+    /// QueryResult.
+    pub fn dwarf_registry(&self) -> &debugee::DwarfRegistry {
+        self.debugee.dwarf_registry()
+    }
+
     /// Update current program counters for current in focus thread.
     fn ecx_update_location(&mut self) -> Result<&ExplorationContext, Error> {
         let old_ecx = self.ecx();

@@ -8,6 +8,7 @@ use crate::debugger::debugee::dwarf::unit::die_ref::{Argument, FatDieRef, Typed,
 use crate::debugger::error::Error;
 use crate::debugger::error::Error::FunctionNotFound;
 use crate::debugger::variable::dqe::{DataCast, Dqe, PointerCast, Selector};
+use crate::debugger::variable::storage::StorageClass;
 use crate::debugger::variable::value::Value;
 use crate::debugger::variable::value::parser::{ParseContext, ValueModifiers, ValueParser};
 use crate::debugger::variable::r#virtual::VirtualVariableDie;
@@ -37,6 +38,11 @@ pub struct QueryResult<'a> {
     base_type: Rc<ComplexType>,
     identity: Identity,
     evcx_builder: EvaluationContextBuilder<'a>,
+    /// Variables-view §5.3 storage class. Computed at construction
+    /// time from the variable's DW_AT_location expression + the
+    /// segment-kind index. `None` for results derived via DQE
+    /// (DataCast / PointerCast) where there's no source DIE.
+    storage: Option<StorageClass>,
 }
 
 impl QueryResult<'_> {
@@ -88,6 +94,13 @@ impl QueryResult<'_> {
     #[inline(always)]
     pub fn scope(&self) -> &Option<Box<[Range]>> {
         &self.scope
+    }
+
+    /// Variables-view §5.3 storage class. `None` for synthetic
+    /// QueryResults produced by DQE casts (no source DIE to walk).
+    #[inline(always)]
+    pub fn storage(&self) -> Option<StorageClass> {
+        self.storage
     }
 
     /// Evaluate any function with evaluation context.
@@ -304,6 +317,12 @@ impl<'dbg> DqeExecutor<'dbg> {
         die_ref: &FatDieRef<'dbg, H>,
         ranges: Option<Box<[Range]>>,
     ) -> Option<QueryResult<'dbg>> {
+        // Storage classification (variables-view §5.3) happens at
+        // the call site, after this method returns — the caller
+        // knows whether it's looking at a Variable or Argument
+        // and we don't want to specialise on H here. Default `None`
+        // is then overwritten by `qr.storage = …`.
+        let storage = None;
         let debugger = self.debugger;
         let r#type = gcx().with_type_cache(|tc| weak_error!(type_from_cache!(die_ref, tc)))?;
 
@@ -336,6 +355,7 @@ impl<'dbg> DqeExecutor<'dbg> {
             base_type: r#type,
             identity: Identity::from_die(die_ref),
             evcx_builder: context_builder,
+            storage,
         })
     }
 
@@ -365,7 +385,18 @@ impl<'dbg> DqeExecutor<'dbg> {
                 let vars = self.variable_die_by_selector(selector)?;
                 Ok(vars
                     .iter()
-                    .filter_map(|var_die| self.root_from_die(var_die, var_die.ranges()))
+                    .filter_map(|var_die| {
+                        let mut qr = self.root_from_die(var_die, var_die.ranges())?;
+                        // Variables-view §5.3: now that root_from_die
+                        // has populated `qr.value` (and therefore
+                        // `value.in_memory_location()`), compute the
+                        // storage class by walking the DW_AT_location
+                        // expression + the segment-kind index.
+                        let addr = qr.value().in_memory_location();
+                        qr.storage =
+                            compute_storage_for_variable(var_die, addr, self.debugger);
+                        Some(qr)
+                    })
                     .collect())
             }
         }
@@ -409,6 +440,9 @@ impl<'dbg> DqeExecutor<'dbg> {
             base_type: r#type,
             identity: Identity::default(),
             evcx_builder: context_builder,
+            // Synthetic QueryResult — no source DIE to walk for
+            // storage classification (variables-view §5.3).
+            storage: None,
         })
     }
 
@@ -466,6 +500,9 @@ impl<'dbg> DqeExecutor<'dbg> {
             base_type: r#type,
             identity: Identity::default(),
             evcx_builder: context_builder,
+            // Synthetic QueryResult — no source DIE to walk for
+            // storage classification (variables-view §5.3).
+            storage: None,
         })
     }
 
@@ -617,7 +654,11 @@ impl<'dbg> DqeExecutor<'dbg> {
                 // silently drop those entries for v0. A future
                 // refactor could surface them with an "<unavailable>"
                 // placeholder so the user still sees the name.
-                if let Some(qr) = self.root_from_die(&die_ref, None) {
+                if let Some(mut qr) = self.root_from_die(&die_ref, None) {
+                    // Variables-view §5.3 storage class for the
+                    // file-scope enumeration path (statics + TLS).
+                    let addr = qr.value().in_memory_location();
+                    qr.storage = compute_storage_for_variable(&die_ref, addr, self.debugger);
                     out.push(qr);
                 }
             }
@@ -671,6 +712,23 @@ pub enum FileScopeKind {
     Statics,
     /// `thread_local!`s.
     ThreadLocals,
+}
+
+/// Walk a Variable DIE's `DW_AT_location` and classify the storage
+/// class (variables-view §5.3). Cross-references the evaluated
+/// address (passed in via `addr` from the parsed Value, no need to
+/// re-evaluate) with the segment-kind index to split Static into
+/// RO / RW.
+fn compute_storage_for_variable(
+    die_ref: &FatDieRef<'_, Variable>,
+    addr: Option<usize>,
+    dbg: &Debugger,
+) -> Option<StorageClass> {
+    use crate::debugger::variable::storage;
+    let pc = dbg.ecx().location().global_pc;
+    let expr = die_ref.location_expression(pc);
+    let encoding = die_ref.unit_encoding();
+    Some(storage::classify(expr.as_ref(), addr, encoding, dbg))
 }
 
 /// Interned name symbols for the three names rustc gives to

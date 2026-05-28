@@ -7,7 +7,7 @@ mod rendezvous;
 pub mod tracee;
 pub mod tracer;
 
-pub use registry::{DwarfRegistry, RegionInfo, SegmentWritability};
+pub use registry::{DwarfRegistry, RegionInfo, SegmentKind, SegmentWritability};
 pub use rendezvous::RendezvousError;
 
 use super::r#async::TokioVersion;

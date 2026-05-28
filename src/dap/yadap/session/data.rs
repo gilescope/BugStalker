@@ -60,6 +60,17 @@ pub struct VarItem {
     /// ["readOnly"]` so stock DAP clients (default VSCode pane)
     /// italicise the row even without our extension.
     pub mutability: Option<&'static str>,
+    /// Variables-view §5.3: serialised as the DAP custom field
+    /// `bugstalker.storage = "stack" | "register" | "static_ro" |
+    /// "static_rw" | "tls" | "optimized" | "unknown"`. Drives the
+    /// leading storage-class glyph in the vscode-extension.
+    pub storage: Option<&'static str>,
+    /// Variables-view §5.3 heap overlay: when `true`, this
+    /// binding's value points into a heap-ish mapping (the `↗`
+    /// glyph layers on top of the storage class). Serialised as
+    /// `bugstalker.points_to_heap = true` and omitted when false
+    /// to keep DAP JSON tight.
+    pub points_to_heap: bool,
 }
 
 impl super::DebugSession {
@@ -141,6 +152,14 @@ impl super::DebugSession {
                         "attributes": ["readOnly"],
                     });
                 }
+            }
+            // Variables-view §5.3 — storage class + heap overlay.
+            // Both emitted as custom fields; no stock DAP equivalent.
+            if let Some(s) = v.storage {
+                entry["bugstalker.storage"] = json!(s);
+            }
+            if v.points_to_heap {
+                entry["bugstalker.points_to_heap"] = json!(true);
             }
             out.push(entry);
         }
@@ -1229,13 +1248,14 @@ fn value_children(
                     child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
-                    // Variables-view §5.2: child mutability inherits
-                    // logically from the parent (a field of a `ro`
-                    // struct is `ro` for the user's purposes), but
-                    // computing it here would need the parent's
-                    // mutability propagated through the recursion.
-                    // Deferred — top-level row already shows the hint.
+                    // Variables-view §5.2 / §5.3: child rows skip
+                    // mutability / storage / heap hints in v0 —
+                    // top-level row already shows them. Per-field
+                    // inheritance from parent is a documented §7
+                    // follow-up.
                     mutability: None,
+                    storage: None,
+                    points_to_heap: false,
                 });
             }
             Some(out)
@@ -1256,6 +1276,8 @@ fn value_children(
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
                     mutability: None,
+                    storage: None,
+                    points_to_heap: false,
                 });
             }
             Some(out)
@@ -1276,6 +1298,8 @@ fn value_children(
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
                     mutability: None,
+                    storage: None,
+                    points_to_heap: false,
                 });
             }
             Some(out)
@@ -1299,6 +1323,8 @@ fn value_children(
                     write: None,
                     source: cell_qr.map(|qr| qr.value().clone()),
                     mutability: None,
+                    storage: None,
+                    points_to_heap: false,
                 });
             }
             Some(out)
@@ -1323,6 +1349,8 @@ fn value_children(
                     write: value_write_meta(deref_qr.value(), type_graph.clone()),
                     source: Some(deref_qr.value().clone()),
                     mutability: None,
+                    storage: None,
+                    points_to_heap: false,
                 }];
                 Some(out)
             } else {
@@ -1342,6 +1370,8 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
         let mutability = mutability_hint(&r, dbg);
+        let storage = storage_hint(&r);
+        let points_to_heap = points_to_heap_hint(&r, dbg);
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1350,6 +1380,8 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
             mutability,
+            storage,
+            points_to_heap,
         });
     }
     Ok(out)
@@ -1370,6 +1402,25 @@ fn mutability_hint(
     }
 }
 
+/// Variables-view §5.3: stringify the storage class from a
+/// QueryResult. Returns the result already cached on the
+/// QueryResult by `DqeExecutor::root_from_die` — we don't redo
+/// the DWARF walk here.
+fn storage_hint(
+    qr: &debugger::variable::execute::QueryResult<'_>,
+) -> Option<&'static str> {
+    qr.storage().map(|s| s.as_dap_str())
+}
+
+/// Variables-view §5.3 heap overlay — `true` when the variable's
+/// value points into a heap-ish mapping (`[heap]` or anon RW).
+fn points_to_heap_hint(
+    qr: &debugger::variable::execute::QueryResult<'_>,
+    dbg: &debugger::Debugger,
+) -> bool {
+    debugger::variable::storage::value_points_to_heap(qr.value(), dbg)
+}
+
 pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     use debugger::variable::dqe::{Dqe, Selector};
     use debugger::variable::render::RenderValue;
@@ -1380,6 +1431,8 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
         let mutability = mutability_hint(&r, dbg);
+        let storage = storage_hint(&r);
+        let points_to_heap = points_to_heap_hint(&r, dbg);
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1388,6 +1441,8 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
             mutability,
+            storage,
+            points_to_heap,
         });
     }
     Ok(out)
@@ -1431,6 +1486,8 @@ fn file_scope_var_items(
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
         let mutability = mutability_hint(&r, dbg);
+        let storage = storage_hint(&r);
+        let points_to_heap = points_to_heap_hint(&r, dbg);
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1439,6 +1496,8 @@ fn file_scope_var_items(
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
             mutability,
+            storage,
+            points_to_heap,
         });
     }
     Ok(out)

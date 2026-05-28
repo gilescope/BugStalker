@@ -7,6 +7,41 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- storage-class glyph data per variable (variables-view §5.3):
+  - `DwarfRegistry` segment index now carries a `SegmentKind` enum
+    (`Static`, `Stack`, `Heap`, `AnonRw`, `Other`) per mapping,
+    classified from `proc_maps` filenames. New
+    `address_segment_kind(addr)` accessor; existing
+    `address_writability(addr)` still works.
+  - New `variable::storage` module: `StorageClass` enum (Stack,
+    Register, StaticReadOnly, StaticReadWrite, ThreadLocal,
+    OptimizedAway, Unknown) plus `classify(expr, addr, encoding, dbg)`
+    that walks the raw `DW_AT_location` operations and matches the
+    first significant opcode. For Address-producing expressions
+    (DW_OP_addr), the evaluated address is cross-referenced with
+    the segment-kind index to split Static into RO / RW.
+  - `value_points_to_heap(value, dbg)` extracts the pointee
+    address from Box / Rc / Arc / NonNull / Weak / raw pointers
+    and returns `true` when it falls in `[heap]` or anon-RW.
+  - `FatDieRef<Variable>::location_expression(pc)` +
+    `unit_encoding()` public accessors expose the raw expression
+    for classification without going through the private
+    `DwarfLocation` wrapper.
+  - `QueryResult` carries `storage: Option<StorageClass>`,
+    populated by `DqeExecutor::apply_select_die` (variables path)
+    and `query_file_scope` (statics + TLS path) after `value` is
+    parsed.
+  - DAP `handle_variables` emits two more custom fields per
+    top-level row:
+    * `bugstalker.storage = "stack" | "register" | "static_ro" |
+      "static_rw" | "tls" | "optimized" | "unknown"`
+    * `bugstalker.points_to_heap = true` (omitted when false)
+  - 2 unit tests for the DAP string vocab + 1 live-debuggee
+    integration test pinning `static GLOB_2` to StaticReadOnly
+    and the `box_d: Box<i32>` binding to Stack. Heap-overlay
+    assertion is currently lenient — see variables-view.md §7
+    on segment-index refresh.
+
 - mutability classifier + DAP hint per variable (variables-view §5.2):
   - New `DwarfRegistry::address_writability(addr)` builds a sorted
     index of all `PT_LOAD` mappings (with their PF_R/W/X bits, read

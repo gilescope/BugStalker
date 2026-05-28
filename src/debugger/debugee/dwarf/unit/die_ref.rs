@@ -264,6 +264,34 @@ impl<'dbg> FatDieRef<'dbg, Variable> {
             .map(|ranges| pc.in_ranges(&ranges))
             .unwrap_or(true)
     }
+
+    /// Resolve this variable DIE's `DW_AT_location` into a gimli
+    /// `Expression` at the given PC. Returns `None` when the DIE
+    /// has no location attribute (optimised-away binding) or when
+    /// the attribute's loclist has no entry covering `pc`.
+    ///
+    /// Variables-view §5.3: callers walk the returned Expression's
+    /// `operations()` to classify the storage class (stack /
+    /// register / static / TLS / optimized-away) by inspecting
+    /// the head opcode.
+    pub fn location_expression(
+        &self,
+        pc: GlobalAddress,
+    ) -> Option<gimli::Expression<crate::debugger::debugee::dwarf::EndianArcSlice>> {
+        let die = weak_error!(self.deref())?;
+        let loc = die.location()?;
+        crate::debugger::debugee::dwarf::location::Location(&loc).try_as_expression(
+            self.debug_info,
+            self.unit(),
+            pc,
+        )
+    }
+
+    /// Encoding of the DWARF unit this variable lives in — needed
+    /// by gimli to decode the Expression's operations.
+    pub fn unit_encoding(&self) -> gimli::Encoding {
+        self.unit().encoding()
+    }
 }
 
 impl<'dbg, H: Typed> FatDieRef<'dbg, H> {
