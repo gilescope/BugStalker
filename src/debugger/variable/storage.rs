@@ -139,7 +139,10 @@ fn classify_address(evaluated_addr: Option<usize>, dbg: &Debugger) -> StorageCla
     };
     let reg = dbg.debugee.dwarf_registry();
     let raddr = RelocatedAddress::from(addr);
-    match (reg.address_segment_kind(raddr), reg.address_writability(raddr)) {
+    match (
+        reg.address_segment_kind(raddr),
+        reg.address_writability(raddr),
+    ) {
         (Some(SegmentKind::Static), Some(SegmentWritability::ReadOnly)) => {
             StorageClass::StaticReadOnly
         }

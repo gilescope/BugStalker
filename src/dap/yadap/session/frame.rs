@@ -125,17 +125,13 @@ impl super::DebugSession {
                 "line": line.unwrap_or(0),
                 "column": col.unwrap_or(0),
             });
-            if let Some(rec_count) = f
-                .func_name
-                .as_ref()
-                .and_then(|n| {
-                    bt.iter()
-                        .filter(|s| s.func_name.as_ref() == Some(n))
-                        .count()
-                        .checked_sub(0)
-                        .filter(|c| *c >= 2)
-                })
-            {
+            if let Some(rec_count) = f.func_name.as_ref().and_then(|n| {
+                bt.iter()
+                    .filter(|s| s.func_name.as_ref() == Some(n))
+                    .count()
+                    .checked_sub(0)
+                    .filter(|c| *c >= 2)
+            }) {
                 frame_obj["bugstalker.recursionCount"] = json!(rec_count);
             }
             frames.push(frame_obj);

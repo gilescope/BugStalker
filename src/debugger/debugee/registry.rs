@@ -627,9 +627,7 @@ mod segment_writability_tests {
     #[test]
     fn lookup_in_readonly_segment_returns_ro() {
         let mut r = empty_registry();
-        r.set_segment_writability_for_test(vec![
-            (0x1000, 0x2000, SegmentWritability::ReadOnly),
-        ]);
+        r.set_segment_writability_for_test(vec![(0x1000, 0x2000, SegmentWritability::ReadOnly)]);
         assert_eq!(
             r.address_writability(RelocatedAddress::from(0x1234usize)),
             Some(SegmentWritability::ReadOnly)
@@ -639,9 +637,7 @@ mod segment_writability_tests {
     #[test]
     fn lookup_at_segment_boundaries() {
         let mut r = empty_registry();
-        r.set_segment_writability_for_test(vec![
-            (0x1000, 0x2000, SegmentWritability::ReadOnly),
-        ]);
+        r.set_segment_writability_for_test(vec![(0x1000, 0x2000, SegmentWritability::ReadOnly)]);
         // Inclusive lower bound, exclusive upper.
         assert_eq!(
             r.address_writability(RelocatedAddress::from(0x1000usize)),
@@ -661,9 +657,7 @@ mod segment_writability_tests {
     #[test]
     fn lookup_below_lowest_segment_returns_none() {
         let mut r = empty_registry();
-        r.set_segment_writability_for_test(vec![
-            (0x1000, 0x2000, SegmentWritability::ReadOnly),
-        ]);
+        r.set_segment_writability_for_test(vec![(0x1000, 0x2000, SegmentWritability::ReadOnly)]);
         assert_eq!(
             r.address_writability(RelocatedAddress::from(0x0500usize)),
             None

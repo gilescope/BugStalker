@@ -30,8 +30,8 @@ use std::collections::HashSet;
 
 use crate::debugger::Debugger;
 use crate::debugger::address::RelocatedAddress;
-use crate::debugger::debugee::dwarf::r#type::{CModifier, ComplexType, TypeDeclaration, TypeId};
 use crate::debugger::debugee::SegmentWritability;
+use crate::debugger::debugee::dwarf::r#type::{CModifier, ComplexType, TypeDeclaration, TypeId};
 use crate::debugger::variable::execute::QueryResult;
 use crate::debugger::variable::value::Value;
 
@@ -155,11 +155,7 @@ pub fn classify_by_type(graph: &ComplexType) -> Mutability {
 /// Recursively scan `ty` for any `UnsafeCell<…>` Structure / Union
 /// declaration. `visited` breaks cycles in self-referential types
 /// (Rc<RefCell<Node { next: Option<Rc<…>> }>>).
-fn contains_unsafe_cell(
-    graph: &ComplexType,
-    ty: TypeId,
-    visited: &mut HashSet<TypeId>,
-) -> bool {
+fn contains_unsafe_cell(graph: &ComplexType, ty: TypeId, visited: &mut HashSet<TypeId>) -> bool {
     if !visited.insert(ty) {
         return false;
     }
@@ -169,15 +165,13 @@ fn contains_unsafe_cell(
     match decl {
         TypeDeclaration::Structure { name, members, .. }
         | TypeDeclaration::Union { name, members, .. } => {
-            if name
-                .as_deref()
-                .is_some_and(|n| n.starts_with("UnsafeCell"))
-            {
+            if name.as_deref().is_some_and(|n| n.starts_with("UnsafeCell")) {
                 return true;
             }
-            members
-                .iter()
-                .any(|m| m.type_ref.is_some_and(|t| contains_unsafe_cell(graph, t, visited)))
+            members.iter().any(|m| {
+                m.type_ref
+                    .is_some_and(|t| contains_unsafe_cell(graph, t, visited))
+            })
         }
         TypeDeclaration::RustEnum {
             enumerators,
@@ -190,15 +184,17 @@ fn contains_unsafe_cell(
             {
                 return true;
             }
-            enumerators
-                .values()
-                .any(|m| m.type_ref.is_some_and(|t| contains_unsafe_cell(graph, t, visited)))
+            enumerators.values().any(|m| {
+                m.type_ref
+                    .is_some_and(|t| contains_unsafe_cell(graph, t, visited))
+            })
         }
         TypeDeclaration::Array(arr) => arr
             .element_type()
             .is_some_and(|t| contains_unsafe_cell(graph, t, visited)),
-        TypeDeclaration::ModifiedType { inner, .. } => inner
-            .is_some_and(|t| contains_unsafe_cell(graph, t, visited)),
+        TypeDeclaration::ModifiedType { inner, .. } => {
+            inner.is_some_and(|t| contains_unsafe_cell(graph, t, visited))
+        }
         // We deliberately don't recurse through Pointer — a `Box<UnsafeCell<T>>`
         // is RW because it's a smart pointer (owned, default-RW), not because
         // we follow the pointer's target. The same logic at the top of

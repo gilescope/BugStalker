@@ -51,10 +51,7 @@ impl LayoutBreakdown {
         if self.total == 0 {
             return None;
         }
-        Some(
-            (self.padding.saturating_mul(100) / self.total)
-                .min(100) as u8,
-        )
+        Some((self.padding.saturating_mul(100) / self.total).min(100) as u8)
     }
 }
 
@@ -520,8 +517,7 @@ impl<'dbg> DqeExecutor<'dbg> {
                         // storage class by walking the DW_AT_location
                         // expression + the segment-kind index.
                         let addr = qr.value().in_memory_location();
-                        qr.storage =
-                            compute_storage_for_variable(var_die, addr, self.debugger);
+                        qr.storage = compute_storage_for_variable(var_die, addr, self.debugger);
                         Some(qr)
                     })
                     .collect())
@@ -878,9 +874,7 @@ impl TlsInternalNames {
     }
 
     fn is_tls_internal(&self, sym: string_interner::DefaultSymbol) -> bool {
-        Some(sym) == self.key
-            || Some(sym) == self.val
-            || Some(sym) == self.rust_std_internal
+        Some(sym) == self.key || Some(sym) == self.val || Some(sym) == self.rust_std_internal
     }
 }
 

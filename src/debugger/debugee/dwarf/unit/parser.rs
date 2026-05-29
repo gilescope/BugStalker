@@ -125,8 +125,11 @@ impl<'a> DwarfUnitParser<'a> {
         // variable's subprogram ancestor may be later in unit order
         // (children come after parents in DWARF, but we want the
         // *complete* parent chain which only stabilises post-walk).
-        let mut all_variables: Vec<(string_interner::DefaultSymbol, NamespaceHierarchy, UnitOffset)> =
-            Vec::new();
+        let mut all_variables: Vec<(
+            string_interner::DefaultSymbol,
+            NamespaceHierarchy,
+            UnitOffset,
+        )> = Vec::new();
 
         let mut cursor = bs_unit.unit.entries();
         let mut parent_offset = None;

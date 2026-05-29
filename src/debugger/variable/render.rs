@@ -1451,10 +1451,7 @@ impl RenderValue for Value {
                     match inner_layout {
                         Some(ValueLayout::PreRendered(s)) => {
                             let glyph = lock_state_glyph(state);
-                            ValueLayout::PreRendered(Cow::Owned(format!(
-                                "{glyph} {}",
-                                s.as_ref()
-                            )))
+                            ValueLayout::PreRendered(Cow::Owned(format!("{glyph} {}", s.as_ref())))
                         }
                         Some(other) => other,
                         None => return None,
@@ -1689,7 +1686,10 @@ mod lock_state_tests {
     #[test]
     fn glyph_shared_saturates_at_nine_plus() {
         assert_eq!(lock_state_glyph(LockState::Shared(10)).as_ref(), "👥9+");
-        assert_eq!(lock_state_glyph(LockState::Shared(u32::MAX)).as_ref(), "👥9+");
+        assert_eq!(
+            lock_state_glyph(LockState::Shared(u32::MAX)).as_ref(),
+            "👥9+"
+        );
     }
 
     #[test]

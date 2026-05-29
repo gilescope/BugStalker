@@ -1451,9 +1451,7 @@ fn mutability_hint(
 /// QueryResult. Returns the result already cached on the
 /// QueryResult by `DqeExecutor::root_from_die` — we don't redo
 /// the DWARF walk here.
-fn storage_hint(
-    qr: &debugger::variable::execute::QueryResult<'_>,
-) -> Option<&'static str> {
+fn storage_hint(qr: &debugger::variable::execute::QueryResult<'_>) -> Option<&'static str> {
     qr.storage().map(|s| s.as_dap_str())
 }
 
