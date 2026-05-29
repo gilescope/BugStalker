@@ -2191,6 +2191,15 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- variables: the Statics and Thread-locals panes now render as a
+  navigable namespace tree keyed by the `::` identity path
+  (`hyper_util::client::legacy::pool::__CALLSITE` becomes collapsible
+  `hyper_util` → … → `__CALLSITE` nodes) instead of a flat, unordered
+  dump. Single-child namespace chains collapse into one node so there
+  are no empty intermediate clicks; entries are sorted, namespaces
+  before leaves, and each namespace node shows a `(N)` descendant count.
+  Expands level-by-level via the existing child machinery. See
+  `doc/design-principles.md` §4.
 - variables/perf: the Statics and Thread-locals DAP scopes are now lazy.
   `handle_scopes` previously read and rendered every file-scope static's
   value on every stop just to build the scope list — ~15 ms per step on

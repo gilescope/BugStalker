@@ -25,10 +25,10 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::path::PathBuf;
 
-/// Breakpoint line in `statics_heavy/src/main.rs` — every generated
-/// module static is in scope, and the frame resolves to the
-/// `statics_heavy` crate so `current_crate` matches all 4000.
-const BP_LINE: u64 = 14;
+/// Breakpoint line in `statics_heavy/src/main.rs` (the `println!`) —
+/// every generated module static is in scope and the frame resolves to
+/// the `statics_heavy` crate so `current_crate` matches all 4000.
+const BP_LINE: u64 = 13;
 
 fn debuggee_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/target/debug/statics_heavy")

@@ -1598,7 +1598,168 @@ fn file_scope_var_items(
             layout,
         });
     }
-    Ok(out)
+    // Group the flat list into a navigable namespace tree
+    // (design-principles.md §4). The existing child machinery in
+    // `handle_variables` expands the tree level-by-level.
+    Ok(group_by_namespace(out))
+}
+
+/// Group a flat list of file-scope variables into a namespace tree
+/// keyed by each entry's `::`-separated identity path
+/// (design-principles.md §4). `hyper_util::client::legacy::pool::
+/// __CALLSITE` becomes nested namespace nodes ending in a `__CALLSITE`
+/// leaf, so the pane is navigable instead of a flat unordered dump.
+/// Single-child namespace chains are collapsed (`a::b::c` shown as one
+/// node) so the user isn't forced to click through empty intermediate
+/// levels. Entries at each level are sorted (namespaces before leaves);
+/// each namespace node carries a `(N)` descendant-count summary and
+/// expands via the normal child-reference machinery.
+fn group_by_namespace(items: Vec<VarItem>) -> Vec<VarItem> {
+    let mut root = NsTrie::default();
+    for item in items {
+        // Owned segments so `item` can move into `insert` without the
+        // path borrow outliving it.
+        let segments: Vec<String> = item
+            .name
+            .split("::")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        root.insert(&segments, item);
+    }
+    root.into_varitems()
+}
+
+/// Namespace trie used by [`group_by_namespace`].
+#[derive(Default)]
+struct NsTrie {
+    /// Child namespaces, sorted by segment for stable display order.
+    subs: std::collections::BTreeMap<String, NsTrie>,
+    /// Statics declared at exactly this namespace level (name already
+    /// shortened to the final path segment).
+    leaves: Vec<VarItem>,
+}
+
+impl NsTrie {
+    fn insert(&mut self, segments: &[String], mut item: VarItem) {
+        match segments {
+            [] | [_] => {
+                // Leaf at this level — display only the final segment;
+                // the namespace path is now the row's ancestry.
+                if let Some(leaf) = segments.last() {
+                    item.name = leaf.clone();
+                }
+                self.leaves.push(item);
+            }
+            [head, rest @ ..] => {
+                self.subs.entry(head.clone()).or_default().insert(rest, item);
+            }
+        }
+    }
+
+    /// Total descendant leaf (static) count, for the namespace summary.
+    fn leaf_count(&self) -> usize {
+        self.leaves.len() + self.subs.values().map(NsTrie::leaf_count).sum::<usize>()
+    }
+
+    fn into_varitems(self) -> Vec<VarItem> {
+        let mut out = Vec::new();
+        for (seg, sub) in self.subs {
+            let (label, sub) = collapse_chain(seg, sub);
+            let count = sub.leaf_count();
+            let children = sub.into_varitems();
+            out.push(namespace_node(label, count, children));
+        }
+        // Leaves after namespaces, sorted for a stable, scannable order.
+        let mut leaves = self.leaves;
+        leaves.sort_by(|a, b| a.name.cmp(&b.name));
+        out.extend(leaves);
+        out
+    }
+}
+
+/// Fold a chain of single-child, leaf-free namespaces into one label so
+/// `a` → `b` → `c` shows as `a::b::c` rather than three empty clicks.
+fn collapse_chain(mut label: String, mut node: NsTrie) -> (String, NsTrie) {
+    while node.leaves.is_empty() && node.subs.len() == 1 {
+        let (seg, sub) = node.subs.into_iter().next().expect("len == 1");
+        label.push_str("::");
+        label.push_str(&seg);
+        node = sub;
+    }
+    (label, node)
+}
+
+/// A synthetic namespace row: collapsible, no value of its own beyond a
+/// `(N)` descendant count, no storage/mutability/size metadata.
+fn namespace_node(name: String, leaf_count: usize, children: Vec<VarItem>) -> VarItem {
+    VarItem {
+        name,
+        value: format!("({leaf_count})"),
+        type_name: None,
+        child: Some(children),
+        write: None,
+        source: None,
+        mutability: None,
+        storage: None,
+        points_to_heap: false,
+        byte_size: None,
+        layout: None,
+    }
+}
+
+#[cfg(test)]
+mod namespace_tree_tests {
+    use super::*;
+
+    fn leaf(name: &str) -> VarItem {
+        VarItem {
+            name: name.into(),
+            value: "v".into(),
+            type_name: None,
+            child: None,
+            write: None,
+            source: None,
+            mutability: None,
+            storage: None,
+            points_to_heap: false,
+            byte_size: None,
+            layout: None,
+        }
+    }
+
+    fn names(items: &[VarItem]) -> Vec<&str> {
+        items.iter().map(|i| i.name.as_str()).collect()
+    }
+
+    #[test]
+    fn single_chain_is_collapsed() {
+        let out = group_by_namespace(vec![leaf("a::b::c::X"), leaf("a::b::c::Y")]);
+        assert_eq!(names(&out), ["a::b::c"]);
+        assert_eq!(out[0].value, "(2)");
+        assert_eq!(names(out[0].child.as_ref().unwrap()), ["X", "Y"]);
+    }
+
+    #[test]
+    fn branches_are_not_collapsed() {
+        let out = group_by_namespace(vec![leaf("a::b::X"), leaf("a::c::Y")]);
+        assert_eq!(names(&out), ["a"]);
+        assert_eq!(names(out[0].child.as_ref().unwrap()), ["b", "c"]);
+    }
+
+    #[test]
+    fn root_level_static_stays_a_leaf() {
+        let out = group_by_namespace(vec![leaf("X")]);
+        assert_eq!(names(&out), ["X"]);
+        assert!(out[0].child.is_none());
+    }
+
+    #[test]
+    fn namespaces_precede_sorted_leaves() {
+        let out = group_by_namespace(vec![leaf("Z"), leaf("m::A"), leaf("B")]);
+        // namespace `m` first, then root leaves sorted B, Z.
+        assert_eq!(names(&out), ["m", "B", "Z"]);
+    }
 }
 
 #[cfg(test)]

@@ -10,5 +10,5 @@ fn main() {
     // despite `#[used]`, and so there's a live line to break on with
     // all the module statics in scope.
     let sum = m0::RO_0 + m39::RW_49.load(Ordering::Relaxed);
-    println!("{sum}"); // breakpoint line (line 14)
+    println!("{sum}"); // breakpoint line 13 — benches/tests stop here
 }

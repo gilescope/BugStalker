@@ -1059,6 +1059,96 @@ fn test_file_scope_enumeration_no_crash() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Namespace tree (variables-view, design-principles.md §4). Expanding
+/// the Statics scope on a static-heavy binary must yield a *tree* keyed
+/// by `::` path — collapsible namespace nodes — not a flat dump. Drives
+/// `statics_heavy` (4000 statics across `m0..m39`): expanding Statics
+/// surfaces the `statics_heavy` crate node; expanding that surfaces the
+/// `m*` module nodes; expanding one of those reaches the `RO_*`/`RW_*`
+/// leaves.
+#[test]
+#[serial]
+fn test_statics_rendered_as_namespace_tree() -> anyhow::Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "statics_heavy"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build statics_heavy example");
+    }
+
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("statics_heavy"),
+        &example_source("examples/statics_heavy/src/main.rs"),
+        13
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+
+    // Descend the tree: each `expand` returns the children of a ref and
+    // asserts the response is a successful variables array.
+    let expand = |session: &mut DapSession, vref: i64| -> anyhow::Result<Vec<Value>> {
+        let seq = session
+            .client
+            .send_request("variables", json!({ "variablesReference": vref }))?;
+        let resp = session.client.read_response(seq)?;
+        assert!(
+            resp["success"].as_bool().unwrap_or(false),
+            "variables failed: {resp}"
+        );
+        Ok(resp["body"]["variables"].as_array().cloned().unwrap_or_default())
+    };
+    // A namespace node is expandable (non-zero ref) and carries a
+    // `(N)` count rather than a typed value.
+    let namespace_ref = |rows: &[Value]| -> Option<i64> {
+        rows.iter()
+            .find(|r| {
+                r["variablesReference"].as_i64().unwrap_or(0) != 0
+                    && r["value"].as_str().is_some_and(|v| v.starts_with('('))
+            })
+            .and_then(|r| r["variablesReference"].as_i64())
+    };
+
+    let scopes_seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes_resp = session.client.read_response(scopes_seq)?;
+    ensure_response!(session, &scopes_resp, "scopes", scopes_seq, true);
+    let statics_ref = scopes_resp["body"]["scopes"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+    assert!(statics_ref != 0);
+
+    // Level 1: the Statics scope is a tree, not a flat 4000-row list.
+    // The top is one collapsed namespace node down to where it branches.
+    let level1 = expand(&mut session, statics_ref)?;
+    let ns1 = namespace_ref(&level1).expect("a namespace node at the top of Statics");
+
+    // Descend until we hit the `m*` module fan-out, then once more into
+    // the RO_/RW_ leaves — proving the tree expands level-by-level.
+    let level2 = expand(&mut session, ns1)?;
+    let ns2 = namespace_ref(&level2).expect("a module namespace node");
+    let leaves = expand(&mut session, ns2)?;
+    assert!(
+        leaves.iter().any(|r| {
+            r["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("RO_") || n.starts_with("RW_"))
+        }),
+        "expected RO_*/RW_* leaf statics under a module node; got: {:?}",
+        leaves
+            .iter()
+            .map(|r| r["name"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
 /// Regression test: walking every local in the showcase example
 /// (which exercises most variable shapes BugStalker renders) must
 /// not crash bs. Currently reproduces a kill-on-debug seen when
