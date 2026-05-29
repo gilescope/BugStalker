@@ -105,9 +105,9 @@ All notable changes to this project will be documented in this file.
     parsed.
   - DAP `handle_variables` emits two more custom fields per
     top-level row:
-    * `bugstalker.storage = "stack" | "register" | "static_ro" |
+    - `bugstalker.storage = "stack" | "register" | "static_ro" |
       "static_rw" | "tls" | "optimized" | "unknown"`
-    * `bugstalker.points_to_heap = true` (omitted when false)
+    - `bugstalker.points_to_heap = true` (omitted when false)
   - 2 unit tests for the DAP string vocab + 1 live-debuggee
     integration test pinning `static GLOB_2` to StaticReadOnly
     and the `box_d: Box<i32>` binding to Stack. Heap-overlay
@@ -131,10 +131,10 @@ All notable changes to this project will be documented in this file.
     `UnsafeCell` (recursive, cycle-broken) are `ReadWrite`.
   - DAP `handle_variables` now emits two new fields per top-level
     variable:
-    * standard `presentationHint.attributes = ["readOnly"]` for `ro`
+    - standard `presentationHint.attributes = ["readOnly"]` for `ro`
       rows so stock DAP clients (default VSCode pane) italicise the
       row even without our extension.
-    * custom `bugstalker.mutability = "ro" | "rw"` for the
+    - custom `bugstalker.mutability = "ro" | "rw"` for the
       vscode-extension to paint the grey/orange row-background hue
       (per variables-view §1.2). The string vocabulary is stable —
       bumping the enum without coordinating with the extension is
@@ -2274,6 +2274,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- variables/file-scope: stop the DAP session crashing when a variable's
+  DWARF array type carries a negative element count (e.g.
+  `DW_AT_upper_bound = -1`, emitted by C/`-sys` debug info for a
+  zero/unknown-length array). The byte-size computation read the `-1`
+  as a `u64::MAX` element count and overflowed, panicking
+  `BytesMut::with_capacity` ("capacity overflow") — and since
+  `handle_scopes` enumerates every file-scope static eagerly, one such
+  global tore down the whole session (`adapter-error: connection
+  closed`). Now `array_byte_size` uses checked arithmetic (negative
+  count clamps to 0), `into_raw_bytes` refuses sizes above `isize::MAX`,
+  and the new non-fatal `Error::ValueSizeImplausible` degrades the
+  offending variable to unreadable instead of crashing.
 - call: align the debuggee's RSP to 16 bytes before the inferior `CALL`
   instruction in `CallHelper::call_fn`, as System V AMD64 requires.
   Previously the trampoline kept whatever RSP the debuggee was stopped

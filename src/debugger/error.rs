@@ -54,6 +54,13 @@ pub enum Error {
     // --------------------------------- remote memory errors --------------------------------------
     #[error("invalid binary representation of type `{0}`: {1:?}")]
     TypeBinaryRepr(&'static str, Box<[u8]>),
+    #[error(
+        "type reports an implausible size of {0} bytes — refusing to allocate. \
+         This usually means malformed DWARF (e.g. a `DW_AT_upper_bound = -1` \
+         array bound emitted by C/-sys debug info); the variable is shown as \
+         unavailable instead of crashing the session."
+    )]
+    ValueSizeImplausible(u64),
     #[error("unknown address")]
     UnknownAddress,
     #[error("memory region offset not found ({0})")]
@@ -276,6 +283,9 @@ impl Error {
             Error::TraceeNotFound(_) => false,
             Error::DieNotFound(_) => false,
             Error::TypeBinaryRepr(_, _) => false,
+            // A single variable with a bogus size shouldn't tear down
+            // the session — degrade it to unreadable and continue.
+            Error::ValueSizeImplausible(_) => false,
             Error::UnknownAddress => false,
             Error::MappingOffsetNotFound(_) => false,
             Error::MappingNotFound(_) => false,

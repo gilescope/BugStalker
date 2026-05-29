@@ -452,6 +452,16 @@ impl CompletedResult<'_> {
         byte_size: usize,
         address_kind: AddressKind,
     ) -> Result<(Option<usize>, Bytes), Error> {
+        // Defence in depth: never hand an implausible size to
+        // `BytesMut::with_capacity`, which panics ("capacity overflow")
+        // above `isize::MAX` and would take down the whole session.
+        // Malformed DWARF type sizes are degraded to an unreadable
+        // variable instead (see `Error::ValueSizeImplausible`).
+        if byte_size > isize::MAX as usize {
+            return Err(Error::ValueSizeImplausible(
+                byte_size.try_into().unwrap_or(u64::MAX),
+            ));
+        }
         let mut data = BytesMut::with_capacity(byte_size);
         let mut data_addr = None;
 

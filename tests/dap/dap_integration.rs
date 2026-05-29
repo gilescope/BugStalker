@@ -925,6 +925,81 @@ fn test_variables_request() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Smoke guard for the variables-view file-scope read path: building
+/// the DAP `scopes` response eagerly enumerates every file-scope
+/// static + thread-local in the current crate (`handle_scopes` →
+/// `file_scope_var_items` → `query_file_scope` → `root_from_die` →
+/// `read_value` → `into_raw_bytes`), and the field crash (capacity
+/// overflow, seen as `adapter-error: connection closed`) happened
+/// right there. This stops inside `dap_cache_vars::main` and requests
+/// `scopes` *and* the `variables` of every scope, so a panic anywhere
+/// in that path surfaces as a connection-closed error and fails the
+/// test.
+///
+/// NB: this does not by itself reproduce the original capacity
+/// overflow — that needs a `DW_AT_upper_bound = -1` array DIE, which
+/// rustc doesn't emit (it uses `DW_AT_count`); it comes from C/`-sys`
+/// debug info. The overflow arithmetic itself is covered directly by
+/// the unit test on `array_byte_size` in `dwarf::r#type`.
+#[test]
+#[serial]
+fn test_file_scope_enumeration_no_crash() -> anyhow::Result<()> {
+    // Ensure the debuggee exists (default build).
+    let status = Command::new("cargo")
+        .args(["build", "-p", "dap_cache_vars"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build dap_cache_vars example");
+    }
+
+    let mut session = DapSession::start()?;
+    // Line 25 is the `println!` in dap_cache_vars/main.rs — after
+    // `outer` is fully built, so the stop is in a user frame and the
+    // current-crate file-scope filter resolves.
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("dap_cache_vars"),
+        &example_source("examples/dap_cache_vars/src/main.rs"),
+        25
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+
+    // The crash path: `scopes` builds the file-scope scopes eagerly.
+    let scopes_seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes_response = session.client.read_response(scopes_seq)?;
+    ensure_response!(session, &scopes_response, "scopes", scopes_seq, true);
+
+    // Drive the `variables` read of every scope (Locals, Statics,
+    // Thread-locals, …) so the file-scope value read is exercised
+    // even where it's deferred to the `variables` request.
+    let scopes = scopes_response["body"]["scopes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for scope in scopes {
+        let vref = scope["variablesReference"].as_i64().unwrap_or(0);
+        if vref == 0 {
+            continue;
+        }
+        let seq = session
+            .client
+            .send_request("variables", json!({ "variablesReference": vref }))?;
+        let response = session.client.read_response(seq)?;
+        ensure_response!(session, &response, "variables", seq, true);
+        assert!(
+            response["body"]["variables"].is_array(),
+            "variables for scope {} not an array: {response}",
+            scope["name"]
+        );
+    }
+
+    session.shutdown();
+    Ok(())
+}
+
 /// Regression test: walking every local in the showcase example
 /// (which exercises most variable shapes BugStalker renders) must
 /// not crash bs. Currently reproduces a kill-on-debug seen when
