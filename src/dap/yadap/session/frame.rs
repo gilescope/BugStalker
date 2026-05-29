@@ -237,43 +237,48 @@ impl super::DebugSession {
         // first-class DAP scopes. Both default to "current crate"
         // filtering to keep the pane signal-to-noise high — the
         // user's crate is usually what they want, not std/dep
-        // internals. Cached per (thread, frame) since the values
-        // can change between steps.
-        let statics_ref = if let Some(r) = self
-            .scope_cache
-            .get(&(thread_id, frame_num, ScopeKind::Statics))
-            .copied()
-        {
-            r
-        } else {
-            let v = super::data::read_statics(dbg).unwrap_or_default();
-            let r = self.vars.alloc(v);
-            self.scope_cache
-                .insert((thread_id, frame_num, ScopeKind::Statics), r);
-            r
-        };
-        let tls_ref = if let Some(r) = self
-            .scope_cache
-            .get(&(thread_id, frame_num, ScopeKind::ThreadLocals))
-            .copied()
-        {
-            r
-        } else {
-            let v = super::data::read_thread_locals(dbg).unwrap_or_default();
-            let r = self.vars.alloc(v);
-            self.scope_cache
-                .insert((thread_id, frame_num, ScopeKind::ThreadLocals), r);
-            r
-        };
+        // internals.
+        //
+        // Deferred (design-principles.md §2): reading every static's
+        // value here would cost ~tens of ms on a dependency-rich binary
+        // *on every stop*, for a pane usually never opened. Instead hand
+        // back a placeholder ref marked `expensive: true` and record it
+        // in `pending_scopes`; `handle_variables` enumerates only when
+        // the user expands the node. `dbg` is not borrowed below, so the
+        // mutable `self` access is clean.
+        let statics_ref =
+            self.alloc_lazy_scope(thread_id, frame_num, ScopeKind::Statics);
+        let tls_ref =
+            self.alloc_lazy_scope(thread_id, frame_num, ScopeKind::ThreadLocals);
 
         let scopes = vec![
             json!({"name": "Locals", "variablesReference": locals_ref, "expensive": false}),
             json!({"name": "Arguments", "variablesReference": args_ref, "expensive": false}),
-            json!({"name": "Statics", "variablesReference": statics_ref, "expensive": false}),
-            json!({"name": "Thread-locals", "variablesReference": tls_ref, "expensive": false}),
+            json!({"name": "Statics", "variablesReference": statics_ref, "expensive": true}),
+            json!({"name": "Thread-locals", "variablesReference": tls_ref, "expensive": true}),
         ];
 
         self.send_success_body(req, json!({"scopes": scopes}))
+    }
+
+    /// Allocate (or reuse) a deferred file-scope scope reference. The
+    /// slot starts empty; `pending_scopes` records the
+    /// `(thread, frame, kind)` so `handle_variables` can re-focus the
+    /// right frame and enumerate on first expand. Reusing the cached ref
+    /// within a stop means the statics are read at most once even if the
+    /// client requests `scopes` repeatedly.
+    fn alloc_lazy_scope(&mut self, thread_id: i64, frame_num: u32, kind: ScopeKind) -> i64 {
+        if let Some(r) = self
+            .scope_cache
+            .get(&(thread_id, frame_num, kind))
+            .copied()
+        {
+            return r;
+        }
+        let r = self.vars.alloc(Vec::new());
+        self.scope_cache.insert((thread_id, frame_num, kind), r);
+        self.pending_scopes.insert(r, (thread_id, frame_num, kind));
+        r
     }
 
     pub fn handle_restart_frame(&mut self, req: &DapRequest) -> anyhow::Result<()> {

@@ -46,6 +46,15 @@ pub struct DebugSession {
     next_breakpoint_id: i64,
     vars: VariablesStore,
     scope_cache: HashMap<(i64, u32, frame::ScopeKind), i64>,
+    /// Deferred file-scope scopes (variables-view, design-principles.md
+    /// §2). `handle_scopes` hands back a `variablesReference` for the
+    /// Statics / Thread-locals scopes without reading them — enumerating
+    /// thousands of statics on every stop is the bulk of the per-step
+    /// cost and is usually never looked at. The ref is recorded here with
+    /// the `(thread, frame, kind)` it was created for; `handle_variables`
+    /// re-focuses that frame and enumerates only when the user expands it.
+    /// Cleared per stop alongside `scope_cache`.
+    pending_scopes: HashMap<i64, (i64, u32, frame::ScopeKind)>,
     child_links: HashMap<(i64, usize), i64>,
     disasm_cache_by_addr: HashMap<usize, source::DisasmSource>,
     disasm_cache_by_reference: HashMap<i64, source::DisasmSource>,
@@ -93,6 +102,12 @@ impl VariablesStore {
         self.store.get_mut(&key)
     }
 
+    /// Overwrite an already-allocated slot — used to fill a lazily
+    /// deferred scope (see `pending_scopes`) on first expand.
+    fn set(&mut self, key: i64, vars: Vec<data::VarItem>) {
+        self.store.insert(key, vars);
+    }
+
     fn remove(&mut self, key: i64) -> Option<Vec<data::VarItem>> {
         self.store.remove(&key)
     }
@@ -120,6 +135,7 @@ impl DebugSession {
             next_breakpoint_id: 1,
             vars: VariablesStore::default(),
             scope_cache: HashMap::new(),
+            pending_scopes: HashMap::new(),
             child_links: HashMap::new(),
             disasm_cache_by_addr: HashMap::new(),
             disasm_cache_by_reference: HashMap::new(),
@@ -210,6 +226,7 @@ impl DebugSession {
         self.vars.clear();
         self.scope_cache.clear();
         self.child_links.clear();
+        self.pending_scopes.clear();
     }
 
     fn begin_running(&mut self) {
@@ -217,6 +234,7 @@ impl DebugSession {
         self.vars.clear();
         self.scope_cache.clear();
         self.child_links.clear();
+        self.pending_scopes.clear();
         self.begin_perf_run();
     }
 

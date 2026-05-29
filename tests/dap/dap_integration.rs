@@ -895,6 +895,65 @@ fn test_scopes_request() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Lazy file-scope scopes (variables-view perf, design-principles.md
+/// §2). Statics / Thread-locals must advertise `expensive: true` so the
+/// client doesn't auto-expand them — enumerating every static's value
+/// on each stop is the per-step cost we moved off the hot path. Locals /
+/// Arguments stay cheap (`expensive: false`). Expanding the deferred
+/// scope must still return a variables array, proving the lazy
+/// population fires on demand.
+#[test]
+#[serial]
+fn test_file_scope_scopes_are_lazy() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+    let seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "scopes", seq, true);
+
+    let scopes = response["body"]["scopes"].as_array().cloned().unwrap();
+    let expensive_of = |name: &str| -> Option<bool> {
+        scopes
+            .iter()
+            .find(|s| s["name"] == name)
+            .and_then(|s| s["expensive"].as_bool())
+    };
+    assert_eq!(expensive_of("Statics"), Some(true), "Statics must be lazy");
+    assert_eq!(
+        expensive_of("Thread-locals"),
+        Some(true),
+        "Thread-locals must be lazy"
+    );
+    assert_eq!(expensive_of("Locals"), Some(false));
+    assert_eq!(expensive_of("Arguments"), Some(false));
+
+    // Expanding the deferred Statics scope must still resolve — this is
+    // the on-demand enumeration path.
+    let statics_ref = scopes
+        .iter()
+        .find(|s| s["name"] == "Statics")
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+    assert!(statics_ref != 0, "Statics scope needs a real reference");
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": statics_ref }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "variables", seq, true);
+    assert!(response["body"]["variables"].is_array());
+
+    session.shutdown();
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_variables_request() -> anyhow::Result<()> {

@@ -94,6 +94,38 @@ impl super::DebugSession {
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow!("variables: missing arguments.variablesReference"))?;
 
+        // Lazy file-scope population (design-principles.md §2). If this
+        // ref is a deferred Statics / Thread-locals scope, enumerate it
+        // now — re-focusing the exact frame it was created for so the
+        // current-crate filter resolves correctly — and fill the slot.
+        // This is the cost `handle_scopes` deliberately kept off the
+        // per-step path; it's paid once, on the expand the user asked
+        // for.
+        if let Some((thread_id, frame_num, kind)) =
+            self.pending_scopes.remove(&variables_reference)
+        {
+            let pid = self
+                .thread_cache
+                .get(&thread_id)
+                .copied()
+                .unwrap_or_else(|| Pid::from_raw(thread_id as i32));
+            let items = if let Some(dbg) = self.debugger.as_mut() {
+                let _ = dbg.set_thread_into_focus_by_pid(pid);
+                let _ = dbg.set_frame_into_focus(frame_num);
+                match kind {
+                    super::frame::ScopeKind::Statics => read_statics(dbg).unwrap_or_default(),
+                    super::frame::ScopeKind::ThreadLocals => {
+                        read_thread_locals(dbg).unwrap_or_default()
+                    }
+                    // Locals/Arguments are never deferred.
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            self.vars.set(variables_reference, items);
+        }
+
         let vars = self
             .vars
             .get(variables_reference)

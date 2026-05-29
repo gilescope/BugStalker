@@ -2191,6 +2191,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- variables/perf: the Statics and Thread-locals DAP scopes are now lazy.
+  `handle_scopes` previously read and rendered every file-scope static's
+  value on every stop just to build the scope list — ~15 ms per step on
+  a binary with a few thousand statics, for a pane usually never opened.
+  It now hands back a placeholder reference marked `expensive: true` and
+  enumerates only when the user expands the node, re-focusing the exact
+  frame so the current-crate filter still resolves. Locals/Arguments are
+  unchanged. See `doc/design-principles.md` §2.
 - variables: single-element tuples now render with Rust's
   disambiguating trailing comma — `(x,)` instead of `(x)` — across the
   DAP variables pane, the console, and the TUI. Multi-element tuples
