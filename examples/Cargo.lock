@@ -1404,6 +1404,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "statics_heavy"
+version = "0.0.0"
+
+[[package]]
 name = "syn"
 version = "2.0.111"
 source = "registry+https://github.com/rust-lang/crates.io-index"

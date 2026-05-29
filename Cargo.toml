@@ -226,3 +226,13 @@ harness = false
 name = "attach_cold"
 path = "benches/attach_cold.rs"
 harness = false
+
+[[bench]]
+name = "statics_enumerate"
+path = "benches/statics_enumerate.rs"
+harness = false
+
+[[bench]]
+name = "stepping"
+path = "benches/stepping.rs"
+harness = false
