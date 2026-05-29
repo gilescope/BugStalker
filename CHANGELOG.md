@@ -2191,6 +2191,17 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- variables/perf: read-only statics are now cached for the life of the
+  process and not re-read across stops. A static in a read-only segment
+  (`.rodata`) can't change, so once read its rendered value is reused;
+  only mutable (`static_rw`) statics are re-read when the Statics pane is
+  re-expanded after a step. The read is skipped at the source —
+  `query_file_scope` derives each static's name from its DIE and skips
+  the value read for excluded (cached) entries — so excluding the
+  read-only majority drops a re-expand from ~15 ms to ~2.8 ms on the
+  4000-static bench (the residual is DIE enumeration). Cache is keyed by
+  the full `::` identity path and invalidated when a new debuggee is
+  launched/attached. See `doc/design-principles.md` §3.
 - variables: the Statics and Thread-locals panes now render as a
   navigable namespace tree keyed by the `::` identity path
   (`hyper_util::client::legacy::pool::__CALLSITE` becomes collapsible

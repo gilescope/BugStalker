@@ -64,6 +64,29 @@ fn bench_statics_enumerate(c: &mut Criterion) {
             });
         });
     }
+
+    // Immutable-static cache (design-principles.md §3): once read-only
+    // statics are cached, subsequent stops exclude them by name and skip
+    // the read entirely. Excluding *every* current-crate static is the
+    // upper bound on that saving — it should collapse to near-nothing
+    // versus `current_crate` above, since no `root_from_die` runs.
+    let all_names: std::collections::HashSet<String> = debugger
+        .read_static_variables(FileScopeFilter::CurrentCrate)
+        .unwrap_or_default()
+        .iter()
+        .map(|r| r.identity().to_string())
+        .collect();
+    group.bench_function("current_crate_all_excluded", |b| {
+        b.iter(|| {
+            let v = debugger
+                .read_static_variables_excluding(
+                    FileScopeFilter::CurrentCrate,
+                    black_box(&all_names),
+                )
+                .unwrap_or_default();
+            black_box(v.len())
+        });
+    });
     group.finish();
 }
 

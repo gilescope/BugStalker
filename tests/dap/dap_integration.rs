@@ -1149,6 +1149,113 @@ fn test_statics_rendered_as_namespace_tree() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Descend the Statics namespace tree, following the first expandable
+/// (namespace) row at each level, and return the leaf names at the
+/// first level that actually holds statics (`RO_*` / `RW_*`).
+fn statics_first_chain_leaves(
+    session: &mut DapSession,
+    frame_id: i64,
+) -> anyhow::Result<Vec<String>> {
+    let seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let resp = session.client.read_response(seq)?;
+    let mut vref = resp["body"]["scopes"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+    let mut rows = Vec::new();
+    for _ in 0..16 {
+        let seq = session
+            .client
+            .send_request("variables", json!({ "variablesReference": vref }))?;
+        let r = session.client.read_response(seq)?;
+        rows = r["body"]["variables"].as_array().cloned().unwrap_or_default();
+        let has_leaves = rows.iter().any(|row| {
+            row["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("RO_") || n.starts_with("RW_"))
+        });
+        if has_leaves {
+            break;
+        }
+        match rows
+            .iter()
+            .find(|row| row["variablesReference"].as_i64().unwrap_or(0) != 0)
+            .and_then(|row| row["variablesReference"].as_i64())
+        {
+            Some(next) => vref = next,
+            None => break,
+        }
+    }
+    Ok(rows
+        .iter()
+        .filter_map(|row| row["name"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// Immutable-static cache (design-principles.md §3). When the Statics
+/// pane is kept open across a step, read-only statics are served from
+/// cache and only mutable ones are re-read — but the tree must stay
+/// *complete*: a buggy merge could drop the cached read-only half. This
+/// expands Statics, steps over one line, re-expands, and asserts the
+/// same module still surfaces both `RO_*` (cache) and `RW_*` (re-read)
+/// leaves with an unchanged count.
+#[test]
+#[serial]
+fn test_statics_cache_survives_step() -> anyhow::Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "statics_heavy"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build statics_heavy example");
+    }
+
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("statics_heavy"),
+        &example_source("examples/statics_heavy/src/main.rs"),
+        13
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+    let before = statics_first_chain_leaves(&mut session, frame_id)?;
+    assert!(before.iter().any(|n| n.starts_with("RO_")), "no RO_ before");
+    assert!(before.iter().any(|n| n.starts_with("RW_")), "no RW_ before");
+
+    // Step over one line, then re-expand at the new stop.
+    let seq = session
+        .client
+        .send_request("next", json!({ "threadId": thread_id }))?;
+    let _ = session.client.read_response(seq)?;
+    if wait_for_event_or_terminated(&mut session, "stopped", Duration::from_secs(10))?.is_none() {
+        // Program ran to completion — nothing left to assert.
+        session.shutdown();
+        return Ok(());
+    }
+    let frame_id = require_frame!(&mut session, thread_id);
+    let after = statics_first_chain_leaves(&mut session, frame_id)?;
+
+    assert!(
+        after.iter().any(|n| n.starts_with("RO_")),
+        "read-only statics missing after step — cache dropped them"
+    );
+    assert!(
+        after.iter().any(|n| n.starts_with("RW_")),
+        "mutable statics missing after step"
+    );
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "statics leaf count changed across a step (before {before:?}, after {after:?})"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
 /// Regression test: walking every local in the showcase example
 /// (which exercises most variable shapes BugStalker renders) must
 /// not crash bs. Currently reproduces a kill-on-debug seen when

@@ -97,6 +97,9 @@ impl super::DebugSession {
             .build(process)
             .context("Build debugger")?;
         self.debugger = Some(dbg);
+        // New process — any cached read-only static values belong to the
+        // old debuggee (design-principles.md §3).
+        self.ro_statics.clear();
 
         self.start_output_forwarding(stdout_reader, stderr_reader);
         Ok(())
@@ -141,6 +144,8 @@ impl super::DebugSession {
             .context("Attach external process")?;
 
         self.debugger = Some(dbg);
+        // New process — drop the old debuggee's read-only static cache.
+        self.ro_statics.clear();
         self.start_output_forwarding(stdout_reader, stderr_reader);
         Ok(())
     }

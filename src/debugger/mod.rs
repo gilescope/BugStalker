@@ -1510,9 +1510,23 @@ impl Debugger {
         &self,
         scope: variable::execute::FileScopeFilter,
     ) -> Result<Vec<variable::execute::QueryResult<'_>>, Error> {
+        self.read_static_variables_excluding(scope, &std::collections::HashSet::new())
+    }
+
+    /// Like [`Debugger::read_static_variables`] but skips any static
+    /// whose full identity path is in `exclude` — used by the
+    /// immutable-static cache (design-principles.md §3) to avoid
+    /// re-reading read-only statics whose value can't have changed since
+    /// an earlier stop. Skipping happens before the value read, so an
+    /// excluded static costs no inferior-memory access.
+    pub fn read_static_variables_excluding(
+        &self,
+        scope: variable::execute::FileScopeFilter,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Result<Vec<variable::execute::QueryResult<'_>>, Error> {
         disable_when_not_stared!(self);
         let executor = variable::execute::DqeExecutor::new(self);
-        executor.query_file_scope(variable::execute::FileScopeKind::Statics, scope)
+        executor.query_file_scope(variable::execute::FileScopeKind::Statics, scope, exclude)
     }
 
     /// Read every `thread_local!` reachable in the debugee,
@@ -1525,7 +1539,11 @@ impl Debugger {
     ) -> Result<Vec<variable::execute::QueryResult<'_>>, Error> {
         disable_when_not_stared!(self);
         let executor = variable::execute::DqeExecutor::new(self);
-        executor.query_file_scope(variable::execute::FileScopeKind::ThreadLocals, scope)
+        executor.query_file_scope(
+            variable::execute::FileScopeKind::ThreadLocals,
+            scope,
+            &std::collections::HashSet::new(),
+        )
     }
 
     /// Return following register value.

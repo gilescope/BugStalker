@@ -738,6 +738,7 @@ impl<'dbg> DqeExecutor<'dbg> {
         &self,
         kind: FileScopeKind,
         filter: FileScopeFilter,
+        exclude: &std::collections::HashSet<String>,
     ) -> Result<Vec<QueryResult<'dbg>>, Error> {
         let tls_names = TlsInternalNames::resolve();
         let current_crate = match filter {
@@ -768,6 +769,18 @@ impl<'dbg> DqeExecutor<'dbg> {
                 }
                 if let Some(uid) = current_unit_id
                     && die_ref.unit().id != uid
+                {
+                    continue;
+                }
+                // Immutable-static cache (variables-view, design-
+                // principles.md §3): the caller already holds a rendered
+                // value for these read-only statics from an earlier stop,
+                // so skip `root_from_die` entirely — its value can't have
+                // changed. The name is derived from the DIE, so this
+                // costs no memory read. `Identity::from_die` matches what
+                // `root_from_die` stamps as the result identity below.
+                if !exclude.is_empty()
+                    && exclude.contains(&Identity::from_die(&die_ref).to_string())
                 {
                     continue;
                 }

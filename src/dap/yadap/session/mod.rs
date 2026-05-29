@@ -55,6 +55,14 @@ pub struct DebugSession {
     /// re-focuses that frame and enumerates only when the user expands it.
     /// Cleared per stop alongside `scope_cache`.
     pending_scopes: HashMap<i64, (i64, u32, frame::ScopeKind)>,
+    /// Immutable-static value cache (design-principles.md §3), keyed by
+    /// full `::` identity path. Read-only statics live in a read-only
+    /// segment, so their rendered value can't change for the life of the
+    /// process — read once, reuse across stops. Only mutable
+    /// (`static_rw`) statics are re-read on each expand. Persists across
+    /// stops (NOT cleared in `begin_stop_epoch`); invalidated only when a
+    /// new debuggee is launched/attached (see `init.rs`).
+    ro_statics: HashMap<String, data::VarItem>,
     child_links: HashMap<(i64, usize), i64>,
     disasm_cache_by_addr: HashMap<usize, source::DisasmSource>,
     disasm_cache_by_reference: HashMap<i64, source::DisasmSource>,
@@ -136,6 +144,7 @@ impl DebugSession {
             vars: VariablesStore::default(),
             scope_cache: HashMap::new(),
             pending_scopes: HashMap::new(),
+            ro_statics: HashMap::new(),
             child_links: HashMap::new(),
             disasm_cache_by_addr: HashMap::new(),
             disasm_cache_by_reference: HashMap::new(),

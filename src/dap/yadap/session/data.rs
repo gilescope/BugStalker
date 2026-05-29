@@ -109,11 +109,22 @@ impl super::DebugSession {
                 .get(&thread_id)
                 .copied()
                 .unwrap_or_else(|| Pid::from_raw(thread_id as i32));
-            let items = if let Some(dbg) = self.debugger.as_mut() {
+            // Read-only statics already cached from an earlier stop —
+            // skip re-reading them (design-principles.md §3). Computed
+            // before borrowing `dbg`.
+            let exclude: std::collections::HashSet<String> = match kind {
+                super::frame::ScopeKind::Statics => self.ro_statics.keys().cloned().collect(),
+                _ => std::collections::HashSet::new(),
+            };
+            // `dbg` borrow confined to this block so the `self.ro_statics`
+            // update below doesn't conflict.
+            let fresh = if let Some(dbg) = self.debugger.as_mut() {
                 let _ = dbg.set_thread_into_focus_by_pid(pid);
                 let _ = dbg.set_frame_into_focus(frame_num);
                 match kind {
-                    super::frame::ScopeKind::Statics => read_statics(dbg).unwrap_or_default(),
+                    super::frame::ScopeKind::Statics => {
+                        read_statics_flat_excluding(dbg, &exclude).unwrap_or_default()
+                    }
                     super::frame::ScopeKind::ThreadLocals => {
                         read_thread_locals(dbg).unwrap_or_default()
                     }
@@ -122,6 +133,29 @@ impl super::DebugSession {
                 }
             } else {
                 Vec::new()
+            };
+            let items = match kind {
+                super::frame::ScopeKind::Statics => {
+                    // Cache the read-only statics we just read so future
+                    // stops skip them; their `.rodata` value can't change.
+                    for vi in &fresh {
+                        if vi.storage == Some("static_ro") {
+                            self.ro_statics.insert(vi.name.clone(), vi.clone());
+                        }
+                    }
+                    // Merge cached read-only statics with the freshly-read
+                    // mutable ones (read-only ones are already in the
+                    // cache), then build the namespace tree.
+                    let mut all: Vec<VarItem> = self.ro_statics.values().cloned().collect();
+                    all.extend(
+                        fresh
+                            .into_iter()
+                            .filter(|vi| vi.storage != Some("static_ro")),
+                    );
+                    group_by_namespace(all)
+                }
+                // `read_thread_locals` already returns a grouped tree.
+                _ => fresh,
             };
             self.vars.set(variables_reference, items);
         }
@@ -1569,11 +1603,39 @@ fn file_scope_var_items(
     filter: debugger::variable::execute::FileScopeFilter,
 ) -> anyhow::Result<Vec<VarItem>> {
     use debugger::variable::execute::FileScopeKind;
-    use debugger::variable::render::RenderValue;
     let entries = match kind {
         FileScopeKind::Statics => dbg.read_static_variables(filter)?,
         FileScopeKind::ThreadLocals => dbg.read_thread_local_variables(filter)?,
     };
+    // Group the flat list into a navigable namespace tree
+    // (design-principles.md §4). The existing child machinery in
+    // `handle_variables` expands the tree level-by-level.
+    Ok(group_by_namespace(varitems_from_query_results(entries, dbg)))
+}
+
+/// Flat (ungrouped) read of file-scope statics, skipping any whose full
+/// identity path is in `exclude` — the immutable-static cache path
+/// (design-principles.md §3). Returns full-path names so the caller can
+/// cache read-only entries by name and merge them before grouping.
+pub fn read_statics_flat_excluding(
+    dbg: &debugger::Debugger,
+    exclude: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<VarItem>> {
+    let entries = dbg.read_static_variables_excluding(
+        debugger::variable::execute::FileScopeFilter::CurrentCrate,
+        exclude,
+    )?;
+    Ok(varitems_from_query_results(entries, dbg))
+}
+
+/// Render a batch of file-scope query results into flat `VarItem`s with
+/// their full `::` identity-path names (ungrouped). Callers group into
+/// the namespace tree and/or merge with cached read-only entries.
+fn varitems_from_query_results(
+    entries: Vec<debugger::variable::execute::QueryResult<'_>>,
+    dbg: &debugger::Debugger,
+) -> Vec<VarItem> {
+    use debugger::variable::render::RenderValue;
     let viz = Some(dbg.view_registry());
     let mut out = Vec::new();
     for r in entries {
@@ -1598,10 +1660,7 @@ fn file_scope_var_items(
             layout,
         });
     }
-    // Group the flat list into a navigable namespace tree
-    // (design-principles.md §4). The existing child machinery in
-    // `handle_variables` expands the tree level-by-level.
-    Ok(group_by_namespace(out))
+    out
 }
 
 /// Group a flat list of file-scope variables into a namespace tree
