@@ -854,6 +854,20 @@ fn is_tuple_field_set<'a, I: IntoIterator<Item = Option<&'a str>>>(names: I) -> 
     count > 0
 }
 
+/// Wrap a comma-joined tuple body in parens for inline display,
+/// adding the trailing comma Rust uses to disambiguate a 1-tuple
+/// (`(x,)`) from a merely parenthesised value (`(x)`). Only *bare*
+/// tuples get the comma — a single-field tuple struct or enum variant
+/// (`Wrap(x)`, `Ok(x)`) reads without one. `bare_tuple` is true when
+/// the value's own type name is parens-shaped (e.g. `(i32,)`).
+fn wrap_tuple_body(joined: &str, member_count: usize, bare_tuple: bool) -> String {
+    if bare_tuple && member_count == 1 {
+        format!("({joined},)")
+    } else {
+        format!("({joined})")
+    }
+}
+
 /// Phase 4 Tier-A — DAP renderer that consults the
 /// [`debugger::viz::VizRegistry`]. When the value is a struct
 /// whose type has a registered `summary` template, the rendered
@@ -1048,7 +1062,8 @@ pub fn render_value_to_string_with_viz(
                 let joined = rendered.join(", ");
                 const MAX_INLINE_LEN: usize = 120;
                 if joined.len() <= MAX_INLINE_LEN {
-                    return format!("({joined})");
+                    let bare_tuple = type_name.starts_with('(');
+                    return wrap_tuple_body(&joined, members.len(), bare_tuple);
                 }
                 return "(…)".to_string();
             }
@@ -1561,6 +1576,26 @@ mod tuple_rendering_tests {
     #[test]
     fn empty_struct_is_not_a_tuple() {
         assert!(!is_tuple_field_set(std::iter::empty()));
+    }
+
+    #[test]
+    fn bare_one_tuple_gets_trailing_comma() {
+        // A 1-tuple must read as `("a",)`, not `("a")`, so it's
+        // clearly a tuple and not a parenthesised value.
+        assert_eq!(wrap_tuple_body("\"a\"", 1, true), "(\"a\",)");
+    }
+
+    #[test]
+    fn bare_multi_tuple_has_no_trailing_comma() {
+        assert_eq!(wrap_tuple_body("1, \"one\"", 2, true), "(1, \"one\")");
+    }
+
+    #[test]
+    fn one_field_tuple_struct_or_variant_has_no_comma() {
+        // `bare_tuple == false` for tuple structs / enum variants
+        // (`Wrap(x)`, `Ok(x)`) — the prefix is added by the caller and
+        // Rust writes those without a trailing comma.
+        assert_eq!(wrap_tuple_body("7", 1, false), "(7)");
     }
 
     #[test]

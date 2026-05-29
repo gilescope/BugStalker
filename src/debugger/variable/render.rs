@@ -758,7 +758,14 @@ fn render_concrete_compact(
             }
             if is_tuple {
                 if type_name.starts_with('(') {
-                    format!("({body})")
+                    // Bare 1-tuple needs Rust's disambiguating trailing
+                    // comma: `(x,)` not `(x)`. Tuple structs / enum
+                    // variants (the `else` branch) never do.
+                    if members.len() == 1 && elided == 0 {
+                        format!("({body},)")
+                    } else {
+                        format!("({body})")
+                    }
                 } else {
                     format!("{type_name}({body})")
                 }

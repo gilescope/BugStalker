@@ -2191,6 +2191,11 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- variables: single-element tuples now render with Rust's
+  disambiguating trailing comma — `(x,)` instead of `(x)` — across the
+  DAP variables pane, the console, and the TUI. Multi-element tuples
+  and one-field tuple structs / enum variants (`Wrap(x)`, `Ok(x)`) are
+  unaffected.
 - `thread_db` is now an x86_64-only dependency; a thin in-tree shim
   (`debugger::thread_db_compat`) provides stubs on other architectures
   so the debugger degrades gracefully rather than failing to build.
