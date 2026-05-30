@@ -2191,6 +2191,14 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- variables: the Statics pane now shows statics from **all** crates, not
+  just the current one. The current-crate-only default predated the
+  namespace tree, when a flat list of all of std + deps was unusable;
+  now the tree itself is the anti-flood (top level is a sorted, collapsed
+  set of crate nodes, each lazy), so a thin crate or test binary — whose
+  interesting statics all live in dependencies (e.g.
+  `hyper_util::client::legacy::pool::__CALLSITE`) — no longer shows an
+  empty pane. Thread-locals stay current-crate.
 - variables/perf: the Statics tree is now walked lazily — only the
   namespaces you open are read. The first expand builds the namespace
   skeleton from names alone (no value reads): ~1.1 ms vs ~15.6 ms for the

@@ -116,8 +116,15 @@ impl super::DebugSession {
         {
             let _ = dbg.set_thread_into_focus_by_pid(pid);
             let _ = dbg.set_frame_into_focus(frame_num);
+            // Enumerate *every* crate's statics. The current-crate-only
+            // default predated the namespace tree, when a flat list of
+            // all of std + deps was unusable noise. Now the tree itself
+            // is the anti-flood: the top level is a sorted set of crate
+            // nodes, each collapsed and lazy, so showing everything costs
+            // a names-only walk and the user opens just the crate they
+            // want (their own, or a dependency like `hyper_util`).
             let names = dbg
-                .read_static_names(FileScopeFilter::CurrentCrate)
+                .read_static_names(FileScopeFilter::All)
                 .unwrap_or_default();
             self.statics_index = Some(NameTrie::build(names));
         }
@@ -1693,8 +1700,11 @@ pub fn read_statics_flat_including(
     dbg: &debugger::Debugger,
     include: &std::collections::HashSet<String>,
 ) -> anyhow::Result<Vec<VarItem>> {
+    // `All`, not current-crate: the `include` set is the authoritative
+    // filter (the exact leaf names under the expanded namespace), and a
+    // current-crate filter would wrongly drop dependency leaves.
     let entries = dbg.read_static_variables_including(
-        debugger::variable::execute::FileScopeFilter::CurrentCrate,
+        debugger::variable::execute::FileScopeFilter::All,
         include,
     )?;
     Ok(varitems_from_query_results(entries, dbg))

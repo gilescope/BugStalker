@@ -1,0 +1,13 @@
+[package]
+name = "thin_app"
+version = "0.0.0"
+edition = "2024"
+workspace = "./.."
+publish = false
+
+[[bin]]
+name = "thin_app"
+path = "src/main.rs"
+
+[dependencies]
+dep_with_static = { path = "../dep_with_static" }

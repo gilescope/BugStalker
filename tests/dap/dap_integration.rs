@@ -948,6 +948,9 @@ fn test_file_scope_scopes_are_lazy() -> anyhow::Result<()> {
         .send_request("variables", json!({ "variablesReference": statics_ref }))?;
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "variables", seq, true);
+    // (hello_world links only std, which is precompiled without debug
+    // info, so its all-crates set can legitimately be empty — the
+    // all-crates *broadening* is guarded by `test_thin_crate_sees_dep_statics`.)
     assert!(response["body"]["variables"].is_array());
 
     session.shutdown();
@@ -1086,63 +1089,16 @@ fn test_statics_rendered_as_namespace_tree() -> anyhow::Result<()> {
     );
     let frame_id = require_frame!(&mut session, thread_id);
 
-    // Descend the tree: each `expand` returns the children of a ref and
-    // asserts the response is a successful variables array.
-    let expand = |session: &mut DapSession, vref: i64| -> anyhow::Result<Vec<Value>> {
-        let seq = session
-            .client
-            .send_request("variables", json!({ "variablesReference": vref }))?;
-        let resp = session.client.read_response(seq)?;
-        assert!(
-            resp["success"].as_bool().unwrap_or(false),
-            "variables failed: {resp}"
-        );
-        Ok(resp["body"]["variables"].as_array().cloned().unwrap_or_default())
-    };
-    // A namespace node is expandable (non-zero ref) and carries a
-    // `(N)` count rather than a typed value.
-    let namespace_ref = |rows: &[Value]| -> Option<i64> {
-        rows.iter()
-            .find(|r| {
-                r["variablesReference"].as_i64().unwrap_or(0) != 0
-                    && r["value"].as_str().is_some_and(|v| v.starts_with('('))
-            })
-            .and_then(|r| r["variablesReference"].as_i64())
-    };
-
-    let scopes_seq = session
-        .client
-        .send_request("scopes", json!({ "frameId": frame_id }))?;
-    let scopes_resp = session.client.read_response(scopes_seq)?;
-    ensure_response!(session, &scopes_resp, "scopes", scopes_seq, true);
-    let statics_ref = scopes_resp["body"]["scopes"]
-        .as_array()
-        .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
-        .and_then(|s| s["variablesReference"].as_i64())
-        .unwrap_or(0);
-    assert!(statics_ref != 0);
-
-    // Level 1: the Statics scope is a tree, not a flat 4000-row list.
-    // The top is one collapsed namespace node down to where it branches.
-    let level1 = expand(&mut session, statics_ref)?;
-    let ns1 = namespace_ref(&level1).expect("a namespace node at the top of Statics");
-
-    // Descend until we hit the `m*` module fan-out, then once more into
-    // the RO_/RW_ leaves — proving the tree expands level-by-level.
-    let level2 = expand(&mut session, ns1)?;
-    let ns2 = namespace_ref(&level2).expect("a module namespace node");
-    let leaves = expand(&mut session, ns2)?;
+    // Descend the tree from the `statics_heavy` crate node down through
+    // its `m*` module chain to the `RO_*`/`RW_*` leaves — proving the
+    // Statics scope is a navigable tree, not a flat dump, and that it
+    // expands level-by-level.
+    let leaves = statics_first_chain_leaves(&mut session, frame_id)?;
     assert!(
-        leaves.iter().any(|r| {
-            r["name"]
-                .as_str()
-                .is_some_and(|n| n.starts_with("RO_") || n.starts_with("RW_"))
-        }),
-        "expected RO_*/RW_* leaf statics under a module node; got: {:?}",
         leaves
             .iter()
-            .map(|r| r["name"].as_str().unwrap_or(""))
-            .collect::<Vec<_>>()
+            .any(|n| n.starts_with("RO_") || n.starts_with("RW_")),
+        "expected RO_*/RW_* leaf statics by descending the tree; got: {leaves:?}"
     );
 
     session.shutdown();
@@ -1222,10 +1178,27 @@ fn statics_first_chain_leaves(
         .client
         .send_request("scopes", json!({ "frameId": frame_id }))?;
     let resp = session.client.read_response(seq)?;
-    let mut vref = resp["body"]["scopes"]
+    let statics_ref = resp["body"]["scopes"]
         .as_array()
         .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
         .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+    // The Statics scope now lists every crate (design-principles.md §4);
+    // start from the `statics_heavy` crate node, then descend its chain.
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": statics_ref }))?;
+    let top = session.client.read_response(seq)?;
+    let mut vref = top["body"]["variables"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter().find(|r| {
+                r["name"]
+                    .as_str()
+                    .is_some_and(|n| n == "statics_heavy" || n.starts_with("statics_heavy::"))
+            })
+        })
+        .and_then(|r| r["variablesReference"].as_i64())
         .unwrap_or(0);
     let mut rows = Vec::new();
     for _ in 0..16 {
@@ -1312,6 +1285,89 @@ fn test_statics_cache_survives_step() -> anyhow::Result<()> {
         before.len(),
         after.len(),
         "statics leaf count changed across a step (before {before:?}, after {after:?})"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
+/// All-crates Statics default (design-principles.md §4) — the
+/// regression behind the field report of an empty pane. A binary with
+/// no statics of its own (`thin_app`) must still surface a dependency's
+/// statics (`dep_with_static::DEP_STATIC`); the old current-crate-only
+/// filter hid them. Reproduces the user's case (a test binary whose
+/// interesting statics — `hyper_util::…::__CALLSITE` etc. — all live in
+/// dependencies).
+#[test]
+#[serial]
+fn test_thin_crate_sees_dep_statics() -> anyhow::Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "thin_app"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build thin_app example");
+    }
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("thin_app"),
+        &example_source("examples/thin_app/src/main.rs"),
+        5
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+
+    let seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes = session.client.read_response(seq)?;
+    ensure_response!(session, &scopes, "scopes", seq, true);
+    let statics_ref = scopes["body"]["scopes"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+
+    // The dependency crate appears as a top-level namespace node even
+    // though it isn't the current crate.
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": statics_ref }))?;
+    let top = session.client.read_response(seq)?;
+    ensure_response!(session, &top, "variables", seq, true);
+    let dep_ref = top["body"]["variables"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter().find(|r| {
+                r["name"]
+                    .as_str()
+                    .is_some_and(|n| n == "dep_with_static" || n.starts_with("dep_with_static::"))
+            })
+        })
+        .and_then(|r| r["variablesReference"].as_i64())
+        .unwrap_or(0);
+    assert!(
+        dep_ref != 0,
+        "dependency crate `dep_with_static` missing from Statics: {:?}",
+        top["body"]["variables"]
+            .as_array()
+            .map(|rows| rows.iter().map(|r| r["name"].as_str().unwrap_or("")).collect::<Vec<_>>())
+    );
+
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": dep_ref }))?;
+    let leaves = session.client.read_response(seq)?;
+    ensure_response!(session, &leaves, "variables", seq, true);
+    // The DAP row name is the `name : type` display form
+    // (`DEP_STATIC : u64`), so match the leading identifier.
+    assert!(
+        leaves["body"]["variables"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r["name"].as_str().is_some_and(|n| n.starts_with("DEP_STATIC")))
+        }),
+        "DEP_STATIC not found under dep_with_static; got: {:?}",
+        leaves["body"]["variables"]
     );
 
     session.shutdown();

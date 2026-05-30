@@ -12,12 +12,13 @@ use crate::dap::yadap::protocol::DapRequest;
 pub enum ScopeKind {
     Locals,
     Arguments,
-    /// File-scope `static`s — variables-view §5.4. Filtered by
-    /// `variablesView.statics.scope` (default: current crate only,
-    /// to avoid flooding the pane with std / dep statics).
+    /// File-scope `static`s — variables-view §5.4. Shown for *all*
+    /// crates, organised into a lazy `::` namespace tree; the tree (not
+    /// a crate filter) is what keeps std / dep statics from flooding the
+    /// pane (design-principles.md §2, §4).
     Statics,
-    /// `thread_local!`s — variables-view §5.4. Same filter as
-    /// `Statics`.
+    /// `thread_local!`s — variables-view §5.4. Current crate only (few,
+    /// and per-thread mutable, so read eagerly).
     ThreadLocals,
 }
 
