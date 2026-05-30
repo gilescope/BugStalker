@@ -1526,7 +1526,39 @@ impl Debugger {
     ) -> Result<Vec<variable::execute::QueryResult<'_>>, Error> {
         disable_when_not_stared!(self);
         let executor = variable::execute::DqeExecutor::new(self);
-        executor.query_file_scope(variable::execute::FileScopeKind::Statics, scope, exclude)
+        executor.query_file_scope(variable::execute::FileScopeKind::Statics, scope, exclude, None)
+    }
+
+    /// Read only the statics whose full identity path is in `include` —
+    /// the immediate leaves of an expanded namespace (variables-view
+    /// lazy expansion, design-principles.md §2). Statics outside the set
+    /// are skipped before the value read, so cost is proportional to the
+    /// subtree opened, not the whole binary.
+    pub fn read_static_variables_including(
+        &self,
+        scope: variable::execute::FileScopeFilter,
+        include: &std::collections::HashSet<String>,
+    ) -> Result<Vec<variable::execute::QueryResult<'_>>, Error> {
+        disable_when_not_stared!(self);
+        let executor = variable::execute::DqeExecutor::new(self);
+        executor.query_file_scope(
+            variable::execute::FileScopeKind::Statics,
+            scope,
+            &std::collections::HashSet::new(),
+            Some(include),
+        )
+    }
+
+    /// Cheap names-only enumeration of file-scope statics — full `::`
+    /// identity paths, no value reads or DIE derefs. Builds the lazy
+    /// Statics namespace skeleton (design-principles.md §2).
+    pub fn read_static_names(
+        &self,
+        scope: variable::execute::FileScopeFilter,
+    ) -> Result<Vec<String>, Error> {
+        disable_when_not_stared!(self);
+        let executor = variable::execute::DqeExecutor::new(self);
+        executor.query_file_scope_names(variable::execute::FileScopeKind::Statics, scope)
     }
 
     /// Read every `thread_local!` reachable in the debugee,
@@ -1543,6 +1575,7 @@ impl Debugger {
             variable::execute::FileScopeKind::ThreadLocals,
             scope,
             &std::collections::HashSet::new(),
+            None,
         )
     }
 

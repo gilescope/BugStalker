@@ -87,6 +87,110 @@ pub struct VarItem {
 }
 
 impl super::DebugSession {
+    /// Materialise one level of the lazy Statics namespace tree
+    /// (design-principles.md §2, §4): the immediate sub-namespaces (lazy
+    /// rows whose subtree is read only when opened) plus the leaf statics
+    /// directly at `prefix` (values read now, read-only ones served from
+    /// the cache). `parent_ref` is the reference being expanded — each
+    /// sub-namespace's lazy ref is pre-registered in `child_links` so the
+    /// normal `handle_variables` child path hands it back.
+    fn render_statics_level(
+        &mut self,
+        parent_ref: i64,
+        thread_id: i64,
+        frame_num: u32,
+        prefix: &[String],
+    ) -> Vec<VarItem> {
+        use debugger::variable::execute::FileScopeFilter;
+        let pid = self
+            .thread_cache
+            .get(&thread_id)
+            .copied()
+            .unwrap_or_else(|| Pid::from_raw(thread_id as i32));
+
+        // Build the name index once per process — cheap (names only, no
+        // value reads) — focusing the requested frame so the
+        // current-crate filter resolves.
+        if self.statics_index.is_none()
+            && let Some(dbg) = self.debugger.as_mut()
+        {
+            let _ = dbg.set_thread_into_focus_by_pid(pid);
+            let _ = dbg.set_frame_into_focus(frame_num);
+            let names = dbg
+                .read_static_names(FileScopeFilter::CurrentCrate)
+                .unwrap_or_default();
+            self.statics_index = Some(NameTrie::build(names));
+        }
+        let Some((subs, leaf_names)) = self
+            .statics_index
+            .as_ref()
+            .and_then(|t| namespace_level(t, prefix))
+        else {
+            return Vec::new();
+        };
+
+        let mut items = Vec::new();
+
+        // Sub-namespaces: lazy rows. Pre-register each lazy ref against
+        // this parent + index so `handle_variables` returns it without
+        // materialising the placeholder child.
+        for child in subs {
+            let lazy_ref = self.vars.alloc(Vec::new());
+            self.pending_namespaces
+                .insert(lazy_ref, (thread_id, frame_num, child.prefix));
+            let idx = items.len();
+            self.child_links.insert((parent_ref, idx), lazy_ref);
+            items.push(lazy_namespace_node(child.label, child.count));
+        }
+
+        // Leaf statics at this level: read the ones we don't already hold
+        // a read-only value for; cache freshly-seen read-only ones.
+        if !leaf_names.is_empty() {
+            let to_read: std::collections::HashSet<String> = leaf_names
+                .iter()
+                .filter(|n| !self.ro_statics.contains_key(*n))
+                .cloned()
+                .collect();
+            let fresh = if to_read.is_empty() {
+                Vec::new()
+            } else if let Some(dbg) = self.debugger.as_mut() {
+                let _ = dbg.set_thread_into_focus_by_pid(pid);
+                let _ = dbg.set_frame_into_focus(frame_num);
+                read_statics_flat_including(dbg, &to_read).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for vi in &fresh {
+                if vi.storage == Some("static_ro") {
+                    self.ro_statics.insert(vi.name.clone(), vi.clone());
+                }
+            }
+            // Assemble leaves for exactly the wanted names: cached
+            // read-only first, then freshly-read mutable ones.
+            let mut leaves: Vec<VarItem> = Vec::new();
+            for name in &leaf_names {
+                if let Some(cached) = self.ro_statics.get(name) {
+                    leaves.push(cached.clone());
+                }
+            }
+            leaves.extend(
+                fresh
+                    .into_iter()
+                    .filter(|vi| vi.storage != Some("static_ro")),
+            );
+            // Display only the final path segment; sort for stable order.
+            for vi in &mut leaves {
+                if let Some(last) = vi.name.rsplit("::").next() {
+                    vi.name = last.to_string();
+                }
+            }
+            leaves.sort_by(|a, b| a.name.cmp(&b.name));
+            items.extend(leaves);
+        }
+
+        items
+    }
+
     pub(super) fn handle_variables(&mut self, req: &DapRequest) -> anyhow::Result<()> {
         let variables_reference = req
             .arguments
@@ -94,69 +198,45 @@ impl super::DebugSession {
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow!("variables: missing arguments.variablesReference"))?;
 
-        // Lazy file-scope population (design-principles.md §2). If this
-        // ref is a deferred Statics / Thread-locals scope, enumerate it
-        // now — re-focusing the exact frame it was created for so the
-        // current-crate filter resolves correctly — and fill the slot.
-        // This is the cost `handle_scopes` deliberately kept off the
-        // per-step path; it's paid once, on the expand the user asked
-        // for.
+        // Lazy file-scope population (design-principles.md §2). The
+        // Statics scope and each namespace node hand back an empty
+        // placeholder ref; the level is materialised here, on the expand
+        // the user actually asked for — and only that level.
         if let Some((thread_id, frame_num, kind)) =
             self.pending_scopes.remove(&variables_reference)
         {
-            let pid = self
-                .thread_cache
-                .get(&thread_id)
-                .copied()
-                .unwrap_or_else(|| Pid::from_raw(thread_id as i32));
-            // Read-only statics already cached from an earlier stop —
-            // skip re-reading them (design-principles.md §3). Computed
-            // before borrowing `dbg`.
-            let exclude: std::collections::HashSet<String> = match kind {
-                super::frame::ScopeKind::Statics => self.ro_statics.keys().cloned().collect(),
-                _ => std::collections::HashSet::new(),
-            };
-            // `dbg` borrow confined to this block so the `self.ro_statics`
-            // update below doesn't conflict.
-            let fresh = if let Some(dbg) = self.debugger.as_mut() {
-                let _ = dbg.set_thread_into_focus_by_pid(pid);
-                let _ = dbg.set_frame_into_focus(frame_num);
-                match kind {
-                    super::frame::ScopeKind::Statics => {
-                        read_statics_flat_excluding(dbg, &exclude).unwrap_or_default()
-                    }
-                    super::frame::ScopeKind::ThreadLocals => {
-                        read_thread_locals(dbg).unwrap_or_default()
-                    }
-                    // Locals/Arguments are never deferred.
-                    _ => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
             let items = match kind {
+                // Statics: build the namespace skeleton from cheap names;
+                // values are read only for leaves at this (root) level,
+                // sub-namespaces stay lazy.
                 super::frame::ScopeKind::Statics => {
-                    // Cache the read-only statics we just read so future
-                    // stops skip them; their `.rodata` value can't change.
-                    for vi in &fresh {
-                        if vi.storage == Some("static_ro") {
-                            self.ro_statics.insert(vi.name.clone(), vi.clone());
-                        }
-                    }
-                    // Merge cached read-only statics with the freshly-read
-                    // mutable ones (read-only ones are already in the
-                    // cache), then build the namespace tree.
-                    let mut all: Vec<VarItem> = self.ro_statics.values().cloned().collect();
-                    all.extend(
-                        fresh
-                            .into_iter()
-                            .filter(|vi| vi.storage != Some("static_ro")),
-                    );
-                    group_by_namespace(all)
+                    self.render_statics_level(variables_reference, thread_id, frame_num, &[])
                 }
-                // `read_thread_locals` already returns a grouped tree.
-                _ => fresh,
+                // Thread-locals stay eager (few, and per-thread mutable):
+                // read + group the whole set in one go.
+                super::frame::ScopeKind::ThreadLocals => {
+                    let pid = self
+                        .thread_cache
+                        .get(&thread_id)
+                        .copied()
+                        .unwrap_or_else(|| Pid::from_raw(thread_id as i32));
+                    if let Some(dbg) = self.debugger.as_mut() {
+                        let _ = dbg.set_thread_into_focus_by_pid(pid);
+                        let _ = dbg.set_frame_into_focus(frame_num);
+                        read_thread_locals(dbg).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => Vec::new(),
             };
+            self.vars.set(variables_reference, items);
+        } else if let Some((thread_id, frame_num, prefix)) =
+            self.pending_namespaces.remove(&variables_reference)
+        {
+            // Expanding a lazy namespace node — materialise just its level.
+            let items =
+                self.render_statics_level(variables_reference, thread_id, frame_num, &prefix);
             self.vars.set(variables_reference, items);
         }
 
@@ -1628,6 +1708,61 @@ pub fn read_statics_flat_excluding(
     Ok(varitems_from_query_results(entries, dbg))
 }
 
+/// Flat (ungrouped) read of *only* the statics whose full identity path
+/// is in `include` — the immediate leaves of an expanded namespace
+/// (lazy expansion, design-principles.md §2). Statics outside the set
+/// cost no value read.
+pub fn read_statics_flat_including(
+    dbg: &debugger::Debugger,
+    include: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<VarItem>> {
+    let entries = dbg.read_static_variables_including(
+        debugger::variable::execute::FileScopeFilter::CurrentCrate,
+        include,
+    )?;
+    Ok(varitems_from_query_results(entries, dbg))
+}
+
+/// One-row placeholder child for a lazy namespace node. Never displayed:
+/// `handle_variables` resolves the namespace's pre-registered
+/// `child_links` entry (→ a `pending_namespaces` ref) and ignores this.
+/// It exists only so the node reports a non-empty child, i.e. an expand
+/// arrow.
+fn lazy_child_placeholder() -> VarItem {
+    VarItem {
+        name: String::new(),
+        value: String::new(),
+        type_name: None,
+        child: None,
+        write: None,
+        source: None,
+        mutability: None,
+        storage: None,
+        points_to_heap: false,
+        byte_size: None,
+        layout: None,
+    }
+}
+
+/// A lazy namespace row: shows `label  (N)`, expandable, but its subtree
+/// is materialised only when the user opens it (the real child ref is
+/// pre-registered in `child_links` by `render_statics_level`).
+fn lazy_namespace_node(label: String, count: usize) -> VarItem {
+    VarItem {
+        name: label,
+        value: format!("({count})"),
+        type_name: None,
+        child: Some(vec![lazy_child_placeholder()]),
+        write: None,
+        source: None,
+        mutability: None,
+        storage: None,
+        points_to_heap: false,
+        byte_size: None,
+        layout: None,
+    }
+}
+
 /// Render a batch of file-scope query results into flat `VarItem`s with
 /// their full `::` identity-path names (ungrouped). Callers group into
 /// the namespace tree and/or merge with cached read-only entries.
@@ -1764,6 +1899,136 @@ fn namespace_node(name: String, leaf_count: usize, children: Vec<VarItem>) -> Va
         points_to_heap: false,
         byte_size: None,
         layout: None,
+    }
+}
+
+/// Namespace trie over static *names only* — no values. Powers the lazy
+/// Statics skeleton: each level is produced on expand without reading
+/// any static's value (design-principles.md §2, §4). Built once per
+/// process from the cheap interned-name enumeration and cached on the
+/// session, so navigating it costs no debugger work.
+#[derive(Default)]
+pub struct NameTrie {
+    subs: std::collections::BTreeMap<String, NameTrie>,
+    /// Full `::` identity paths of statics declared exactly at this level.
+    leaves: Vec<String>,
+}
+
+impl NameTrie {
+    /// Build from full `::` identity paths.
+    pub fn build(names: impl IntoIterator<Item = String>) -> Self {
+        let mut root = NameTrie::default();
+        for full in names {
+            let segs: Vec<&str> = full.split("::").filter(|s| !s.is_empty()).collect();
+            let last = segs.len().saturating_sub(1);
+            let mut node = &mut root;
+            for seg in &segs[..last] {
+                node = node.subs.entry((*seg).to_string()).or_default();
+            }
+            node.leaves.push(full);
+        }
+        root
+    }
+
+    fn total_leaves(&self) -> usize {
+        self.leaves.len() + self.subs.values().map(NameTrie::total_leaves).sum::<usize>()
+    }
+
+    fn at(&self, prefix: &[String]) -> Option<&NameTrie> {
+        let mut node = self;
+        for seg in prefix {
+            node = node.subs.get(seg)?;
+        }
+        Some(node)
+    }
+}
+
+/// One immediate child namespace of a level: the display label
+/// (collapsed across single-child chains), the absolute prefix segments
+/// to reach the collapsed node when it is later expanded, and the
+/// descendant static count for the `(N)` summary.
+pub struct NamespaceChild {
+    pub label: String,
+    pub prefix: Vec<String>,
+    pub count: usize,
+}
+
+/// Immediate children of the level at `prefix`: lazy sub-namespace
+/// descriptors and the full names of leaf statics directly at this
+/// level (sorted). `None` when `prefix` isn't present in the trie.
+pub fn namespace_level(
+    trie: &NameTrie,
+    prefix: &[String],
+) -> Option<(Vec<NamespaceChild>, Vec<String>)> {
+    let node = trie.at(prefix)?;
+    let mut subs = Vec::new();
+    for (seg, child) in &node.subs {
+        // Collapse single-child, leaf-free chains (`a::b::c` as one node)
+        // so there are no empty intermediate clicks.
+        let mut label = seg.clone();
+        let mut abs = prefix.to_vec();
+        abs.push(seg.clone());
+        let mut cur = child;
+        while cur.leaves.is_empty() && cur.subs.len() == 1 {
+            let (s, c) = cur.subs.iter().next().expect("len == 1");
+            label.push_str("::");
+            label.push_str(s);
+            abs.push(s.clone());
+            cur = c;
+        }
+        subs.push(NamespaceChild {
+            label,
+            prefix: abs,
+            count: cur.total_leaves(),
+        });
+    }
+    let mut leaves = node.leaves.clone();
+    leaves.sort();
+    Some((subs, leaves))
+}
+
+#[cfg(test)]
+mod name_trie_tests {
+    use super::*;
+
+    fn level(names: &[&str], prefix: &[&str]) -> (Vec<(String, Vec<String>, usize)>, Vec<String>) {
+        let trie = NameTrie::build(names.iter().map(|s| s.to_string()));
+        let pfx: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+        let (subs, leaves) = namespace_level(&trie, &pfx).unwrap();
+        (
+            subs.into_iter().map(|c| (c.label, c.prefix, c.count)).collect(),
+            leaves,
+        )
+    }
+
+    #[test]
+    fn root_level_collapses_chains_and_counts() {
+        let (subs, leaves) = level(&["a::b::X", "a::b::Y", "c::Z"], &[]);
+        assert_eq!(
+            subs,
+            vec![
+                ("a::b".to_string(), vec!["a".to_string(), "b".to_string()], 2),
+                ("c".to_string(), vec!["c".to_string()], 1),
+            ]
+        );
+        assert!(leaves.is_empty());
+    }
+
+    #[test]
+    fn descend_to_leaves() {
+        let (subs, leaves) = level(
+            &["a::b::X", "a::b::Y", "c::Z"],
+            &["a", "b"],
+        );
+        assert!(subs.is_empty());
+        assert_eq!(leaves, vec!["a::b::X".to_string(), "a::b::Y".to_string()]);
+    }
+
+    #[test]
+    fn root_level_static_is_a_leaf() {
+        let (subs, leaves) = level(&["X"], &[]);
+        assert!(subs.is_empty());
+        assert_eq!(leaves, vec!["X".to_string()]);
     }
 }
 

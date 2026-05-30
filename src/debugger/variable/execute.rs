@@ -739,6 +739,7 @@ impl<'dbg> DqeExecutor<'dbg> {
         kind: FileScopeKind,
         filter: FileScopeFilter,
         exclude: &std::collections::HashSet<String>,
+        include: Option<&std::collections::HashSet<String>>,
     ) -> Result<Vec<QueryResult<'dbg>>, Error> {
         let tls_names = TlsInternalNames::resolve();
         let current_crate = match filter {
@@ -772,21 +773,25 @@ impl<'dbg> DqeExecutor<'dbg> {
                 {
                     continue;
                 }
-                // Immutable-static cache (variables-view, design-
-                // principles.md §3): the caller already holds a rendered
-                // value for these read-only statics from an earlier stop,
-                // so skip `root_from_die` entirely — its value can't have
-                // changed. Build the identity from the cached interned
-                // metadata (`name_sym` + `namespace`), NOT
-                // `Identity::from_die`, which would deref the DIE — both
-                // were interned from the same DIE at parse time, so the
-                // `to_string()` matches the result identity below, but
-                // this version reads no DIE attributes.
-                if !exclude.is_empty() {
+                // Name-based include/exclude (variables-view, design-
+                // principles.md §2, §3). `exclude` carries read-only
+                // statics already cached from an earlier stop (skip the
+                // read — value can't change); `include`, when present,
+                // restricts the read to a specific set (the immediate
+                // leaves of an expanded namespace). The identity is built
+                // from the cached interned metadata (`name_sym` +
+                // `namespace`), NOT `Identity::from_die`, which would
+                // deref the DIE — both were interned from the same DIE at
+                // parse time, so the `to_string()` matches the result
+                // identity below while reading no DIE attributes.
+                if !exclude.is_empty() || include.is_some() {
                     let name =
                         gcx().with_interner(|i| i.resolve(meta.name_sym).map(str::to_string));
-                    let identity = Identity::new(meta.namespace.clone(), name);
-                    if exclude.contains(&identity.to_string()) {
+                    let key = Identity::new(meta.namespace.clone(), name).to_string();
+                    if exclude.contains(&key) {
+                        continue;
+                    }
+                    if include.is_some_and(|inc| !inc.contains(&key)) {
                         continue;
                     }
                 }
@@ -803,6 +808,57 @@ impl<'dbg> DqeExecutor<'dbg> {
                     qr.storage = compute_storage_for_variable(&die_ref, addr, self.debugger);
                     out.push(qr);
                 }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Cheap names-only enumeration of file-scope variables (the same
+    /// `kind`/`filter` rules as [`Self::query_file_scope`]) — returns the
+    /// full `::` identity path of each matching static **without** any
+    /// value read or DIE deref (names come from the interned metadata).
+    /// Powers the lazy Statics skeleton (design-principles.md §2): build
+    /// the namespace tree from names, read values only for the subtree
+    /// the user expands.
+    pub fn query_file_scope_names(
+        &self,
+        kind: FileScopeKind,
+        filter: FileScopeFilter,
+    ) -> Result<Vec<String>, Error> {
+        let tls_names = TlsInternalNames::resolve();
+        let current_crate = match filter {
+            FileScopeFilter::CurrentCrate => self.current_crate_namespace_root(),
+            _ => None,
+        };
+        let current_unit_id = match filter {
+            FileScopeFilter::CurrentUnit => self.current_unit_id(),
+            _ => None,
+        };
+
+        let mut out = Vec::new();
+        for debug_info in self.debugger.debugee.debug_info_all() {
+            let Ok(entries) = debug_info.enumerate_file_scope_variables() else {
+                continue;
+            };
+            for (meta, die_ref) in entries {
+                let is_tls = tls_names.is_tls_internal(meta.name_sym);
+                match kind {
+                    FileScopeKind::Statics if is_tls => continue,
+                    FileScopeKind::ThreadLocals if !is_tls => continue,
+                    _ => {}
+                }
+                if let Some(crate_root) = current_crate.as_ref()
+                    && meta.namespace.as_parts().first() != Some(crate_root)
+                {
+                    continue;
+                }
+                if let Some(uid) = current_unit_id
+                    && die_ref.unit().id != uid
+                {
+                    continue;
+                }
+                let name = gcx().with_interner(|i| i.resolve(meta.name_sym).map(str::to_string));
+                out.push(Identity::new(meta.namespace.clone(), name).to_string());
             }
         }
         Ok(out)

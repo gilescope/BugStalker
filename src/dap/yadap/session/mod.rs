@@ -63,6 +63,17 @@ pub struct DebugSession {
     /// stops (NOT cleared in `begin_stop_epoch`); invalidated only when a
     /// new debuggee is launched/attached (see `init.rs`).
     ro_statics: HashMap<String, data::VarItem>,
+    /// Names-only namespace index for the Statics scope (design-
+    /// principles.md §2). Built once per process from the cheap interned
+    /// metadata so the lazy tree skeleton can be produced without reading
+    /// any static's value; values are read only for the subtree the user
+    /// expands. Persists across stops; invalidated on new launch/attach.
+    statics_index: Option<data::NameTrie>,
+    /// Lazy Statics namespace nodes awaiting expansion, keyed by their
+    /// `variablesReference`: `(thread, frame, namespace prefix)`.
+    /// `handle_variables` materialises the level on expand. Per-stop
+    /// (the refs come from `vars`, cleared each stop).
+    pending_namespaces: HashMap<i64, (i64, u32, Vec<String>)>,
     child_links: HashMap<(i64, usize), i64>,
     disasm_cache_by_addr: HashMap<usize, source::DisasmSource>,
     disasm_cache_by_reference: HashMap<i64, source::DisasmSource>,
@@ -145,6 +156,8 @@ impl DebugSession {
             scope_cache: HashMap::new(),
             pending_scopes: HashMap::new(),
             ro_statics: HashMap::new(),
+            statics_index: None,
+            pending_namespaces: HashMap::new(),
             child_links: HashMap::new(),
             disasm_cache_by_addr: HashMap::new(),
             disasm_cache_by_reference: HashMap::new(),
@@ -236,6 +249,7 @@ impl DebugSession {
         self.scope_cache.clear();
         self.child_links.clear();
         self.pending_scopes.clear();
+        self.pending_namespaces.clear();
     }
 
     fn begin_running(&mut self) {
@@ -244,6 +258,7 @@ impl DebugSession {
         self.scope_cache.clear();
         self.child_links.clear();
         self.pending_scopes.clear();
+        self.pending_namespaces.clear();
         self.begin_perf_run();
     }
 

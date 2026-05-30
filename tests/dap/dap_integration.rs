@@ -1149,6 +1149,68 @@ fn test_statics_rendered_as_namespace_tree() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Lazy skeleton (variables-view, design-principles.md §2). The *first*
+/// Statics expand must not materialise every static — it returns only
+/// the namespace skeleton, built from names. On `statics_heavy` the root
+/// is a single `statics_heavy (4000)` namespace node: the `(4000)` count
+/// proves all names were enumerated, and the absence of any `RO_*`/`RW_*`
+/// row proves no leaf values were read at this level.
+#[test]
+#[serial]
+fn test_statics_first_expand_is_lazy_skeleton() -> anyhow::Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "statics_heavy"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build statics_heavy example");
+    }
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("statics_heavy"),
+        &example_source("examples/statics_heavy/src/main.rs"),
+        13
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+    let seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes = session.client.read_response(seq)?;
+    ensure_response!(session, &scopes, "scopes", seq, true);
+    let statics_ref = scopes["body"]["scopes"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": statics_ref }))?;
+    let resp = session.client.read_response(seq)?;
+    ensure_response!(session, &resp, "variables", seq, true);
+    let rows = resp["body"]["variables"].as_array().cloned().unwrap_or_default();
+
+    assert!(
+        rows.iter().all(|r| {
+            let n = r["name"].as_str().unwrap_or("");
+            !n.starts_with("RO_") && !n.starts_with("RW_")
+        }),
+        "root expand materialised leaf statics instead of a skeleton: {:?}",
+        rows.iter().map(|r| r["name"].as_str().unwrap_or("")).collect::<Vec<_>>()
+    );
+    assert!(
+        rows.iter().any(|r| r["value"].as_str() == Some("(4000)")),
+        "expected a namespace node counting all 4000 statics; got: {:?}",
+        rows.iter()
+            .map(|r| (r["name"].as_str().unwrap_or(""), r["value"].as_str().unwrap_or("")))
+            .collect::<Vec<_>>()
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
 /// Descend the Statics namespace tree, following the first expandable
 /// (namespace) row at each level, and return the leaf names at the
 /// first level that actually holds statics (`RO_*` / `RW_*`).

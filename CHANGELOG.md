@@ -2191,6 +2191,18 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- variables/perf: the Statics tree is now walked lazily — only the
+  namespaces you open are read. The first expand builds the namespace
+  skeleton from names alone (no value reads): ~1.1 ms vs ~15.6 ms for the
+  old read-everything path on a 4000-static binary. Each namespace node
+  is a lazy reference; expanding it reads the value of only its immediate
+  leaf statics (read-only ones still served from the session cache) and
+  leaves its sub-namespaces lazy. So cost scales with what's open, not
+  with total static count — opening `hyper_util::client::legacy::pool`
+  touches its handful, never the thousands elsewhere. Built on a
+  names-only enumeration (`read_static_names`) and an `include`-filtered
+  read (`read_static_variables_including`). See `doc/design-principles.md`
+  §2.
 - variables/perf: read-only statics are now cached for the life of the
   process and not re-read across stops. A static in a read-only segment
   (`.rodata`) can't change, so once read its rendered value is reused;

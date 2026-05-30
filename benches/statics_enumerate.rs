@@ -87,6 +87,19 @@ fn bench_statics_enumerate(c: &mut Criterion) {
             black_box(v.len())
         });
     });
+
+    // Lazy skeleton (design-principles.md §2): the first Statics expand
+    // builds the namespace tree from names only — no value reads. This
+    // is what the full read above is replaced by, so it's the real
+    // first-expand cost on a static-heavy binary.
+    group.bench_function("names_only", |b| {
+        b.iter(|| {
+            let v = debugger
+                .read_static_names(black_box(FileScopeFilter::CurrentCrate))
+                .unwrap_or_default();
+            black_box(v.len())
+        });
+    });
     group.finish();
 }
 
