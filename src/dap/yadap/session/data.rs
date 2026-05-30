@@ -1656,19 +1656,11 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     Ok(out)
 }
 
-/// Variables-view §5.4 — populate the `Statics` DAP scope.
-/// Defaults to the user's crate (filtering out std / dep statics)
-/// so the pane stays useful.
-pub fn read_statics(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
-    file_scope_var_items(
-        dbg,
-        debugger::variable::execute::FileScopeKind::Statics,
-        debugger::variable::execute::FileScopeFilter::CurrentCrate,
-    )
-}
-
 /// Variables-view §5.4 — populate the `Thread-locals` DAP scope.
-/// Same filter rationale as [`read_statics`].
+/// Defaults to the user's crate (filtering out std / dep thread-locals)
+/// so the pane stays useful. Unlike Statics (which is walked lazily per
+/// namespace), thread-locals are read eagerly: there are few of them and
+/// they're per-thread mutable.
 pub fn read_thread_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     file_scope_var_items(
         dbg,
@@ -1691,21 +1683,6 @@ fn file_scope_var_items(
     // (design-principles.md §4). The existing child machinery in
     // `handle_variables` expands the tree level-by-level.
     Ok(group_by_namespace(varitems_from_query_results(entries, dbg)))
-}
-
-/// Flat (ungrouped) read of file-scope statics, skipping any whose full
-/// identity path is in `exclude` — the immutable-static cache path
-/// (design-principles.md §3). Returns full-path names so the caller can
-/// cache read-only entries by name and merge them before grouping.
-pub fn read_statics_flat_excluding(
-    dbg: &debugger::Debugger,
-    exclude: &std::collections::HashSet<String>,
-) -> anyhow::Result<Vec<VarItem>> {
-    let entries = dbg.read_static_variables_excluding(
-        debugger::variable::execute::FileScopeFilter::CurrentCrate,
-        exclude,
-    )?;
-    Ok(varitems_from_query_results(entries, dbg))
 }
 
 /// Flat (ungrouped) read of *only* the statics whose full identity path
