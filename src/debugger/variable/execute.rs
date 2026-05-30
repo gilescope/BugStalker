@@ -776,13 +776,19 @@ impl<'dbg> DqeExecutor<'dbg> {
                 // principles.md §3): the caller already holds a rendered
                 // value for these read-only statics from an earlier stop,
                 // so skip `root_from_die` entirely — its value can't have
-                // changed. The name is derived from the DIE, so this
-                // costs no memory read. `Identity::from_die` matches what
-                // `root_from_die` stamps as the result identity below.
-                if !exclude.is_empty()
-                    && exclude.contains(&Identity::from_die(&die_ref).to_string())
-                {
-                    continue;
+                // changed. Build the identity from the cached interned
+                // metadata (`name_sym` + `namespace`), NOT
+                // `Identity::from_die`, which would deref the DIE — both
+                // were interned from the same DIE at parse time, so the
+                // `to_string()` matches the result identity below, but
+                // this version reads no DIE attributes.
+                if !exclude.is_empty() {
+                    let name =
+                        gcx().with_interner(|i| i.resolve(meta.name_sym).map(str::to_string));
+                    let identity = Identity::new(meta.namespace.clone(), name);
+                    if exclude.contains(&identity.to_string()) {
+                        continue;
+                    }
                 }
                 // `root_from_die` may return None for TLS internals
                 // whose runtime slot hasn't been initialised on the
