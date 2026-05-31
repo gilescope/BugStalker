@@ -54,6 +54,16 @@ pub(super) struct PerfOverlaySession {
     /// diagnosis line.
     #[cfg(target_os = "macos")]
     darwin_last_delta: DarwinLastDelta,
+    /// Whether the last completed run had a live poll sampler.
+    /// Captured in `finish_perf_stop` *before* the sampler is drained:
+    /// that method `take()`s `darwin_run` and consumes the sampler, so
+    /// by the time the stopped summary calls `perf_mode_label` the live
+    /// sampler is already gone. Reading `darwin_run` there always saw
+    /// `None`, so the mode misreported `macos-rusage-only` even when the
+    /// sampler ran (it just resolved no samples — e.g. an I/O-bound
+    /// workload). This snapshot is the source of truth for the label.
+    #[cfg(target_os = "macos")]
+    last_run_sampler_active: bool,
 }
 
 /// macOS in-flight run state. Owns the rusage start snapshot, the
@@ -495,8 +505,12 @@ impl super::DebugSession {
     #[cfg(all(feature = "perf", target_os = "macos"))]
     pub(super) fn finish_perf_stop(&mut self) {
         let Some(run) = self.perf_overlay.darwin_run.take() else {
+            self.perf_overlay.last_run_sampler_active = false;
             return;
         };
+        // Snapshot sampler liveness before `run` (and its sampler) is
+        // consumed below — perf_mode_label reads this after the fact.
+        self.perf_overlay.last_run_sampler_active = run.sampler.is_some();
 
         // 1) Drain poll-sampler samples and attribute them. Even
         // if the resolver is missing (no load slide / no .debug_line),
@@ -1089,11 +1103,10 @@ fn perf_mode_label(session: &PerfOverlaySession) -> &'static str {
 fn perf_mode_label(session: &PerfOverlaySession) -> &'static str {
     if !session.enabled {
         "disabled"
-    } else if session
-        .darwin_run
-        .as_ref()
-        .is_some_and(|run| run.sampler.is_some())
-    {
+    } else if session.last_run_sampler_active {
+        // The live `darwin_run`/sampler are consumed in finish_perf_stop
+        // before this runs, so we trust the snapshot taken there rather
+        // than the now-empty `darwin_run`.
         "macos-poll"
     } else {
         "macos-rusage-only"
@@ -1454,6 +1467,29 @@ mod tests {
 
         let err = parse_perf_overlay_source(&req).expect_err("missing path");
         assert!(err.to_string().contains("missing arguments.source.path"));
+    }
+
+    // Regression: finish_perf_stop take()s darwin_run and drains the
+    // sampler, so by the time the stopped summary calls perf_mode_label
+    // the live sampler is gone. The label must rely on the captured
+    // last_run_sampler_active flag, not the (now None) darwin_run — else
+    // it wrongly reports rusage-only even though the poll sampler ran.
+    // (The full ordering repro needs a live Mach sampler + debuggee, so
+    // this asserts the label decision directly with the post-stop state.)
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    #[test]
+    fn perf_mode_label_reports_poll_after_sampler_consumed() {
+        let mut session = PerfOverlaySession::default();
+        session.enabled = true;
+        session.darwin_run = None; // sampler already consumed at stop
+        session.last_run_sampler_active = true;
+        assert_eq!(perf_mode_label(&session), "macos-poll");
+
+        session.last_run_sampler_active = false;
+        assert_eq!(perf_mode_label(&session), "macos-rusage-only");
+
+        session.enabled = false;
+        assert_eq!(perf_mode_label(&session), "disabled");
     }
 
     #[cfg(feature = "perf")]
