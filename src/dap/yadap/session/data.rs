@@ -123,10 +123,20 @@ impl super::DebugSession {
             // nodes, each collapsed and lazy, so showing everything costs
             // a names-only walk and the user opens just the crate they
             // want (their own, or a dependency like `hyper_util`).
-            let names = dbg
-                .read_static_names(FileScopeFilter::All)
+            let name_sizes = dbg
+                .read_static_name_sizes(FileScopeFilter::All)
                 .unwrap_or_default();
-            self.statics_index = Some(NameTrie::build(names));
+            // Keep only the *large* sizes — that's all the gate and the
+            // lazy-node label ever consult; small statics read inline and
+            // never need their size.
+            self.statics_sizes = name_sizes
+                .iter()
+                .filter_map(|(n, s)| {
+                    s.filter(|&sz| sz > STATIC_LAZY_BYTES)
+                        .map(|sz| (n.clone(), sz))
+                })
+                .collect();
+            self.statics_index = Some(NameTrie::build(name_sizes.into_iter().map(|(n, _)| n)));
         }
         let Some((subs, leaf_names)) = self
             .statics_index
@@ -150,8 +160,27 @@ impl super::DebugSession {
             items.push(lazy_namespace_node(child.label, child.count));
         }
 
-        // Leaf statics at this level: read the ones we don't already hold
-        // a read-only value for; cache freshly-seen read-only ones.
+        // Leaf statics at this level. Giant ones (precomputed crypto
+        // tables, …) are deferred to a lazy node — reading + rendering a
+        // 512 KB array eagerly is what stalls the pane — and read only
+        // when the user expands them. Everything else is read inline.
+        // `statics_sizes` holds only the over-threshold statics, so its
+        // membership *is* the gate (minus ones already cached read-only).
+        let (lazy_leaf_names, leaf_names): (Vec<String>, Vec<String>) = leaf_names
+            .into_iter()
+            .partition(|n| self.statics_sizes.contains_key(n) && !self.ro_statics.contains_key(n));
+        for name in lazy_leaf_names {
+            let lazy_ref = self.vars.alloc(Vec::new());
+            self.pending_static_values
+                .insert(lazy_ref, (thread_id, frame_num, name.clone()));
+            let idx = items.len();
+            self.child_links.insert((parent_ref, idx), lazy_ref);
+            let label = name.rsplit("::").next().unwrap_or(&name).to_string();
+            items.push(lazy_static_value_node(
+                label,
+                self.statics_sizes.get(&name).copied(),
+            ));
+        }
         if !leaf_names.is_empty() {
             let to_read: std::collections::HashSet<String> = leaf_names
                 .iter()
@@ -209,8 +238,7 @@ impl super::DebugSession {
         // Statics scope and each namespace node hand back an empty
         // placeholder ref; the level is materialised here, on the expand
         // the user actually asked for — and only that level.
-        if let Some((thread_id, frame_num, kind)) =
-            self.pending_scopes.remove(&variables_reference)
+        if let Some((thread_id, frame_num, kind)) = self.pending_scopes.remove(&variables_reference)
         {
             let items = match kind {
                 // Statics: build the namespace skeleton from cheap names;
@@ -245,6 +273,31 @@ impl super::DebugSession {
             let items =
                 self.render_statics_level(variables_reference, thread_id, frame_num, &prefix);
             self.vars.set(variables_reference, items);
+        } else if let Some((thread_id, frame_num, name)) =
+            self.pending_static_values.remove(&variables_reference)
+        {
+            // Expanding a deferred giant static — now read its value (the
+            // expensive bit the open deliberately skipped) and surface the
+            // value's own children (array elements / struct fields).
+            let pid = self
+                .thread_cache
+                .get(&thread_id)
+                .copied()
+                .unwrap_or_else(|| Pid::from_raw(thread_id as i32));
+            let children = if let Some(dbg) = self.debugger.as_mut() {
+                let _ = dbg.set_thread_into_focus_by_pid(pid);
+                let _ = dbg.set_frame_into_focus(frame_num);
+                let one: std::collections::HashSet<String> = std::iter::once(name).collect();
+                read_statics_flat_including(dbg, &one)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                    .and_then(|vi| vi.child)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            self.vars.set(variables_reference, children);
         }
 
         let vars = self
@@ -661,6 +714,32 @@ impl super::DebugSession {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("evaluate: missing arguments.expression"))?;
 
+        // VS Code sends `evaluate` with an empty/whitespace expression for
+        // internal probes (REPL prompt, hover over blank, watch
+        // placeholder). Answer benignly instead of surfacing a parser
+        // "found end of input" error to the user / the log.
+        if expression.trim().is_empty() {
+            return self.send_success_body(req, json!({"result": "", "variablesReference": 0}));
+        }
+
+        // Parse before touching the debugger so a hover over a non-variable
+        // token returns cleanly. VS Code auto-extracts whatever token is under
+        // the cursor for a hover, which is frequently not a DQE (integer
+        // literals like `0` in `0..len`, operators, keywords). For
+        // `context == "hover"` answer empty rather than surfacing a parser
+        // error to the IDE/log; REPL and watch expressions still report it.
+        let dqe = match bs_expr::parser().parse(expression).into_result() {
+            Ok(dqe) => dqe,
+            Err(e) => {
+                let context = req.arguments.get("context").and_then(|v| v.as_str());
+                if context == Some("hover") {
+                    return self
+                        .send_success_body(req, json!({"result": "", "variablesReference": 0}));
+                }
+                return Err(anyhow!("evaluate parse error: {e:?}"));
+            }
+        };
+
         let (body, elapsed) = {
             let dbg = self
                 .debugger
@@ -678,11 +757,6 @@ impl super::DebugSession {
                 let _ = dbg.set_thread_into_focus_by_pid(pid);
                 let _ = dbg.set_frame_into_focus(frame_num);
             }
-
-            let dqe = bs_expr::parser()
-                .parse(expression)
-                .into_result()
-                .map_err(|e| anyhow!("evaluate parse error: {e:?}"))?;
 
             let start = Instant::now();
             let results = dbg.read_variable(dqe).context("evaluate read_variable")?;
@@ -1689,7 +1763,9 @@ fn file_scope_var_items(
     // Group the flat list into a navigable namespace tree
     // (design-principles.md §4). The existing child machinery in
     // `handle_variables` expands the tree level-by-level.
-    Ok(group_by_namespace(varitems_from_query_results(entries, dbg)))
+    Ok(group_by_namespace(varitems_from_query_results(
+        entries, dbg,
+    )))
 }
 
 /// Flat (ungrouped) read of *only* the statics whose full identity path
@@ -1734,6 +1810,45 @@ fn lazy_child_placeholder() -> VarItem {
 /// A lazy namespace row: shows `label  (N)`, expandable, but its subtree
 /// is materialised only when the user opens it (the real child ref is
 /// pre-registered in `child_links` by `render_statics_level`).
+/// A leaf static at or above this many bytes is shown lazily (read on
+/// expand) rather than materialised when the Statics pane opens. Tuned
+/// above the largest statics that render instantly (a few KB) and well
+/// below the precomputed-table range (hundreds of KB) that stalls.
+pub const STATIC_LAZY_BYTES: u64 = 16 * 1024;
+
+/// Lazy node for a too-big-to-read-eagerly leaf static: shows a cheap
+/// size summary inline and an expand arrow; the value is read on expand
+/// (see `pending_static_values`).
+fn lazy_static_value_node(label: String, byte_size: Option<u64>) -> VarItem {
+    let value = match byte_size {
+        Some(b) => format!("… {} (expand to load)", human_bytes(b)),
+        None => "… (expand to load)".to_string(),
+    };
+    VarItem {
+        name: label,
+        value,
+        type_name: None,
+        child: Some(vec![lazy_child_placeholder()]),
+        write: None,
+        source: None,
+        mutability: None,
+        storage: None,
+        points_to_heap: false,
+        byte_size,
+        layout: None,
+    }
+}
+
+fn human_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 {
+        format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
+    } else if b >= 1024 {
+        format!("{:.0} KB", b as f64 / 1024.0)
+    } else {
+        format!("{b} B")
+    }
+}
+
 fn lazy_namespace_node(label: String, count: usize) -> VarItem {
     VarItem {
         name: label,
@@ -1833,7 +1948,10 @@ impl NsTrie {
                 self.leaves.push(item);
             }
             [head, rest @ ..] => {
-                self.subs.entry(head.clone()).or_default().insert(rest, item);
+                self.subs
+                    .entry(head.clone())
+                    .or_default()
+                    .insert(rest, item);
             }
         }
     }
@@ -1918,7 +2036,12 @@ impl NameTrie {
     }
 
     fn total_leaves(&self) -> usize {
-        self.leaves.len() + self.subs.values().map(NameTrie::total_leaves).sum::<usize>()
+        self.leaves.len()
+            + self
+                .subs
+                .values()
+                .map(NameTrie::total_leaves)
+                .sum::<usize>()
     }
 
     fn at(&self, prefix: &[String]) -> Option<&NameTrie> {
@@ -1983,7 +2106,9 @@ mod name_trie_tests {
         let pfx: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
         let (subs, leaves) = namespace_level(&trie, &pfx).unwrap();
         (
-            subs.into_iter().map(|c| (c.label, c.prefix, c.count)).collect(),
+            subs.into_iter()
+                .map(|c| (c.label, c.prefix, c.count))
+                .collect(),
             leaves,
         )
     }
@@ -1994,7 +2119,11 @@ mod name_trie_tests {
         assert_eq!(
             subs,
             vec![
-                ("a::b".to_string(), vec!["a".to_string(), "b".to_string()], 2),
+                (
+                    "a::b".to_string(),
+                    vec!["a".to_string(), "b".to_string()],
+                    2
+                ),
                 ("c".to_string(), vec!["c".to_string()], 1),
             ]
         );
@@ -2003,10 +2132,7 @@ mod name_trie_tests {
 
     #[test]
     fn descend_to_leaves() {
-        let (subs, leaves) = level(
-            &["a::b::X", "a::b::Y", "c::Z"],
-            &["a", "b"],
-        );
+        let (subs, leaves) = level(&["a::b::X", "a::b::Y", "c::Z"], &["a", "b"]);
         assert!(subs.is_empty());
         assert_eq!(leaves, vec!["a::b::X".to_string(), "a::b::Y".to_string()]);
     }
