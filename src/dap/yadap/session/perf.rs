@@ -85,6 +85,11 @@ struct DarwinLastDelta {
     pageins: u64,
     disk_bytes_read: u64,
     disk_bytes_written: u64,
+    /// Memory-footprint change over the last run window, in bytes
+    /// (signed). Surfaced as `physFootprintDelta` — a cheap proxy for
+    /// "did this step allocate" (it's footprint growth, not a malloc
+    /// count: the allocator's free-list reuse won't move it).
+    phys_footprint_delta: i64,
 }
 
 #[cfg(all(feature = "perf", target_os = "macos"))]
@@ -570,6 +575,7 @@ impl super::DebugSession {
                     pageins: delta.pageins,
                     disk_bytes_read: delta.disk_bytes_read,
                     disk_bytes_written: delta.disk_bytes_written,
+                    phys_footprint_delta: delta.phys_footprint_delta,
                 };
             }
             Err(err) => {
@@ -751,6 +757,12 @@ impl super::DebugSession {
         let summary = bs_perf::dap::stopped_summary(&self.perf_overlay.data)?;
         let ipc = ipc_for(&summary);
         let diagnosis = diagnose(&summary, &self.perf_overlay);
+        // Memory-footprint delta for the window (bytes, signed). macOS
+        // only — Linux has no equivalent in the rusage path yet, so null.
+        #[cfg(target_os = "macos")]
+        let phys_footprint_delta: Option<i64> = Some(self.perf_overlay.darwin_last_delta.phys_footprint_delta);
+        #[cfg(not(target_os = "macos"))]
+        let phys_footprint_delta: Option<i64> = None;
         Some(json!({
             "mode": perf_mode_label(&self.perf_overlay),
             "runCycles": summary.run_cycles,
@@ -767,6 +779,7 @@ impl super::DebugSession {
             })),
             "unresolvedSamples": summary.unresolved_samples,
             "unsampledThreadCount": unsampled_thread_count(&self.perf_overlay),
+            "physFootprintDelta": phys_footprint_delta,
         }))
     }
 

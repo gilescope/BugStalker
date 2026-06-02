@@ -41,6 +41,11 @@ pub struct ProcessSnapshot {
     pub disk_bytes_read: u64,
     /// Cumulative bytes written to disk (`ri_diskio_byteswritten`).
     pub disk_bytes_written: u64,
+    /// Current memory footprint in bytes (`ri_phys_footprint`) — the
+    /// dirty + compressed physical pages the kernel charges to the
+    /// process (what Activity Monitor shows). Unlike the others this is
+    /// a *level*, not a monotonic counter, so its delta is signed.
+    pub phys_footprint: u64,
 }
 
 /// Per-window deltas produced by [`ProcessSnapshot::delta_since`].
@@ -61,6 +66,9 @@ pub struct ProcessDelta {
     pub disk_bytes_read: u64,
     /// Bytes written to disk during the window.
     pub disk_bytes_written: u64,
+    /// Change in memory footprint over the window, in bytes. Signed:
+    /// negative when the process released memory back to the OS.
+    pub phys_footprint_delta: i64,
 }
 
 impl ProcessSnapshot {
@@ -79,6 +87,7 @@ impl ProcessSnapshot {
             pageins: info.ri_pageins,
             disk_bytes_read: info.ri_diskio_bytesread,
             disk_bytes_written: info.ri_diskio_byteswritten,
+            phys_footprint: info.ri_phys_footprint,
         })
     }
 
@@ -101,7 +110,18 @@ impl ProcessSnapshot {
             disk_bytes_written: self
                 .disk_bytes_written
                 .saturating_sub(earlier.disk_bytes_written),
+            phys_footprint_delta: signed_delta(self.phys_footprint, earlier.phys_footprint),
         }
+    }
+}
+
+/// `now - then` as a saturating `i64` without a lossy `as` cast — the
+/// footprint is a level, so the delta can be negative.
+fn signed_delta(now: u64, then: u64) -> i64 {
+    if now >= then {
+        i64::try_from(now - then).unwrap_or(i64::MAX)
+    } else {
+        i64::try_from(then - now).map_or(i64::MIN, |d| -d)
     }
 }
 
