@@ -1888,6 +1888,15 @@ fn test_arguments() {
         },
     );
 
+    // Regression: resolving an argument *by name* via `read_variable`
+    // (the path used by DAP `evaluate`/hover, breakpoint conditions and
+    // log points) must find formal parameters, not just DW_TAG_variable
+    // locals. Before the fix this returned an empty Vec → `<no result>`
+    // on hover even though the arg shows in the Arguments pane.
+    read_var_dqe!(debugger, Dqe::Variable(Selector::by_name("by_val", false)) => by_val_byname);
+    assert_idents!(by_val_byname => "by_val");
+    assert_scalar(by_val_byname.value(), "i32", Some(SupportedScalar::I32(1)));
+
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);
 }
@@ -4230,12 +4239,20 @@ fn test_read_time() {
                 s.starts_with("now + ") || s.starts_with("now - "),
                 "Instant should render as `now ± …`, got {s:?}"
             );
-            // After `now ± `, expect "HH:MM:SS.mmm" — 12 chars.
+            // After `now ± `, expect "HH:MM:SS.mmm". Hours may exceed two
+            // digits on a long-running machine (the delta can be large),
+            // so validate the shape rather than a fixed length.
             let suffix = &s[6..];
-            assert_eq!(
-                suffix.len(),
-                12,
-                "Instant time format should be 12 chars (HH:MM:SS.mmm), got {suffix:?}"
+            let parts: Vec<&str> = suffix.split([':', '.']).collect();
+            let shape_ok = parts.len() == 4
+                && parts[0].len() >= 2
+                && parts[1].len() == 2
+                && parts[2].len() == 2
+                && parts[3].len() == 3
+                && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()));
+            assert!(
+                shape_ok,
+                "Instant time should render as HH:MM:SS.mmm, got {suffix:?}"
             );
         }
         other => panic!("expected PreRendered Instant delta, got {other:?}"),

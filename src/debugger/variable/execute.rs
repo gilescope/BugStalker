@@ -507,7 +507,7 @@ impl<'dbg> DqeExecutor<'dbg> {
             }
             false => {
                 let vars = self.variable_die_by_selector(selector)?;
-                Ok(vars
+                let results: Vec<QueryResult<'dbg>> = vars
                     .iter()
                     .filter_map(|var_die| {
                         let mut qr = self.root_from_die(var_die, var_die.ranges())?;
@@ -520,7 +520,23 @@ impl<'dbg> DqeExecutor<'dbg> {
                         qr.storage = compute_storage_for_variable(var_die, addr, self.debugger);
                         Some(qr)
                     })
-                    .collect())
+                    .collect();
+
+                // Arguments (DW_TAG_formal_parameter) live in neither the
+                // variable index nor `local_variable` (both only match
+                // DW_TAG_variable), so a by-name lookup — used by DAP
+                // `evaluate`/hover, breakpoint conditions and log points —
+                // misses function parameters even though they're in scope
+                // and visible in the Arguments pane. Fall back to the
+                // parameter search for *name* selectors only; `Selector::Any`
+                // must stay locals-only so the Locals scope doesn't absorb
+                // the Arguments scope.
+                if results.is_empty()
+                    && matches!(selector, Selector::Name { local_only: false, .. })
+                {
+                    return self.apply_select_die(selector, true);
+                }
+                Ok(results)
             }
         }
     }
@@ -859,6 +875,60 @@ impl<'dbg> DqeExecutor<'dbg> {
                 }
                 let name = gcx().with_interner(|i| i.resolve(meta.name_sym).map(str::to_string));
                 out.push(Identity::new(meta.namespace.clone(), name).to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Like [`Self::query_file_scope_names`] but pairs each name with a
+    /// cheap, no-value byte-size from `DW_AT_byte_size` (see
+    /// [`ComplexType::static_byte_size`]). Used to gate eager value reads
+    /// so a giant static (a precomputed crypto table, …) is shown lazily
+    /// instead of materialised on open. `None` size means "unknown" —
+    /// the caller should read it normally.
+    pub fn query_file_scope_name_sizes(
+        &self,
+        kind: FileScopeKind,
+        filter: FileScopeFilter,
+    ) -> Result<Vec<(String, Option<u64>)>, Error> {
+        let tls_names = TlsInternalNames::resolve();
+        let current_crate = match filter {
+            FileScopeFilter::CurrentCrate => self.current_crate_namespace_root(),
+            _ => None,
+        };
+        let current_unit_id = match filter {
+            FileScopeFilter::CurrentUnit => self.current_unit_id(),
+            _ => None,
+        };
+
+        let mut out = Vec::new();
+        for debug_info in self.debugger.debugee.debug_info_all() {
+            let Ok(entries) = debug_info.enumerate_file_scope_variables() else {
+                continue;
+            };
+            for (meta, die_ref) in entries {
+                let is_tls = tls_names.is_tls_internal(meta.name_sym);
+                match kind {
+                    FileScopeKind::Statics if is_tls => continue,
+                    FileScopeKind::ThreadLocals if !is_tls => continue,
+                    _ => {}
+                }
+                if let Some(crate_root) = current_crate.as_ref()
+                    && meta.namespace.as_parts().first() != Some(crate_root)
+                {
+                    continue;
+                }
+                if let Some(uid) = current_unit_id
+                    && die_ref.unit().id != uid
+                {
+                    continue;
+                }
+                let name = gcx().with_interner(|i| i.resolve(meta.name_sym).map(str::to_string));
+                let size = die_ref.r#type().and_then(|t| t.static_byte_size());
+                out.push((
+                    Identity::new(meta.namespace.clone(), name).to_string(),
+                    size,
+                ));
             }
         }
         Ok(out)
