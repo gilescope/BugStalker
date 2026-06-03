@@ -64,6 +64,11 @@ pub(super) struct PerfOverlaySession {
     /// workload). This snapshot is the source of truth for the label.
     #[cfg(target_os = "macos")]
     last_run_sampler_active: bool,
+    /// Dominant blocking syscall (`x16`) sampled during the last run —
+    /// names *why* a mostly-waiting step was waiting (lock / sleep /
+    /// I/O / mach-IPC). `None` when nothing useful was sampled.
+    #[cfg(target_os = "macos")]
+    last_wait_syscall: Option<i64>,
 }
 
 /// macOS in-flight run state. Owns the rusage start snapshot, the
@@ -259,6 +264,7 @@ impl super::DebugSession {
         self.perf_overlay.data.begin_run();
         self.perf_overlay.unavailable = None;
         self.perf_overlay.darwin_run = None;
+        self.perf_overlay.last_wait_syscall = None;
 
         let Some((proc_pid, program)) = self
             .debugger
@@ -540,6 +546,10 @@ impl super::DebugSession {
                     .data
                     .record_unresolved_samples(drain.failed_snapshots);
             }
+            // Name the wait: the dominant blocking syscall sampled in
+            // the window (idle runtime threads sit in mach traps, so we
+            // prefer a positive BSD blocking syscall — see fn).
+            self.perf_overlay.last_wait_syscall = dominant_wait_syscall(&drain.syscalls);
         }
 
         // 2) Take the rusage end snapshot and close the window.
@@ -1213,10 +1223,18 @@ fn diagnose(
     if let Some(share) = cpu_share
         && share < 0.25
     {
+        let summary_text = format!("CPU active for {:.0}% of wall time", share * 100.0);
+        // Go one level deeper: the sampled syscall names the wait
+        // (lock / sleep / I/O / IPC). Falls back to the generic line
+        // when nothing classifiable was sampled.
+        #[cfg(target_os = "macos")]
+        if let Some(w) = session.last_wait_syscall.and_then(classify_wait) {
+            return diagnosis_body(w.emoji, w.label, &summary_text, w.hint);
+        }
         return diagnosis_body(
             "💤",
             "mostly-waiting",
-            &format!("CPU active for {:.0}% of wall time", share * 100.0),
+            &summary_text,
             "blocked on I/O, sleep, lock contention, or syscall — sampling won't help; check thread state",
         );
     }
@@ -1257,6 +1275,75 @@ fn diagnosis_body(emoji: &str, label: &str, summary: &str, hint: &str) -> Value 
         "label": label,
         "summary": summary,
         "hint": hint,
+    })
+}
+
+/// A named wait cause derived from the blocking syscall.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+struct WaitClass {
+    emoji: &'static str,
+    label: &'static str,
+    hint: &'static str,
+}
+
+/// Classify a blocking syscall (`x16`) into a wait cause. Numbers from
+/// macOS `bsd/kern/syscalls.master` (arm64); a negative value is a mach
+/// trap. `None` for syscalls we don't recognise as a blocking wait.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn classify_wait(syscall: i64) -> Option<WaitClass> {
+    if syscall < 0 {
+        return Some(WaitClass {
+            emoji: "📨",
+            label: "ipc/mach wait",
+            hint: "parked in a mach trap (mach_msg / semaphore) — waiting on IPC or a dispatch queue; the work is in another thread or process",
+        });
+    }
+    let (emoji, label, hint) = match syscall {
+        // __psynch_{mutexwait, cvwait, rw_rdlock, rw_wrlock}, __ulock_wait{,2}
+        301 | 302 | 304 | 305 | 515 | 516 => (
+            "🔒",
+            "lock contention",
+            "blocked acquiring a mutex/condvar/rwlock — another thread holds it; shrink the critical section or reduce shared state",
+        ),
+        // __semwait_signal — nanosleep, sem_wait, timed condvar wait
+        334 => (
+            "😴",
+            "sleep / semaphore",
+            "parked in __semwait_signal — an explicit sleep, sem_wait, or timed wait; expected if you meant to block",
+        ),
+        // read, recvmsg, recvfrom, readv, accept, connect, select, poll, kevent{,_qos,_id}
+        3 | 27 | 29 | 120 | 30 | 98 | 93 | 230 | 363 | 374 | 375 => (
+            "🌐",
+            "i/o wait",
+            "blocked on read/recv/kevent/poll — file or socket I/O; the latency is external, not your CPU",
+        ),
+        _ => return None,
+    };
+    Some(WaitClass { emoji, label, hint })
+}
+
+/// Pick the syscall to report from a window's `x16` samples. Prefers the
+/// most frequent *recognised positive* BSD syscall — that's the stepped
+/// thread's real wait. Idle runtime threads sit in mach traps (negative),
+/// so we only fall back to those when no positive wait was sampled.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn dominant_wait_syscall(samples: &[i64]) -> Option<i64> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<i64, usize> = HashMap::new();
+    for &s in samples {
+        *counts.entry(s).or_default() += 1;
+    }
+    let positive = counts
+        .iter()
+        .filter_map(|(&s, &c)| (s > 0 && classify_wait(s).is_some()).then_some((s, c)))
+        .max_by_key(|&(_, c)| c)
+        .map(|(s, _)| s);
+    positive.or_else(|| {
+        counts
+            .iter()
+            .filter_map(|(&s, &c)| (s < 0).then_some((s, c)))
+            .max_by_key(|&(_, c)| c)
+            .map(|(s, _)| s)
     })
 }
 
@@ -1503,6 +1590,32 @@ mod tests {
 
         session.enabled = false;
         assert_eq!(perf_mode_label(&session), "disabled");
+    }
+
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    #[test]
+    fn classify_wait_maps_syscalls_to_causes() {
+        assert_eq!(classify_wait(302).unwrap().label, "lock contention"); // __psynch_mutexwait
+        assert_eq!(classify_wait(515).unwrap().label, "lock contention"); // __ulock_wait
+        assert_eq!(classify_wait(334).unwrap().label, "sleep / semaphore"); // __semwait_signal
+        assert_eq!(classify_wait(3).unwrap().label, "i/o wait"); // read
+        assert_eq!(classify_wait(363).unwrap().label, "i/o wait"); // kevent
+        assert_eq!(classify_wait(-31).unwrap().label, "ipc/mach wait"); // mach_msg trap
+        assert!(classify_wait(20).is_none()); // getpid — not a blocking wait
+    }
+
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    #[test]
+    fn dominant_wait_prefers_positive_blocking_over_idle_mach() {
+        // idle threads parked in mach_msg (-31), one stepped thread in read(3):
+        // the real wait wins over the mach-trap noise.
+        assert_eq!(dominant_wait_syscall(&[-31, -31, -31, -31, -31, 3]), Some(3));
+        // only mach traps → fall back to the mach trap.
+        assert_eq!(dominant_wait_syscall(&[-31, -31]), Some(-31));
+        // unrecognised positive syscalls don't win; mach fallback applies.
+        assert_eq!(dominant_wait_syscall(&[20, 20, -31]), Some(-31));
+        // nothing sampled → nothing to report.
+        assert_eq!(dominant_wait_syscall(&[]), None);
     }
 
     #[cfg(feature = "perf")]
