@@ -69,6 +69,13 @@ pub(super) struct PerfOverlaySession {
     /// I/O / mach-IPC). `None` when nothing useful was sampled.
     #[cfg(target_os = "macos")]
     last_wait_syscall: Option<i64>,
+    /// Thread-isolation guard for the current run (EXPERIMENTAL, opt-in via
+    /// `BS_PERF_ISOLATE_THREAD`): suspends every non-focus thread so the
+    /// process-wide rusage delta reflects only the stepped thread, with a
+    /// watchdog that thaws on a stall (a step that blocks on a frozen thread
+    /// would otherwise hang). Thawed in `finish_perf_stop` / on drop.
+    #[cfg(target_os = "macos")]
+    freeze_guard: Option<ThreadFreezeGuard>,
 }
 
 /// macOS in-flight run state. Owns the rusage start snapshot, the
@@ -346,6 +353,18 @@ impl super::DebugSession {
             sampler,
             resolver,
         });
+
+        // EXPERIMENTAL thread isolation: freeze every non-focus thread for
+        // the step window so the process-wide rusage delta reflects only the
+        // stepped thread (otherwise a runtime worker's millions of
+        // instructions get billed to the stepped line). Off unless
+        // BS_PERF_ISOLATE_THREAD is set — it changes execution semantics and
+        // a step that blocks on a frozen thread relies on the watchdog.
+        if std::env::var_os("BS_PERF_ISOLATE_THREAD").is_some()
+            && let Some(focus_pid) = self.debugger.as_ref().map(|dbg| dbg.ecx().pid_on_focus())
+        {
+            self.perf_overlay.freeze_guard = install_thread_freeze(task, focus_pid);
+        }
     }
 
     #[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
@@ -515,6 +534,9 @@ impl super::DebugSession {
     /// because that call snapshots `last_run` into history.
     #[cfg(all(feature = "perf", target_os = "macos"))]
     pub(super) fn finish_perf_stop(&mut self) {
+        // Thaw the isolation guard first (the step is done) — its Drop
+        // resumes the frozen threads. Runs on every path, incl. early return.
+        self.perf_overlay.freeze_guard = None;
         let Some(run) = self.perf_overlay.darwin_run.take() else {
             self.perf_overlay.last_run_sampler_active = false;
             return;
@@ -1347,6 +1369,108 @@ fn dominant_wait_syscall(samples: &[i64]) -> Option<i64> {
     })
 }
 
+// --- EXPERIMENTAL thread isolation (BS_PERF_ISOLATE_THREAD) ---------------
+// Freeze every non-focus thread during a step so the process-wide rusage
+// delta reflects only the stepped thread (otherwise a runtime worker's
+// instructions get billed to the stepped line). A watchdog thaws on a stall:
+// a step that blocks on a frozen thread never reaches finish_perf_stop (the
+// step's exception receive is infinite-timeout), so the main loop would hang.
+
+/// Thaw if a step hasn't completed by here. Generous — most steps finish in
+/// well under a frame; this only fires on a genuine block-on-frozen-thread.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+const FREEZE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Shared between the guard (thawed in finish_perf_stop / on drop) and the
+/// watchdog thread. Whichever calls `thaw` first resumes + releases the
+/// suspended thread send rights; the other is a no-op.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+#[derive(Debug)]
+struct FreezeInner {
+    suspended: std::sync::Mutex<Vec<mach2::mach_types::thread_act_t>>,
+    thawed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+impl FreezeInner {
+    fn thaw(&self) {
+        use std::sync::atomic::Ordering;
+        if self.thawed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let ports = std::mem::take(&mut *self.suspended.lock().unwrap());
+        for t in ports {
+            let _ = crate::debugger::darwin_mach::thread_resume(t);
+            // SAFETY: `t` is a send right obtained from task_threads; release it.
+            let _ = unsafe {
+                mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), t)
+            };
+        }
+    }
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+#[derive(Debug)]
+struct ThreadFreezeGuard {
+    inner: std::sync::Arc<FreezeInner>,
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+impl Drop for ThreadFreezeGuard {
+    fn drop(&mut self) {
+        self.inner.thaw();
+    }
+}
+
+/// Suspend every thread except the one backing `focus_pid`, returning a
+/// guard that thaws on drop. Focus is matched by **thread id** (not port
+/// name — task_threads hands out distinct send rights for the same thread),
+/// so the stepped thread is never frozen. Spawns a watchdog that thaws after
+/// [`FREEZE_WATCHDOG`] in case the step blocks on a frozen thread. Returns
+/// `None` when single-threaded or the focus thread can't be identified.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn install_thread_freeze(task: mach2::mach_types::task_t, focus_pid: nix::unistd::Pid) -> Option<ThreadFreezeGuard> {
+    use crate::debugger::darwin_mach;
+    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+
+    let dealloc = |t: mach2::mach_types::thread_act_t| {
+        // SAFETY: `t` is a send right we own from task_threads.
+        let _ = unsafe { mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), t) };
+    };
+
+    let focus_port = darwin_mach::thread_port_for_pid_or_first(focus_pid).ok()?;
+    let focus_tid = darwin_mach::thread_identity(focus_port).ok()?.thread_id;
+
+    let mut suspended = Vec::new();
+    for t in darwin_mach::task_threads_vec(task).ok()? {
+        if darwin_mach::thread_identity(t).ok().map(|id| id.thread_id) == Some(focus_tid) {
+            dealloc(t); // never freeze the stepped thread
+            continue;
+        }
+        if darwin_mach::thread_suspend(t).is_ok() {
+            suspended.push(t);
+        } else {
+            dealloc(t);
+        }
+    }
+    if suspended.is_empty() {
+        return None; // single-threaded — nothing to isolate
+    }
+
+    let inner = Arc::new(FreezeInner {
+        suspended: Mutex::new(suspended),
+        thawed: AtomicBool::new(false),
+    });
+    let watchdog = inner.clone();
+    let _ = std::thread::Builder::new()
+        .name("bs-perf-freeze-watchdog".to_owned())
+        .spawn(move || {
+            std::thread::sleep(FREEZE_WATCHDOG);
+            watchdog.thaw(); // no-op if finish_perf_stop already thawed
+        });
+    Some(ThreadFreezeGuard { inner })
+}
+
 #[cfg(all(feature = "perf", target_os = "macos"))]
 fn format_bytes(b: u64) -> String {
     if b >= 1024 * 1024 * 1024 {
@@ -1616,6 +1740,23 @@ mod tests {
         assert_eq!(dominant_wait_syscall(&[20, 20, -31]), Some(-31));
         // nothing sampled → nothing to report.
         assert_eq!(dominant_wait_syscall(&[]), None);
+    }
+
+    // The watchdog and finish_perf_stop can both reach thaw(); only the
+    // first may resume/release ports. (Real suspend/resume needs the live
+    // debugger thread-port registry — exercised by BS_PERF_ISOLATE_THREAD.)
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    #[test]
+    fn freeze_thaw_is_idempotent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let inner = Arc::new(FreezeInner {
+            suspended: Mutex::new(Vec::new()),
+            thawed: AtomicBool::new(false),
+        });
+        inner.thaw();
+        inner.thaw(); // must be a no-op, not a double free / panic
+        assert!(inner.thawed.load(Ordering::SeqCst));
     }
 
     #[cfg(feature = "perf")]
