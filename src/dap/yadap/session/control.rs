@@ -5,6 +5,7 @@ use std::path::Path;
 use super::ThreadFocusByPid;
 use crate::dap::yadap::protocol::{DapRequest, InternalEvent};
 use crate::debugger;
+use crate::debugger::LineInstrCount;
 use crate::debugger::address::{GlobalAddress, RelocatedAddress};
 use crate::debugger::variable::dqe::Literal;
 use crate::ui::command::parser::expression as bs_expr;
@@ -14,6 +15,22 @@ use chumsky::prelude::end;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 use serde_json::json;
+
+/// Max single-steps `step_over_or_count` will take before falling back to a
+/// normal step-over (a hot same-line loop). ~4k traps ≈ tens of ms — snappy for
+/// the common short line; bigger lines use the rusage estimate (accurate at that
+/// scale anyway). See `debug-step-costs.md`.
+const STEP_COUNT_BUDGET: u64 = 4_096;
+
+/// DAP step requests (`next`/`stepIn`/`stepOut`) carry an optional
+/// `granularity`; the Disassembly View sends `"instruction"` to advance one
+/// machine instruction rather than a whole source line.
+fn wants_instruction_step(req: &DapRequest) -> bool {
+    req.arguments
+        .get("granularity")
+        .and_then(serde_json::Value::as_str)
+        == Some("instruction")
+}
 
 #[derive(Debug, Clone)]
 pub struct LastStop {
@@ -511,16 +528,35 @@ impl super::DebugSession {
     }
 
     pub(super) fn handle_next(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        // Disassembly View sends `granularity: "instruction"`, or the Source+ASM
+        // webview has told us it is focused — either way step one machine instruction.
+        if wants_instruction_step(req) || self.asm_view_focused {
+            return self.step_one_instruction(req, "next");
+        }
         self.begin_running();
 
+        // With the perf overlay on, step-count no-call lines for an EXACT
+        // instruction count (single-stepping ≡ step-over for them); otherwise a
+        // plain step-over. `Some(n)` is stashed so the perf body reports the true
+        // count instead of the rusage estimate.
+        let exact_mode = self.perf_overlay_enabled();
         let dbg = self
             .debugger
             .as_mut()
             .ok_or_else(|| anyhow!("next: debugger not initialized"))?;
-        // Blocking step-over.
+        let result: Result<Option<u64>, debugger::Error> = if exact_mode {
+            match dbg.step_over_or_count(STEP_COUNT_BUDGET) {
+                Ok(LineInstrCount::Exact(n)) => Ok(Some(n)),
+                Ok(LineInstrCount::Capped(_)) => Ok(None),
+                Err(e) => Err(e),
+            }
+        } else {
+            dbg.step_over().map(|()| None)
+        };
 
-        match dbg.step_over() {
-            Ok(()) => {
+        match result {
+            Ok(exact) => {
+                self.set_perf_exact_instructions(exact);
                 let thread_id = self.current_thread_id();
                 self.enqueue_event(InternalEvent::Continued {
                     thread_id,
@@ -564,14 +600,108 @@ impl super::DebugSession {
     }
 
     pub(super) fn handle_step_in(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        // Plain DAP `stepIn` (toolbar button, non-keybinding clients):
+        // classic descend-anywhere behaviour. The "skip libraries"
+        // mode is reached only through the `bs/stepIn` custom request,
+        // which the keybindings send explicitly. (Open question in the
+        // phase-12 plan: whether the toolbar default should flip to
+        // skip-libraries; left as AnyFrame to preserve behaviour.)
+        if wants_instruction_step(req) || self.asm_view_focused {
+            return self.step_one_instruction(req, "stepIn");
+        }
+        self.step_in_with_mode(req, "stepIn", debugger::StepIntoMode::AnyFrame)
+    }
+
+    /// Single machine-instruction step (DAP `granularity: "instruction"`),
+    /// shared by `next` and `stepIn` when the Disassembly View is focused.
+    /// Emits the same `continued`/`stopped`/`exited` events as a line step.
+    fn step_one_instruction(&mut self, req: &DapRequest, op: &str) -> anyhow::Result<()> {
+        self.begin_running();
+        let dbg = self
+            .debugger
+            .as_mut()
+            .ok_or_else(|| anyhow!("{op}: debugger not initialized"))?;
+        match dbg.stepi() {
+            Ok(()) => {
+                let thread_id = self.current_thread_id();
+                self.enqueue_event(InternalEvent::Continued {
+                    thread_id,
+                    all_threads_continued: true,
+                });
+                self.send_success_body(req, json!({"allThreadsContinued": true}))?;
+                self.begin_stop_epoch();
+                self.capture_live_reverse_stop();
+                self.last_stop = Some(LastStop {
+                    reason: "pause".to_string(),
+                    description: Some("Paused".to_string()),
+                    signal: None,
+                    source_path: None,
+                    line: None,
+                    column: None,
+                    stack_trace: None,
+                });
+                let thread_id = self.current_thread_id();
+                self.enqueue_event(InternalEvent::Stopped {
+                    reason: "step".to_string(),
+                    thread_id,
+                    description: None,
+                    preserve_focus_hint: false,
+                });
+                self.drain_events()
+            }
+            Err(debugger::Error::ProcessExit(code)) => {
+                let thread_id = self.current_thread_id();
+                self.enqueue_event(InternalEvent::Continued {
+                    thread_id,
+                    all_threads_continued: true,
+                });
+                self.send_success_body(req, json!({"allThreadsContinued": true}))?;
+                self.enqueue_event(InternalEvent::Exited { code });
+                self.drain_events()
+            }
+            Err(e) => self.send_err(req, format!("{op} (instruction) failed: {e}")),
+        }
+    }
+
+    /// BugStalker custom request: Step-In with an explicit "just my
+    /// code" choice. `arguments.skipLibraries` (bool, default false)
+    /// selects [`StepIntoMode::SkipLibraries`]; the VS Code keybindings
+    /// (`alt+right` / `shift+alt+right`) map onto this so the modifier
+    /// becomes a flag rather than fighting VS Code's `stepIn`
+    /// bookkeeping. Emits the same `continued`/`stopped` events as a
+    /// normal step.
+    ///
+    /// [`StepIntoMode::SkipLibraries`]: crate::debugger::StepIntoMode::SkipLibraries
+    pub(super) fn handle_step_in_skip_libs(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let skip = req
+            .arguments
+            .get("skipLibraries")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mode = if skip {
+            debugger::StepIntoMode::SkipLibraries
+        } else {
+            debugger::StepIntoMode::AnyFrame
+        };
+        self.step_in_with_mode(req, "bs/stepIn", mode)
+    }
+
+    /// Shared engine for plain `stepIn` and the `bs/stepIn` custom
+    /// request: dispatch to `step_into_with(mode)` and emit DAP events.
+    fn step_in_with_mode(
+        &mut self,
+        req: &DapRequest,
+        command: &str,
+        mode: debugger::StepIntoMode,
+    ) -> anyhow::Result<()> {
         self.begin_running();
 
         let dbg = self
             .debugger
             .as_mut()
-            .ok_or_else(|| anyhow!("stepIn: debugger not initialized"))?;
+            .ok_or_else(|| anyhow!("{command}: debugger not initialized"))?;
 
-        match dbg.step_into() {
+        match dbg.step_into_with(mode) {
             Ok(()) => {
                 let thread_id = self.current_thread_id();
                 self.enqueue_event(InternalEvent::Continued {
@@ -601,7 +731,7 @@ impl super::DebugSession {
                 self.enqueue_event(InternalEvent::Exited { code });
                 self.drain_events()
             }
-            Err(e) => self.send_err(req, format!("stepIn failed: {e}")),
+            Err(e) => self.send_err(req, format!("{command} failed: {e}")),
         }
     }
 

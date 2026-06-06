@@ -203,6 +203,20 @@ impl super::DebugSession {
         self.send_success_body(req, json!({ "name": name }))
     }
 
+    /// `bs/setAsmFocus` — notified by the extension when the Source+ASM webview
+    /// panel gains or loses focus. While focused, `handle_next`/`handle_step_in`
+    /// treat every step as `granularity: "instruction"` so F10/F11 step one
+    /// machine instruction without any keybinding overrides.
+    pub(super) fn handle_set_asm_focus(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let focused = req
+            .arguments
+            .get("focused")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        self.asm_view_focused = focused;
+        self.send_success(req)
+    }
+
     /// `bs/functionBounds` — returns the relocated start/end addresses of the
     /// function containing the current PC. The extension uses this to request a
     /// full-function disassembly rather than a fixed instruction window.

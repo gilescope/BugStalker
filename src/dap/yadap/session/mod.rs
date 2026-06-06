@@ -112,6 +112,10 @@ pub struct DebugSession {
     canceled_progress_ids: HashSet<String>,
     #[cfg(feature = "perf")]
     perf_overlay: perf::PerfOverlaySession,
+    /// True while the Source+ASM webview panel is the active (focused) editor.
+    /// When set, `handle_next`/`handle_step_in` use instruction granularity
+    /// so F10/F11 step one machine instruction without any keybinding magic.
+    asm_view_focused: bool,
 }
 
 const EXCEPTION_FILTER_SIGNAL: &str = "signal";
@@ -205,6 +209,7 @@ impl DebugSession {
             canceled_progress_ids: HashSet::new(),
             #[cfg(feature = "perf")]
             perf_overlay: perf::PerfOverlaySession::default(),
+            asm_view_focused: false,
         }
     }
 
@@ -772,6 +777,7 @@ impl DebugSession {
             "bs/applyPatch" => self.handle_apply_patch(req)?,
             "bs/functionBounds" => self.handle_function_bounds(req)?,
             "bs/currentFunctionName" => self.handle_current_function_name(req)?,
+            "bs/setAsmFocus" => self.handle_set_asm_focus(req)?,
             other => {
                 self.send_err(req, format!("Unsupported DAP command: {other}"))?;
             }
