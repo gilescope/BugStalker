@@ -623,6 +623,11 @@ impl super::DebugSession {
             .ok_or_else(|| anyhow!("{op}: debugger not initialized"))?;
         match dbg.stepi() {
             Ok(()) => {
+                // A single machine-instruction step is, by definition, exactly
+                // one instruction. Tell the perf overlay so it reports 1 rather
+                // than the rusage delta — which is dominated by the ~11k kernel
+                // instructions of the trap itself (the trap floor).
+                self.set_perf_exact_instructions(Some(1));
                 let thread_id = self.current_thread_id();
                 self.enqueue_event(InternalEvent::Continued {
                     thread_id,

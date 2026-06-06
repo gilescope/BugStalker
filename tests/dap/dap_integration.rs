@@ -1926,6 +1926,49 @@ fn test_asm_focus_next_steps_instruction() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Regression: an instruction step must report `runInstructions == 1`, not the
+/// rusage delta. The rusage delta is dominated by the ~11k *kernel* instructions
+/// of the trap itself (the "trap floor"), so without telling the perf overlay
+/// the exact count, stepping into a trivial line like `i = i + 1` showed ~11k.
+#[cfg(feature = "perf")]
+#[test]
+#[serial]
+fn test_asm_focus_step_reports_one_instruction() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session.client.send_request("bs/perfOverlayEnable", json!({}))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(resp["success"].as_bool().unwrap_or(false), "bs/perfOverlayEnable failed");
+
+    let seq = session
+        .client
+        .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(resp["success"].as_bool().unwrap_or(false), "bs/setAsmFocus failed");
+
+    let seq = session.client.send_request("next", json!({ "threadId": thread_id }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "next", seq, true);
+
+    let stopped = session.client.wait_for_event("stopped")?;
+    let run_instructions = stopped["body"]["bs_perf"]["runInstructions"].as_u64();
+    assert_eq!(
+        run_instructions,
+        Some(1),
+        "single instruction step must report runInstructions=1, not the trap-floor \
+         rusage delta; got {run_instructions:?} (bs_perf: {})",
+        stopped["body"]["bs_perf"],
+    );
+    session.shutdown();
+    Ok(())
+}
+
 /// Same as above but for `stepIn` — asm focus must redirect it to a single
 /// instruction step, not a source-level descent.
 #[test]
