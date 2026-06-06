@@ -645,7 +645,11 @@ impl super::DebugSession {
                     reason: "step".to_string(),
                     thread_id,
                     description: None,
-                    preserve_focus_hint: false,
+                    // Instruction steps must not steal focus from the
+                    // Source+ASM panel — without this VS Code refocuses
+                    // the source editor after every stepi, clearing
+                    // asm_view_focused before the next step fires.
+                    preserve_focus_hint: true,
                 });
                 self.drain_events()
             }

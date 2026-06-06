@@ -1872,6 +1872,105 @@ fn test_next_instruction_granularity() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `bs/setAsmFocus {focused:true}` makes a plain `next` (no granularity field)
+/// step one machine instruction, matching the behaviour VS Code's Disassembly
+/// View gets from `granularity:"instruction"`.
+/// Also checks that the stopped event carries `preserveFocusHint:true` so VS
+/// Code does not steal focus from the asm panel between steps.
+#[test]
+#[serial]
+fn test_asm_focus_next_steps_instruction() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session
+        .client
+        .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(resp["success"].as_bool().unwrap_or(false), "bs/setAsmFocus failed");
+
+    let pc_of = |s: &mut DapSession| -> anyhow::Result<Option<u64>> {
+        let seq = s.client.send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let resp = s.client.read_response(seq)?;
+        Ok(resp["body"]["stackFrames"][0]["instructionPointerReference"]
+            .as_str()
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+    };
+    let before = pc_of(&mut session)?;
+
+    let seq = session.client.send_request("next", json!({ "threadId": thread_id }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "next", seq, true);
+
+    let stopped = session.client.wait_for_event("stopped")?;
+    assert_eq!(
+        stopped["body"]["preserveFocusHint"].as_bool(),
+        Some(true),
+        "instruction step must set preserveFocusHint:true to keep asm panel focused",
+    );
+
+    let after = pc_of(&mut session)?;
+    if let (Some(a), Some(b)) = (before, after) {
+        let delta = b.abs_diff(a);
+        assert!(
+            delta != 0 && delta <= 64,
+            "bs/setAsmFocus next moved {delta} bytes — expected ≤64 (one instruction), not a source line",
+        );
+    }
+    session.shutdown();
+    Ok(())
+}
+
+/// Same as above but for `stepIn` — asm focus must redirect it to a single
+/// instruction step, not a source-level descent.
+#[test]
+#[serial]
+fn test_asm_focus_step_in_steps_instruction() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session
+        .client
+        .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(resp["success"].as_bool().unwrap_or(false), "bs/setAsmFocus failed");
+
+    let pc_of = |s: &mut DapSession| -> anyhow::Result<Option<u64>> {
+        let seq = s.client.send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let resp = s.client.read_response(seq)?;
+        Ok(resp["body"]["stackFrames"][0]["instructionPointerReference"]
+            .as_str()
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+    };
+    let before = pc_of(&mut session)?;
+
+    let seq = session.client.send_request("stepIn", json!({ "threadId": thread_id }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "stepIn", seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    let after = pc_of(&mut session)?;
+    if let (Some(a), Some(b)) = (before, after) {
+        let delta = b.abs_diff(a);
+        assert!(
+            delta != 0 && delta <= 64,
+            "bs/setAsmFocus stepIn moved {delta} bytes — expected ≤64 (one instruction), not a source descent",
+        );
+    }
+    session.shutdown();
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_step_in_request() -> anyhow::Result<()> {
