@@ -1971,6 +1971,57 @@ fn test_asm_focus_step_in_steps_instruction() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `bs/stepIn` custom request (alt+right / shift+alt+right keybindings)
+/// must also honour asm focus: with the panel focused it steps one instruction
+/// rather than running its skip-libraries source descent — otherwise per-step
+/// instruction counts are inflated by a whole line's worth of work.
+#[test]
+#[serial]
+fn test_asm_focus_bs_step_in_steps_instruction() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session
+        .client
+        .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(resp["success"].as_bool().unwrap_or(false), "bs/setAsmFocus failed");
+
+    let pc_of = |s: &mut DapSession| -> anyhow::Result<Option<u64>> {
+        let seq = s.client.send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let resp = s.client.read_response(seq)?;
+        Ok(resp["body"]["stackFrames"][0]["instructionPointerReference"]
+            .as_str()
+            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+    };
+    let before = pc_of(&mut session)?;
+
+    // shift+alt+right maps to bs/stepIn with skipLibraries:false.
+    let seq = session.client.send_request(
+        "bs/stepIn",
+        json!({ "threadId": thread_id, "skipLibraries": false }),
+    )?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "bs/stepIn", seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    let after = pc_of(&mut session)?;
+    if let (Some(a), Some(b)) = (before, after) {
+        let delta = b.abs_diff(a);
+        assert!(
+            delta != 0 && delta <= 64,
+            "asm-focus bs/stepIn moved {delta} bytes — expected ≤64 (one instruction), not a skip-libs source descent",
+        );
+    }
+    session.shutdown();
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_step_in_request() -> anyhow::Result<()> {

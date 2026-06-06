@@ -677,6 +677,13 @@ impl super::DebugSession {
     ///
     /// [`StepIntoMode::SkipLibraries`]: crate::debugger::StepIntoMode::SkipLibraries
     pub(super) fn handle_step_in_skip_libs(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        // When the Source+ASM panel is focused, alt+right / shift+alt+right
+        // should step one machine instruction too — not just plain stepIn.
+        // Otherwise the skip-libs path runs a full source step-in, inflating
+        // the per-step instruction count.
+        if wants_instruction_step(req) || self.asm_view_focused {
+            return self.step_one_instruction(req, "bs/stepIn");
+        }
         let skip = req
             .arguments
             .get("skipLibraries")
