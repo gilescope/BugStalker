@@ -778,6 +778,7 @@ impl DebugSession {
             "bs/functionBounds" => self.handle_function_bounds(req)?,
             "bs/currentFunctionName" => self.handle_current_function_name(req)?,
             "bs/setAsmFocus" => self.handle_set_asm_focus(req)?,
+            "bs/registers" => self.handle_registers(req)?,
             other => {
                 self.send_err(req, format!("Unsupported DAP command: {other}"))?;
             }

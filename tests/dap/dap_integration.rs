@@ -1877,6 +1877,48 @@ fn test_next_instruction_granularity() -> anyhow::Result<()> {
 /// View gets from `granularity:"instruction"`.
 /// Also checks that the stopped event carries `preserveFocusHint:true` so VS
 /// Code does not steal focus from the asm panel between steps.
+/// `bs/registers` returns the focus thread's GPRs at the current stop as a
+/// `{ name: "0x…" }` map. The Source+ASM tooltip uses these to show an
+/// instruction's operand values. On aarch64 `pc` must equal the frame's
+/// instructionPointerReference; elsewhere the map is empty (no operand-name
+/// map yet) — assert only that the request succeeds.
+#[test]
+#[serial]
+fn test_registers_request() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session.client.send_request("bs/registers", json!({}))?;
+    let resp = session.client.read_response(seq)?;
+    ensure_response!(session, &resp, "bs/registers", seq, true);
+    let regs = &resp["body"]["registers"];
+
+    if cfg!(target_arch = "aarch64") {
+        let pc = regs["pc"].as_str().expect("pc register present");
+        assert!(pc.starts_with("0x"), "register values are hex strings, got {pc}");
+        // pc must match the top frame's instruction pointer.
+        let seq = session.client.send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let st = session.client.read_response(seq)?;
+        let ip = st["body"]["stackFrames"][0]["instructionPointerReference"]
+            .as_str()
+            .expect("frame ip");
+        assert_eq!(
+            u64::from_str_radix(pc.trim_start_matches("0x"), 16).ok(),
+            u64::from_str_radix(ip.trim_start_matches("0x"), 16).ok(),
+            "bs/registers pc ({pc}) must equal the frame instruction pointer ({ip})",
+        );
+        assert!(regs["x0"].is_string(), "x0 present on aarch64");
+        assert!(regs["sp"].is_string(), "sp present on aarch64");
+    }
+    session.shutdown();
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_asm_focus_next_steps_instruction() -> anyhow::Result<()> {

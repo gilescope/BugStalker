@@ -203,6 +203,21 @@ impl super::DebugSession {
         self.send_success_body(req, json!({ "name": name }))
     }
 
+    /// `bs/registers` — GPR values for the focus thread at the current stop,
+    /// as a `{ name: "0x…" }` map. The Source+ASM view uses these to show an
+    /// instruction's operand registers' live values in its hover tooltip.
+    pub(super) fn handle_registers(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let Some(dbg) = self.debugger.as_ref() else {
+            return self.send_err(req, "bs/registers: no active session");
+        };
+        let map: serde_json::Map<String, serde_json::Value> = dbg
+            .current_registers()
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), json!(format!("0x{value:x}"))))
+            .collect();
+        self.send_success_body(req, json!({ "registers": map }))
+    }
+
     /// `bs/setAsmFocus` — notified by the extension when the Source+ASM webview
     /// panel gains or loses focus. While focused, `handle_next`/`handle_step_in`
     /// treat every step as `granularity: "instruction"` so F10/F11 step one
