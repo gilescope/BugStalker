@@ -2379,6 +2379,19 @@ impl Debugger {
     /// Relocated (runtime) start and end addresses for the function containing
     /// the current PC, derived from DWARF subprogram ranges.
     /// Returns `None` if the PC is outside any known function.
+    pub fn current_function_name(&self) -> Option<String> {
+        let ecx = self.ecx();
+        let pc = ecx.location().pc;
+        let debug_info = self.debugee.debug_info(pc).ok()?;
+        let (_, info) = debug_info
+            .find_function_by_pc(ecx.location().global_pc)
+            .ok()
+            .flatten()?;
+        info.full_name()
+            .or_else(|| info.name.clone())
+            .or_else(|| info.linkage_name.clone())
+    }
+
     pub fn current_function_address_range(&self) -> Option<(usize, usize)> {
         let ecx = self.ecx();
         let pc = ecx.location().pc;

@@ -38,6 +38,14 @@ pub struct DebugSession {
     debugger: Option<debugger::Debugger>,
     session_mode: Option<init::SessionMode>,
     source_map: SourceMap,
+    /// Launch option `focusPanicCulprit` (bool, default `true`). When set,
+    /// a break-on-panic stop deemphasizes the panic-runtime frames (omits
+    /// their `source` so the editor can't auto-open a toolchain tab) and
+    /// corrects the culprit frame's line/column from the `#[track_caller]`
+    /// `&Location`. Turn it off for vanilla behaviour: every frame
+    /// navigable, raw DWARF lines, the editor lands wherever the top frame
+    /// points. See `frame.rs`.
+    focus_panic_culprit: bool,
     breakpoints_by_source: HashMap<String, Vec<breakpoint::BreakpointRecord>>,
     function_breakpoints: Vec<breakpoint::BreakpointRecord>,
     instruction_breakpoints: Vec<breakpoint::BreakpointRecord>,
@@ -69,11 +77,23 @@ pub struct DebugSession {
     /// any static's value; values are read only for the subtree the user
     /// expands. Persists across stops; invalidated on new launch/attach.
     statics_index: Option<data::NameTrie>,
+    /// `DW_AT_byte_size` of *only* the over-`data::STATIC_LAZY_BYTES`
+    /// statics (full `::` identity path), built alongside `statics_index`.
+    /// Membership is the lazy-leaf gate; the value feeds the node's size
+    /// label. Small statics aren't stored (their size is never consulted).
+    /// A giant precomputed table (e.g. the 512 KB secp256k1 generator
+    /// tables) is thus read on expand, not on open, so it doesn't stall
+    /// the Statics pane. Same lifetime as `statics_index`.
+    statics_sizes: HashMap<String, u64>,
     /// Lazy Statics namespace nodes awaiting expansion, keyed by their
     /// `variablesReference`: `(thread, frame, namespace prefix)`.
     /// `handle_variables` materialises the level on expand. Per-stop
     /// (the refs come from `vars`, cleared each stop).
     pending_namespaces: HashMap<i64, (i64, u32, Vec<String>)>,
+    /// Lazy *leaf* statics (too big to read eagerly) awaiting expansion,
+    /// keyed by `variablesReference`: `(thread, frame, full identity)`.
+    /// On expand `handle_variables` reads that one static's value. Per-stop.
+    pending_static_values: HashMap<i64, (i64, u32, String)>,
     child_links: HashMap<(i64, usize), i64>,
     disasm_cache_by_addr: HashMap<usize, source::DisasmSource>,
     disasm_cache_by_reference: HashMap<i64, source::DisasmSource>,
@@ -146,6 +166,7 @@ impl DebugSession {
             debugger: None,
             session_mode: None,
             source_map: SourceMap::default(),
+            focus_panic_culprit: true,
             breakpoints_by_source: HashMap::new(),
             function_breakpoints: Vec::new(),
             instruction_breakpoints: Vec::new(),
@@ -157,7 +178,9 @@ impl DebugSession {
             pending_scopes: HashMap::new(),
             ro_statics: HashMap::new(),
             statics_index: None,
+            statics_sizes: HashMap::new(),
             pending_namespaces: HashMap::new(),
+            pending_static_values: HashMap::new(),
             child_links: HashMap::new(),
             disasm_cache_by_addr: HashMap::new(),
             disasm_cache_by_reference: HashMap::new(),
@@ -250,6 +273,7 @@ impl DebugSession {
         self.child_links.clear();
         self.pending_scopes.clear();
         self.pending_namespaces.clear();
+        self.pending_static_values.clear();
     }
 
     fn begin_running(&mut self) {
@@ -260,6 +284,9 @@ impl DebugSession {
         self.pending_scopes.clear();
         self.pending_namespaces.clear();
         self.begin_perf_run();
+        // Each step window starts with no exact count; the step path fills it in
+        // for no-call lines (see handle_next / step_over_or_count).
+        self.set_perf_exact_instructions(None);
     }
 
     fn enqueue_thread_event(&mut self, reason: &'static str, thread_id: i64) {
@@ -693,6 +720,10 @@ impl DebugSession {
             "restartFrame" => self.handle_restart_frame(req)?,
             "next" => self.handle_next(req)?,
             "stepIn" => self.handle_step_in(req)?,
+            // Phase 12 — Step-Into "just my code". Carries
+            // `skipLibraries`; the VS Code keybindings send this so the
+            // alt/shift-alt modifier picks the mode explicitly.
+            "bs/stepIn" => self.handle_step_in_skip_libs(req)?,
             "stepInTargets" => self.handle_step_in_targets(req)?,
             "stepOut" => self.handle_step_out(req)?,
             "stepBack" => self.handle_step_back(req)?,
@@ -739,6 +770,8 @@ impl DebugSession {
             "bs/replayJump" => self.handle_replay_jump(req)?,
             "bs/replayTimeline" => self.handle_replay_timeline(req)?,
             "bs/applyPatch" => self.handle_apply_patch(req)?,
+            "bs/functionBounds" => self.handle_function_bounds(req)?,
+            "bs/currentFunctionName" => self.handle_current_function_name(req)?,
             other => {
                 self.send_err(req, format!("Unsupported DAP command: {other}"))?;
             }
