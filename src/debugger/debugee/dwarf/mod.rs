@@ -82,6 +82,28 @@ pub struct DebugInformation<R: gimli::Reader = EndianArcSlice> {
     /// lazily on each query (zero-copy parser; the per-query cost is
     /// just header reads). See `compact_cfa_at`.
     compact_unwind_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// Image base (`object::Object::relative_address_base`) — the value
+    /// the `__unwind_info` function offsets are relative to. On macOS
+    /// this is the `__TEXT` segment vmaddr (e.g. `0x1_0000_0000`).
+    /// Global PCs are this-plus-offset, so they must have `base`
+    /// subtracted before the (u32, image-relative) compact-unwind
+    /// lookup — otherwise `u32::try_from` overflows and every lookup
+    /// silently misses. 0 when there's no compact-unwind section.
+    compact_unwind_base: u64,
+}
+
+/// Minimal macOS arm64 compact-unwind (`__unwind_info`) description for a
+/// function — enough to compute the CFA and recover the return address
+/// when there's no DWARF `__eh_frame` FDE (the common case for trivial /
+/// frameless library functions like `Vec::new`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactUnwind {
+    /// Standard `[fp, lr]` frame record: CFA = `fp + 16`, saved `fp` at
+    /// `[fp]`, saved `lr` (return address) at `[fp + 8]`.
+    FrameBased,
+    /// No frame record: CFA = `sp + stack_size`, return address still in
+    /// `lr` (the function — a leaf — never spilled it).
+    Frameless { stack_size: u32 },
 }
 
 impl Clone for DebugInformation {
@@ -125,6 +147,7 @@ impl Clone for DebugInformation {
             // Dwarf sections.
             addr2_ctx: once_cell::sync::OnceCell::new(),
             compact_unwind_bytes: self.compact_unwind_bytes.clone(),
+            compact_unwind_base: self.compact_unwind_base,
         }
     }
 }
@@ -268,73 +291,56 @@ impl DebugInformation {
         }
     }
 
-    /// Compute the canonical frame address (CFA) at `pc` using
-    /// Mach-O `__compact_unwind` data when present. Returns `Ok(None)`
-    /// when the binary has no compact-unwind section, when the lookup
-    /// misses, or when the encoding asks us to fall through to a
-    /// `__eh_frame` FDE (in which case the caller should already have
-    /// resolved that path).
-    ///
-    /// The compact-unwind ARM64 encoding tells us directly how the
-    /// frame is laid out at a PC:
-    /// * `FrameBased` — standard `[fp, lr]` pair on the stack; CFA is
-    ///   `old_fp + 16`.
-    /// * `Frameless` — no frame pointer; CFA is `sp + stack_size`.
-    /// * `Dwarf { eh_frame_fde }` — defer to the FDE at that offset.
-    /// * `Null` / unrecognised — no info available.
+    /// Classify the macOS `__compact_unwind` entry covering `pc`, if any
+    /// (see [`CompactUnwind`]). Returns `None` when there's no
+    /// compact-unwind section, no entry for `pc`, the PC is beyond 4 GiB
+    /// from the image base, or the entry defers to `__eh_frame` / has no
+    /// info (`Dwarf` / `Null`) — in those cases the caller should rely on
+    /// DWARF CFI instead.
+    pub fn compact_unwind_at(&self, pc: GlobalAddress) -> Option<CompactUnwind> {
+        let bytes = self.compact_unwind_bytes.as_ref()?;
+        let info = macho_unwind_info::UnwindInfo::parse(bytes.as_ref()).ok()?;
+        // Compact-unwind function offsets are image-relative; the global
+        // PC is image_base + offset (on macOS arm64 the base is
+        // ~0x1_0000_0000, so the raw PC always overflows u32). Subtract
+        // the base before the u32 lookup.
+        let probe = u32::try_from(u64::from(pc).wrapping_sub(self.compact_unwind_base)).ok()?;
+        let function = info.lookup(probe).ok().flatten()?;
+        use macho_unwind_info::opcodes::OpcodeArm64;
+        match OpcodeArm64::parse(function.opcode) {
+            OpcodeArm64::FrameBased { .. } => Some(CompactUnwind::FrameBased),
+            OpcodeArm64::Frameless {
+                stack_size_in_bytes,
+            } => Some(CompactUnwind::Frameless {
+                stack_size: stack_size_in_bytes.into(),
+            }),
+            OpcodeArm64::Dwarf { .. } | OpcodeArm64::Null | OpcodeArm64::UnrecognizedKind(_) => {
+                None
+            }
+        }
+    }
+
     pub fn compact_cfa_at(
         &self,
         pc: GlobalAddress,
         pid: nix::unistd::Pid,
     ) -> Result<Option<RelocatedAddress>, Error> {
-        let Some(bytes) = self.compact_unwind_bytes.as_ref() else {
+        let Some(kind) = self.compact_unwind_at(pc) else {
             return Ok(None);
         };
-        let info = match macho_unwind_info::UnwindInfo::parse(bytes.as_ref()) {
-            Ok(i) => i,
-            Err(err) => {
-                log::warn!(target: "debugger", "compact unwind parse error: {err}");
-                return Ok(None);
-            }
-        };
-        let probe: u64 = pc.into();
-        let probe_u32 = match u32::try_from(probe) {
-            Ok(v) => v,
-            // Compact unwind keys are u32; PCs beyond 4 GiB into the
-            // image aren't representable. Fall through to "no info".
-            Err(_) => return Ok(None),
-        };
-        let function = match info.lookup(probe_u32) {
-            Ok(Some(f)) => f,
-            Ok(None) => return Ok(None),
-            Err(err) => {
-                log::debug!(
-                    target: "debugger",
-                    "compact unwind lookup at {probe:#x} failed: {err}"
-                );
-                return Ok(None);
-            }
-        };
-        use macho_unwind_info::opcodes::OpcodeArm64;
-        let opcode = OpcodeArm64::parse(function.opcode);
         let regs = DwarfRegisterMap::from(RegisterMap::current(pid)?);
         // arm64 DWARF register numbers: x0..x30 -> 0..30, SP -> 31,
         // x29 (FP) -> 29. Same numbering gimli uses.
         const FP: gimli::Register = gimli::Register(29);
         const SP: gimli::Register = gimli::Register(31);
-        let cfa: u64 = match opcode {
-            OpcodeArm64::FrameBased { .. } => {
+        let cfa: u64 = match kind {
+            CompactUnwind::FrameBased => {
                 let fp = regs.value(FP)?;
                 fp.saturating_add(16)
             }
-            OpcodeArm64::Frameless {
-                stack_size_in_bytes,
-            } => {
+            CompactUnwind::Frameless { stack_size } => {
                 let sp = regs.value(SP)?;
-                sp.saturating_add(stack_size_in_bytes as u64)
-            }
-            OpcodeArm64::Dwarf { .. } | OpcodeArm64::Null | OpcodeArm64::UnrecognizedKind(_) => {
-                return Ok(None);
+                sp.saturating_add(stack_size as u64)
             }
         };
         Ok(Some(RelocatedAddress::from(cfa as usize)))
@@ -428,6 +434,17 @@ impl DebugInformation {
     ) -> Result<Option<PlaceDescriptor<'_>>, Error> {
         let mb_unit = self.find_unit_by_pc(pc)?;
         Ok(mb_unit.and_then(|u| u.find_place_by_pc(pc)))
+    }
+
+    /// Like [`find_place_from_pc`] but snaps to the nearest `is_stmt=true` row.
+    /// Use for disassembly annotation so non-`is_stmt` boundary markers don't
+    /// label instructions with an adjacent line's number.
+    pub fn find_stmt_place_from_pc(
+        &self,
+        pc: GlobalAddress,
+    ) -> Result<Option<PlaceDescriptor<'_>>, Error> {
+        let mb_unit = self.find_unit_by_pc(pc)?;
+        Ok(mb_unit.and_then(|u| u.find_stmt_place_by_pc(pc)))
     }
 
     /// Returns first place with line address equals to program counter global address.
@@ -1045,9 +1062,13 @@ impl DebugInformation {
     pub fn compact_function_range_at(&self, pc: GlobalAddress) -> Option<(u64, u64)> {
         let bytes = self.compact_unwind_bytes.as_ref()?;
         let info = macho_unwind_info::UnwindInfo::parse(bytes.as_ref()).ok()?;
-        let probe = u32::try_from(u64::from(pc)).ok()?;
+        // Image-relative: subtract the base (see `compact_cfa_at`).
+        let probe = u32::try_from(u64::from(pc).wrapping_sub(self.compact_unwind_base)).ok()?;
         let f = info.lookup(probe).ok().flatten()?;
-        Some((f.start_address as u64, f.end_address as u64))
+        // Returned offsets are image-relative too; lift them back to
+        // global addresses so callers can compare against PCs.
+        let base = self.compact_unwind_base;
+        Some((f.start_address as u64 + base, f.end_address as u64 + base))
     }
 
     pub fn tls_symbol_offset(&self, mangled_name: &str) -> Option<u64> {
@@ -1458,18 +1479,17 @@ impl DebugInformationBuilder {
             return Ok(());
         }
 
-        let bin_mtime = fs::metadata(obj_path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
         let Some(dsym_path) = Self::dsym_inner_dwarf_path(obj_path) else {
             return Ok(());
         };
-        let needs_refresh = match fs::metadata(&dsym_path).and_then(|m| m.modified()) {
-            Ok(dsym_mtime) => dsym_mtime < bin_mtime,
-            Err(_) => true,
-        };
-        if !needs_refresh {
+        // Freshness by Mach-O **UUID**, not mtime. The LC_UUID is a content
+        // hash of the linked image, so a `.dSYM` whose UUID matches the
+        // binary is valid no matter the mtimes. The old `dsym_mtime <
+        // bin_mtime` test fired a needless — and, when the spawning
+        // context can't write the bundle, noisily failing — `dsymutil` run
+        // on every launch for incremental / patched builds that re-touch
+        // the binary without changing its code (same UUID, newer mtime).
+        if Self::dsym_uuid_matches(file, &dsym_path) {
             return Ok(());
         }
 
@@ -1479,17 +1499,41 @@ impl DebugInformationBuilder {
              running `dsymutil` to materialise debug info from the \
              OSO-pointed `.o` files"
         );
-        match Command::new("dsymutil").arg(obj_path).status() {
-            Ok(s) if s.success() => {
+        // Capture dsymutil's stdio rather than inheriting it (`.status()`):
+        // when it fails it prints `error: cannot create bundle: …` to its
+        // stderr, which would otherwise flood ours. We decide the log
+        // level ourselves below.
+        match Command::new("dsymutil").arg(obj_path).output() {
+            Ok(o) if o.status.success() => {
                 debug!(target: "dwarf-loader", "dsymutil produced {dsym_path:?}");
             }
-            Ok(s) => {
-                log::warn!(
-                    target: "dwarf-loader",
-                    "dsymutil exited with status {s}; debug info will be unavailable. \
-                     If the binary lives in a read-only path, copy it locally and re-run \
-                     `dsymutil <bin>` by hand."
-                );
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let stderr = stderr.trim();
+                // A `.dSYM` already exists — we can keep debugging with it.
+                // The refresh failing is then just noise: common with
+                // incremental / patched builds (the binary's mtime keeps
+                // moving ahead of a `.dSYM` whose `.o` inputs churn, or a
+                // bundle another process is touching). Log it at debug and
+                // carry on with the existing, slightly-stale debug info.
+                if dsym_path.exists() {
+                    debug!(
+                        target: "dwarf-loader",
+                        "dsymutil refresh of {dsym_path:?} failed ({}); \
+                         using the existing .dSYM. dsymutil: {stderr}",
+                        o.status,
+                    );
+                } else {
+                    // No `.dSYM` at all → the user genuinely has no debug
+                    // info; this one is worth surfacing.
+                    log::warn!(
+                        target: "dwarf-loader",
+                        "dsymutil exited with status {} and produced no .dSYM; debug info \
+                         will be unavailable (dsymutil: {stderr}). If the binary lives in a \
+                         read-only path, copy it locally and run `dsymutil <bin>` by hand.",
+                        o.status,
+                    );
+                }
             }
             Err(e) => {
                 log::warn!(
@@ -1500,6 +1544,24 @@ impl DebugInformationBuilder {
             }
         }
         Ok(())
+    }
+
+    /// Whether the `.dSYM`'s inner DWARF Mach-O carries the same `LC_UUID`
+    /// as the executable — the canonical "this debug info belongs to this
+    /// exact binary" check, and far cheaper than regenerating the bundle.
+    /// Returns `false` on any read/parse error or absent UUID, so the
+    /// caller falls back to regenerating.
+    fn dsym_uuid_matches(bin_file: &object::File<'_>, dsym_path: &Path) -> bool {
+        let Ok(Some(bin_uuid)) = object::Object::mach_uuid(bin_file) else {
+            return false;
+        };
+        let Ok(data) = fs::read(dsym_path) else {
+            return false;
+        };
+        let Ok(dsym_file) = object::File::parse(&*data) else {
+            return false;
+        };
+        matches!(object::Object::mach_uuid(&dsym_file), Ok(Some(u)) if u == bin_uuid)
     }
 
     /// Look for `<obj_path>.dSYM/Contents/Resources/DWARF/<basename>`
@@ -1626,6 +1688,16 @@ impl DebugInformationBuilder {
             .find(|s| s.name().ok() == Some("__unwind_info"))
             .and_then(|s| s.data().ok())
             .map(|d| std::sync::Arc::new(d.to_vec()));
+        // The base that `__unwind_info` function offsets are relative to:
+        // the Mach-O image base = the `__TEXT` segment vmaddr (the
+        // mach_header address, typically 0x1_0000_0000). `object`'s
+        // `relative_address_base()` returns 0 for Mach-O, so read the
+        // segment directly. Only meaningful on macOS (compact unwind is
+        // macOS-only); 0 elsewhere.
+        let compact_unwind_base = object::Object::segments(file)
+            .find(|s| object::ObjectSegment::name(s).ok().flatten() == Some("__TEXT"))
+            .map(|s| object::ObjectSegment::address(&s))
+            .unwrap_or(0);
         let mut bases = BaseAddresses::default();
         if let Some(got) = section_addr(&[".got", "__got"]) {
             bases = bases.set_got(got);
@@ -1763,6 +1835,7 @@ impl DebugInformationBuilder {
                 files_index: PathSearchIndex::new(""),
                 addr2_ctx: once_cell::sync::OnceCell::new(),
                 compact_unwind_bytes: None,
+                compact_unwind_base: 0,
             });
         }
 
@@ -1802,6 +1875,7 @@ impl DebugInformationBuilder {
             files_index,
             addr2_ctx: once_cell::sync::OnceCell::new(),
             compact_unwind_bytes,
+            compact_unwind_base,
         })
     }
 }
@@ -1939,5 +2013,74 @@ mod test {
             assert_eq!(ns.as_parts(), tc.expected_ns);
             assert_eq!(name, tc.expected_fn);
         }
+    }
+}
+
+/// macOS arm64 compact-unwind regression coverage. The lookup was dead
+/// for years because it keyed the table with the full global PC
+/// (`0x1_0000_0000+`) instead of an image-relative offset, so
+/// `u32::try_from` always overflowed and silently returned `None` — only
+/// masked by `__eh_frame` happening to cover the functions exercised.
+/// These assert the success case the fallback exists for, so it can't
+/// rot back to always-`None`.
+#[cfg(test)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod compact_unwind_tests {
+    use super::{DebugInformationBuilder, GlobalAddress};
+
+    #[test]
+    fn compact_unwind_base_and_lookup_round_trip() {
+        // Built by the integration harness; skip if not present (e.g. a
+        // bare `cargo test --lib` run that didn't build examples).
+        let path = std::path::Path::new("./examples/target/debug/hello_world");
+        let Ok(data) = std::fs::read(path) else {
+            eprintln!("skipping compact-unwind test: {path:?} not built");
+            return;
+        };
+        let file = object::File::parse(&*data).expect("parse mach-o");
+        let di = DebugInformationBuilder
+            .build(path, &file)
+            .expect("build debug info");
+
+        // The image base must be the `__TEXT` vmaddr, not 0. A 0 base
+        // makes every image-relative compact lookup overflow u32 and
+        // miss — the exact bug.
+        assert!(
+            di.compact_unwind_bytes.is_some(),
+            "a macOS executable should carry a __unwind_info section",
+        );
+        assert!(
+            di.compact_unwind_base >= 0x1_0000_0000,
+            "compact base should be the __TEXT vmaddr, got {:#x}",
+            di.compact_unwind_base,
+        );
+
+        // Round-trip: lift real function starts (image-relative) to
+        // global PCs and confirm `compact_unwind_at` classifies at least
+        // one of them. With the old base-less math, *every* lookup
+        // overflowed u32 → `None`, so this count would be 0. (Not every
+        // function is classifiable — `Null`/`Dwarf` opcodes legitimately
+        // return `None` — hence "at least one" rather than "the first".)
+        let bytes = di.compact_unwind_bytes.as_ref().unwrap();
+        let info = macho_unwind_info::UnwindInfo::parse(bytes).expect("parse __unwind_info");
+        let mut funcs = info.functions();
+        let (mut checked, mut resolved) = (0usize, 0usize);
+        while let Ok(Some(func)) = funcs.next() {
+            checked += 1;
+            let global =
+                GlobalAddress::from(u64::from(func.start_address) + di.compact_unwind_base);
+            if di.compact_unwind_at(global).is_some() {
+                resolved += 1;
+                break;
+            }
+            if checked >= 200 {
+                break;
+            }
+        }
+        assert!(
+            resolved > 0,
+            "no compact-unwind function classified via image-relative lookup \
+             ({checked} checked) — base-offset regression",
+        );
     }
 }

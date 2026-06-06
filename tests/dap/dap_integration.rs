@@ -2742,6 +2742,148 @@ fn test_disassemble_view_context_before() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Software breakpoints replace the original instruction with a trap opcode
+/// (`brk #0` on aarch64, `int3` on x86_64). `disassemble` must restore the
+/// original bytes so the caller never sees the trap.
+#[test]
+#[serial]
+fn test_disassemble_no_brk_at_breakpoint() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("dap_disassemble"),
+        &example_source("examples/dap_disassemble/src/main.rs"),
+        22
+    );
+    // Get the breakpoint PC from the stack trace.
+    let st = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let st = session.client.read_response(st)?;
+    let ip = st["body"]["stackFrames"][0]["instructionPointerReference"]
+        .as_str()
+        .expect("frame must carry instructionPointerReference")
+        .to_string();
+
+    // Disassemble the breakpoint address itself.
+    let seq = session.client.send_request(
+        "disassemble",
+        json!({ "memoryReference": ip, "instructionOffset": 0, "instructionCount": 4 }),
+    )?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "disassemble", seq, true);
+
+    let instructions = response["body"]["instructions"]
+        .as_array()
+        .expect("instructions array");
+
+    // The instruction at the breakpoint address must not be the trap opcode.
+    let trap_mnemonics: &[&str] = &["brk", "int3", "int"];
+    let bp_ins = instructions
+        .iter()
+        .find(|ins| ins["address"].as_str() == Some(ip.as_str()));
+    let ins_text = bp_ins
+        .and_then(|i| i["instruction"].as_str())
+        .unwrap_or("");
+    let first_word = ins_text.split_whitespace().next().unwrap_or("");
+    assert!(
+        !trap_mnemonics.contains(&first_word),
+        "disassemble at breakpoint address returned trap opcode `{ins_text}`, \
+         expected original instruction (breakpoint byte-patching failed)",
+    );
+    session.shutdown();
+    Ok(())
+}
+
+/// Disassembly source-line annotations must use `is_stmt=true` DWARF rows only.
+/// Non-`is_stmt` rows are boundary markers that often carry the NEXT line's number
+/// as a transition hint; if we return one, annotations shift ±1 for instructions
+/// that straddle a statement boundary.
+///
+/// Invariant: every `line` annotation in the full-function disassembly of
+/// `busy_work` (lines 5–11 in dap_disassemble's main.rs) must fall in [5, 11].
+#[test]
+#[serial]
+fn test_disassemble_line_annotations_are_stmt_only() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    // Break inside busy_work's loop body (line 8).
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("dap_disassemble"),
+        &example_source("examples/dap_disassemble/src/main.rs"),
+        8
+    );
+    let st = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let st = session.client.read_response(st)?;
+    let ip = st["body"]["stackFrames"][0]["instructionPointerReference"]
+        .as_str()
+        .expect("frame must carry instructionPointerReference")
+        .to_string();
+
+    // Use bs/functionBounds to get the exact address range of busy_work.
+    let bounds = session
+        .client
+        .send_request("bs/functionBounds", json!({}))?;
+    let bounds = session.client.read_response(bounds)?;
+    let (mem_ref, instr_count) = if bounds["body"]["unavailable"].as_bool() == Some(true) {
+        // Fallback: modest window (no +8 overshoot into adjacent functions).
+        (ip.clone(), 64i64)
+    } else {
+        let start = bounds["body"]["startAddress"]
+            .as_str()
+            .unwrap_or(ip.as_str())
+            .to_string();
+        let end_str = bounds["body"]["endAddress"].as_str().unwrap_or("0");
+        let start_int = u64::from_str_radix(start.trim_start_matches("0x"), 16).unwrap_or(0);
+        let end_int = u64::from_str_radix(end_str.trim_start_matches("0x"), 16).unwrap_or(0);
+        // Exact instruction count — no +8 overshoot into the next function.
+        let count = ((end_int.saturating_sub(start_int)) / 4) as i64;
+        (start, count.max(1))
+    };
+
+    let disasm_seq = session.client.send_request(
+        "disassemble",
+        json!({ "memoryReference": mem_ref, "instructionOffset": 0, "instructionCount": instr_count }),
+    )?;
+    let disasm_resp = session.client.read_response(disasm_seq)?;
+    ensure_response!(session, &disasm_resp, "disassemble", disasm_seq, true);
+    let instructions = disasm_resp["body"]["instructions"]
+        .as_array()
+        .expect("instructions array");
+
+    // Collect every `line` annotation emitted for the dap_disassemble source.
+    let src_path = example_source("examples/dap_disassemble/src/main.rs");
+    let src_str = src_path.to_string_lossy();
+    let annotated_lines: Vec<u64> = instructions
+        .iter()
+        .filter(|ins| {
+            ins["location"]["path"]
+                .as_str()
+                .map_or(false, |p| p == src_str.as_ref())
+        })
+        .filter_map(|ins| ins["line"].as_u64())
+        .collect();
+
+    assert!(
+        !annotated_lines.is_empty(),
+        "disassemble must emit at least one source-line annotation"
+    );
+    // busy_work body spans lines 5-11 (fn signature through closing brace).
+    // Non-is_stmt boundary rows could bleed in lines 4 (the #[inline(never)]
+    // attribute) or 13+ (next function).
+    for &ln in &annotated_lines {
+        assert!(
+            (5..=11).contains(&ln),
+            "disassemble emitted line {ln} outside busy_work's span [5,11]; \
+             likely a non-is_stmt boundary row leaked into annotation"
+        );
+    }
+    session.shutdown();
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_data_breakpoint_info_request() -> anyhow::Result<()> {

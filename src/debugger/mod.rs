@@ -10,6 +10,7 @@ pub mod darwin_mach;
 mod debugee;
 mod enc_checkpoint;
 mod error;
+mod panic_loc;
 pub(crate) mod platform_checkpoint;
 pub mod process;
 pub mod register;
@@ -40,12 +41,30 @@ pub use debugee::dwarf::r#type::TypeDeclaration;
 pub use debugee::dwarf::unit::FunctionInfo;
 pub use debugee::dwarf::unit::PlaceDescriptor;
 pub use debugee::dwarf::unit::PlaceDescriptorOwned;
+
+/// Result of [`Debugger::count_line_instructions`]: the exact instruction count
+/// for a source line, or a lower bound when the line exceeded the step budget
+/// (a hot same-line loop / stepped-into call — count those via the rusage
+/// estimate instead). See `debug-step-costs.md` (step-count + disasm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineInstrCount {
+    /// The line completed within budget; `n` is its exact retired-instruction
+    /// count. Step-into flavored: instructions inside calls the line makes are
+    /// not included (entering a callee changes the source line and ends the
+    /// count). For straight-line lines this is the true total.
+    Exact(u64),
+    /// The line was still executing after `n` single-steps (budget hit). `n` is
+    /// a lower bound; callers fall back to the rusage figure.
+    Capped(u64),
+}
 /// Public unwind API backed by the internal DWARF unwinder (no libunwind feature gate).
 pub use debugee::dwarf::unwind;
 pub use debugee::tracee::Tracee;
 pub use debugee::tracee::TraceeStatus;
 pub use debugee::tracer::StopReason;
 pub use error::Error;
+pub use panic_loc::PanicLocation;
+pub use step::{FrameKind, StepIntoMode, classify_source_path};
 pub use watchpoint::WatchpointView;
 pub use watchpoint::WatchpointViewOwned;
 
@@ -696,6 +715,19 @@ impl Debugger {
         &self.debugee
     }
 
+    /// Number of low-level traps (single-steps + resumes) driven since the last
+    /// [`reset_trap_count`](Self::reset_trap_count). The macOS rusage perf path
+    /// uses this to subtract the fixed per-trap kernel/exception overhead out of
+    /// a step's instruction/cycle cost (see `bs_perf::TrapFloor`).
+    pub fn trap_count(&self) -> u64 {
+        self.debugee.trap_count()
+    }
+
+    /// Zero the trap counter at the start of a perf measurement window.
+    pub fn reset_trap_count(&mut self) {
+        self.debugee.reset_trap_count();
+    }
+
     pub fn detach(&mut self) -> Result<(), Error> {
         if self.detached {
             return Ok(());
@@ -1290,14 +1322,33 @@ impl Debugger {
             .map_err(Hook)
     }
 
-    /// Do a single step (until debugee reaches a different source line).
+    /// Do a single step (until debugee reaches a different source line),
+    /// descending into whatever the current line calls (classic Step-In).
+    ///
+    /// Equivalent to [`Self::step_into_with`]`(StepIntoMode::AnyFrame)`.
     ///
     /// **! change exploration context**
     pub fn step_into(&mut self) -> Result<(), Error> {
+        self.step_into_with(StepIntoMode::AnyFrame)
+    }
+
+    /// Step-In with an explicit "just my code" mode.
+    ///
+    /// - [`StepIntoMode::AnyFrame`] — classic Step-In (descend anywhere).
+    /// - [`StepIntoMode::SkipLibraries`] — step through library/runtime
+    ///   frames and stop at the next line of user code.
+    ///
+    /// **! change exploration context**
+    pub fn step_into_with(&mut self, mode: StepIntoMode) -> Result<(), Error> {
         disable_when_not_stared!(self);
         self.ecx_restore_frame()?;
 
-        match self.step_in()? {
+        let result = match mode {
+            StepIntoMode::AnyFrame => self.step_in()?,
+            StepIntoMode::SkipLibraries => self.step_in_skip_libraries()?,
+        };
+
+        match result {
             StepResult::Done => self.execute_on_step_hook(),
             StepResult::SignalInterrupt { signal, quiet } if !quiet => {
                 self.hooks.on_signal(signal);
@@ -1330,6 +1381,99 @@ impl Debugger {
             }
             _ => self.execute_on_step_hook(),
         }
+    }
+
+    /// Exact retired-instruction count for the source line at the current stop,
+    /// obtained by single-stepping until the reported source line changes. Each
+    /// ptrace step is exactly one instruction, so the count is exact and
+    /// excludes the debugger's trap/kernel overhead *by construction* (unlike
+    /// the rusage counters — see `debug-step-costs.md` #3). ADVANCES the program
+    /// past the line. `budget` caps runaway lines (hot same-line loops or
+    /// stepped-into calls); past it the result is [`LineInstrCount::Capped`] and
+    /// the caller should fall back to the rusage estimate.
+    pub fn count_line_instructions(&mut self, budget: u64) -> Result<LineInstrCount, Error> {
+        disable_when_not_stared!(self);
+        self.ecx_restore_frame()?;
+        let start = self.current_source_place();
+        let mut n = 0u64;
+        while n < budget {
+            // A signal/watchpoint mid-line isn't a retired-instruction step;
+            // stop and report what we counted so far as exact.
+            match self.single_step_instruction()? {
+                Some(StopReason::SignalStop(..)) | Some(StopReason::Watchpoint(..)) => break,
+                _ => {}
+            }
+            n += 1;
+            // Skip DWARF line-0 rows (compiler glue with no source line) and the
+            // start line; stop only on a real *different* source line, so we
+            // land where a normal step-over would — not on a line-0 trampoline.
+            let cur = self.current_source_place();
+            if matches!(&cur, Some((_, l)) if *l != 0) && cur != start {
+                return Ok(LineInstrCount::Exact(n));
+            }
+        }
+        Ok(LineInstrCount::Capped(n))
+    }
+
+    /// Step over the current source line, returning its **exact** instruction
+    /// count when cheap to obtain. Single-steps and counts; if that stayed at
+    /// the same stack depth (no real call was taken — note a debug line's
+    /// *untaken* overflow-check `bl` doesn't count) it's the true line cost
+    /// ([`LineInstrCount::Exact`], trap-overhead-free). If the count descended
+    /// into a callee (a call was taken) or blew `budget`, it recovers step-over
+    /// semantics — leaves the callee / finishes the line — and returns
+    /// [`LineInstrCount::Capped`] (caller uses the rusage estimate). Lands on the
+    /// next source line either way. The macOS perf overlay uses this to show
+    /// exact per-line instruction counts (see `debug-step-costs.md` #3).
+    pub fn step_over_or_count(&mut self, budget: u64) -> Result<LineInstrCount, Error> {
+        let start_depth = self.frame_depth();
+        match self.count_line_instructions(budget)? {
+            LineInstrCount::Exact(n) => {
+                if self.frame_depth() > start_depth {
+                    // We single-stepped *into* a call on this line (step-into
+                    // count, not step-over). Recover: leave the callee and finish
+                    // the line; report the rusage estimate instead.
+                    self.step_out()?;
+                    self.step_over()?;
+                    return Ok(LineInstrCount::Capped(0));
+                }
+                // count_line_instructions is lower-level than `step_over`: it
+                // updates the location each step but not the full frame, and
+                // doesn't fire the step hook. Restore the frame then fire the
+                // hook so callers see the same post-step state as a step-over.
+                self.ecx_restore_frame()?;
+                self.execute_on_step_hook()?;
+                Ok(LineInstrCount::Exact(n))
+            }
+            LineInstrCount::Capped(n) => {
+                // Hot same-line loop blew the budget; finish the line normally.
+                self.step_over()?;
+                Ok(LineInstrCount::Capped(n))
+            }
+        }
+    }
+
+    /// Current call-stack depth (frame count), best-effort `0` on failure. Used
+    /// by [`step_over_or_count`](Self::step_over_or_count) to detect whether a
+    /// step descended into a callee.
+    fn frame_depth(&self) -> usize {
+        self.backtrace(self.ecx().pid_on_focus())
+            .map(|bt| bt.len())
+            .unwrap_or(0)
+    }
+
+    /// Heuristic: does the debuggee look like an unoptimized (debug) build?
+    /// Perf numbers from a debug build are inflated — overflow checks, no
+    /// inlining, every local spilled to the stack (`i = i * 2` is 9 instructions
+    /// in debug, 1 `lsl` in release) — so the overlay should flag them as
+    /// relative, not release-representative. Uses the Cargo `/target/debug/`
+    /// path convention; the more robust signal (arithmetic overflow-check
+    /// symbols `panic_const_{add,mul,…}_overflow`, present only when
+    /// `overflow-checks=on`) is noted in `debug-step-costs.md` as a refinement.
+    pub fn is_likely_debug_build(&self) -> bool {
+        std::path::PathBuf::from(self.process().program())
+            .to_string_lossy()
+            .contains("/target/debug/")
     }
 
     /// Return list of currently running debugee threads.
@@ -1526,7 +1670,12 @@ impl Debugger {
     ) -> Result<Vec<variable::execute::QueryResult<'_>>, Error> {
         disable_when_not_stared!(self);
         let executor = variable::execute::DqeExecutor::new(self);
-        executor.query_file_scope(variable::execute::FileScopeKind::Statics, scope, exclude, None)
+        executor.query_file_scope(
+            variable::execute::FileScopeKind::Statics,
+            scope,
+            exclude,
+            None,
+        )
     }
 
     /// Read only the statics whose full identity path is in `include` —
@@ -1559,6 +1708,18 @@ impl Debugger {
         disable_when_not_stared!(self);
         let executor = variable::execute::DqeExecutor::new(self);
         executor.query_file_scope_names(variable::execute::FileScopeKind::Statics, scope)
+    }
+
+    /// Cheap names-with-sizes enumeration of file-scope statics: each
+    /// name paired with its `DW_AT_byte_size` (no value reads). Lets the
+    /// UI gate eager reads of giant statics. `None` size = unknown.
+    pub fn read_static_name_sizes(
+        &self,
+        scope: variable::execute::FileScopeFilter,
+    ) -> Result<Vec<(String, Option<u64>)>, Error> {
+        disable_when_not_stared!(self);
+        let executor = variable::execute::DqeExecutor::new(self);
+        executor.query_file_scope_name_sizes(variable::execute::FileScopeKind::Statics, scope)
     }
 
     /// Read every `thread_local!` reachable in the debugee,
@@ -1668,6 +1829,25 @@ impl Debugger {
             .address
             .relocate_to_segment_by_pc(&self.debugee, reloc)
             .ok()
+    }
+
+    /// Resolve a runtime address to its source `(file, line, column)` via the
+    /// DWARF line table, or `None` if the address has no line info. Used by the
+    /// DAP `disassemble` response to interleave Rust source with the
+    /// instructions (the source-on-left / asm-on-right view).
+    pub fn source_location_at(&self, addr: usize) -> Option<(std::path::PathBuf, u64, u64)> {
+        let reloc = RelocatedAddress::from(addr);
+        let global = reloc.into_global(&self.debugee).ok()?;
+        let dwarf = self.debugee.debug_info(reloc).ok()?;
+        // Use is_stmt-aware lookup so non-statement boundary rows (which carry
+        // the next line's number as a transition marker) don't shift the
+        // annotation off by one. Matches the step engine's is_stmt filter.
+        let place = dwarf.find_stmt_place_from_pc(global).ok().flatten()?;
+        Some((
+            place.file.to_path_buf(),
+            place.line_number,
+            place.column_number,
+        ))
     }
 
     /// Install a hidden transparent breakpoint at the entry of the
@@ -2167,6 +2347,57 @@ impl Debugger {
     pub fn current_function_range(&self) -> Result<FunctionRange<'_>, Error> {
         disable_when_not_stared!(self);
         self.debugee.function_range(self.ecx())
+    }
+
+    /// Restore original instruction bytes at software-breakpoint addresses within
+    /// `buf` (which was read starting at `start_addr`) so the disassembler sees
+    /// the original instructions rather than the trap opcodes the debugger wrote.
+    pub fn patch_disasm_buf(&self, start_addr: usize, buf: &mut [u8]) {
+        for bp in self.breakpoints.active_breakpoints() {
+            if !bp.is_enabled() {
+                continue;
+            }
+            let bp_addr = bp.addr.as_usize();
+            if bp_addr < start_addr {
+                continue;
+            }
+            let offset = bp_addr - start_addr;
+            let saved = bp.saved_data.get();
+
+            #[cfg(target_arch = "aarch64")]
+            if offset + 4 <= buf.len() {
+                buf[offset..offset + 4].copy_from_slice(&(saved as u32).to_le_bytes());
+            }
+
+            #[cfg(target_arch = "x86_64")]
+            if offset < buf.len() {
+                buf[offset] = (saved & 0xFF) as u8;
+            }
+        }
+    }
+
+    /// Relocated (runtime) start and end addresses for the function containing
+    /// the current PC, derived from DWARF subprogram ranges.
+    /// Returns `None` if the PC is outside any known function.
+    pub fn current_function_address_range(&self) -> Option<(usize, usize)> {
+        let ecx = self.ecx();
+        let pc = ecx.location().pc;
+        let debug_info = self.debugee.debug_info(pc).ok()?;
+        let (function, _) = debug_info
+            .find_function_by_pc(ecx.location().global_pc)
+            .ok()
+            .flatten()?;
+        let start = function
+            .start_instruction()
+            .ok()?
+            .relocate_to_segment(&self.debugee, debug_info)
+            .ok()?;
+        let end = function
+            .end_instruction()
+            .ok()?
+            .relocate_to_segment(&self.debugee, debug_info)
+            .ok()?;
+        Some((start.as_usize(), end.as_usize()))
     }
 }
 

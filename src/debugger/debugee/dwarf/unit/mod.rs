@@ -474,6 +474,33 @@ impl BsUnit {
         self.find_place_by_idx(pos)
     }
 
+    /// Like [`find_place_by_pc`] but returns the nearest `is_stmt=true` row.
+    ///
+    /// Non-`is_stmt` rows are compiler-emitted boundary markers that often carry
+    /// the NEXT line's number for transition bookkeeping. Using one for source
+    /// attribution causes off-by-one shifts in disassembly annotation.
+    /// Walking back to the most-recent `is_stmt` row gives the containing
+    /// statement, consistent with how the step engine resolves source positions.
+    pub fn find_stmt_place_by_pc(&self, pc: GlobalAddress) -> Option<PlaceDescriptor<'_>> {
+        let pc = u64::from(pc);
+        let mut pos = self
+            .lines
+            .binary_search_by_key(&pc, |line| line.address)
+            .unwrap_or_else(|p| p.saturating_sub(1));
+
+        loop {
+            if self.lines.get(pos).map_or(false, |r| r.is_stmt()) {
+                return self.find_place_by_idx(pos);
+            }
+            if pos == 0 {
+                break;
+            }
+            pos -= 1;
+        }
+        // No is_stmt row found above — fall back so we always return something.
+        self.find_place_by_pc(GlobalAddress::from(pc))
+    }
+
     /// Return the nearest line with EB (epilog begin).
     /// Nearest means - at given address or at address less than given.
     ///
