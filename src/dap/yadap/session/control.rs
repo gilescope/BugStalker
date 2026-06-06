@@ -712,13 +712,31 @@ impl super::DebugSession {
     ) -> anyhow::Result<()> {
         self.begin_running();
 
+        // With the perf overlay on, exact-count the step (single-stepping ≡
+        // step-in for it) so the overlay reports the true line cost instead of
+        // the rusage delta — which is dominated by the ~11k–45k kernel
+        // instructions of the trap itself. Only for AnyFrame: SkipLibraries
+        // traverses runtime frames where a per-line count isn't meaningful.
+        let exact_mode =
+            self.perf_overlay_enabled() && matches!(mode, debugger::StepIntoMode::AnyFrame);
         let dbg = self
             .debugger
             .as_mut()
             .ok_or_else(|| anyhow!("{command}: debugger not initialized"))?;
 
-        match dbg.step_into_with(mode) {
-            Ok(()) => {
+        let result: Result<Option<u64>, debugger::Error> = if exact_mode {
+            match dbg.step_into_or_count(STEP_COUNT_BUDGET) {
+                Ok(LineInstrCount::Exact(n)) => Ok(Some(n)),
+                Ok(LineInstrCount::Capped(_)) => Ok(None),
+                Err(e) => Err(e),
+            }
+        } else {
+            dbg.step_into_with(mode).map(|()| None)
+        };
+
+        match result {
+            Ok(exact) => {
+                self.set_perf_exact_instructions(exact);
                 let thread_id = self.current_thread_id();
                 self.enqueue_event(InternalEvent::Continued {
                     thread_id,

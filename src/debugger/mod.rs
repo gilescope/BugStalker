@@ -1453,6 +1453,32 @@ impl Debugger {
         }
     }
 
+    /// Step **into** the current source line, returning its **exact** instruction
+    /// count when cheap to obtain. Unlike [`step_over_or_count`](Self::step_over_or_count)
+    /// this keeps step-in semantics: [`count_line_instructions`](Self::count_line_instructions)
+    /// already single-steps *into* any call on the line and stops at the next
+    /// source line (the callee's first line for a call, the following line for a
+    /// no-call line), so no depth recovery is needed. The count is trap-overhead-
+    /// free by construction. On budget blowout (hot same-line loop) it falls back
+    /// to a normal [`step_into`](Self::step_into) and returns [`LineInstrCount::Capped`].
+    pub fn step_into_or_count(&mut self, budget: u64) -> Result<LineInstrCount, Error> {
+        match self.count_line_instructions(budget)? {
+            LineInstrCount::Exact(n) => {
+                // count_line_instructions updates the location each step but not
+                // the full frame, and doesn't fire the step hook. Restore the
+                // frame then fire the hook so callers see the same post-step
+                // state as a normal step-into.
+                self.ecx_restore_frame()?;
+                self.execute_on_step_hook()?;
+                Ok(LineInstrCount::Exact(n))
+            }
+            LineInstrCount::Capped(n) => {
+                self.step_into()?;
+                Ok(LineInstrCount::Capped(n))
+            }
+        }
+    }
+
     /// Current call-stack depth (frame count), best-effort `0` on failure. Used
     /// by [`step_over_or_count`](Self::step_over_or_count) to detect whether a
     /// step descended into a callee.
