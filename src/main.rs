@@ -284,6 +284,16 @@ fn main() {
         exit(code);
     }
 
+    // macOS: make sure we hold the cs.debugger entitlement before any DAP
+    // session begins. If we don't, sign + re-exec NOW — doing it lazily on the
+    // first task_for_pid failure happens mid-handshake and orphans the session
+    // ("configurationDone: debugger not initialized"). See
+    // darwin_mach::ensure_debugger_entitlement_at_startup.
+    #[cfg(target_os = "macos")]
+    if args.dap_local || args.dap_remote.is_some() {
+        bugstalker::debugger::darwin_mach::ensure_debugger_entitlement_at_startup();
+    }
+
     // Determine interface mode
     let interface = if args.dap_local {
         // Stdio DAP mode
