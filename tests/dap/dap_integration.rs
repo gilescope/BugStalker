@@ -2025,6 +2025,15 @@ fn test_asm_focus_step_reports_one_instruction() -> anyhow::Result<()> {
     ensure_response!(session, &response, "next", seq, true);
 
     let stopped = session.client.wait_for_event("stopped")?;
+    if stopped["body"]["bs_perf"].is_null() {
+        // No perf backend on this runner (CI containers typically run with
+        // perf_event_paranoid >= 2, so perf_event_open is refused). The
+        // overlay correctly reports nothing rather than a junk count — the
+        // =1 contract is only testable where a backend exists.
+        eprintln!("skipping runInstructions check: no perf backend (bs_perf null)");
+        session.shutdown();
+        return Ok(());
+    }
     let run_instructions = stopped["body"]["bs_perf"]["runInstructions"].as_u64();
     assert_eq!(
         run_instructions,

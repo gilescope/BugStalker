@@ -153,7 +153,7 @@ impl super::DebugSession {
             .as_ref()
             .ok_or_else(|| anyhow!("disassemble: debugger not initialized"))?;
         let mut prev: Option<(String, u64)> = None;
-        let instructions = instructions
+        let mut instructions = instructions
             .into_iter()
             .skip(start_index)
             .take(instruction_count as usize)
@@ -181,6 +181,27 @@ impl super::DebugSession {
                 obj
             })
             .collect::<Vec<_>>();
+
+        // DAP contract: return EXACTLY instructionCount entries. On x86-64 a
+        // context-before request starts disassembling `back × max_len` bytes
+        // early, and capstone can desync on the variable-length stream and
+        // stop short — arm64's fixed 4-byte instructions always fill the
+        // budget, which is why this only shows up on x86 CI. Pad the tail
+        // with explicit invalid entries (VS Code renders them greyed) rather
+        // than under-deliver, which desyncs the Disassembly View's scrolling.
+        let mut next_addr = instructions
+            .last()
+            .and_then(|i| i["address"].as_str())
+            .and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+            .map_or(anchor_addr as u64, |a| a + 1);
+        while instructions.len() < instruction_count as usize {
+            instructions.push(json!({
+                "address": format!("0x{next_addr:x}"),
+                "instruction": "??",
+                "instructionBytes": "",
+            }));
+            next_addr += 1;
+        }
 
         self.enqueue_progress_update(
             progress_id.clone(),
