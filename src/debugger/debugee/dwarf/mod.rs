@@ -1551,6 +1551,7 @@ impl DebugInformationBuilder {
     /// exact binary" check, and far cheaper than regenerating the bundle.
     /// Returns `false` on any read/parse error or absent UUID, so the
     /// caller falls back to regenerating.
+    #[cfg(target_os = "macos")]
     fn dsym_uuid_matches(bin_file: &object::File<'_>, dsym_path: &Path) -> bool {
         let Ok(Some(bin_uuid)) = object::Object::mach_uuid(bin_file) else {
             return false;

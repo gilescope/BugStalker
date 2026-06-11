@@ -489,7 +489,7 @@ impl BsUnit {
             .unwrap_or_else(|p| p.saturating_sub(1));
 
         loop {
-            if self.lines.get(pos).map_or(false, |r| r.is_stmt()) {
+            if self.lines.get(pos).is_some_and(|r| r.is_stmt()) {
                 return self.find_place_by_idx(pos);
             }
             if pos == 0 {
