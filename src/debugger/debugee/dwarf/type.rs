@@ -270,6 +270,28 @@ impl ArrayType {
         self.byte_size
     }
 
+    /// Byte size from constant subrange bounds, no eval context (mirrors
+    /// [`Self::size_in_bytes`] for the const case). `None` when a bound
+    /// is a runtime expression — those need a live evaluator. This is the
+    /// path that sizes a `[T; N]` C/Rust static array whose DWARF carries
+    /// only a constant `DW_AT_upper_bound`/`DW_AT_count`, not a
+    /// `DW_AT_byte_size` (e.g. the secp256k1 precomputed tables).
+    pub fn static_byte_size(&self, type_graph: &ComplexType) -> Option<u64> {
+        if let Some(bs) = self.byte_size {
+            return Some(bs);
+        }
+        let ArrayBoundValue::Const(lb) = self.lower_bound else {
+            return None;
+        };
+        let span = match self.upper_bound.as_ref()? {
+            UpperBound::UpperBound(ArrayBoundValue::Const(ub)) => ub - lb,
+            UpperBound::Count(ArrayBoundValue::Const(c)) => *c,
+            _ => return None,
+        };
+        let element_size = type_graph.static_byte_size_of(self.element_type?)?;
+        array_byte_size(lb, span, element_size)
+    }
+
     fn lower_bound(&self, evcx: &EvaluationContext) -> i64 {
         self.lower_bound.value(evcx).unwrap_or(0)
     }
@@ -295,10 +317,63 @@ impl ArrayType {
             let bounds = self.bounds(evcx)?;
             let inner_type_size = type_graph.type_size_in_bytes(evcx, self.element_type?)?;
             self.byte_size_memo
-                .set(Some(inner_type_size * (bounds.1 - bounds.0) as u64));
+                .set(Some(array_byte_size(bounds.0, bounds.1, inner_type_size)?));
         }
 
         self.byte_size_memo.get()
+    }
+}
+
+/// Total byte size of an array subrange, given the resolved
+/// `(lower, span_end)` from [`ArrayType::bounds`] and the element
+/// size. `span_end - lower` is the element count.
+///
+/// Some DWARF producers (C/`-sys` debug info, older toolchains) emit
+/// `DW_AT_upper_bound = -1` for a zero- or unknown-length array, which
+/// [`ArrayType::bounds`] surfaces as a negative span. The old inline
+/// `element_size * (span_end - lower) as u64` then read that `-1` as a
+/// `u64::MAX` element count and overflowed, producing a near-`u64::MAX`
+/// byte size that panicked `BytesMut::with_capacity` ("capacity
+/// overflow") the moment such a global was read — taking down the whole
+/// debug session. Here a negative count clamps to `0` and the multiply
+/// is checked, so a malformed bound yields `Some(0)`/`None` and the
+/// caller degrades the variable to unreadable instead of crashing.
+fn array_byte_size(lower: i64, span_end: i64, element_size: u64) -> Option<u64> {
+    // A negative element count means a malformed / zero-length bound
+    // (e.g. DW_AT_upper_bound = -1) — treat as empty rather than
+    // wrapping into a giant unsigned count.
+    let count = u64::try_from(span_end.checked_sub(lower)?).unwrap_or(0);
+    element_size.checked_mul(count)
+}
+
+#[cfg(test)]
+mod array_byte_size_tests {
+    use super::array_byte_size;
+
+    #[test]
+    fn normal_count() {
+        // `[i32; 3]` → lower 0, span_end 3, element 4 bytes.
+        assert_eq!(array_byte_size(0, 3, 4), Some(12));
+    }
+
+    #[test]
+    fn empty_array() {
+        assert_eq!(array_byte_size(0, 0, 8), Some(0));
+    }
+
+    #[test]
+    fn upper_bound_minus_one_clamps_to_zero() {
+        // DW_AT_upper_bound = -1 → bounds() span_end = -1. Must NOT
+        // wrap into a u64::MAX element count (the capacity-overflow
+        // crash). Regression for the variables-view file-scope panic.
+        assert_eq!(array_byte_size(0, -1, 8), Some(0));
+    }
+
+    #[test]
+    fn element_count_times_size_overflow_is_none() {
+        // A huge-but-positive span must saturate to None rather than
+        // wrap, so callers degrade gracefully.
+        assert_eq!(array_byte_size(0, i64::MAX, u64::MAX), None);
     }
 }
 
@@ -501,6 +576,34 @@ impl ComplexType {
             TypeDeclaration::Subroutine { .. } => Some(mem::size_of::<usize>() as u64),
             TypeDeclaration::ModifiedType { inner, .. } => {
                 inner.and_then(|inner_id| self.type_size_in_bytes(evcx, inner_id))
+            }
+        }
+    }
+
+    /// Best-effort byte size of the root type **without** an evaluation
+    /// context — straight from `DW_AT_byte_size`, or for arrays from
+    /// constant subrange bounds × element size (no live memory / dynamic
+    /// bound eval). Used as a cheap size gate (e.g. "is this static a
+    /// giant array we shouldn't eagerly read?"). `None` for types whose
+    /// size the DWARF doesn't state statically (truly dynamic arrays);
+    /// callers should treat `None` as "small / unknown" and read normally.
+    pub fn static_byte_size(&self) -> Option<u64> {
+        self.static_byte_size_of(self.root())
+    }
+
+    fn static_byte_size_of(&self, typ: TypeId) -> Option<u64> {
+        match self.types.get(&typ)? {
+            TypeDeclaration::Scalar(s) => s.byte_size,
+            TypeDeclaration::Structure { byte_size, .. } => *byte_size,
+            TypeDeclaration::Array(arr) => arr.static_byte_size(self),
+            TypeDeclaration::CStyleEnum { byte_size, .. } => *byte_size,
+            TypeDeclaration::RustEnum { byte_size, .. } => *byte_size,
+            TypeDeclaration::Union { byte_size, .. } => *byte_size,
+            TypeDeclaration::Pointer { .. } | TypeDeclaration::Subroutine { .. } => {
+                Some(mem::size_of::<usize>() as u64)
+            }
+            TypeDeclaration::ModifiedType { inner, .. } => {
+                inner.and_then(|inner_id| self.static_byte_size_of(inner_id))
             }
         }
     }

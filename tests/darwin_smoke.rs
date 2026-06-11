@@ -668,3 +668,73 @@ fn exception_port_reply_to_null_port() {
         "expected a MACH_SEND_* error, got 0x{kr:08x}"
     );
 }
+
+/// Regression: a DAP-mode `bs` that is signed but lacks the `cs.debugger`
+/// entitlement must re-sign + re-exec itself AT STARTUP, before reading any DAP
+/// message. The lazy recovery fires on the first `task_for_pid` failure, which
+/// in a DAP session is mid-handshake (`configurationDone`) and orphans the
+/// session — the re-exec'd process has no initialized debugger, so every later
+/// request fails with "debugger not initialized" and the client drops.
+///
+/// Self-contained: signs its own copy of `bs`, so it needs no entitled test
+/// binary (not `#[ignore]`d). macOS + `codesign` only.
+#[test]
+fn dap_startup_resigns_when_entitlement_missing() {
+    use std::process::{Command, Stdio};
+
+    fn has_entitlement(p: &std::path::Path) -> bool {
+        let out = Command::new("codesign")
+            .args(["-d", "--entitlements", "-", "--xml"])
+            .arg(p)
+            .output()
+            .expect("run codesign -d");
+        const KEY: &str = "com.apple.security.cs.debugger";
+        String::from_utf8_lossy(&out.stdout).contains(KEY)
+            || String::from_utf8_lossy(&out.stderr).contains(KEY)
+    }
+
+    let bs = env!("CARGO_BIN_EXE_bs");
+    let dir = std::env::temp_dir().join(format!("bs-noent-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mk tmp dir");
+    let copy = dir.join("bs");
+    std::fs::copy(bs, &copy).expect("copy bs");
+
+    // Adhoc-sign WITHOUT the entitlement (arm64 refuses to exec a fully
+    // unsigned binary, so this models the real "signed but unentitled" case).
+    assert!(
+        Command::new("codesign")
+            .args(["-s", "-", "--force"])
+            .arg(&copy)
+            .status()
+            .unwrap()
+            .success(),
+        "adhoc sign failed",
+    );
+    assert!(
+        !has_entitlement(&copy),
+        "copy must start without the entitlement"
+    );
+
+    // Empty stdin → the DAP loop hits EOF and exits right after the startup
+    // check. Must not inherit BS_AUTO_SIGN_TRIED (would skip the re-sign).
+    let out = Command::new(&copy)
+        .arg("--dap")
+        .env_remove("BS_AUTO_SIGN_TRIED")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run bs --dap");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        stderr.contains("auto-signing"),
+        "expected a STARTUP auto-sign before any DAP processing; stderr:\n{stderr}",
+    );
+    assert!(
+        has_entitlement(&copy),
+        "bs must carry the entitlement after the startup re-sign",
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

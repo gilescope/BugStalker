@@ -5,8 +5,14 @@ use crate::common::{TestInfo, rust_version};
 use crate::{assert_no_proc, prepare_debugee_process};
 use bugstalker::debugger::DebuggerBuilder;
 use bugstalker::debugger::call::fmt::call_debug_fmt;
+use bugstalker::debugger::stack_health;
 use bugstalker::debugger::variable::dqe::{Dqe, Literal, LiteralOrWildcard, PointerCast, Selector};
+use bugstalker::debugger::variable::execute::{FileScopeFilter, LayoutBreakdown};
+use bugstalker::debugger::variable::mutability::{self, Mutability};
 use bugstalker::debugger::variable::render::RenderValue;
+use bugstalker::debugger::variable::storage;
+use bugstalker::debugger::variable::storage::StorageClass;
+use bugstalker::debugger::variable::value::specialization::LockState;
 use bugstalker::debugger::variable::value::{Member, SpecializedValue, SupportedScalar, Value};
 use bugstalker::version::Version;
 use bugstalker::version_switch;
@@ -1073,6 +1079,385 @@ fn test_read_static_variables() {
     assert_no_proc!(debugee_pid);
 }
 
+/// Variables-view §5.4 — bulk enumeration of file-scope statics
+/// via the new `Debugger::read_static_variables` API powers the
+/// DAP `Statics` scope. The user-crate filter must include the
+/// fixture's `GLOB_1`/`GLOB_2`/`GLOB_3` (declared in the `vars`
+/// crate) and exclude TLS internals which belong in the
+/// `Thread-locals` scope.
+#[test]
+#[serial]
+fn test_bulk_enumerate_statics() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 168).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(168));
+
+    let statics = debugger
+        .read_static_variables(FileScopeFilter::CurrentCrate)
+        .unwrap();
+    let names: Vec<String> = statics.iter().map(|r| r.identity().to_string()).collect();
+
+    // Sanity: the three fixture-declared file-scope statics in
+    // the user (`vars`) crate must be enumerated.
+    for needle in ["GLOB_1", "GLOB_2", "GLOB_3"] {
+        assert!(
+            names.iter().any(|n| n.contains(needle)),
+            "expected {needle} in current-crate statics; got: {names:?}"
+        );
+    }
+    // And TLS internals must NOT appear here — they're a separate
+    // scope. Detection is by the rustc-lowered TLS name.
+    for forbidden in ["__KEY", "__RUST_STD_INTERNAL_VAL"] {
+        assert!(
+            names.iter().all(|n| !n.contains(forbidden)),
+            "{forbidden} leaked into statics: {names:?}"
+        );
+    }
+    // Current-crate filter must keep std out — pick one common
+    // std static that's always linked in a binary that uses stdio.
+    assert!(
+        names.iter().all(|n| !n.starts_with("std::")),
+        "current-crate filter let std::* through: {names:?}"
+    );
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.4 — bulk enumeration of TLS via
+/// `Debugger::read_thread_local_variables`. The fixture declares
+/// `THREAD_LOCAL_VAR_1` and `THREAD_LOCAL_VAR_2`; rustc lowers
+/// each to a `DW_TAG_variable` named `__KEY` / `VAL` /
+/// `__RUST_STD_INTERNAL_VAL` (the precise name depends on the
+/// rustc version) nested under the user identifier's namespace.
+#[test]
+#[serial]
+fn test_bulk_enumerate_thread_locals() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 168).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(168));
+
+    let tls = debugger
+        .read_thread_local_variables(FileScopeFilter::CurrentCrate)
+        .unwrap();
+    let names: Vec<String> = tls.iter().map(|r| r.identity().to_string()).collect();
+
+    // §5.4 known limit: `root_from_die` succeeds only when the TLS
+    // slot's *value* is readable from the current thread. For
+    // non-const-init thread_locals (THREAD_LOCAL_VAR_1, _2 here)
+    // the slot isn't initialised on the main thread at the time
+    // of the breakpoint, so the value-parse step returns None and
+    // the entry is dropped. const-init thread_locals like
+    // CONSTANT_THREAD_LOCAL *are* always readable.
+    //
+    // Asserting the const-init case proves the path works
+    // end-to-end. The runtime-init case will start surfacing
+    // entries once §5.4 gains the "<unavailable>" placeholder
+    // fallback for unreadable values (see variables-view.md §7).
+    assert!(
+        names.iter().any(|n| n.contains("CONSTANT_THREAD_LOCAL")),
+        "expected at least one TLS entry; got: {names:?}"
+    );
+    // And the non-TLS statics must NOT appear here even when
+    // their values are perfectly readable — the kind filter must
+    // exclude them by name-symbol regardless of parse success.
+    for forbidden in ["GLOB_1", "GLOB_2", "GLOB_3"] {
+        assert!(
+            names.iter().all(|n| !n.contains(forbidden)),
+            "{forbidden} leaked into thread-locals: {names:?}"
+        );
+    }
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.6 — payload/padding breakdown for a struct
+/// type. The fixture's `Foo { bar: i32, baz: [i32; 2], foo: &i32 }`
+/// at vars.rs:107 has 4 + 8 + 8 = 20 bytes of payload. The total
+/// size depends on rustc field reordering + alignment, but for
+/// any layout: `total - sum(member_sizes) = padding`, and our
+/// classifier reports exactly those numbers.
+///
+/// We assert structural invariants (payload+padding=total,
+/// payload=20, padding≥0) rather than pinning specific numbers
+/// — rustc may reorder fields between versions but the
+/// arithmetic identity always holds.
+#[test]
+#[serial]
+fn test_layout_payload_padding_breakdown() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 119).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(119));
+
+    let locals = debugger.read_local_variables().unwrap();
+    let f = locals
+        .iter()
+        .find(|qr| qr.identity().to_string() == "f")
+        .expect("`f` not in locals");
+
+    let layout: LayoutBreakdown = f.layout().expect("Foo should report a layout");
+
+    // Identity: payload + padding == total.
+    assert_eq!(
+        layout.payload + layout.padding,
+        layout.total,
+        "payload+padding must equal total: {layout:?}"
+    );
+    // Payload is the sum of member sizes (i32 + [i32;2] + &i32 =
+    // 4 + 8 + 8 = 20) regardless of layout reordering.
+    assert_eq!(
+        layout.payload, 20,
+        "Foo's payload should sum to 20 bytes (i32 + [i32;2] + &i32)"
+    );
+    // padding_pct is well-defined for nonzero total.
+    let pct = layout.padding_pct().expect("nonzero total → pct defined");
+    assert!(pct <= 100);
+
+    // A non-struct (i32) reports None — only Structure types
+    // have meaningful payload/padding splits in this design.
+    let a = locals
+        .iter()
+        .find(|qr| qr.identity().to_string() == "a")
+        .expect("`a` not in locals");
+    assert!(
+        a.layout().is_none(),
+        "i32 (Scalar) should not produce a LayoutBreakdown"
+    );
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.5 — stack health is computed against the
+/// live thread's SP + the backtrace. We assert observable
+/// invariants without depending on rustc-version-sensitive
+/// numbers:
+///   * `thread_stack_size` is reported (the main thread is
+///     always present in `proc_maps` with a `[stack]` mapping).
+///   * `thread_stack_used` is ≤ `thread_stack_size`.
+///   * `used_pct()` falls in the valid 0–100 range.
+///   * `frame_count ≥ 1` (we're definitely in `main`).
+/// Per-local byte size: every QueryResult should report a size
+/// (every scalar / struct has a known `DW_AT_byte_size`).
+#[test]
+#[serial]
+fn test_stack_health_and_byte_size_on_live_thread() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 119).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(119));
+
+    // Stack health
+    let bt = debugger.backtrace(debugger.ecx().pid_on_focus()).unwrap();
+    let health = stack_health::compute(&debugger, debugger.ecx().pid_on_focus(), &bt);
+    assert!(
+        health.thread_stack_size.is_some(),
+        "main thread should have a known stack size from proc_maps"
+    );
+    let total = health.thread_stack_size.unwrap();
+    let used = health
+        .thread_stack_used
+        .expect("used reported when size is");
+    assert!(
+        used <= total,
+        "used ({used}) must not exceed total ({total})"
+    );
+    let pct = health.used_pct().expect("pct reported when both are");
+    assert!(pct <= 100, "pct {pct} out of range");
+    assert!(health.frame_count >= 1, "we're in main at minimum");
+
+    // Per-local byte size — pick a known scalar (a: i32 → 4 bytes)
+    // and assert. The classifier should resolve DW_AT_byte_size
+    // through the existing type pipeline.
+    let locals = debugger.read_local_variables().unwrap();
+    let a = locals
+        .iter()
+        .find(|qr| qr.identity().to_string() == "a")
+        .expect("`a` not in locals");
+    assert_eq!(a.byte_size(), Some(4), "i32 should report 4 bytes");
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.3 — storage class is computed during the
+/// variables-enumeration path and stored on each QueryResult.
+/// We assert on three observable properties:
+///   * `static GLOB_2` lands in `.rodata` (file-backed, RO segment)
+///     → `StorageClass::StaticReadOnly`.
+///   * The `box_d` local at vars.rs:119 (a `Box<i32>`) has its
+///     pointee in a heap-ish mapping →
+///     `storage::value_points_to_heap` returns true.
+///   * A stack-allocated local has `StorageClass::Stack` — any
+///     `let x: i32 = ...` reliably gets fbreg lowered.
+#[test]
+#[serial]
+fn test_storage_classifier_runs_on_live_variables() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 119).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(119));
+
+    // `static GLOB_2: i32 = 2` lands in .rodata → StaticReadOnly.
+    // We use the bulk-statics enumeration which sets the storage
+    // field during root_from_die.
+    let statics = debugger
+        .read_static_variables(FileScopeFilter::CurrentCrate)
+        .unwrap();
+    let glob_2 = statics
+        .iter()
+        .find(|qr| qr.identity().to_string().contains("GLOB_2"))
+        .expect("GLOB_2 not enumerated");
+    assert_eq!(
+        glob_2.storage(),
+        Some(StorageClass::StaticReadOnly),
+        "static GLOB_2 should classify as StaticReadOnly via the .rodata segment lookup"
+    );
+
+    // §5.3 refresh-on-stop: the segment-writability index is now
+    // re-read from proc_maps before each variables-pane query in
+    // the DAP layer, so post-startup heap allocations (Box::new
+    // etc.) appear by the time the heap-overlay lookup runs.
+    // Integration tests don't go through the DAP layer, so call
+    // the refresh explicitly first — must happen before
+    // `read_local_variables` since the latter holds an
+    // immutable borrow that conflicts with the mutable refresh.
+    debugger
+        .refresh_segment_index()
+        .expect("refresh_segment_index should succeed");
+    let locals = debugger.read_local_variables().unwrap();
+
+    // Heap overlay: `box_d` is a `Box<i32>` whose pointee lives
+    // on the heap (Rust's default allocator → anon RW mapping on
+    // Linux). The overlay logic is independent of the storage
+    // class — the binding itself is on the stack.
+    let box_d = locals
+        .iter()
+        .find(|qr| qr.identity().to_string().contains("box_d"))
+        .expect("box_d not in locals");
+    assert_eq!(
+        box_d.storage(),
+        Some(StorageClass::Stack),
+        "the Box binding itself lives on the stack"
+    );
+    assert!(
+        storage::value_points_to_heap(box_d.value(), &debugger),
+        "Box<i32>'s pointee should land in [heap] or anon-rw — \
+         refresh-on-stop must have picked up the post-startup allocation"
+    );
+
+    // Some local should be on the stack — `a: i32` at this bp is
+    // a plain owned i32 which rustc lowers as fbreg-relative.
+    let a = locals
+        .iter()
+        .find(|qr| qr.identity().to_string() == "a")
+        .expect("`a` not in locals");
+    assert_eq!(a.storage(), Some(StorageClass::Stack));
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
+/// Variables-view §5.2 — the mutability classifier should run
+/// without panicking on every variable produced by the bulk
+/// enumeration APIs, and the GLOB_2 static (a plain `static i32`)
+/// should classify as ReadOnly because the linker puts it in
+/// `.rodata` regardless of the rustc / LLVM version. Other GLOB_*
+/// statics may land in `.data.rel.ro` (read-only after relocation)
+/// or similar — we don't assert on them to stay portable across
+/// linker quirks.
+#[test]
+#[serial]
+fn test_mutability_classifier_runs_on_live_variables() {
+    let process = prepare_debugee_process(VARS_APP, &[]);
+    let debugee_pid = process.pid();
+    let info = TestInfo::default();
+    let builder = DebuggerBuilder::new()
+        .with_auto_traps(false)
+        .with_hooks(TestHooks::new(info.clone()));
+    let mut debugger = builder.build(process).unwrap();
+
+    debugger.set_breakpoint_at_line("vars.rs", 168).unwrap();
+    debugger.start_debugee().unwrap();
+    assert_eq!(info.line.take(), Some(168));
+
+    // Every static must classify into some Mutability variant
+    // without panicking. The exact bucket depends on the linker
+    // (`.rodata` vs `.data.rel.ro`); we just ensure the path
+    // returns something for every entry.
+    let statics = debugger
+        .read_static_variables(FileScopeFilter::CurrentCrate)
+        .unwrap();
+    assert!(!statics.is_empty(), "no statics enumerated");
+    for qr in &statics {
+        let _ = mutability::classify(qr, &debugger);
+    }
+
+    // GLOB_2 is `static GLOB_2: i32 = 2;` — pure integer literal,
+    // no relocations, lands in `.rodata` on every supported
+    // toolchain. Assert it classifies as ReadOnly to lock that in.
+    let glob_2 = statics
+        .iter()
+        .find(|qr| qr.identity().to_string().contains("GLOB_2"))
+        .expect("GLOB_2 not enumerated");
+    assert_eq!(
+        mutability::classify(glob_2, &debugger),
+        Mutability::ReadOnly,
+        "static GLOB_2 should be ReadOnly (in .rodata)"
+    );
+
+    // Local variables go through the type-based classifier. We
+    // don't assert specifics (the fixture's locals are mostly
+    // owned types which default-RW per the let-mut DWARF gap) —
+    // just exercise the path and verify it doesn't panic.
+    let locals = debugger.read_local_variables().unwrap();
+    for qr in &locals {
+        let _ = mutability::classify(qr, &debugger);
+    }
+
+    debugger.continue_debugee().unwrap();
+    assert_no_proc!(debugee_pid);
+}
+
 #[test]
 #[serial]
 fn test_read_only_local_variables() {
@@ -1502,6 +1887,15 @@ fn test_arguments() {
             _ => panic!("2 members expected"),
         },
     );
+
+    // Regression: resolving an argument *by name* via `read_variable`
+    // (the path used by DAP `evaluate`/hover, breakpoint conditions and
+    // log points) must find formal parameters, not just DW_TAG_variable
+    // locals. Before the fix this returned an empty Vec → `<no result>`
+    // on hover even though the arg shows in the Arguments pane.
+    read_var_dqe!(debugger, Dqe::Variable(Selector::by_name("by_val", false)) => by_val_byname);
+    assert_idents!(by_val_byname => "by_val");
+    assert_scalar(by_val_byname.value(), "i32", Some(SupportedScalar::I32(1)));
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);
@@ -2407,12 +2801,14 @@ fn assert_mutex_poisoned(val: &Value, exp_poisoned: bool) {
     assert_eq!(*poisoned, exp_poisoned);
 }
 
-/// Phase 1 S1 (locked) helper: assert lock-state matches expectation.
-/// Note: the futex backend (Linux, modern Windows, etc.) reports
-/// accurate state; macOS / Win7 always report `false`.
-fn assert_mutex_locked(val: &Value, exp_locked: bool) {
+/// Phase 1 S1 (state) helper: assert lock-state matches expectation.
+/// The futex backend (Linux, modern Windows, etc.) reports accurate
+/// state including reader counts for RwLock; macOS pthread handles
+/// Mutex held/free but reports `Free` for RwLock; Win7 SRWLOCK
+/// always reports `Free`.
+fn assert_mutex_state(val: &Value, exp_state: LockState) {
     let Value::Specialized {
-        value: Some(SpecializedValue::Mutex { locked, .. }),
+        value: Some(SpecializedValue::Mutex { state, .. }),
         ..
     } = val
     else {
@@ -2421,7 +2817,7 @@ fn assert_mutex_locked(val: &Value, exp_locked: bool) {
             val.r#type().name_fmt()
         );
     };
-    assert_eq!(*locked, exp_locked);
+    assert_eq!(*state, exp_state);
 }
 
 /// Phase 1 S1 — `Mutex<T>` and `RwLock<T>` peel through their `data:
@@ -2459,15 +2855,20 @@ fn test_read_mutex_rwlock() {
     // locks would assert `true` here.
     assert_mutex_poisoned(pick("mtx").value(), false);
     assert_mutex_poisoned(pick("rwl").value(), false);
-    // Phase 1 S1 (locked): the fixture *does* hold both locks at
+    // Phase 1 S1 (state): the fixture *does* hold both locks at
     // the breakpoint — `mtx.lock()` runs at vars.rs:734 and
     // `rwl.read()` at vars.rs:735, both before the bp at 749. The
-    // probe correctly reports `locked = true`. On macOS the futex
-    // backend isn't used so the probe reports `false` there even
-    // when held; gate that platform out below if/when this test is
-    // re-enabled on darwin.
-    assert_mutex_locked(pick("mtx").value(), true);
-    assert_mutex_locked(pick("rwl").value(), true);
+    // probe behaviour splits by platform:
+    //   * Linux / futex backend: Mutex⇒Exclusive, RwLock with one
+    //     reader ⇒ Shared(1) — full decoding via libstd's MASK.
+    //   * macOS pthread: Mutex⇒Exclusive (owner-field probe), but
+    //     RwLock has no probe yet (TODO) so reports Free.
+    //   * Win7 SRWLOCK: always Free (no probe).
+    assert_mutex_state(pick("mtx").value(), LockState::Exclusive);
+    #[cfg(not(target_os = "macos"))]
+    assert_mutex_state(pick("rwl").value(), LockState::Shared(1));
+    #[cfg(target_os = "macos")]
+    assert_mutex_state(pick("rwl").value(), LockState::Free);
 
     debugger.continue_debugee().unwrap();
     assert_no_proc!(debugee_pid);
@@ -3838,12 +4239,20 @@ fn test_read_time() {
                 s.starts_with("now + ") || s.starts_with("now - "),
                 "Instant should render as `now ± …`, got {s:?}"
             );
-            // After `now ± `, expect "HH:MM:SS.mmm" — 12 chars.
+            // After `now ± `, expect "HH:MM:SS.mmm". Hours may exceed two
+            // digits on a long-running machine (the delta can be large),
+            // so validate the shape rather than a fixed length.
             let suffix = &s[6..];
-            assert_eq!(
-                suffix.len(),
-                12,
-                "Instant time format should be 12 chars (HH:MM:SS.mmm), got {suffix:?}"
+            let parts: Vec<&str> = suffix.split([':', '.']).collect();
+            let shape_ok = parts.len() == 4
+                && parts[0].len() >= 2
+                && parts[1].len() == 2
+                && parts[2].len() == 2
+                && parts[3].len() == 3
+                && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit()));
+            assert!(
+                shape_ok,
+                "Instant time should render as HH:MM:SS.mmm, got {suffix:?}"
             );
         }
         other => panic!("expected PreRendered Instant delta, got {other:?}"),

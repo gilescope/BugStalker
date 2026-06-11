@@ -184,6 +184,24 @@ fn top_frame_line(session: &mut DapSession, thread_id: i64) -> anyhow::Result<Op
     Ok(stack_response["body"]["stackFrames"][0]["line"].as_i64())
 }
 
+/// Top stack frame's source path (DAP `stackFrames[0].source.path`), or
+/// `None` if the frame has no source (e.g. a stripped/library frame).
+fn top_frame_source_path(
+    session: &mut DapSession,
+    thread_id: i64,
+) -> anyhow::Result<Option<String>> {
+    let stack_seq = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let stack_response = session.client.read_response(stack_seq)?;
+    if !assert_response(&stack_response, "stackTrace", stack_seq, true) {
+        return Ok(None);
+    }
+    Ok(stack_response["body"]["stackFrames"][0]["source"]["path"]
+        .as_str()
+        .map(str::to_owned))
+}
+
 fn wait_for_event_or_terminated(
     session: &mut DapSession,
     event_name: &str,
@@ -895,6 +913,68 @@ fn test_scopes_request() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Lazy file-scope scopes (variables-view perf, design-principles.md
+/// §2). Statics / Thread-locals must advertise `expensive: true` so the
+/// client doesn't auto-expand them — enumerating every static's value
+/// on each stop is the per-step cost we moved off the hot path. Locals /
+/// Arguments stay cheap (`expensive: false`). Expanding the deferred
+/// scope must still return a variables array, proving the lazy
+/// population fires on demand.
+#[test]
+#[serial]
+fn test_file_scope_scopes_are_lazy() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+    let seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "scopes", seq, true);
+
+    let scopes = response["body"]["scopes"].as_array().cloned().unwrap();
+    let expensive_of = |name: &str| -> Option<bool> {
+        scopes
+            .iter()
+            .find(|s| s["name"] == name)
+            .and_then(|s| s["expensive"].as_bool())
+    };
+    assert_eq!(expensive_of("Statics"), Some(true), "Statics must be lazy");
+    assert_eq!(
+        expensive_of("Thread-locals"),
+        Some(true),
+        "Thread-locals must be lazy"
+    );
+    assert_eq!(expensive_of("Locals"), Some(false));
+    assert_eq!(expensive_of("Arguments"), Some(false));
+
+    // Expanding the deferred Statics scope must still resolve — this is
+    // the on-demand enumeration path.
+    let statics_ref = scopes
+        .iter()
+        .find(|s| s["name"] == "Statics")
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+    assert!(statics_ref != 0, "Statics scope needs a real reference");
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": statics_ref }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "variables", seq, true);
+    // (hello_world links only std, which is precompiled without debug
+    // info, so its all-crates set can legitimately be empty — the
+    // all-crates *broadening* is guarded by `test_thin_crate_sees_dep_statics`.)
+    assert!(response["body"]["variables"].is_array());
+
+    session.shutdown();
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_variables_request() -> anyhow::Result<()> {
@@ -921,6 +1001,509 @@ fn test_variables_request() -> anyhow::Result<()> {
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "variables", seq, true);
     assert!(response["body"]["variables"].is_array());
+    session.shutdown();
+    Ok(())
+}
+
+/// Smoke guard for the variables-view file-scope read path: building
+/// the DAP `scopes` response eagerly enumerates every file-scope
+/// static + thread-local in the current crate (`handle_scopes` →
+/// `file_scope_var_items` → `query_file_scope` → `root_from_die` →
+/// `read_value` → `into_raw_bytes`), and the field crash (capacity
+/// overflow, seen as `adapter-error: connection closed`) happened
+/// right there. This stops inside `dap_cache_vars::main` and requests
+/// `scopes` *and* the `variables` of every scope, so a panic anywhere
+/// in that path surfaces as a connection-closed error and fails the
+/// test.
+///
+/// NB: this does not by itself reproduce the original capacity
+/// overflow — that needs a `DW_AT_upper_bound = -1` array DIE, which
+/// rustc doesn't emit (it uses `DW_AT_count`); it comes from C/`-sys`
+/// debug info. The overflow arithmetic itself is covered directly by
+/// the unit test on `array_byte_size` in `dwarf::r#type`.
+#[test]
+#[serial]
+fn test_file_scope_enumeration_no_crash() -> anyhow::Result<()> {
+    // Ensure the debuggee exists (default build).
+    let status = Command::new("cargo")
+        .args(["build", "-p", "dap_cache_vars"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build dap_cache_vars example");
+    }
+
+    let mut session = DapSession::start()?;
+    // Line 25 is the `println!` in dap_cache_vars/main.rs — after
+    // `outer` is fully built, so the stop is in a user frame and the
+    // current-crate file-scope filter resolves.
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("dap_cache_vars"),
+        &example_source("examples/dap_cache_vars/src/main.rs"),
+        25
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+
+    // The crash path: `scopes` builds the file-scope scopes eagerly.
+    let scopes_seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes_response = session.client.read_response(scopes_seq)?;
+    ensure_response!(session, &scopes_response, "scopes", scopes_seq, true);
+
+    // Drive the `variables` read of every scope (Locals, Statics,
+    // Thread-locals, …) so the file-scope value read is exercised
+    // even where it's deferred to the `variables` request.
+    let scopes = scopes_response["body"]["scopes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for scope in scopes {
+        let vref = scope["variablesReference"].as_i64().unwrap_or(0);
+        if vref == 0 {
+            continue;
+        }
+        let seq = session
+            .client
+            .send_request("variables", json!({ "variablesReference": vref }))?;
+        let response = session.client.read_response(seq)?;
+        ensure_response!(session, &response, "variables", seq, true);
+        assert!(
+            response["body"]["variables"].is_array(),
+            "variables for scope {} not an array: {response}",
+            scope["name"]
+        );
+    }
+
+    session.shutdown();
+    Ok(())
+}
+
+/// Namespace tree (variables-view, design-principles.md §4). Expanding
+/// the Statics scope on a static-heavy binary must yield a *tree* keyed
+/// by `::` path — collapsible namespace nodes — not a flat dump. Drives
+/// `statics_heavy` (4000 statics across `m0..m39`): expanding Statics
+/// surfaces the `statics_heavy` crate node; expanding that surfaces the
+/// `m*` module nodes; expanding one of those reaches the `RO_*`/`RW_*`
+/// leaves.
+#[test]
+#[serial]
+fn test_statics_rendered_as_namespace_tree() -> anyhow::Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "statics_heavy"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build statics_heavy example");
+    }
+
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("statics_heavy"),
+        &example_source("examples/statics_heavy/src/main.rs"),
+        13
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+
+    // Descend the tree from the `statics_heavy` crate node down through
+    // its `m*` module chain to the `RO_*`/`RW_*` leaves — proving the
+    // Statics scope is a navigable tree, not a flat dump, and that it
+    // expands level-by-level.
+    let leaves = statics_first_chain_leaves(&mut session, frame_id)?;
+    assert!(
+        leaves
+            .iter()
+            .any(|n| n.starts_with("RO_") || n.starts_with("RW_")),
+        "expected RO_*/RW_* leaf statics by descending the tree; got: {leaves:?}"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
+/// A giant static (800 KB `BIG_TABLE`) must be shown as a *lazy* leaf —
+/// a size summary + expand arrow — not materialised (all 100 000 elements
+/// read) when the Statics tree opens. Guards the size-gate that keeps the
+/// Statics pane responsive on binaries with precomputed crypto tables.
+#[test]
+#[serial]
+fn test_statics_giant_static_is_lazy() -> anyhow::Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "big_static"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build big_static example");
+    }
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("big_static"),
+        &example_source("examples/big_static/src/main.rs"),
+        15
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+    let seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes = session.client.read_response(seq)?;
+    ensure_response!(session, &scopes, "scopes", seq, true);
+    let statics_ref = scopes["body"]["scopes"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+
+    // Descend the namespace tree (root → `big_static` → …) collecting the
+    // `BIG_TABLE` and `SMALL` leaves. Bounded so a malformed tree can't loop.
+    let mut frontier = vec![statics_ref];
+    let mut seen = std::collections::HashSet::new();
+    let (mut big_row, mut small_row): (Option<Value>, Option<Value>) = (None, None);
+    for _ in 0..64 {
+        let Some(r) = frontier.pop() else { break };
+        if r == 0 || !seen.insert(r) {
+            continue;
+        }
+        let seq = session
+            .client
+            .send_request("variables", json!({ "variablesReference": r }))?;
+        let resp = session.client.read_response(seq)?;
+        ensure_response!(session, &resp, "variables", seq, true);
+        for row in resp["body"]["variables"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            // The DAP layer renders names as `name : type` (var_name_matches).
+            let leaf = row["name"].as_str().unwrap_or("");
+            let leaf = leaf.split(" : ").next().unwrap_or(leaf);
+            match leaf {
+                "BIG_TABLE" => big_row = Some(row.clone()),
+                "SMALL" => small_row = Some(row.clone()),
+                _ => {}
+            }
+            // Descend namespace nodes only (value is a `(count)`).
+            if let Some(child) = row["variablesReference"].as_i64()
+                && row["value"].as_str().is_some_and(|v| v.starts_with('('))
+            {
+                frontier.push(child);
+            }
+        }
+        if big_row.is_some() && small_row.is_some() {
+            break;
+        }
+    }
+
+    // The giant static is a lazy node — size summary + expand arrow, no
+    // eager read of its 100 000 elements.
+    let big = big_row.expect("BIG_TABLE leaf should appear in the Statics tree");
+    assert!(
+        big["value"]
+            .as_str()
+            .unwrap_or("")
+            .contains("expand to load"),
+        "giant static must be a lazy node, got value {:?}",
+        big["value"]
+    );
+    assert!(
+        big["variablesReference"].as_i64().unwrap_or(0) != 0,
+        "lazy giant static must be expandable: {big}"
+    );
+
+    // The small static is *not* gated — it still renders inline.
+    let small = small_row.expect("SMALL leaf should appear in the Statics tree");
+    assert_eq!(
+        small["value"].as_str(),
+        Some("42"),
+        "small static must render its value inline, not lazily: {small}"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
+/// Lazy skeleton (variables-view, design-principles.md §2). The *first*
+/// Statics expand must not materialise every static — it returns only
+/// the namespace skeleton, built from names. On `statics_heavy` the root
+/// is a single `statics_heavy (4000)` namespace node: the `(4000)` count
+/// proves all names were enumerated, and the absence of any `RO_*`/`RW_*`
+/// row proves no leaf values were read at this level.
+#[test]
+#[serial]
+fn test_statics_first_expand_is_lazy_skeleton() -> anyhow::Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "statics_heavy"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build statics_heavy example");
+    }
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("statics_heavy"),
+        &example_source("examples/statics_heavy/src/main.rs"),
+        13
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+    let seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes = session.client.read_response(seq)?;
+    ensure_response!(session, &scopes, "scopes", seq, true);
+    let statics_ref = scopes["body"]["scopes"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": statics_ref }))?;
+    let resp = session.client.read_response(seq)?;
+    ensure_response!(session, &resp, "variables", seq, true);
+    let rows = resp["body"]["variables"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    assert!(
+        rows.iter().all(|r| {
+            let n = r["name"].as_str().unwrap_or("");
+            !n.starts_with("RO_") && !n.starts_with("RW_")
+        }),
+        "root expand materialised leaf statics instead of a skeleton: {:?}",
+        rows.iter()
+            .map(|r| r["name"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        rows.iter().any(|r| r["value"].as_str() == Some("(4000)")),
+        "expected a namespace node counting all 4000 statics; got: {:?}",
+        rows.iter()
+            .map(|r| (
+                r["name"].as_str().unwrap_or(""),
+                r["value"].as_str().unwrap_or("")
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
+/// Descend the Statics namespace tree, following the first expandable
+/// (namespace) row at each level, and return the leaf names at the
+/// first level that actually holds statics (`RO_*` / `RW_*`).
+fn statics_first_chain_leaves(
+    session: &mut DapSession,
+    frame_id: i64,
+) -> anyhow::Result<Vec<String>> {
+    let seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let resp = session.client.read_response(seq)?;
+    let statics_ref = resp["body"]["scopes"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+    // The Statics scope now lists every crate (design-principles.md §4);
+    // start from the `statics_heavy` crate node, then descend its chain.
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": statics_ref }))?;
+    let top = session.client.read_response(seq)?;
+    let mut vref = top["body"]["variables"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter().find(|r| {
+                r["name"]
+                    .as_str()
+                    .is_some_and(|n| n == "statics_heavy" || n.starts_with("statics_heavy::"))
+            })
+        })
+        .and_then(|r| r["variablesReference"].as_i64())
+        .unwrap_or(0);
+    let mut rows = Vec::new();
+    for _ in 0..16 {
+        let seq = session
+            .client
+            .send_request("variables", json!({ "variablesReference": vref }))?;
+        let r = session.client.read_response(seq)?;
+        rows = r["body"]["variables"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let has_leaves = rows.iter().any(|row| {
+            row["name"]
+                .as_str()
+                .is_some_and(|n| n.starts_with("RO_") || n.starts_with("RW_"))
+        });
+        if has_leaves {
+            break;
+        }
+        match rows
+            .iter()
+            .find(|row| row["variablesReference"].as_i64().unwrap_or(0) != 0)
+            .and_then(|row| row["variablesReference"].as_i64())
+        {
+            Some(next) => vref = next,
+            None => break,
+        }
+    }
+    Ok(rows
+        .iter()
+        .filter_map(|row| row["name"].as_str().map(str::to_string))
+        .collect())
+}
+
+/// Immutable-static cache (design-principles.md §3). When the Statics
+/// pane is kept open across a step, read-only statics are served from
+/// cache and only mutable ones are re-read — but the tree must stay
+/// *complete*: a buggy merge could drop the cached read-only half. This
+/// expands Statics, steps over one line, re-expands, and asserts the
+/// same module still surfaces both `RO_*` (cache) and `RW_*` (re-read)
+/// leaves with an unchanged count.
+#[test]
+#[serial]
+fn test_statics_cache_survives_step() -> anyhow::Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "statics_heavy"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build statics_heavy example");
+    }
+
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("statics_heavy"),
+        &example_source("examples/statics_heavy/src/main.rs"),
+        13
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+    let before = statics_first_chain_leaves(&mut session, frame_id)?;
+    assert!(before.iter().any(|n| n.starts_with("RO_")), "no RO_ before");
+    assert!(before.iter().any(|n| n.starts_with("RW_")), "no RW_ before");
+
+    // Step over one line, then re-expand at the new stop.
+    let seq = session
+        .client
+        .send_request("next", json!({ "threadId": thread_id }))?;
+    let _ = session.client.read_response(seq)?;
+    if wait_for_event_or_terminated(&mut session, "stopped", Duration::from_secs(10))?.is_none() {
+        // Program ran to completion — nothing left to assert.
+        session.shutdown();
+        return Ok(());
+    }
+    let frame_id = require_frame!(&mut session, thread_id);
+    let after = statics_first_chain_leaves(&mut session, frame_id)?;
+
+    assert!(
+        after.iter().any(|n| n.starts_with("RO_")),
+        "read-only statics missing after step — cache dropped them"
+    );
+    assert!(
+        after.iter().any(|n| n.starts_with("RW_")),
+        "mutable statics missing after step"
+    );
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "statics leaf count changed across a step (before {before:?}, after {after:?})"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
+/// All-crates Statics default (design-principles.md §4) — the
+/// regression behind the field report of an empty pane. A binary with
+/// no statics of its own (`thin_app`) must still surface a dependency's
+/// statics (`dep_with_static::DEP_STATIC`); the old current-crate-only
+/// filter hid them. Reproduces the user's case (a test binary whose
+/// interesting statics — `hyper_util::…::__CALLSITE` etc. — all live in
+/// dependencies).
+#[test]
+#[serial]
+fn test_thin_crate_sees_dep_statics() -> anyhow::Result<()> {
+    let status = Command::new("cargo")
+        .args(["build", "-p", "thin_app"])
+        .current_dir(dap_client::repo_root().join("examples"))
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("failed to build thin_app example");
+    }
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("thin_app"),
+        &example_source("examples/thin_app/src/main.rs"),
+        5
+    );
+    let frame_id = require_frame!(&mut session, thread_id);
+
+    let seq = session
+        .client
+        .send_request("scopes", json!({ "frameId": frame_id }))?;
+    let scopes = session.client.read_response(seq)?;
+    ensure_response!(session, &scopes, "scopes", seq, true);
+    let statics_ref = scopes["body"]["scopes"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["name"] == "Statics"))
+        .and_then(|s| s["variablesReference"].as_i64())
+        .unwrap_or(0);
+
+    // The dependency crate appears as a top-level namespace node even
+    // though it isn't the current crate.
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": statics_ref }))?;
+    let top = session.client.read_response(seq)?;
+    ensure_response!(session, &top, "variables", seq, true);
+    let dep_ref = top["body"]["variables"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter().find(|r| {
+                r["name"]
+                    .as_str()
+                    .is_some_and(|n| n == "dep_with_static" || n.starts_with("dep_with_static::"))
+            })
+        })
+        .and_then(|r| r["variablesReference"].as_i64())
+        .unwrap_or(0);
+    assert!(
+        dep_ref != 0,
+        "dependency crate `dep_with_static` missing from Statics: {:?}",
+        top["body"]["variables"].as_array().map(|rows| rows
+            .iter()
+            .map(|r| r["name"].as_str().unwrap_or(""))
+            .collect::<Vec<_>>())
+    );
+
+    let seq = session
+        .client
+        .send_request("variables", json!({ "variablesReference": dep_ref }))?;
+    let leaves = session.client.read_response(seq)?;
+    ensure_response!(session, &leaves, "variables", seq, true);
+    // The DAP row name is the `name : type` display form
+    // (`DEP_STATIC : u64`), so match the leading identifier.
+    assert!(
+        leaves["body"]["variables"].as_array().is_some_and(|rows| {
+            rows.iter().any(|r| {
+                r["name"]
+                    .as_str()
+                    .is_some_and(|n| n.starts_with("DEP_STATIC"))
+            })
+        }),
+        "DEP_STATIC not found under dep_with_static; got: {:?}",
+        leaves["body"]["variables"]
+    );
+
     session.shutdown();
     Ok(())
 }
@@ -1244,6 +1827,337 @@ fn test_next_request() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `next` with `granularity: "instruction"` (Disassembly View) advances a single
+/// machine instruction, not a whole source line — the PC moves by ~one
+/// instruction's worth, not a line's.
+#[test]
+#[serial]
+fn test_next_instruction_granularity() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+    let pc_of = |session: &mut DapSession| -> anyhow::Result<Option<u64>> {
+        let seq = session
+            .client
+            .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let resp = session.client.read_response(seq)?;
+        Ok(
+            resp["body"]["stackFrames"][0]["instructionPointerReference"]
+                .as_str()
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
+        )
+    };
+    let before = pc_of(&mut session)?;
+
+    let seq = session.client.send_request(
+        "next",
+        json!({ "threadId": thread_id, "granularity": "instruction" }),
+    )?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "next", seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    let after = pc_of(&mut session)?;
+    if let (Some(a), Some(b)) = (before, after) {
+        let delta = b.abs_diff(a);
+        assert!(
+            delta != 0 && delta <= 64,
+            "instruction-granularity step moved the PC {delta} bytes; expected \
+             ~one instruction (≤64), not a whole source line",
+        );
+    }
+    session.shutdown();
+    Ok(())
+}
+
+/// `bs/setAsmFocus {focused:true}` makes a plain `next` (no granularity field)
+/// step one machine instruction, matching the behaviour VS Code's Disassembly
+/// View gets from `granularity:"instruction"`.
+/// Also checks that the stopped event carries `preserveFocusHint:true` so VS
+/// Code does not steal focus from the asm panel between steps.
+/// `bs/registers` returns the focus thread's GPRs at the current stop as a
+/// `{ name: "0x…" }` map. The Source+ASM tooltip uses these to show an
+/// instruction's operand values. On aarch64 `pc` must equal the frame's
+/// instructionPointerReference; elsewhere the map is empty (no operand-name
+/// map yet) — assert only that the request succeeds.
+#[test]
+#[serial]
+fn test_registers_request() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session.client.send_request("bs/registers", json!({}))?;
+    let resp = session.client.read_response(seq)?;
+    ensure_response!(session, &resp, "bs/registers", seq, true);
+    let regs = &resp["body"]["registers"];
+
+    if cfg!(target_arch = "aarch64") {
+        let pc = regs["pc"].as_str().expect("pc register present");
+        assert!(
+            pc.starts_with("0x"),
+            "register values are hex strings, got {pc}"
+        );
+        // pc must match the top frame's instruction pointer.
+        let seq = session
+            .client
+            .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let st = session.client.read_response(seq)?;
+        let ip = st["body"]["stackFrames"][0]["instructionPointerReference"]
+            .as_str()
+            .expect("frame ip");
+        assert_eq!(
+            u64::from_str_radix(pc.trim_start_matches("0x"), 16).ok(),
+            u64::from_str_radix(ip.trim_start_matches("0x"), 16).ok(),
+            "bs/registers pc ({pc}) must equal the frame instruction pointer ({ip})",
+        );
+        assert!(regs["x0"].is_string(), "x0 present on aarch64");
+        assert!(regs["sp"].is_string(), "sp present on aarch64");
+    }
+    session.shutdown();
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_asm_focus_next_steps_instruction() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session
+        .client
+        .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/setAsmFocus failed"
+    );
+
+    let pc_of = |s: &mut DapSession| -> anyhow::Result<Option<u64>> {
+        let seq = s
+            .client
+            .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let resp = s.client.read_response(seq)?;
+        Ok(
+            resp["body"]["stackFrames"][0]["instructionPointerReference"]
+                .as_str()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+        )
+    };
+    let before = pc_of(&mut session)?;
+
+    let seq = session
+        .client
+        .send_request("next", json!({ "threadId": thread_id }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "next", seq, true);
+
+    let stopped = session.client.wait_for_event("stopped")?;
+    assert_eq!(
+        stopped["body"]["preserveFocusHint"].as_bool(),
+        Some(true),
+        "instruction step must set preserveFocusHint:true to keep asm panel focused",
+    );
+
+    let after = pc_of(&mut session)?;
+    if let (Some(a), Some(b)) = (before, after) {
+        let delta = b.abs_diff(a);
+        assert!(
+            delta != 0 && delta <= 64,
+            "bs/setAsmFocus next moved {delta} bytes — expected ≤64 (one instruction), not a source line",
+        );
+    }
+    session.shutdown();
+    Ok(())
+}
+
+/// Regression: an instruction step must report `runInstructions == 1`, not the
+/// rusage delta. The rusage delta is dominated by the ~11k *kernel* instructions
+/// of the trap itself (the "trap floor"), so without telling the perf overlay
+/// the exact count, stepping into a trivial line like `i = i + 1` showed ~11k.
+#[cfg(feature = "perf")]
+#[test]
+#[serial]
+fn test_asm_focus_step_reports_one_instruction() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session
+        .client
+        .send_request("bs/perfOverlayEnable", json!({}))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/perfOverlayEnable failed"
+    );
+
+    let seq = session
+        .client
+        .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/setAsmFocus failed"
+    );
+
+    let seq = session
+        .client
+        .send_request("next", json!({ "threadId": thread_id }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "next", seq, true);
+
+    let stopped = session.client.wait_for_event("stopped")?;
+    if stopped["body"]["bs_perf"].is_null() {
+        // No perf backend on this runner (CI containers typically run with
+        // perf_event_paranoid >= 2, so perf_event_open is refused). The
+        // overlay correctly reports nothing rather than a junk count — the
+        // =1 contract is only testable where a backend exists.
+        eprintln!("skipping runInstructions check: no perf backend (bs_perf null)");
+        session.shutdown();
+        return Ok(());
+    }
+    let run_instructions = stopped["body"]["bs_perf"]["runInstructions"].as_u64();
+    assert_eq!(
+        run_instructions,
+        Some(1),
+        "single instruction step must report runInstructions=1, not the trap-floor \
+         rusage delta; got {run_instructions:?} (bs_perf: {})",
+        stopped["body"]["bs_perf"],
+    );
+    session.shutdown();
+    Ok(())
+}
+
+/// Same as above but for `stepIn` — asm focus must redirect it to a single
+/// instruction step, not a source-level descent.
+#[test]
+#[serial]
+fn test_asm_focus_step_in_steps_instruction() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session
+        .client
+        .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/setAsmFocus failed"
+    );
+
+    let pc_of = |s: &mut DapSession| -> anyhow::Result<Option<u64>> {
+        let seq = s
+            .client
+            .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let resp = s.client.read_response(seq)?;
+        Ok(
+            resp["body"]["stackFrames"][0]["instructionPointerReference"]
+                .as_str()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+        )
+    };
+    let before = pc_of(&mut session)?;
+
+    let seq = session
+        .client
+        .send_request("stepIn", json!({ "threadId": thread_id }))?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "stepIn", seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    let after = pc_of(&mut session)?;
+    if let (Some(a), Some(b)) = (before, after) {
+        let delta = b.abs_diff(a);
+        assert!(
+            delta != 0 && delta <= 64,
+            "bs/setAsmFocus stepIn moved {delta} bytes — expected ≤64 (one instruction), not a source descent",
+        );
+    }
+    session.shutdown();
+    Ok(())
+}
+
+/// The `bs/stepIn` custom request (alt+right / shift+alt+right keybindings)
+/// must also honour asm focus: with the panel focused it steps one instruction
+/// rather than running its skip-libraries source descent — otherwise per-step
+/// instruction counts are inflated by a whole line's worth of work.
+#[test]
+#[serial]
+fn test_asm_focus_bs_step_in_steps_instruction() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("hello_world"),
+        &example_source("examples/hello_world/src/hello_world.rs"),
+        HELLO_LINE
+    );
+
+    let seq = session
+        .client
+        .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
+    let resp = session.client.read_response(seq)?;
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/setAsmFocus failed"
+    );
+
+    let pc_of = |s: &mut DapSession| -> anyhow::Result<Option<u64>> {
+        let seq = s
+            .client
+            .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let resp = s.client.read_response(seq)?;
+        Ok(
+            resp["body"]["stackFrames"][0]["instructionPointerReference"]
+                .as_str()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+        )
+    };
+    let before = pc_of(&mut session)?;
+
+    // shift+alt+right maps to bs/stepIn with skipLibraries:false.
+    let seq = session.client.send_request(
+        "bs/stepIn",
+        json!({ "threadId": thread_id, "skipLibraries": false }),
+    )?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "bs/stepIn", seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    let after = pc_of(&mut session)?;
+    if let (Some(a), Some(b)) = (before, after) {
+        let delta = b.abs_diff(a);
+        assert!(
+            delta != 0 && delta <= 64,
+            "asm-focus bs/stepIn moved {delta} bytes — expected ≤64 (one instruction), not a skip-libs source descent",
+        );
+    }
+    session.shutdown();
+    Ok(())
+}
+
 #[test]
 #[serial]
 fn test_step_in_request() -> anyhow::Result<()> {
@@ -1260,6 +2174,381 @@ fn test_step_in_request() -> anyhow::Result<()> {
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "stepIn", seq, true);
     let _ = session.client.wait_for_event("stopped")?;
+    session.shutdown();
+    Ok(())
+}
+
+// `step_into_jmc` fixture line numbers (1-indexed). Keep in sync with
+// `examples/step_into_jmc/src/main.rs`.
+const JMC_SOURCE: &str = "examples/step_into_jmc/src/main.rs";
+const JMC_LINE_A: i64 = 22; // entirely-library call (`to_uppercase`)
+const JMC_LINE_B: i64 = 26; // library call invoking a user closure
+const JMC_LINE_PRINTLN: i64 = 28; // the user line after LINE B
+
+/// `bs/stepIn { skipLibraries: true }` on an entirely-library call must
+/// behave as Step-Over: stop on the next *user* line, never inside
+/// alloc/core.
+#[test]
+#[serial]
+fn test_bs_step_in_skip_libraries_steps_over_library_call() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("step_into_jmc"),
+        &example_source(JMC_SOURCE),
+        JMC_LINE_A
+    );
+
+    let seq = session.client.send_request(
+        "bs/stepIn",
+        json!({ "threadId": thread_id, "skipLibraries": true }),
+    )?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "bs/stepIn", seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    // Landed back in the user frame on the next user line, not in core.
+    let path = top_frame_source_path(&mut session, thread_id)?;
+    assert_eq!(
+        path.as_deref(),
+        Some(example_source(JMC_SOURCE).to_string_lossy().as_ref()),
+        "skip-libraries step-in should stop in the user source file"
+    );
+    assert_eq!(top_frame_line(&mut session, thread_id)?, Some(JMC_LINE_B));
+
+    session.shutdown();
+    Ok(())
+}
+
+/// `bs/stepIn { skipLibraries: false }` preserves classic Step-In:
+/// descend into the library frame the line calls. The contrast with the
+/// skip-libraries test above is the whole point of the feature.
+#[test]
+#[serial]
+fn test_bs_step_in_any_frame_descends_into_library() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("step_into_jmc"),
+        &example_source(JMC_SOURCE),
+        JMC_LINE_A
+    );
+
+    let seq = session.client.send_request(
+        "bs/stepIn",
+        json!({ "threadId": thread_id, "skipLibraries": false }),
+    )?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "bs/stepIn", seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    // We descended somewhere out of `main` — definitely not stopped on
+    // the next user line. (A library frame may have no source path at
+    // all, so assert the negative: not the user line in the fixture.)
+    let path = top_frame_source_path(&mut session, thread_id)?;
+    let user_src = example_source(JMC_SOURCE).to_string_lossy().into_owned();
+    let line = top_frame_line(&mut session, thread_id)?;
+    let stopped_on_user_next_line =
+        path.as_deref() == Some(user_src.as_str()) && line == Some(JMC_LINE_B);
+    assert!(
+        !stopped_on_user_next_line,
+        "any-frame step-in should descend into the library, not step over it \
+         (path={path:?}, line={line:?})"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
+/// MVP engine: `bs/stepIn { skipLibraries: true }` on a line whose
+/// library call invokes a *user closure* currently steps OVER the call
+/// (it does not yet stop in the callback). Pin that behaviour so the
+/// phase-4 engine upgrade — which flips this to stop in `user_fn` — is a
+/// deliberate, visible change. See `doc/plans/phase-12-step-into-just-my-code.md`.
+#[test]
+#[serial]
+fn test_bs_step_in_skip_libraries_callback_is_stepped_over_mvp() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("step_into_jmc"),
+        &example_source(JMC_SOURCE),
+        JMC_LINE_B
+    );
+
+    let seq = session.client.send_request(
+        "bs/stepIn",
+        json!({ "threadId": thread_id, "skipLibraries": true }),
+    )?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "bs/stepIn", seq, true);
+    let _ = session.client.wait_for_event("stopped")?;
+
+    // MVP: stepped over the whole iterator expression, landing on the
+    // next user line in `main` — never inside `user_fn`.
+    let path = top_frame_source_path(&mut session, thread_id)?;
+    assert_eq!(
+        path.as_deref(),
+        Some(example_source(JMC_SOURCE).to_string_lossy().as_ref()),
+        "MVP skip-libraries should stay in the user source file"
+    );
+    assert_eq!(
+        top_frame_line(&mut session, thread_id)?,
+        Some(JMC_LINE_PRINTLN),
+        "MVP skip-libraries should step over the callback to the next user line"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
+/// Break-on-panic: the auto-trap fires in the panic runtime, so frame 0 is
+/// `core::panicking::…`. The stack-trace must deemphasize the panic
+/// machinery (so VS Code skips it) while leaving the user frame that
+/// panicked focusable — that's what puts the editor on the `.unwrap()`
+/// instead of in toolchain `panicking.rs`.
+#[test]
+#[serial]
+fn test_break_on_panic_deemphasizes_runtime_keeps_culprit() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    initialize(&mut session)?;
+
+    let launch_seq = session.client.send_request(
+        "launch",
+        json!({ "program": example_bin("panic"), "args": ["user"] }),
+    )?;
+    let launch_response = session.client.read_response(launch_seq)?;
+    ensure_response!(session, &launch_response, "launch", launch_seq, true);
+
+    let config_seq = session
+        .client
+        .send_request("configurationDone", json!({}))?;
+    let config_response = session.client.read_response(config_seq)?;
+    ensure_response!(
+        session,
+        &config_response,
+        "configurationDone",
+        config_seq,
+        true
+    );
+
+    // The default auto-traps stop the program in the panic runtime.
+    let Some(stopped) =
+        wait_for_event_or_terminated(&mut session, "stopped", OPTIONAL_EVENT_TIMEOUT)?
+    else {
+        // No auto-trap stop on this platform/toolchain — nothing to assert.
+        session.shutdown();
+        return Ok(());
+    };
+    let thread_id = stopped["body"]["threadId"].as_i64().unwrap_or_default();
+
+    let stack_seq = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let stack = session.client.read_response(stack_seq)?;
+    ensure_response!(session, &stack, "stackTrace", stack_seq, true);
+    let frames = stack["body"]["stackFrames"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    // First user frame = first whose source resolves to the fixture.
+    let Some(user_idx) = frames.iter().position(|f| {
+        f["source"]["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("panic.rs"))
+    }) else {
+        // User frame's source didn't resolve (stripped) — can't assert focus.
+        session.shutdown();
+        return Ok(());
+    };
+
+    // The culprit user frame must stay focusable: it keeps a real,
+    // navigable source and is not rendered subtle.
+    assert!(
+        frames[user_idx]["source"]["path"].is_string(),
+        "the panicking user frame must keep a navigable source: {}",
+        frames[user_idx]
+    );
+    assert_ne!(
+        frames[user_idx]["presentationHint"].as_str(),
+        Some("subtle"),
+        "the user frame that panicked must not be deemphasized: {}",
+        frames[user_idx]
+    );
+    // … and the panic machinery above it must be non-navigable (no `source`)
+    // and greyed (`subtle`), so VS Code's on-stop reveal skips it and walks
+    // down to the culprit instead of popping a toolchain tab.
+    assert!(
+        user_idx > 0,
+        "expected panic-runtime frames above the user frame, got {frames:?}"
+    );
+    let suppressed_above = frames[..user_idx]
+        .iter()
+        .all(|f| f["source"].is_null() && f["presentationHint"].as_str() == Some("subtle"));
+    assert!(
+        suppressed_above,
+        "panic-runtime frames above the culprit must be non-navigable + subtle: {frames:?}"
+    );
+
+    session.shutdown();
+    Ok(())
+}
+
+/// Break-on-panic: the culprit frame's reported line must be the *exact*
+/// panic site from the `#[track_caller]` `&Location`, not the imprecise
+/// DWARF statement line. `panic_kinds str` panics at `main.rs:24:5`; the
+/// fixture pins that line, so the stackTrace must report it for the user
+/// frame even though the enclosing statement's DWARF line can differ.
+#[test]
+#[serial]
+fn test_break_on_panic_reports_exact_location() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    initialize(&mut session)?;
+
+    let launch_seq = session.client.send_request(
+        "launch",
+        json!({ "program": example_bin("panic_kinds"), "args": ["str"] }),
+    )?;
+    let launch_response = session.client.read_response(launch_seq)?;
+    ensure_response!(session, &launch_response, "launch", launch_seq, true);
+
+    let config_seq = session
+        .client
+        .send_request("configurationDone", json!({}))?;
+    let config_response = session.client.read_response(config_seq)?;
+    ensure_response!(
+        session,
+        &config_response,
+        "configurationDone",
+        config_seq,
+        true
+    );
+
+    let Some(stopped) =
+        wait_for_event_or_terminated(&mut session, "stopped", OPTIONAL_EVENT_TIMEOUT)?
+    else {
+        // No auto-trap stop on this platform/toolchain — nothing to assert.
+        session.shutdown();
+        return Ok(());
+    };
+    let thread_id = stopped["body"]["threadId"].as_i64().unwrap_or_default();
+
+    let stack_seq = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let stack = session.client.read_response(stack_seq)?;
+    ensure_response!(session, &stack, "stackTrace", stack_seq, true);
+    let frames = stack["body"]["stackFrames"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    let Some(culprit_idx) = frames.iter().position(|f| {
+        f["source"]["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("panic_kinds/src/main.rs"))
+    }) else {
+        // Fixture source didn't resolve (stripped) — can't assert the line.
+        session.shutdown();
+        return Ok(());
+    };
+    let culprit = &frames[culprit_idx];
+
+    // The exact panic site: `panic!("boom")` on line 24, col 5.
+    assert_eq!(
+        culprit["line"].as_i64(),
+        Some(24),
+        "culprit frame must report the exact panic line from &Location: {culprit}"
+    );
+    assert_eq!(
+        culprit["column"].as_i64(),
+        Some(5),
+        "culprit frame must report the exact panic column from &Location: {culprit}"
+    );
+
+    // Every panic-runtime frame *above* the culprit must be non-navigable
+    // (no `source.path`, no `source.sourceReference`) so VS Code's on-stop
+    // reveal can't pop a toolchain tab (`panic_info.rs`/`panicking.rs`); it
+    // falls through to the culprit instead. They stay visible as greyed,
+    // name-only labels.
+    for (i, f) in frames[..culprit_idx].iter().enumerate() {
+        assert!(
+            f["source"]["path"].is_null() && f["source"]["sourceReference"].is_null(),
+            "frame #{i} above the culprit must be non-navigable, got {f}"
+        );
+    }
+
+    session.shutdown();
+    Ok(())
+}
+
+/// `focusPanicCulprit: false` opts out: a break-on-panic stop must yield a
+/// vanilla stack — every frame keeps a navigable `source`, nothing is greyed
+/// (`subtle`), and the top frame is the raw panic-runtime frame (so the
+/// editor lands wherever DWARF points, like a plain debugger).
+#[test]
+#[serial]
+fn test_break_on_panic_focus_opt_out() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    initialize(&mut session)?;
+
+    let launch_seq = session.client.send_request(
+        "launch",
+        json!({
+            "program": example_bin("panic_kinds"),
+            "args": ["str"],
+            "focusPanicCulprit": false,
+        }),
+    )?;
+    let launch_response = session.client.read_response(launch_seq)?;
+    ensure_response!(session, &launch_response, "launch", launch_seq, true);
+
+    let config_seq = session
+        .client
+        .send_request("configurationDone", json!({}))?;
+    let config_response = session.client.read_response(config_seq)?;
+    ensure_response!(
+        session,
+        &config_response,
+        "configurationDone",
+        config_seq,
+        true
+    );
+
+    let Some(stopped) =
+        wait_for_event_or_terminated(&mut session, "stopped", OPTIONAL_EVENT_TIMEOUT)?
+    else {
+        session.shutdown();
+        return Ok(());
+    };
+    let thread_id = stopped["body"]["threadId"].as_i64().unwrap_or_default();
+
+    let stack_seq = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let stack = session.client.read_response(stack_seq)?;
+    ensure_response!(session, &stack, "stackTrace", stack_seq, true);
+    let frames = stack["body"]["stackFrames"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    // No frame may be deemphasized when the feature is off.
+    assert!(
+        frames
+            .iter()
+            .all(|f| f["presentationHint"].as_str() != Some("subtle")),
+        "with focusPanicCulprit off no frame should be subtle: {frames:?}"
+    );
+    // The top frame keeps its (navigable) source rather than being suppressed.
+    if let Some(top) = frames.first() {
+        assert!(
+            top["source"].is_null() || top["source"]["path"].is_string(),
+            "top frame source must be raw (navigable or genuinely absent), got {top}"
+        );
+    }
+
     session.shutdown();
     Ok(())
 }
@@ -1668,7 +2957,228 @@ fn test_disassemble_request() -> anyhow::Result<()> {
     )?;
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "disassemble", seq, true);
-    assert!(response["body"]["instructions"].is_array());
+    let instructions = response["body"]["instructions"]
+        .as_array()
+        .expect("disassemble: instructions must be an array");
+    assert!(
+        !instructions.is_empty(),
+        "disassemble returned no instructions"
+    );
+    // Source interleaving: at least one instruction carries a `location`+`line`
+    // so VS Code can show Rust on the left, asm on the right.
+    let interleaved = instructions.iter().any(|ins| {
+        ins.get("location")
+            .and_then(|loc| loc.get("path"))
+            .and_then(serde_json::Value::as_str)
+            .is_some()
+            && ins
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+    });
+    assert!(
+        interleaved,
+        "disassemble response should interleave source (location+line) on at least one instruction",
+    );
+    session.shutdown();
+    Ok(())
+}
+
+/// VS Code's Disassembly View drives `disassemble` with a **negative**
+/// `instructionOffset` (to show context *before* the current PC) and a frame's
+/// `instructionPointerReference` as the `memoryReference` — the path the simpler
+/// test above skips. Mirror that exact request and assert it succeeds and the
+/// anchor instruction is in range.
+#[test]
+#[serial]
+fn test_disassemble_view_context_before() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("dap_disassemble"),
+        &example_source("examples/dap_disassemble/src/main.rs"),
+        22
+    );
+    // The Disassembly View anchors on the focused frame's IP, like VS Code.
+    let st = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let st = session.client.read_response(st)?;
+    let ip = st["body"]["stackFrames"][0]["instructionPointerReference"]
+        .as_str()
+        .expect("stackTrace frame must carry instructionPointerReference (the disasm anchor)")
+        .to_string();
+
+    // VS Code's real request shape: anchor + context before (negative offset).
+    let seq = session.client.send_request(
+        "disassemble",
+        json!({
+            "memoryReference": ip,
+            "instructionOffset": -8,
+            "instructionCount": 24,
+        }),
+    )?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "disassemble", seq, true);
+    let instructions = response["body"]["instructions"]
+        .as_array()
+        .expect("disassemble: instructions must be an array");
+    assert_eq!(
+        instructions.len(),
+        24,
+        "disassemble must return exactly instructionCount entries (padded), even with context-before",
+    );
+    let anchor = u64::from_str_radix(ip.trim_start_matches("0x"), 16).unwrap();
+    let has_anchor = instructions.iter().any(|ins| {
+        ins["address"]
+            .as_str()
+            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            == Some(anchor)
+    });
+    assert!(
+        has_anchor,
+        "the anchor (current PC) must appear in the disassembled window"
+    );
+    session.shutdown();
+    Ok(())
+}
+
+/// Software breakpoints replace the original instruction with a trap opcode
+/// (`brk #0` on aarch64, `int3` on x86_64). `disassemble` must restore the
+/// original bytes so the caller never sees the trap.
+#[test]
+#[serial]
+fn test_disassemble_no_brk_at_breakpoint() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("dap_disassemble"),
+        &example_source("examples/dap_disassemble/src/main.rs"),
+        22
+    );
+    // Get the breakpoint PC from the stack trace.
+    let st = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let st = session.client.read_response(st)?;
+    let ip = st["body"]["stackFrames"][0]["instructionPointerReference"]
+        .as_str()
+        .expect("frame must carry instructionPointerReference")
+        .to_string();
+
+    // Disassemble the breakpoint address itself.
+    let seq = session.client.send_request(
+        "disassemble",
+        json!({ "memoryReference": ip, "instructionOffset": 0, "instructionCount": 4 }),
+    )?;
+    let response = session.client.read_response(seq)?;
+    ensure_response!(session, &response, "disassemble", seq, true);
+
+    let instructions = response["body"]["instructions"]
+        .as_array()
+        .expect("instructions array");
+
+    // The instruction at the breakpoint address must not be the trap opcode.
+    let trap_mnemonics: &[&str] = &["brk", "int3", "int"];
+    let bp_ins = instructions
+        .iter()
+        .find(|ins| ins["address"].as_str() == Some(ip.as_str()));
+    let ins_text = bp_ins.and_then(|i| i["instruction"].as_str()).unwrap_or("");
+    let first_word = ins_text.split_whitespace().next().unwrap_or("");
+    assert!(
+        !trap_mnemonics.contains(&first_word),
+        "disassemble at breakpoint address returned trap opcode `{ins_text}`, \
+         expected original instruction (breakpoint byte-patching failed)",
+    );
+    session.shutdown();
+    Ok(())
+}
+
+/// Disassembly source-line annotations must use `is_stmt=true` DWARF rows only.
+/// Non-`is_stmt` rows are boundary markers that often carry the NEXT line's number
+/// as a transition hint; if we return one, annotations shift ±1 for instructions
+/// that straddle a statement boundary.
+///
+/// Invariant: every `line` annotation in the full-function disassembly of
+/// `busy_work` (lines 5–11 in dap_disassemble's main.rs) must fall in [5, 11].
+#[test]
+#[serial]
+fn test_disassemble_line_annotations_are_stmt_only() -> anyhow::Result<()> {
+    let mut session = DapSession::start()?;
+    // Break inside busy_work's loop body (line 8).
+    let thread_id = require_launch!(
+        &mut session,
+        &example_bin("dap_disassemble"),
+        &example_source("examples/dap_disassemble/src/main.rs"),
+        8
+    );
+    let st = session
+        .client
+        .send_request("stackTrace", json!({ "threadId": thread_id }))?;
+    let st = session.client.read_response(st)?;
+    let ip = st["body"]["stackFrames"][0]["instructionPointerReference"]
+        .as_str()
+        .expect("frame must carry instructionPointerReference")
+        .to_string();
+
+    // Use bs/functionBounds to get the exact address range of busy_work.
+    let bounds = session
+        .client
+        .send_request("bs/functionBounds", json!({}))?;
+    let bounds = session.client.read_response(bounds)?;
+    let (mem_ref, instr_count) = if bounds["body"]["unavailable"].as_bool() == Some(true) {
+        // Fallback: modest window (no +8 overshoot into adjacent functions).
+        (ip.clone(), 64i64)
+    } else {
+        let start = bounds["body"]["startAddress"]
+            .as_str()
+            .unwrap_or(ip.as_str())
+            .to_string();
+        let end_str = bounds["body"]["endAddress"].as_str().unwrap_or("0");
+        let start_int = u64::from_str_radix(start.trim_start_matches("0x"), 16).unwrap_or(0);
+        let end_int = u64::from_str_radix(end_str.trim_start_matches("0x"), 16).unwrap_or(0);
+        // Exact instruction count — no +8 overshoot into the next function.
+        let count = ((end_int.saturating_sub(start_int)) / 4) as i64;
+        (start, count.max(1))
+    };
+
+    let disasm_seq = session.client.send_request(
+        "disassemble",
+        json!({ "memoryReference": mem_ref, "instructionOffset": 0, "instructionCount": instr_count }),
+    )?;
+    let disasm_resp = session.client.read_response(disasm_seq)?;
+    ensure_response!(session, &disasm_resp, "disassemble", disasm_seq, true);
+    let instructions = disasm_resp["body"]["instructions"]
+        .as_array()
+        .expect("instructions array");
+
+    // Collect every `line` annotation emitted for the dap_disassemble source.
+    let src_path = example_source("examples/dap_disassemble/src/main.rs");
+    let src_str = src_path.to_string_lossy();
+    let annotated_lines: Vec<u64> = instructions
+        .iter()
+        .filter(|ins| {
+            ins["location"]["path"]
+                .as_str()
+                .map_or(false, |p| p == src_str.as_ref())
+        })
+        .filter_map(|ins| ins["line"].as_u64())
+        .collect();
+
+    assert!(
+        !annotated_lines.is_empty(),
+        "disassemble must emit at least one source-line annotation"
+    );
+    // busy_work body spans lines 5-11 (fn signature through closing brace).
+    // Non-is_stmt boundary rows could bleed in lines 4 (the #[inline(never)]
+    // attribute) or 13+ (next function).
+    for &ln in &annotated_lines {
+        assert!(
+            (5..=11).contains(&ln),
+            "disassemble emitted line {ln} outside busy_work's span [5,11]; \
+             likely a non-is_stmt boundary row leaked into annotation"
+        );
+    }
     session.shutdown();
     Ok(())
 }

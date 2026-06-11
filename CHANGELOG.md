@@ -7,6 +7,204 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- macOS step-cost correction (`debug-step-costs.md` #3):
+  - New `bs_perf::TrapFloor` (`crates/bs-perf/src/trap_floor.rs`) —
+    `proc_pid_rusage` charges each debugger trap's Mach-exception +
+    ptrace round-trip (~35k instructions) to the debuggee, swamping a
+    stepped line's real cost. `TrapFloor` passively learns that fixed
+    per-trap floor as a rolling-min over observed steps and subtracts
+    `traps × floor` from each step's instruction/cycle delta — no extra
+    traps, no debuggee perturbation. Trivial stepped lines drop from
+    ~73k to single-digit-k.
+  - `Debugee` / `Debugger` gained `trap_count()` / `reset_trap_count()`;
+    the macOS perf session brackets the trap count per window and emits
+    the corrected `runInstructions` / `runCycles`.
+
+- segment-index refresh-on-stop (variables-view §5.3 follow-up):
+  - New `DwarfRegistry::refresh_segment_index()` re-reads
+    `proc_maps` and rebuilds just the segment-writability +
+    segment-kind index (the heavier `update_mappings` also
+    rebuilds the per-file DWARF `mappings` + `ranges`, which
+    only change on dylib load/unload). Cheap — one
+    /proc/PID/maps read on Linux.
+  - `Debugger::refresh_segment_index()` exposes it; DAP
+    `handle_scopes` calls it once per query so post-startup
+    heap allocations (`Box::new`, `Vec::with_capacity`,
+    spawned-thread stacks) appear in the index by the time the
+    variables pane's storage classifier + heap-overlay lookup
+    run. Best-effort — failure is logged but doesn't block the
+    response.
+  - The `test_storage_classifier_runs_on_live_variables` test
+    is now a hard assertion that `box_d` (a `Box<i32>` allocated
+    after debugger startup) reports `points_to_heap == true`.
+    Pre-fix this was a lenient comment; the assertion now
+    catches regressions in the refresh path.
+
+- payload/padding layout breakdown per variable (variables-view §5.6):
+  - New `LayoutBreakdown { total, payload, padding }` carried on
+    `QueryResult` with a `padding_pct()` helper that saturates at
+    100 to handle pathological inputs defensively.
+  - `QueryResult::layout()` shallow-classifies `Structure` types:
+    walks members, sums `type_size_in_bytes(member.type_ref)` for
+    payload, computes `padding = total − payload`. Returns `None`
+    for non-struct types and for any layout-walk that fails (a
+    member with no resolvable type, evaluator failure).
+  - DAP `handle_variables` emits `bugstalker.layout =
+    { totalBytes, payloadBytes, paddingBytes }` per top-level
+    row, gated on `padding_pct ≥ 5` (the `showThresholdPct`
+    from variables-view §4) so trivial slop doesn't clutter
+    the pane.
+  - 4 unit tests for the `padding_pct` arithmetic +
+    1 live-debuggee integration test pinning the structural
+    identity `payload + padding == total` and `payload == 20`
+    for the fixture's `Foo { i32, [i32; 2], &i32 }`. The sum
+    is invariant under rustc field reordering; the total isn't
+    (so we don't pin it).
+  - Enum layout breakdown deferred — see variables-view.md §7.
+    Structs alone cover most "row is wasting space" cases.
+
+- stack-health snapshot + per-local byte size (variables-view §5.5):
+  - New `stack_health` module: `StackHealth` struct carries
+    `thread_stack_size`, `thread_stack_used`, `frame_count`, and
+    a per-function `recursion: HashMap<String, u32>` (only
+    functions appearing ≥ 2 times in the backtrace) plus
+    `max_recursion`. `used_pct()` saturates at 100 so a
+    guard-page-overflow mid-stop reads as 100% rather than
+    wrapping.
+  - `DwarfRegistry::containing_range(addr)` returns the half-open
+    `[from, to)` of the segment containing an address — used by
+    `stack_health` to look up the thread-stack mapping from the
+    SP register.
+  - `QueryResult::byte_size()` resolves `DW_AT_byte_size` via the
+    existing `ComplexType::type_size_in_bytes` path.
+  - DAP `handle_stack_trace` attaches `bugstalker.stackHealth`
+    (frameCount / maxRecursion / threadStackSize /
+    threadStackUsed / threadStackUsedPct) to the response and
+    `bugstalker.recursionCount` per frame when the function
+    repeats.
+  - DAP `handle_variables` emits `bugstalker.byte_size` per
+    top-level row.
+  - 4 unit tests for the `used_pct` arithmetic + 1 live-debuggee
+    integration test asserting `thread_stack_size`/`used`
+    invariants and `a: i32 → byte_size == 4`.
+  - Deferred for v0 (see variables-view.md §7): per-frame size
+    from CFA — needs extending the unwinder's `FrameSpan` with
+    `cfa` and computing `CFA(this) − CFA(parent)`. The other
+    three §5.5 signals already give actionable hints.
+
+- storage-class glyph data per variable (variables-view §5.3):
+  - `DwarfRegistry` segment index now carries a `SegmentKind` enum
+    (`Static`, `Stack`, `Heap`, `AnonRw`, `Other`) per mapping,
+    classified from `proc_maps` filenames. New
+    `address_segment_kind(addr)` accessor; existing
+    `address_writability(addr)` still works.
+  - New `variable::storage` module: `StorageClass` enum (Stack,
+    Register, StaticReadOnly, StaticReadWrite, ThreadLocal,
+    OptimizedAway, Unknown) plus `classify(expr, addr, encoding, dbg)`
+    that walks the raw `DW_AT_location` operations and matches the
+    first significant opcode. For Address-producing expressions
+    (DW_OP_addr), the evaluated address is cross-referenced with
+    the segment-kind index to split Static into RO / RW.
+  - `value_points_to_heap(value, dbg)` extracts the pointee
+    address from Box / Rc / Arc / NonNull / Weak / raw pointers
+    and returns `true` when it falls in `[heap]` or anon-RW.
+  - `FatDieRef<Variable>::location_expression(pc)` +
+    `unit_encoding()` public accessors expose the raw expression
+    for classification without going through the private
+    `DwarfLocation` wrapper.
+  - `QueryResult` carries `storage: Option<StorageClass>`,
+    populated by `DqeExecutor::apply_select_die` (variables path)
+    and `query_file_scope` (statics + TLS path) after `value` is
+    parsed.
+  - DAP `handle_variables` emits two more custom fields per
+    top-level row:
+    - `bugstalker.storage = "stack" | "register" | "static_ro" |
+      "static_rw" | "tls" | "optimized" | "unknown"`
+    - `bugstalker.points_to_heap = true` (omitted when false)
+  - 2 unit tests for the DAP string vocab + 1 live-debuggee
+    integration test pinning `static GLOB_2` to StaticReadOnly
+    and the `box_d: Box<i32>` binding to Stack. Heap-overlay
+    assertion is currently lenient — see variables-view.md §7
+    on segment-index refresh.
+
+- mutability classifier + DAP hint per variable (variables-view §5.2):
+  - New `DwarfRegistry::address_writability(addr)` builds a sorted
+    index of all `PT_LOAD` mappings (with their PF_R/W/X bits, read
+    out of `proc_maps` during `update_mappings`) and answers
+    "writable or read-only?" in O(log N). Index covers heap / stack /
+    anon-mmap regions too — §5.3 will reuse it for the storage-class
+    glyph's heap overlay.
+  - New `variable::mutability` module: `Mutability { ReadOnly, ReadWrite,
+    Unknown }` plus `classify(&QueryResult, &Debugger)` that combines
+    segment writability (ground truth for statics + TLS) with
+    type-based fallback for locals/args. Type fallback uses the rustc
+    DWARF convention: `&T` is `Pointer { target: ModifiedType { Const,
+    inner } }`, `&mut T` has no const qualifier — distinguishable
+    without parsing the type name. Owned types and any type containing
+    `UnsafeCell` (recursive, cycle-broken) are `ReadWrite`.
+  - DAP `handle_variables` now emits two new fields per top-level
+    variable:
+    - standard `presentationHint.attributes = ["readOnly"]` for `ro`
+      rows so stock DAP clients (default VSCode pane) italicise the
+      row even without our extension.
+    - custom `bugstalker.mutability = "ro" | "rw"` for the
+      vscode-extension to paint the grey/orange row-background hue
+      (per variables-view §1.2). The string vocabulary is stable —
+      bumping the enum without coordinating with the extension is
+      caught by `dap_str_round_trips_via_match`.
+  - 6 segment-index unit tests + 2 classifier unit tests + 1 live-
+    debuggee integration test (`test_mutability_classifier_runs_on_live_variables`,
+    pins `static GLOB_2: i32 = 2` to ReadOnly via the segment
+    lookup since it's always in `.rodata` on any Linux toolchain).
+  - Known limits documented in variables-view.md §7: child-row
+    mutability inheritance, vscode-extension CSS not wired up yet.
+
+- `Statics` + `Thread-locals` as new DAP scopes (variables-view §5.4):
+  - `DqeExecutor::query_file_scope(kind, filter)` enumerates every
+    file-scope `DW_TAG_variable` across loaded debug-info. `kind`
+    picks `Statics` vs `ThreadLocals` (TLS classification by the
+    rustc-lowered names `__KEY` / `VAL` / `__RUST_STD_INTERNAL_VAL`);
+    `filter` is one of `CurrentCrate` (default), `CurrentUnit`, `All`.
+  - New parser pass classifies each `DW_TAG_variable` as file-scope
+    vs local using a `subprogram_offsets` set + `parent_index`
+    ancestor walk. TLS internals are unconditionally file-scope —
+    rustc nests them under closures but the user thinks of them as
+    living at the surrounding namespace.
+  - `Debugger::read_static_variables` and
+    `Debugger::read_thread_local_variables` are the public APIs;
+    DAP `handle_scopes` adds `Statics` and `Thread-locals` to the
+    scope list (joining the existing `Locals` and `Arguments`).
+  - Default `CurrentCrate` filter matches on the namespace root, so
+    `std::*` and dependency statics don't drown out user code.
+  - 1 new unit test for the TLS-name classifier + 2 integration
+    tests on a live `vars` debuggee.
+  - Known limit: non-const-init thread_locals whose slot isn't
+    initialised on the current thread are silently dropped during
+    value-parse (no entry in the `Thread-locals` scope). Const-init
+    thread_locals always surface. Tracked in variables-view.md §7.
+
+- sharing-mode glyphs for `RwLock` and `RefCell` (variables-view §5.1):
+  - `SpecializedValue::Mutex` (shared by `Mutex` and `RwLock`) gains a
+    `state: LockState` field replacing the older `locked: bool`. The
+    new `LockState` enum carries `Free` / `Exclusive` / `Shared(N)`.
+  - On the Linux/FreeBSD futex backend, `RwLock`'s state field is now
+    decoded per libstd's `MASK = (1 << 30) - 1` constant: `state &
+    MASK == 0` ⇒ `Free`; `== MASK` ⇒ `Exclusive` (write-held); any
+    other value `N` ⇒ `Shared(N)` readers. Mutex still reduces to
+    `Free` / `Exclusive`. macOS pthread probe handles Mutex only;
+    RwLock on macOS is a TODO.
+  - `SpecializedValue::RefCell` rendering now reads the inner
+    `borrow: Cell<BorrowFlag>` to decode the same `LockState` shape:
+    `0` ⇒ `Free`; `N > 0` ⇒ `Shared(N)`; `N < 0` ⇒ `Exclusive`
+    (a `borrow_mut` is outstanding).
+  - Renderer maps `LockState` to glyph: `🔑` (free) / `🔒` (exclusive) /
+    `👥N` (with `N` saturating at `9+` so the row stays narrow).
+    `☠️` poison trailer unchanged for Mutex/RwLock.
+  - 8 new unit tests in `render::lock_state_tests` cover the glyph
+    formatter and `RefCell` borrow-flag decoder. The existing
+    `test_read_mutex_rwlock` integration test now asserts the
+    `Shared(1)` case for a live `RwLock` held by a single reader.
+
 - physical-function range filter for line breakpoints (macOS):
   - On macOS arm64 with `-C symbol-mangling-version=v0` + LTO, the
     DWARF subprogram for `showcase::main` claims it spans
@@ -2006,6 +2204,61 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- variables: the Statics pane now shows statics from **all** crates, not
+  just the current one. The current-crate-only default predated the
+  namespace tree, when a flat list of all of std + deps was unusable;
+  now the tree itself is the anti-flood (top level is a sorted, collapsed
+  set of crate nodes, each lazy), so a thin crate or test binary — whose
+  interesting statics all live in dependencies (e.g.
+  `hyper_util::client::legacy::pool::__CALLSITE`) — no longer shows an
+  empty pane. Thread-locals stay current-crate.
+- variables/perf: the Statics tree is now walked lazily — only the
+  namespaces you open are read. The first expand builds the namespace
+  skeleton from names alone (no value reads): ~1.1 ms vs ~15.6 ms for the
+  old read-everything path on a 4000-static binary. Each namespace node
+  is a lazy reference; expanding it reads the value of only its immediate
+  leaf statics (read-only ones still served from the session cache) and
+  leaves its sub-namespaces lazy. So cost scales with what's open, not
+  with total static count — opening `hyper_util::client::legacy::pool`
+  touches its handful, never the thousands elsewhere. Built on a
+  names-only enumeration (`read_static_names`) and an `include`-filtered
+  read (`read_static_variables_including`). See `doc/design-principles.md`
+  §2.
+- variables/perf: read-only statics are now cached for the life of the
+  process and not re-read across stops. A static in a read-only segment
+  (`.rodata`) can't change, so once read its rendered value is reused;
+  only mutable (`static_rw`) statics are re-read when the Statics pane is
+  re-expanded after a step. The read is skipped at the source —
+  `query_file_scope` derives each static's name from its DIE and skips
+  the value read for excluded (cached) entries — so excluding the
+  read-only majority drops a re-expand from ~15 ms to ~1.2 ms on the
+  4000-static bench (the residual is the metadata walk + name building;
+  the exclude check uses the cached interned name, never a DIE deref).
+  Cache is keyed by
+  the full `::` identity path and invalidated when a new debuggee is
+  launched/attached. See `doc/design-principles.md` §3.
+- variables: the Statics and Thread-locals panes now render as a
+  navigable namespace tree keyed by the `::` identity path
+  (`hyper_util::client::legacy::pool::__CALLSITE` becomes collapsible
+  `hyper_util` → … → `__CALLSITE` nodes) instead of a flat, unordered
+  dump. Single-child namespace chains collapse into one node so there
+  are no empty intermediate clicks; entries are sorted, namespaces
+  before leaves, and each namespace node shows a `(N)` descendant count.
+  Expands level-by-level via the existing child machinery. See
+  `doc/design-principles.md` §4.
+- variables/perf: the Statics and Thread-locals DAP scopes are now lazy.
+  `handle_scopes` previously read and rendered every file-scope static's
+  value on every stop just to build the scope list — ~15 ms per step on
+  a binary with a few thousand statics, for a pane usually never opened.
+  It now hands back a placeholder reference marked `expensive: true` and
+  enumerates only when the user expands the node, re-focusing the exact
+  frame so the current-crate filter still resolves. Locals/Arguments are
+  unchanged. See `doc/design-principles.md` §2.
+- variables: single-element tuples now render with Rust's
+  disambiguating trailing comma — `(x,)` instead of `(x)` — across the
+  DAP variables pane, the console, and the TUI. Multi-element tuples
+  and one-field tuple structs / enum variants (`Wrap(x)`, `Ok(x)`) are
+  unaffected.
 - `thread_db` is now an x86_64-only dependency; a thin in-tree shim
   (`debugger::thread_db_compat`) provides stubs on other architectures
   so the debugger degrades gracefully rather than failing to build.
@@ -2089,6 +2342,18 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- variables/file-scope: stop the DAP session crashing when a variable's
+  DWARF array type carries a negative element count (e.g.
+  `DW_AT_upper_bound = -1`, emitted by C/`-sys` debug info for a
+  zero/unknown-length array). The byte-size computation read the `-1`
+  as a `u64::MAX` element count and overflowed, panicking
+  `BytesMut::with_capacity` ("capacity overflow") — and since
+  `handle_scopes` enumerates every file-scope static eagerly, one such
+  global tore down the whole session (`adapter-error: connection
+  closed`). Now `array_byte_size` uses checked arithmetic (negative
+  count clamps to 0), `into_raw_bytes` refuses sizes above `isize::MAX`,
+  and the new non-fatal `Error::ValueSizeImplausible` degrades the
+  offending variable to unreadable instead of crashing.
 - call: align the debuggee's RSP to 16 bytes before the inferior `CALL`
   instruction in `CallHelper::call_fn`, as System V AMD64 requires.
   Previously the trampoline kept whatever RSP the debuggee was stopped

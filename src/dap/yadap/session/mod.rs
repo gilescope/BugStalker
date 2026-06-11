@@ -38,6 +38,14 @@ pub struct DebugSession {
     debugger: Option<debugger::Debugger>,
     session_mode: Option<init::SessionMode>,
     source_map: SourceMap,
+    /// Launch option `focusPanicCulprit` (bool, default `true`). When set,
+    /// a break-on-panic stop deemphasizes the panic-runtime frames (omits
+    /// their `source` so the editor can't auto-open a toolchain tab) and
+    /// corrects the culprit frame's line/column from the `#[track_caller]`
+    /// `&Location`. Turn it off for vanilla behaviour: every frame
+    /// navigable, raw DWARF lines, the editor lands wherever the top frame
+    /// points. See `frame.rs`.
+    focus_panic_culprit: bool,
     breakpoints_by_source: HashMap<String, Vec<breakpoint::BreakpointRecord>>,
     function_breakpoints: Vec<breakpoint::BreakpointRecord>,
     instruction_breakpoints: Vec<breakpoint::BreakpointRecord>,
@@ -46,6 +54,46 @@ pub struct DebugSession {
     next_breakpoint_id: i64,
     vars: VariablesStore,
     scope_cache: HashMap<(i64, u32, frame::ScopeKind), i64>,
+    /// Deferred file-scope scopes (variables-view, design-principles.md
+    /// §2). `handle_scopes` hands back a `variablesReference` for the
+    /// Statics / Thread-locals scopes without reading them — enumerating
+    /// thousands of statics on every stop is the bulk of the per-step
+    /// cost and is usually never looked at. The ref is recorded here with
+    /// the `(thread, frame, kind)` it was created for; `handle_variables`
+    /// re-focuses that frame and enumerates only when the user expands it.
+    /// Cleared per stop alongside `scope_cache`.
+    pending_scopes: HashMap<i64, (i64, u32, frame::ScopeKind)>,
+    /// Immutable-static value cache (design-principles.md §3), keyed by
+    /// full `::` identity path. Read-only statics live in a read-only
+    /// segment, so their rendered value can't change for the life of the
+    /// process — read once, reuse across stops. Only mutable
+    /// (`static_rw`) statics are re-read on each expand. Persists across
+    /// stops (NOT cleared in `begin_stop_epoch`); invalidated only when a
+    /// new debuggee is launched/attached (see `init.rs`).
+    ro_statics: HashMap<String, data::VarItem>,
+    /// Names-only namespace index for the Statics scope (design-
+    /// principles.md §2). Built once per process from the cheap interned
+    /// metadata so the lazy tree skeleton can be produced without reading
+    /// any static's value; values are read only for the subtree the user
+    /// expands. Persists across stops; invalidated on new launch/attach.
+    statics_index: Option<data::NameTrie>,
+    /// `DW_AT_byte_size` of *only* the over-`data::STATIC_LAZY_BYTES`
+    /// statics (full `::` identity path), built alongside `statics_index`.
+    /// Membership is the lazy-leaf gate; the value feeds the node's size
+    /// label. Small statics aren't stored (their size is never consulted).
+    /// A giant precomputed table (e.g. the 512 KB secp256k1 generator
+    /// tables) is thus read on expand, not on open, so it doesn't stall
+    /// the Statics pane. Same lifetime as `statics_index`.
+    statics_sizes: HashMap<String, u64>,
+    /// Lazy Statics namespace nodes awaiting expansion, keyed by their
+    /// `variablesReference`: `(thread, frame, namespace prefix)`.
+    /// `handle_variables` materialises the level on expand. Per-stop
+    /// (the refs come from `vars`, cleared each stop).
+    pending_namespaces: HashMap<i64, (i64, u32, Vec<String>)>,
+    /// Lazy *leaf* statics (too big to read eagerly) awaiting expansion,
+    /// keyed by `variablesReference`: `(thread, frame, full identity)`.
+    /// On expand `handle_variables` reads that one static's value. Per-stop.
+    pending_static_values: HashMap<i64, (i64, u32, String)>,
     child_links: HashMap<(i64, usize), i64>,
     disasm_cache_by_addr: HashMap<usize, source::DisasmSource>,
     disasm_cache_by_reference: HashMap<i64, source::DisasmSource>,
@@ -64,6 +112,10 @@ pub struct DebugSession {
     canceled_progress_ids: HashSet<String>,
     #[cfg(feature = "perf")]
     perf_overlay: perf::PerfOverlaySession,
+    /// True while the Source+ASM webview panel is the active (focused) editor.
+    /// When set, `handle_next`/`handle_step_in` use instruction granularity
+    /// so F10/F11 step one machine instruction without any keybinding magic.
+    asm_view_focused: bool,
 }
 
 const EXCEPTION_FILTER_SIGNAL: &str = "signal";
@@ -93,6 +145,12 @@ impl VariablesStore {
         self.store.get_mut(&key)
     }
 
+    /// Overwrite an already-allocated slot — used to fill a lazily
+    /// deferred scope (see `pending_scopes`) on first expand.
+    fn set(&mut self, key: i64, vars: Vec<data::VarItem>) {
+        self.store.insert(key, vars);
+    }
+
     fn remove(&mut self, key: i64) -> Option<Vec<data::VarItem>> {
         self.store.remove(&key)
     }
@@ -112,6 +170,7 @@ impl DebugSession {
             debugger: None,
             session_mode: None,
             source_map: SourceMap::default(),
+            focus_panic_culprit: true,
             breakpoints_by_source: HashMap::new(),
             function_breakpoints: Vec::new(),
             instruction_breakpoints: Vec::new(),
@@ -120,6 +179,12 @@ impl DebugSession {
             next_breakpoint_id: 1,
             vars: VariablesStore::default(),
             scope_cache: HashMap::new(),
+            pending_scopes: HashMap::new(),
+            ro_statics: HashMap::new(),
+            statics_index: None,
+            statics_sizes: HashMap::new(),
+            pending_namespaces: HashMap::new(),
+            pending_static_values: HashMap::new(),
             child_links: HashMap::new(),
             disasm_cache_by_addr: HashMap::new(),
             disasm_cache_by_reference: HashMap::new(),
@@ -144,6 +209,7 @@ impl DebugSession {
             canceled_progress_ids: HashSet::new(),
             #[cfg(feature = "perf")]
             perf_overlay: perf::PerfOverlaySession::default(),
+            asm_view_focused: false,
         }
     }
 
@@ -210,6 +276,9 @@ impl DebugSession {
         self.vars.clear();
         self.scope_cache.clear();
         self.child_links.clear();
+        self.pending_scopes.clear();
+        self.pending_namespaces.clear();
+        self.pending_static_values.clear();
     }
 
     fn begin_running(&mut self) {
@@ -217,7 +286,12 @@ impl DebugSession {
         self.vars.clear();
         self.scope_cache.clear();
         self.child_links.clear();
+        self.pending_scopes.clear();
+        self.pending_namespaces.clear();
         self.begin_perf_run();
+        // Each step window starts with no exact count; the step path fills it in
+        // for no-call lines (see handle_next / step_over_or_count).
+        self.set_perf_exact_instructions(None);
     }
 
     fn enqueue_thread_event(&mut self, reason: &'static str, thread_id: i64) {
@@ -651,6 +725,10 @@ impl DebugSession {
             "restartFrame" => self.handle_restart_frame(req)?,
             "next" => self.handle_next(req)?,
             "stepIn" => self.handle_step_in(req)?,
+            // Phase 12 — Step-Into "just my code". Carries
+            // `skipLibraries`; the VS Code keybindings send this so the
+            // alt/shift-alt modifier picks the mode explicitly.
+            "bs/stepIn" => self.handle_step_in_skip_libs(req)?,
             "stepInTargets" => self.handle_step_in_targets(req)?,
             "stepOut" => self.handle_step_out(req)?,
             "stepBack" => self.handle_step_back(req)?,
@@ -697,6 +775,10 @@ impl DebugSession {
             "bs/replayJump" => self.handle_replay_jump(req)?,
             "bs/replayTimeline" => self.handle_replay_timeline(req)?,
             "bs/applyPatch" => self.handle_apply_patch(req)?,
+            "bs/functionBounds" => self.handle_function_bounds(req)?,
+            "bs/currentFunctionName" => self.handle_current_function_name(req)?,
+            "bs/setAsmFocus" => self.handle_set_asm_focus(req)?,
+            "bs/registers" => self.handle_registers(req)?,
             other => {
                 self.send_err(req, format!("Unsupported DAP command: {other}"))?;
             }

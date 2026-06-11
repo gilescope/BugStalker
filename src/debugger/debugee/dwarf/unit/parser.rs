@@ -2,8 +2,8 @@
 use crate::debugger::context::gcx;
 use crate::debugger::debugee::dwarf::unit::die::DerefContext;
 use crate::debugger::debugee::dwarf::unit::{
-    BsUnit, DieRange, END_SEQUENCE, EPILOG_BEGIN, FunctionInfo, IS_STMT, LineRow, PROLOG_END,
-    UnitLazyPart, UnitProperties,
+    BsUnit, DieRange, END_SEQUENCE, EPILOG_BEGIN, FileScopeVariable, FunctionInfo, IS_STMT,
+    LineRow, PROLOG_END, UnitLazyPart, UnitProperties,
 };
 use crate::debugger::debugee::dwarf::utils::PathSearchIndex;
 use crate::debugger::debugee::dwarf::{EndianArcSlice, NamespaceHierarchy};
@@ -17,7 +17,7 @@ use gimli::{
 use indexmap::IndexMap;
 use log::warn;
 use once_cell::sync::OnceCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -112,6 +112,24 @@ impl<'a> DwarfUnitParser<'a> {
         let mut function_index = HashMap::<UnitOffset, FunctionInfo>::new();
         let mut function_name_index = PathSearchIndex::new("::");
         let mut parent_index = IndexMap::<UnitOffset, UnitOffset>::new();
+        // Track every DW_TAG_subprogram offset seen during the walk so
+        // we can later classify each DW_TAG_variable as local
+        // (subprogram-nested) or file-scope. Inserted before the
+        // `!ranges.is_empty()` gate in the subprogram arm so even
+        // range-less subprograms participate in the ancestor check.
+        let mut subprogram_offsets: HashSet<UnitOffset> = HashSet::new();
+        // (name_sym, namespace, offset) for every DW_TAG_variable seen
+        // in unit-walk order. Filtered after the main loop using
+        // `subprogram_offsets` + `parent_index` to keep only file-scope
+        // entries. We can't decide at insertion time because the
+        // variable's subprogram ancestor may be later in unit order
+        // (children come after parents in DWARF, but we want the
+        // *complete* parent chain which only stabilises post-walk).
+        let mut all_variables: Vec<(
+            string_interner::DefaultSymbol,
+            NamespaceHierarchy,
+            UnitOffset,
+        )> = Vec::new();
 
         let mut cursor = bs_unit.unit.entries();
         let mut parent_offset = None;
@@ -128,6 +146,10 @@ impl<'a> DwarfUnitParser<'a> {
 
             match die.tag() {
                 gimli::DW_TAG_subprogram => {
+                    // Variables-view §5.4: every subprogram, with or
+                    // without ranges, is a "this DIE is a function"
+                    // signal for the file-scope-variable classifier.
+                    subprogram_offsets.insert(die.offset());
                     let fn_info_from_die = |d: &DebuggingInformationEntry<
                         EndianArcSlice,
                         usize,
@@ -244,7 +266,12 @@ impl<'a> DwarfUnitParser<'a> {
                         variable_index
                             .entry(name_sym)
                             .or_default()
-                            .push((variable_ns, die.offset()));
+                            .push((variable_ns.clone(), die.offset()));
+                        // Stash the same triple for post-walk
+                        // file-scope classification (variables-view
+                        // §5.4). The clones are cheap — NamespaceHierarchy
+                        // is a `Vec<DefaultSymbol>` of interned ids.
+                        all_variables.push((name_sym, variable_ns, die.offset()));
                     }
                 }
                 gimli::DW_TAG_base_type => {
@@ -292,11 +319,69 @@ impl<'a> DwarfUnitParser<'a> {
         }
         fn_ranges.sort_unstable_by_key(|dr| dr.range.begin);
 
+        // Variables-view §5.4: classify each DW_TAG_variable as
+        // file-scope (any-`static`, any-`thread_local!`) vs local.
+        //
+        // Two paths:
+        //   * TLS internals (DW_AT_name in {__KEY, VAL,
+        //     __RUST_STD_INTERNAL_VAL}) are ALWAYS file-scope. rustc
+        //     lowers `thread_local!{}` into a chain of nested
+        //     closures + const-eval scopes; the literal DIE is
+        //     subprogram-nested but the *meaning* is "TLS belonging
+        //     to the surrounding namespace". The user expects to
+        //     see these in the Thread-locals scope, so we don't
+        //     gate on the parent chain.
+        //   * Everything else uses the parent_index ancestor chain
+        //     check: file-scope iff no DW_TAG_subprogram ancestor
+        //     before exhausting. (Function-local statics like
+        //     `static mut INNER_STATIC` inside `fn` are therefore
+        //     correctly excluded — they're locals, not statics.)
+        // `get_or_intern` (not `get`) because the first unit parsed
+        // may not have encountered any of these names yet — `get`
+        // would return None and the TLS path would silently miss
+        // everything in the first unit until something else seeded
+        // the interner. Forcing the intern is idempotent and cheap.
+        let tls_key_sym = gcx().with_interner(|i| i.get_or_intern("__KEY"));
+        let tls_val_sym = gcx().with_interner(|i| i.get_or_intern("VAL"));
+        let tls_rsi_sym = gcx().with_interner(|i| i.get_or_intern("__RUST_STD_INTERNAL_VAL"));
+        let is_tls_internal = |sym: string_interner::DefaultSymbol| {
+            sym == tls_key_sym || sym == tls_val_sym || sym == tls_rsi_sym
+        };
+        let mut file_scope_variables: Vec<FileScopeVariable> =
+            Vec::with_capacity(all_variables.len() / 4);
+        for (name_sym, namespace, offset) in all_variables {
+            if is_tls_internal(name_sym) {
+                file_scope_variables.push(FileScopeVariable {
+                    name_sym,
+                    namespace,
+                    offset,
+                });
+                continue;
+            }
+            let mut cursor = parent_index.get(&offset).copied();
+            let mut is_local = false;
+            while let Some(parent_off) = cursor {
+                if subprogram_offsets.contains(&parent_off) {
+                    is_local = true;
+                    break;
+                }
+                cursor = parent_index.get(&parent_off).copied();
+            }
+            if !is_local {
+                file_scope_variables.push(FileScopeVariable {
+                    name_sym,
+                    namespace,
+                    offset,
+                });
+            }
+        }
+
         fn_ranges.shrink_to_fit();
         variable_index.shrink_to_fit();
         type_index.shrink_to_fit();
         function_index.shrink_to_fit();
         function_name_index.shrink_to_fit();
+        file_scope_variables.shrink_to_fit();
 
         Ok(UnitLazyPart {
             fn_ranges,
@@ -305,6 +390,7 @@ impl<'a> DwarfUnitParser<'a> {
             function_index,
             function_name_index,
             parent_index,
+            file_scope_variables,
         })
     }
 }

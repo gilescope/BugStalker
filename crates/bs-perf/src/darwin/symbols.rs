@@ -98,6 +98,16 @@ pub struct KperfLibrary {
     /// `int kpc_force_all_ctrs_set(int val)` — force-take the PMU.
     /// Requires the kpc entitlement or root on modern macOS.
     pub kpc_force_all_ctrs_set: unsafe extern "C" fn(c_int) -> c_int,
+    /// `int kpc_get_thread_counters(uint32_t tid, uint32_t buf_count, uint64_t *buf)`
+    /// — snapshot the calling thread's accumulated PMC values into `buf`
+    /// (`buf_count` u64 slots). `tid` is informational; the kernel returns the
+    /// current thread's counters. Needs `kpc_set_thread_counting` enabled first.
+    pub kpc_get_thread_counters: unsafe extern "C" fn(u32, u32, *mut u64) -> c_int,
+    /// `int kpc_set_config(uint32_t classes, uint64_t *config)` — program the
+    /// configurable counters' event-select words (sized to
+    /// `kpc_get_counter_count(classes)`). The config words come from the KPEP
+    /// database (`kpep_config_kpc`).
+    pub kpc_set_config: unsafe extern "C" fn(u32, *mut u64) -> c_int,
     /// `int kperf_action_count_set(uint32_t count)` — allocate N
     /// action slots.
     pub kperf_action_count_set: unsafe extern "C" fn(u32) -> c_int,
@@ -198,6 +208,14 @@ impl KperfLibrary {
             kpc_force_all_ctrs_set: sym!(
                 "kpc_force_all_ctrs_set",
                 unsafe extern "C" fn(c_int) -> c_int
+            ),
+            kpc_get_thread_counters: sym!(
+                "kpc_get_thread_counters",
+                unsafe extern "C" fn(u32, u32, *mut u64) -> c_int
+            ),
+            kpc_set_config: sym!(
+                "kpc_set_config",
+                unsafe extern "C" fn(u32, *mut u64) -> c_int
             ),
             kperf_action_count_set: sym!(
                 "kperf_action_count_set",

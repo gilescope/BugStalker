@@ -238,6 +238,22 @@ struct UnitProperties {
     address_size: u8,
 }
 
+/// File-scope `DW_TAG_variable` entry — a `static` (any segment) or
+/// thread-local. Captured separately from `variable_index` so the
+/// variables-pane `Statics` / `Thread-locals` scopes (variables-view
+/// §5.4) can enumerate without walking the full DIE tree.
+///
+/// TLS classification by name is left to the consumer; the rustc
+/// `thread_local!` macro lowers to a `DW_TAG_variable` named
+/// `__KEY`, `VAL`, or `__RUST_STD_INTERNAL_VAL` nested under the
+/// user-visible identifier's namespace.
+#[derive(Debug, Clone)]
+pub struct FileScopeVariable {
+    pub name_sym: string_interner::DefaultSymbol,
+    pub namespace: NamespaceHierarchy,
+    pub offset: UnitOffset,
+}
+
 /// This fields is a part of a compilation unit but
 /// loaded on first call, for reduce memory consumption.
 #[derive(Debug, Clone)]
@@ -254,6 +270,11 @@ struct UnitLazyPart {
     function_name_index: PathSearchIndex<UnitOffset>,
     /// {die ; die parent} pairs
     parent_index: IndexMap<UnitOffset, UnitOffset>,
+    /// `DW_TAG_variable` DIEs that are NOT nested inside a
+    /// `DW_TAG_subprogram` — i.e. file-scope variables: `static`s
+    /// and `thread_local!`s. Populated in a second pass after the
+    /// main DIE walk so all subprogram offsets are known.
+    file_scope_variables: Vec<FileScopeVariable>,
 }
 
 /// Some of the compilation unit methods may return UnitResult
@@ -453,6 +474,33 @@ impl BsUnit {
         self.find_place_by_idx(pos)
     }
 
+    /// Like [`find_place_by_pc`] but returns the nearest `is_stmt=true` row.
+    ///
+    /// Non-`is_stmt` rows are compiler-emitted boundary markers that often carry
+    /// the NEXT line's number for transition bookkeeping. Using one for source
+    /// attribution causes off-by-one shifts in disassembly annotation.
+    /// Walking back to the most-recent `is_stmt` row gives the containing
+    /// statement, consistent with how the step engine resolves source positions.
+    pub fn find_stmt_place_by_pc(&self, pc: GlobalAddress) -> Option<PlaceDescriptor<'_>> {
+        let pc = u64::from(pc);
+        let mut pos = self
+            .lines
+            .binary_search_by_key(&pc, |line| line.address)
+            .unwrap_or_else(|p| p.saturating_sub(1));
+
+        loop {
+            if self.lines.get(pos).is_some_and(|r| r.is_stmt()) {
+                return self.find_place_by_idx(pos);
+            }
+            if pos == 0 {
+                break;
+            }
+            pos -= 1;
+        }
+        // No is_stmt row found above — fall back so we always return something.
+        self.find_place_by_pc(GlobalAddress::from(pc))
+    }
+
     /// Return the nearest line with EB (epilog begin).
     /// Nearest means - at given address or at address less than given.
     ///
@@ -552,6 +600,17 @@ impl BsUnit {
         match self.lazy_part.get() {
             None => UnitResult::Reload,
             Some(additional) => UnitResult::Ok(&additional.parent_index),
+        }
+    }
+
+    /// Return every file-scope `DW_TAG_variable` in this unit —
+    /// `static`s and `thread_local!`s, in DIE-walk order. Excludes
+    /// locals (variables nested inside any `DW_TAG_subprogram`).
+    /// Note: this method requires a full unit.
+    pub fn file_scope_variables(&self) -> UnitResult<&[FileScopeVariable]> {
+        match self.lazy_part.get() {
+            None => UnitResult::Reload,
+            Some(additional) => UnitResult::Ok(&additional.file_scope_variables),
         }
     }
 

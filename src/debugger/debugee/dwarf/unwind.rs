@@ -289,12 +289,34 @@ impl<'a> UnwindContext<'a> {
         previous_ucx: UnwindContext<'a>,
         ecx: &ExplorationContext,
     ) -> Result<Option<Self>, Error> {
+        let prev_cfa = u64::from(previous_ucx.cfa);
+        let debugee = previous_ucx.debugee;
         let mut next_frame_registers: DwarfRegisterMap = previous_ucx.registers;
         let sp_register = Register::SP
             .dwarf_register()
             .expect("stack pointer register must map to dwarf register");
         next_frame_registers.update(sp_register, previous_ucx.cfa.into());
-        UnwindContext::new(previous_ucx.debugee, next_frame_registers, ecx)
+        let next = UnwindContext::new(debugee, next_frame_registers, ecx)?;
+
+        // The stack grows down, so a caller's CFA can never be *below*
+        // the callee's. A strictly-decreasing CFA is a physically
+        // impossible (bogus) unwind row — most likely a wrong
+        // compact-unwind CFA — that would spin the unwinder, since the
+        // next frame's SP is set to this CFA. Treat it as the end of the
+        // walk rather than looping. (Equal CFAs do occur legitimately at
+        // some frame boundaries, so only a strict decrease bails;
+        // `MAX_UNWIND_DEPTH` backstops any equal-CFA pathology.)
+        if let Some(ucx) = next.as_ref()
+            && u64::from(ucx.cfa) < prev_cfa
+        {
+            log::debug!(
+                target: "debugger",
+                "unwind stop: CFA went backwards {:#x} < {prev_cfa:#x} (bogus unwind row)",
+                u64::from(ucx.cfa),
+            );
+            return Ok(None);
+        }
+        Ok(next)
     }
 
     fn return_address(&self) -> Option<RelocatedAddress> {
@@ -377,12 +399,20 @@ impl<'a> DwarfUnwinder<'a> {
                 return Ok(None);
             }
 
+            // Resolve the caller at its *call site* (`lr - 1`), not the
+            // raw `lr`: a noreturn tail call (`panic!`, `abort`) pushes an
+            // `lr` pointing at the start of the *next* function in memory,
+            // so symbolising / FDE-looking-up the raw `lr` mislabels the
+            // frame (a panic backtrace showing an unrelated adjacent
+            // function). Same rationale as the DWARF unwind loop.
+            let lookup_addr = lr_addr.offset(-1);
+
             // Probe whether `lr` lands in a dylib we have DWARF for.
             // If yes, build an UnwindContext at that PC and let the
             // caller continue with DWARF.
             let location = Location {
-                pc: lr_addr,
-                global_pc: match lr_addr.into_global(self.debugee) {
+                pc: lookup_addr,
+                global_pc: match lookup_addr.into_global(self.debugee) {
                     Ok(g) => g,
                     Err(_) => {
                         // Untracked module — push an anonymous frame
@@ -514,7 +544,17 @@ impl<'a> DwarfUnwinder<'a> {
                 break;
             }
 
-            let global_pc = match return_addr.into_global(self.debugee) {
+            // Resolve caller frames at the *call site* (`return_addr - 1`),
+            // not the raw return address. A noreturn tail call (`panic!`,
+            // `abort`, a diverging call at a function's end) pushes a
+            // return address that points at the *start of the next
+            // function* in memory; symbolising and FDE-looking-up that raw
+            // address mislabels the frame (a panic backtrace showing an
+            // unrelated adjacent function) and, via the wrong FDE, derails
+            // the rest of the unwind. Frame 0 is exact — we're stopped
+            // there — so this only applies to unwound caller frames.
+            let lookup_addr = return_addr.offset(-1);
+            let global_pc = match lookup_addr.into_global(self.debugee) {
                 Ok(gpc) => gpc,
                 Err(Error::MappingOffsetNotFound(_)) => {
                     // Address is outside any known mapped region (e.g. vDSO,
@@ -526,7 +566,7 @@ impl<'a> DwarfUnwinder<'a> {
             };
 
             let next_location = Location {
-                pc: return_addr,
+                pc: lookup_addr,
                 global_pc,
                 pid: ucx.location.pid,
             };
@@ -611,7 +651,51 @@ impl<'a> DwarfUnwinder<'a> {
         if let Some(ucx) = mb_ucx {
             return Ok(ucx.return_address());
         }
-        Ok(None)
+        // DWARF CFI had no FDE for frame 0. On macOS arm64 the majority
+        // of trivial / frameless library functions (`Vec::new`, …) live
+        // only in compact unwind, so fall back to it — otherwise
+        // `step_out_frame` can't climb out of them and stepping stalls.
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.compact_return_address(&ecx, pid)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = &ecx;
+            Ok(None)
+        }
+    }
+
+    /// Return address recovered from macOS compact unwind for a frame
+    /// with no DWARF FDE. `Frameless` (leaf) keeps the return address in
+    /// `lr`; `FrameBased` saves it at `[fp + 8]`. `None` when there's no
+    /// compact entry either.
+    #[cfg(target_arch = "aarch64")]
+    fn compact_return_address(
+        &self,
+        ecx: &ExplorationContext,
+        pid: Pid,
+    ) -> Result<Option<RelocatedAddress>, Error> {
+        let dwarf = self.debugee.debug_info(ecx.location().pc)?;
+        let Some(kind) = dwarf.compact_unwind_at(ecx.location().global_pc) else {
+            return Ok(None);
+        };
+        let regs = RegisterMap::current(pid)?;
+        let ra = match kind {
+            super::CompactUnwind::Frameless { .. } => regs.value(Register::X30),
+            super::CompactUnwind::FrameBased => {
+                let fp = regs.value(Register::X29);
+                let Ok(bytes) = debugger::read_memory_by_pid(pid, (fp as usize).wrapping_add(8), 8)
+                else {
+                    return Ok(None);
+                };
+                let Ok(arr) = <[u8; 8]>::try_from(bytes.as_slice()) else {
+                    return Ok(None);
+                };
+                u64::from_ne_bytes(arr)
+            }
+        };
+        Ok(Some(RelocatedAddress::from(strip_pac(ra) as usize)))
     }
 
     /// Returns unwind context for location.

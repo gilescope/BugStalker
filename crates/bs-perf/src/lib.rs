@@ -52,6 +52,9 @@
 //!   returning [`PerfError::Unsupported`].
 //! - [`open_cycles_for_pid`] — opens a cycles+IP sampling event
 //!   on a target PID. Linux only.
+//! - [`TrapFloor`] — learns the fixed per-trap `proc_pid_rusage`
+//!   overhead and subtracts it from step instruction/cycle counts
+//!   (macOS Tier 2 step-cost correction; see the module docs).
 //! - [`PerfError`] — the single error type.
 //!
 //! ## Pure-Rust policy
@@ -78,9 +81,12 @@ pub mod decoder;
 pub mod linux;
 pub mod overlay;
 pub mod pt_decode;
+pub mod trap_floor;
 
 #[cfg(not(target_os = "linux"))]
 pub mod stub;
+
+pub use trap_floor::TrapFloor;
 
 // Re-export the top-level `open_cycles_for_pid` so callers don't
 // have to spell the platform module path. The Linux impl returns

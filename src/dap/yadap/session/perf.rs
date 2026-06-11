@@ -54,6 +54,41 @@ pub(super) struct PerfOverlaySession {
     /// diagnosis line.
     #[cfg(target_os = "macos")]
     darwin_last_delta: DarwinLastDelta,
+    /// Whether the last completed run had a live poll sampler.
+    /// Captured in `finish_perf_stop` *before* the sampler is drained:
+    /// that method `take()`s `darwin_run` and consumes the sampler, so
+    /// by the time the stopped summary calls `perf_mode_label` the live
+    /// sampler is already gone. Reading `darwin_run` there always saw
+    /// `None`, so the mode misreported `macos-rusage-only` even when the
+    /// sampler ran (it just resolved no samples — e.g. an I/O-bound
+    /// workload). This snapshot is the source of truth for the label.
+    #[cfg(target_os = "macos")]
+    last_run_sampler_active: bool,
+    /// Dominant blocking syscall (`x16`) sampled during the last run —
+    /// names *why* a mostly-waiting step was waiting (lock / sleep /
+    /// I/O / mach-IPC). `None` when nothing useful was sampled.
+    #[cfg(target_os = "macos")]
+    last_wait_syscall: Option<i64>,
+    /// Thread-isolation guard for the current run (EXPERIMENTAL, opt-in via
+    /// `BS_PERF_ISOLATE_THREAD`): suspends every non-focus thread so the
+    /// process-wide rusage delta reflects only the stepped thread, with a
+    /// watchdog that thaws on a stall (a step that blocks on a frozen thread
+    /// would otherwise hang). Thawed in `finish_perf_stop` / on drop.
+    #[cfg(target_os = "macos")]
+    freeze_guard: Option<ThreadFreezeGuard>,
+    /// Passive per-trap overhead floor, learned from the user's own steps. Used
+    /// to subtract the fixed Mach-exception/ptrace round-trip cost (~35k instr
+    /// per trap) the rusage counters charge to the debuggee out of each step's
+    /// instruction/cycle delta. Persists across runs — only the debugger's trap
+    /// *count* resets per window. See `bs_perf::TrapFloor`.
+    #[cfg(target_os = "macos")]
+    trap_floor: bs_perf::TrapFloor,
+    /// Exact per-line instruction count for the step just taken, when the step
+    /// path obtained one (`Debugger::step_over_or_count` on a no-call line).
+    /// `Some` overrides the rusage-derived `runInstructions` with the true count
+    /// (see `debug-step-costs.md` #3); `None` falls back to rusage − `TrapFloor`.
+    /// Reset at the start of each step window.
+    last_exact_instructions: Option<u64>,
 }
 
 /// macOS in-flight run state. Owns the rusage start snapshot, the
@@ -75,6 +110,11 @@ struct DarwinLastDelta {
     pageins: u64,
     disk_bytes_read: u64,
     disk_bytes_written: u64,
+    /// Memory-footprint change over the last run window, in bytes
+    /// (signed). Surfaced as `physFootprintDelta` — a cheap proxy for
+    /// "did this step allocate" (it's footprint growth, not a malloc
+    /// count: the allocator's free-list reuse won't move it).
+    phys_footprint_delta: i64,
 }
 
 #[cfg(all(feature = "perf", target_os = "macos"))]
@@ -244,6 +284,12 @@ impl super::DebugSession {
         self.perf_overlay.data.begin_run();
         self.perf_overlay.unavailable = None;
         self.perf_overlay.darwin_run = None;
+        self.perf_overlay.last_wait_syscall = None;
+        // Start the trap count for this window; finish_perf_stop reads it to
+        // subtract the per-trap rusage overhead.
+        if let Some(dbg) = self.debugger.as_mut() {
+            dbg.reset_trap_count();
+        }
 
         let Some((proc_pid, program)) = self
             .debugger
@@ -325,6 +371,18 @@ impl super::DebugSession {
             sampler,
             resolver,
         });
+
+        // EXPERIMENTAL thread isolation: freeze every non-focus thread for
+        // the step window so the process-wide rusage delta reflects only the
+        // stepped thread (otherwise a runtime worker's millions of
+        // instructions get billed to the stepped line). Off unless
+        // BS_PERF_ISOLATE_THREAD is set — it changes execution semantics and
+        // a step that blocks on a frozen thread relies on the watchdog.
+        if std::env::var_os("BS_PERF_ISOLATE_THREAD").is_some()
+            && let Some(focus_pid) = self.debugger.as_ref().map(|dbg| dbg.ecx().pid_on_focus())
+        {
+            self.perf_overlay.freeze_guard = install_thread_freeze(task, focus_pid);
+        }
     }
 
     #[cfg(all(feature = "perf", not(any(target_os = "linux", target_os = "macos"))))]
@@ -494,9 +552,16 @@ impl super::DebugSession {
     /// because that call snapshots `last_run` into history.
     #[cfg(all(feature = "perf", target_os = "macos"))]
     pub(super) fn finish_perf_stop(&mut self) {
+        // Thaw the isolation guard first (the step is done) — its Drop
+        // resumes the frozen threads. Runs on every path, incl. early return.
+        self.perf_overlay.freeze_guard = None;
         let Some(run) = self.perf_overlay.darwin_run.take() else {
+            self.perf_overlay.last_run_sampler_active = false;
             return;
         };
+        // Snapshot sampler liveness before `run` (and its sampler) is
+        // consumed below — perf_mode_label reads this after the fact.
+        self.perf_overlay.last_run_sampler_active = run.sampler.is_some();
 
         // 1) Drain poll-sampler samples and attribute them. Even
         // if the resolver is missing (no load slide / no .debug_line),
@@ -521,10 +586,20 @@ impl super::DebugSession {
                     .data
                     .record_unresolved_samples(drain.failed_snapshots);
             }
+            // Name the wait: the dominant blocking syscall sampled in
+            // the window (idle runtime threads sit in mach traps, so we
+            // prefer a positive BSD blocking syscall — see fn).
+            self.perf_overlay.last_wait_syscall = dominant_wait_syscall(&drain.syscalls);
         }
 
-        // 2) Take the rusage end snapshot and close the window.
-        let Some(proc_pid) = self.debugger.as_ref().map(|dbg| dbg.process().pid()) else {
+        // 2) Take the rusage end snapshot and close the window. Grab the trap
+        // count for the window in the same borrow — it drives the per-trap
+        // overhead subtraction below.
+        let Some((proc_pid, traps)) = self
+            .debugger
+            .as_ref()
+            .map(|dbg| (dbg.process().pid(), dbg.trap_count()))
+        else {
             // Debugger gone — finalise with what we have.
             let wall_ns = run
                 .rusage_start
@@ -541,13 +616,32 @@ impl super::DebugSession {
         match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
             Ok(end) => {
                 let delta = end.delta_since(run.rusage_start);
-                let instructions = if delta.instructions != 0 {
-                    Some(delta.instructions)
-                } else {
-                    None
-                };
+                // Subtract the fixed per-trap kernel/exception overhead the
+                // rusage counters charge to the debuggee for each debugger trap
+                // (see `bs_perf::TrapFloor`). Correct using the floor learned
+                // from *prior* steps, then fold this step in — so a step can't
+                // cancel itself to zero.
+                let cycles = self
+                    .perf_overlay
+                    .trap_floor
+                    .corrected_cycles(delta.cycles, traps);
+                let corrected_instructions = self
+                    .perf_overlay
+                    .trap_floor
+                    .corrected_instructions(delta.instructions, traps);
+                self.perf_overlay
+                    .trap_floor
+                    .observe(delta.instructions, delta.cycles, traps);
+                // Prefer the exact step-count when the step path obtained one
+                // (no-call line) — that's the true instruction count, not the
+                // rusage estimate. Otherwise: `Some(0)` = "measured, negligible";
+                // `None` = host doesn't populate `ri_instructions` (raw was 0).
+                let instructions = self
+                    .perf_overlay
+                    .last_exact_instructions
+                    .or_else(|| (delta.instructions != 0).then_some(corrected_instructions));
                 self.perf_overlay.data.finish_stop_full(
-                    delta.cycles,
+                    cycles,
                     delta.wall_ns,
                     Some(delta.cpu_time_ns),
                     instructions,
@@ -556,6 +650,7 @@ impl super::DebugSession {
                     pageins: delta.pageins,
                     disk_bytes_read: delta.disk_bytes_read,
                     disk_bytes_written: delta.disk_bytes_written,
+                    phys_footprint_delta: delta.phys_footprint_delta,
                 };
             }
             Err(err) => {
@@ -582,6 +677,27 @@ impl super::DebugSession {
 
     #[cfg(not(feature = "perf"))]
     pub(super) fn finish_perf_stop(&mut self) {}
+
+    /// Whether the perf overlay is enabled — gates the exact-instruction-count
+    /// step path in `handle_next`.
+    #[cfg(feature = "perf")]
+    pub(super) fn perf_overlay_enabled(&self) -> bool {
+        self.perf_overlay.enabled
+    }
+    #[cfg(not(feature = "perf"))]
+    pub(super) fn perf_overlay_enabled(&self) -> bool {
+        false
+    }
+
+    /// Stash the exact per-line instruction count from the step just taken (or
+    /// `None` to fall back to the rusage estimate). `finish_perf_stop` prefers it
+    /// for `runInstructions`. Reset at the start of each step window.
+    #[cfg(feature = "perf")]
+    pub(super) fn set_perf_exact_instructions(&mut self, n: Option<u64>) {
+        self.perf_overlay.last_exact_instructions = n;
+    }
+    #[cfg(not(feature = "perf"))]
+    pub(super) fn set_perf_exact_instructions(&mut self, _n: Option<u64>) {}
 
     #[cfg(feature = "perf")]
     pub(super) fn handle_perf_overlay(&mut self, req: &DapRequest) -> anyhow::Result<()> {
@@ -737,6 +853,13 @@ impl super::DebugSession {
         let summary = bs_perf::dap::stopped_summary(&self.perf_overlay.data)?;
         let ipc = ipc_for(&summary);
         let diagnosis = diagnose(&summary, &self.perf_overlay);
+        // Memory-footprint delta for the window (bytes, signed). macOS
+        // only — Linux has no equivalent in the rusage path yet, so null.
+        #[cfg(target_os = "macos")]
+        let phys_footprint_delta: Option<i64> =
+            Some(self.perf_overlay.darwin_last_delta.phys_footprint_delta);
+        #[cfg(not(target_os = "macos"))]
+        let phys_footprint_delta: Option<i64> = None;
         Some(json!({
             "mode": perf_mode_label(&self.perf_overlay),
             "runCycles": summary.run_cycles,
@@ -753,6 +876,7 @@ impl super::DebugSession {
             })),
             "unresolvedSamples": summary.unresolved_samples,
             "unsampledThreadCount": unsampled_thread_count(&self.perf_overlay),
+            "physFootprintDelta": phys_footprint_delta,
         }))
     }
 
@@ -1089,11 +1213,10 @@ fn perf_mode_label(session: &PerfOverlaySession) -> &'static str {
 fn perf_mode_label(session: &PerfOverlaySession) -> &'static str {
     if !session.enabled {
         "disabled"
-    } else if session
-        .darwin_run
-        .as_ref()
-        .is_some_and(|run| run.sampler.is_some())
-    {
+    } else if session.last_run_sampler_active {
+        // The live `darwin_run`/sampler are consumed in finish_perf_stop
+        // before this runs, so we trust the snapshot taken there rather
+        // than the now-empty `darwin_run`.
         "macos-poll"
     } else {
         "macos-rusage-only"
@@ -1187,10 +1310,18 @@ fn diagnose(
     if let Some(share) = cpu_share
         && share < 0.25
     {
+        let summary_text = format!("CPU active for {:.0}% of wall time", share * 100.0);
+        // Go one level deeper: the sampled syscall names the wait
+        // (lock / sleep / I/O / IPC). Falls back to the generic line
+        // when nothing classifiable was sampled.
+        #[cfg(target_os = "macos")]
+        if let Some(w) = session.last_wait_syscall.and_then(classify_wait) {
+            return diagnosis_body(w.emoji, w.label, &summary_text, w.hint);
+        }
         return diagnosis_body(
             "💤",
             "mostly-waiting",
-            &format!("CPU active for {:.0}% of wall time", share * 100.0),
+            &summary_text,
             "blocked on I/O, sleep, lock contention, or syscall — sampling won't help; check thread state",
         );
     }
@@ -1232,6 +1363,181 @@ fn diagnosis_body(emoji: &str, label: &str, summary: &str, hint: &str) -> Value 
         "summary": summary,
         "hint": hint,
     })
+}
+
+/// A named wait cause derived from the blocking syscall.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+struct WaitClass {
+    emoji: &'static str,
+    label: &'static str,
+    hint: &'static str,
+}
+
+/// Classify a blocking syscall (`x16`) into a wait cause. Numbers from
+/// macOS `bsd/kern/syscalls.master` (arm64); a negative value is a mach
+/// trap. `None` for syscalls we don't recognise as a blocking wait.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn classify_wait(syscall: i64) -> Option<WaitClass> {
+    if syscall < 0 {
+        return Some(WaitClass {
+            emoji: "📨",
+            label: "ipc/mach wait",
+            hint: "parked in a mach trap (mach_msg / semaphore) — waiting on IPC or a dispatch queue; the work is in another thread or process",
+        });
+    }
+    let (emoji, label, hint) = match syscall {
+        // __psynch_{mutexwait, cvwait, rw_rdlock, rw_wrlock}, __ulock_wait{,2}
+        301 | 302 | 304 | 305 | 515 | 516 => (
+            "🔒",
+            "lock contention",
+            "blocked acquiring a mutex/condvar/rwlock — another thread holds it; shrink the critical section or reduce shared state",
+        ),
+        // __semwait_signal — nanosleep, sem_wait, timed condvar wait
+        334 => (
+            "😴",
+            "sleep / semaphore",
+            "parked in __semwait_signal — an explicit sleep, sem_wait, or timed wait; expected if you meant to block",
+        ),
+        // read, recvmsg, recvfrom, readv, accept, connect, select, poll, kevent{,_qos,_id}
+        3 | 27 | 29 | 120 | 30 | 98 | 93 | 230 | 363 | 374 | 375 => (
+            "🌐",
+            "i/o wait",
+            "blocked on read/recv/kevent/poll — file or socket I/O; the latency is external, not your CPU",
+        ),
+        _ => return None,
+    };
+    Some(WaitClass { emoji, label, hint })
+}
+
+/// Pick the syscall to report from a window's `x16` samples. Prefers the
+/// most frequent *recognised positive* BSD syscall — that's the stepped
+/// thread's real wait. Idle runtime threads sit in mach traps (negative),
+/// so we only fall back to those when no positive wait was sampled.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn dominant_wait_syscall(samples: &[i64]) -> Option<i64> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<i64, usize> = HashMap::new();
+    for &s in samples {
+        *counts.entry(s).or_default() += 1;
+    }
+    let positive = counts
+        .iter()
+        .filter_map(|(&s, &c)| (s > 0 && classify_wait(s).is_some()).then_some((s, c)))
+        .max_by_key(|&(_, c)| c)
+        .map(|(s, _)| s);
+    positive.or_else(|| {
+        counts
+            .iter()
+            .filter_map(|(&s, &c)| (s < 0).then_some((s, c)))
+            .max_by_key(|&(_, c)| c)
+            .map(|(s, _)| s)
+    })
+}
+
+// --- EXPERIMENTAL thread isolation (BS_PERF_ISOLATE_THREAD) ---------------
+// Freeze every non-focus thread during a step so the process-wide rusage
+// delta reflects only the stepped thread (otherwise a runtime worker's
+// instructions get billed to the stepped line). A watchdog thaws on a stall:
+// a step that blocks on a frozen thread never reaches finish_perf_stop (the
+// step's exception receive is infinite-timeout), so the main loop would hang.
+
+/// Thaw if a step hasn't completed by here. Generous — most steps finish in
+/// well under a frame; this only fires on a genuine block-on-frozen-thread.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+const FREEZE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Shared between the guard (thawed in finish_perf_stop / on drop) and the
+/// watchdog thread. Whichever calls `thaw` first resumes + releases the
+/// suspended thread send rights; the other is a no-op.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+#[derive(Debug)]
+struct FreezeInner {
+    suspended: std::sync::Mutex<Vec<mach2::mach_types::thread_act_t>>,
+    thawed: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+impl FreezeInner {
+    fn thaw(&self) {
+        use std::sync::atomic::Ordering;
+        if self.thawed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let ports = std::mem::take(&mut *self.suspended.lock().unwrap());
+        for t in ports {
+            let _ = crate::debugger::darwin_mach::thread_resume(t);
+            // SAFETY: `t` is a send right obtained from task_threads; release it.
+            let _ = unsafe {
+                mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), t)
+            };
+        }
+    }
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+#[derive(Debug)]
+struct ThreadFreezeGuard {
+    inner: std::sync::Arc<FreezeInner>,
+}
+
+#[cfg(all(feature = "perf", target_os = "macos"))]
+impl Drop for ThreadFreezeGuard {
+    fn drop(&mut self) {
+        self.inner.thaw();
+    }
+}
+
+/// Suspend every thread except the one backing `focus_pid`, returning a
+/// guard that thaws on drop. Focus is matched by **thread id** (not port
+/// name — task_threads hands out distinct send rights for the same thread),
+/// so the stepped thread is never frozen. Spawns a watchdog that thaws after
+/// [`FREEZE_WATCHDOG`] in case the step blocks on a frozen thread. Returns
+/// `None` when single-threaded or the focus thread can't be identified.
+#[cfg(all(feature = "perf", target_os = "macos"))]
+fn install_thread_freeze(
+    task: mach2::mach_types::task_t,
+    focus_pid: nix::unistd::Pid,
+) -> Option<ThreadFreezeGuard> {
+    use crate::debugger::darwin_mach;
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    let dealloc = |t: mach2::mach_types::thread_act_t| {
+        // SAFETY: `t` is a send right we own from task_threads.
+        let _ =
+            unsafe { mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), t) };
+    };
+
+    let focus_port = darwin_mach::thread_port_for_pid_or_first(focus_pid).ok()?;
+    let focus_tid = darwin_mach::thread_identity(focus_port).ok()?.thread_id;
+
+    let mut suspended = Vec::new();
+    for t in darwin_mach::task_threads_vec(task).ok()? {
+        if darwin_mach::thread_identity(t).ok().map(|id| id.thread_id) == Some(focus_tid) {
+            dealloc(t); // never freeze the stepped thread
+            continue;
+        }
+        if darwin_mach::thread_suspend(t).is_ok() {
+            suspended.push(t);
+        } else {
+            dealloc(t);
+        }
+    }
+    if suspended.is_empty() {
+        return None; // single-threaded — nothing to isolate
+    }
+
+    let inner = Arc::new(FreezeInner {
+        suspended: Mutex::new(suspended),
+        thawed: AtomicBool::new(false),
+    });
+    let watchdog = inner.clone();
+    let _ = std::thread::Builder::new()
+        .name("bs-perf-freeze-watchdog".to_owned())
+        .spawn(move || {
+            std::thread::sleep(FREEZE_WATCHDOG);
+            watchdog.thaw(); // no-op if finish_perf_stop already thawed
+        });
+    Some(ThreadFreezeGuard { inner })
 }
 
 #[cfg(all(feature = "perf", target_os = "macos"))]
@@ -1454,6 +1760,75 @@ mod tests {
 
         let err = parse_perf_overlay_source(&req).expect_err("missing path");
         assert!(err.to_string().contains("missing arguments.source.path"));
+    }
+
+    // Regression: finish_perf_stop take()s darwin_run and drains the
+    // sampler, so by the time the stopped summary calls perf_mode_label
+    // the live sampler is gone. The label must rely on the captured
+    // last_run_sampler_active flag, not the (now None) darwin_run — else
+    // it wrongly reports rusage-only even though the poll sampler ran.
+    // (The full ordering repro needs a live Mach sampler + debuggee, so
+    // this asserts the label decision directly with the post-stop state.)
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    #[test]
+    fn perf_mode_label_reports_poll_after_sampler_consumed() {
+        let mut session = PerfOverlaySession::default();
+        session.enabled = true;
+        session.darwin_run = None; // sampler already consumed at stop
+        session.last_run_sampler_active = true;
+        assert_eq!(perf_mode_label(&session), "macos-poll");
+
+        session.last_run_sampler_active = false;
+        assert_eq!(perf_mode_label(&session), "macos-rusage-only");
+
+        session.enabled = false;
+        assert_eq!(perf_mode_label(&session), "disabled");
+    }
+
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    #[test]
+    fn classify_wait_maps_syscalls_to_causes() {
+        assert_eq!(classify_wait(302).unwrap().label, "lock contention"); // __psynch_mutexwait
+        assert_eq!(classify_wait(515).unwrap().label, "lock contention"); // __ulock_wait
+        assert_eq!(classify_wait(334).unwrap().label, "sleep / semaphore"); // __semwait_signal
+        assert_eq!(classify_wait(3).unwrap().label, "i/o wait"); // read
+        assert_eq!(classify_wait(363).unwrap().label, "i/o wait"); // kevent
+        assert_eq!(classify_wait(-31).unwrap().label, "ipc/mach wait"); // mach_msg trap
+        assert!(classify_wait(20).is_none()); // getpid — not a blocking wait
+    }
+
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    #[test]
+    fn dominant_wait_prefers_positive_blocking_over_idle_mach() {
+        // idle threads parked in mach_msg (-31), one stepped thread in read(3):
+        // the real wait wins over the mach-trap noise.
+        assert_eq!(
+            dominant_wait_syscall(&[-31, -31, -31, -31, -31, 3]),
+            Some(3)
+        );
+        // only mach traps → fall back to the mach trap.
+        assert_eq!(dominant_wait_syscall(&[-31, -31]), Some(-31));
+        // unrecognised positive syscalls don't win; mach fallback applies.
+        assert_eq!(dominant_wait_syscall(&[20, 20, -31]), Some(-31));
+        // nothing sampled → nothing to report.
+        assert_eq!(dominant_wait_syscall(&[]), None);
+    }
+
+    // The watchdog and finish_perf_stop can both reach thaw(); only the
+    // first may resume/release ports. (Real suspend/resume needs the live
+    // debugger thread-port registry — exercised by BS_PERF_ISOLATE_THREAD.)
+    #[cfg(all(feature = "perf", target_os = "macos"))]
+    #[test]
+    fn freeze_thaw_is_idempotent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let inner = Arc::new(FreezeInner {
+            suspended: Mutex::new(Vec::new()),
+            thawed: AtomicBool::new(false),
+        });
+        inner.thaw();
+        inner.thaw(); // must be a no-op, not a double free / panic
+        assert!(inner.thawed.load(Ordering::SeqCst));
     }
 
     #[cfg(feature = "perf")]

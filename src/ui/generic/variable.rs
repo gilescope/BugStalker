@@ -278,8 +278,17 @@ fn render_value_inner(
                             render_value_inner(&m.value, depth, keep_type, viz)
                         })
                         .collect();
-                    let body = format!("({})", inner.join(", "));
-                    return if print_type && !type_name.starts_with('(') {
+                    let joined = inner.join(", ");
+                    let bare_tuple = type_name.starts_with('(');
+                    // Bare 1-tuple needs Rust's disambiguating trailing
+                    // comma: `(x,)` not `(x)`. Tuple structs / enum
+                    // variants keep their prefix and take no comma.
+                    let body = if bare_tuple && inner.len() == 1 {
+                        format!("({joined},)")
+                    } else {
+                        format!("({joined})")
+                    };
+                    return if print_type && !bare_tuple {
                         // Bare-tuple types are already parens-shaped
                         // (`(i32, &str)`); doubling them up gives
                         // `(i32, &str)(1, "one")`. Skip the prefix.

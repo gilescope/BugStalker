@@ -71,7 +71,7 @@ pub struct PatchApply {
     ///
     /// End result: the user sees their breakpoint hit again,
     /// inside the *patched* function body, without manual
-    /// intervention. Mirrors the DAP `bs/encApplyPatch` flow.
+    /// intervention. Mirrors the DAP `bs/applyPatch` flow.
     /// Set `false` to apply the patch but leave the debugger
     /// at the pre-restart PC (useful when a script wants to
     /// inspect intermediate state).
@@ -191,7 +191,7 @@ impl StructuredCommand for PatchApply {
         // function the focused thread is paused inside, rewind PC
         // to the function entry and continue past intermediate
         // breakpoints back to the user's original PC. Mirrors the
-        // DAP `bs/encApplyPatch` flow so a `bs --script` agent
+        // DAP `bs/applyPatch` flow so a `bs --script` agent
         // gets the same "edit, save, your breakpoint hits in the
         // patched code" semantics as VSCode users.
         let restarted_frame_fn_start = if self.restart && report.entries_applied > 0 {

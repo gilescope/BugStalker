@@ -7,7 +7,7 @@ mod rendezvous;
 pub mod tracee;
 pub mod tracer;
 
-pub use registry::{DwarfRegistry, RegionInfo};
+pub use registry::{DwarfRegistry, RegionInfo, SegmentKind, SegmentWritability};
 pub use rendezvous::RendezvousError;
 
 use super::r#async::TokioVersion;
@@ -126,6 +126,12 @@ pub struct Debugee {
     libthread_db: Arc<thread_db::Lib>,
     /// Version of tokio runtime, if exist.
     tokio_version: Option<TokioVersion>,
+    /// Low-level traps (single-steps + resumes) driven since the last
+    /// [`reset_trap_count`](Self::reset_trap_count). The macOS rusage perf path
+    /// divides the fixed per-trap kernel/exception overhead out of step costs
+    /// using this count (see `bs_perf::TrapFloor`). Reset at the start of each
+    /// perf window; otherwise free-running and harmless.
+    trap_count: u64,
 }
 
 impl Debugee {
@@ -164,6 +170,7 @@ impl Debugee {
             disassembly: Disassembler::new()?,
             libthread_db: Arc::new(thread_db::Lib::try_load()?),
             tokio_version: tokio_ver,
+            trap_count: 0,
         })
     }
 
@@ -212,6 +219,7 @@ impl Debugee {
             disassembly: Disassembler::new()?,
             libthread_db: Arc::new(thread_db::Lib::try_load()?),
             tokio_version: tokio_ver,
+            trap_count: 0,
         };
 
         debugee.attach_libthread_db();
@@ -236,6 +244,7 @@ impl Debugee {
             disassembly: Disassembler::new().expect("infallible"),
             libthread_db: self.libthread_db.clone(),
             tokio_version: self.tokio_version,
+            trap_count: 0,
         }
     }
 
@@ -257,6 +266,16 @@ impl Debugee {
     /// listing the mapping keys we know about.
     pub fn dwarf_registry(&self) -> &DwarfRegistry {
         &self.dwarf_registry
+    }
+
+    /// Mutable access to the DWARF/load-mapping registry. Used by
+    /// the variables-view §5.3 refresh-on-stop path
+    /// (`Debugger::refresh_segment_index`) to rebuild the
+    /// proc_maps-derived segment index just before a variables-pane
+    /// query reads addresses, so post-startup heap allocations
+    /// participate in the storage classification.
+    pub fn dwarf_registry_mut(&mut self) -> &mut DwarfRegistry {
+        &mut self.dwarf_registry
     }
 
     /// Translate a file offset within the main executable (the kind
@@ -324,6 +343,22 @@ impl Debugee {
         &self.tracer
     }
 
+    /// Traps (single-steps + resumes) driven since [`reset_trap_count`](Self::reset_trap_count).
+    pub fn trap_count(&self) -> u64 {
+        self.trap_count
+    }
+
+    /// Zero the trap counter — called at the start of a perf measurement window.
+    pub fn reset_trap_count(&mut self) {
+        self.trap_count = 0;
+    }
+
+    /// Record one single-step trap (the resume path bumps the counter itself in
+    /// [`trace_until_stop`](Self::trace_until_stop)).
+    pub(crate) fn bump_single_step_trap(&mut self) {
+        self.trap_count += 1;
+    }
+
     pub fn tracer_mut(&mut self) -> &mut Tracer {
         &mut self.tracer
     }
@@ -344,6 +379,9 @@ impl Debugee {
     }
 
     pub fn trace_until_stop(&mut self, tcx: TraceContext) -> Result<StopReason, Error> {
+        // Each resume is one trap (one kernel exception round-trip) charged to
+        // the debuggee's rusage; the perf path subtracts it back out.
+        self.trap_count += 1;
         let event = self.tracer.resume(tcx)?;
         match event {
             StopReason::DebugeeExit(_) => {
@@ -437,7 +475,12 @@ impl Debugee {
             .enumerate()
             .find(|(_, frame)| frame.ip == ecx.location().pc)
             .expect("frame must exists");
-        let return_addr = backtrace.get(bt_frame_num + 1).map(|f| f.ip);
+        // Caller frames' `ip` is the *call site* (raw return address − 1, see
+        // the unwind loop) so symbolization doesn't mislabel noreturn tail
+        // calls. `return_addr` is the contract "where execution resumes" and
+        // must equal the CIE's return-address register — undo the lookup
+        // adjustment.
+        let return_addr = backtrace.get(bt_frame_num + 1).map(|f| f.ip.offset(1));
         Ok(FrameInfo {
             frame: frame.clone(),
             num: bt_frame_num as u32,

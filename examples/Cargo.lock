@@ -121,6 +121,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "big_static"
+version = "0.0.0"
+
+[[package]]
 name = "binascii"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -272,6 +276,10 @@ version = "0.0.0"
 [[package]]
 name = "dap_source_map"
 version = "0.1.0"
+
+[[package]]
+name = "dep_with_static"
+version = "0.0.0"
 
 [[package]]
 name = "deranged"
@@ -876,6 +884,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "panic_kinds"
+version = "0.0.0"
+
+[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -934,6 +946,10 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "perf_lines"
+version = "0.0.0"
 
 [[package]]
 name = "pin-project"
@@ -1404,6 +1420,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "statics_heavy"
+version = "0.0.0"
+
+[[package]]
+name = "step_into_jmc"
+version = "0.0.0"
+
+[[package]]
 name = "syn"
 version = "2.0.111"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1431,6 +1455,13 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "thin_app"
+version = "0.0.0"
+dependencies = [
+ "dep_with_static",
 ]
 
 [[package]]

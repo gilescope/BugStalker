@@ -65,6 +65,20 @@ pub const DEFAULT_POLL_PERIOD: Duration = Duration::from_millis(1);
 /// frames via its own DWARF + dyld-slide pipeline.
 pub type RawPc = u64;
 
+/// One thread snapshot: the user PC plus, on aarch64, the syscall
+/// number register (`x16`). When a thread is parked in-kernel `x16`
+/// still holds the `mov x16,#n; svc #0x80` number, so it names the
+/// blocking syscall (read / kevent / __psynch_mutexwait / …); negative
+/// values are mach traps. `None` on x86 (different ABI) — the PC heat
+/// map works regardless; only the wait classifier needs the syscall.
+#[derive(Debug, Clone, Copy)]
+pub struct ThreadSample {
+    /// User program counter (PAC-stripped on aarch64).
+    pub pc: RawPc,
+    /// Syscall number from `x16` (aarch64); `None` on x86.
+    pub syscall: Option<i64>,
+}
+
 /// AArch64 PAC strip mask. Apple Silicon signs pointers with the
 /// top bits of the virtual address; the hardware strips them at
 /// load but the value saved into `arm_thread_state64.__pc` retains
@@ -81,6 +95,9 @@ pub struct PollSampler {
     task: mach_port_t,
     period: Duration,
     samples: Arc<Mutex<Vec<RawPc>>>,
+    /// Syscall numbers (`x16`) captured alongside each PC — drives the
+    /// wait-cause classifier. Parallel to, not interleaved with, samples.
+    syscalls: Arc<Mutex<Vec<i64>>>,
     stop_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     /// Best-effort count of thread snapshots that failed because the
@@ -106,6 +123,7 @@ impl PollSampler {
             task,
             period,
             samples: Arc::new(Mutex::new(Vec::new())),
+            syscalls: Arc::new(Mutex::new(Vec::new())),
             stop_flag: Arc::new(AtomicBool::new(false)),
             handle: None,
             failed_snapshots: Arc::new(Mutex::new(0)),
@@ -119,11 +137,14 @@ impl PollSampler {
         let task = self.task;
         let period = self.period;
         let samples = self.samples.clone();
+        let syscalls = self.syscalls.clone();
         let stop_flag = self.stop_flag.clone();
         let failed_snapshots = self.failed_snapshots.clone();
         let handle = thread::Builder::new()
             .name("bs-perf-poll-darwin".to_owned())
-            .spawn(move || sampler_loop(task, period, samples, stop_flag, failed_snapshots))
+            .spawn(move || {
+                sampler_loop(task, period, samples, syscalls, stop_flag, failed_snapshots)
+            })
             .map_err(|err| {
                 PerfError::Open(std::io::Error::other(format!(
                     "spawn bs-perf-poll-darwin: {err}"
@@ -140,7 +161,13 @@ impl PollSampler {
     pub fn sample_once(&self) -> usize {
         // SAFETY: mach_thread_self always returns a valid send right.
         let own_thread = unsafe { mach_thread_self() };
-        let pushed = sample_pass(self.task, own_thread, &self.samples, &self.failed_snapshots);
+        let pushed = sample_pass(
+            self.task,
+            own_thread,
+            &self.samples,
+            &self.syscalls,
+            &self.failed_snapshots,
+        );
         // SAFETY: own_thread came from mach_thread_self; balance.
         let _ = unsafe { mach_port_deallocate(mach_task_self(), own_thread) };
         pushed
@@ -158,12 +185,17 @@ impl PollSampler {
             let mut guard = self.samples.lock().expect("samples mutex");
             std::mem::take(&mut *guard)
         };
+        let syscalls = {
+            let mut guard = self.syscalls.lock().expect("syscalls mutex");
+            std::mem::take(&mut *guard)
+        };
         let failed_snapshots = {
             let guard = self.failed_snapshots.lock().expect("failed mutex");
             *guard
         };
         PollDrain {
             samples,
+            syscalls,
             failed_snapshots,
         }
     }
@@ -174,6 +206,9 @@ impl PollSampler {
 pub struct PollDrain {
     /// Raw PC samples captured during the run.
     pub samples: Vec<RawPc>,
+    /// Syscall numbers (`x16`) captured per sample — for wait-cause
+    /// classification. Aggregate the mode to name the blocking syscall.
+    pub syscalls: Vec<i64>,
     /// Thread snapshots the kernel rejected mid-sample (thread
     /// exited, port stale, etc.). The DAP layer reports these as
     /// unresolved.
@@ -184,6 +219,7 @@ fn sampler_loop(
     task: mach_port_t,
     period: Duration,
     samples: Arc<Mutex<Vec<RawPc>>>,
+    syscalls: Arc<Mutex<Vec<i64>>>,
     stop_flag: Arc<AtomicBool>,
     failed_snapshots: Arc<Mutex<u64>>,
 ) {
@@ -197,7 +233,7 @@ fn sampler_loop(
     let own_thread = unsafe { mach_thread_self() };
 
     while !stop_flag.load(Ordering::Relaxed) {
-        sample_pass(task, own_thread, &samples, &failed_snapshots);
+        sample_pass(task, own_thread, &samples, &syscalls, &failed_snapshots);
         thread::sleep(period);
     }
 
@@ -213,6 +249,7 @@ fn sample_pass(
     task: mach_port_t,
     own_thread: thread_act_t,
     samples: &Mutex<Vec<RawPc>>,
+    syscalls: &Mutex<Vec<i64>>,
     failed_snapshots: &Mutex<u64>,
 ) -> usize {
     let threads = match collect_task_threads(task) {
@@ -232,10 +269,15 @@ fn sample_pass(
             // sampler thread is never an interesting sample.
         } else {
             match sample_one_thread(*thread_act) {
-                Some(pc) => {
+                Some(sample) => {
                     if let Ok(mut buf) = samples.lock() {
-                        buf.push(pc);
+                        buf.push(sample.pc);
                         pushed += 1;
+                    }
+                    if let Some(sc) = sample.syscall
+                        && let Ok(mut buf) = syscalls.lock()
+                    {
+                        buf.push(sc);
                     }
                 }
                 None => {
@@ -303,7 +345,7 @@ impl Drop for ResumeOnDrop {
     }
 }
 
-fn sample_one_thread(thread: thread_act_t) -> Option<RawPc> {
+fn sample_one_thread(thread: thread_act_t) -> Option<ThreadSample> {
     // SAFETY: thread_suspend takes a valid send right; the kernel
     // tells us if it isn't, via a non-success kr.
     let kr = unsafe { thread_suspend(thread) };
@@ -313,11 +355,11 @@ fn sample_one_thread(thread: thread_act_t) -> Option<RawPc> {
     // From here, resume is guaranteed on every exit path (including
     // a panic) by the guard's Drop.
     let _resume = ResumeOnDrop(thread);
-    read_thread_pc(thread)
+    read_thread_sample(thread)
 }
 
 #[cfg(target_arch = "aarch64")]
-fn read_thread_pc(thread: thread_act_t) -> Option<RawPc> {
+fn read_thread_sample(thread: thread_act_t) -> Option<ThreadSample> {
     use mach2::structs::arm_thread_state64_t;
     use mach2::thread_status::thread_state_t;
     const ARM_THREAD_STATE64: u32 = 6;
@@ -339,11 +381,17 @@ fn read_thread_pc(thread: thread_act_t) -> Option<RawPc> {
     if kr != KERN_SUCCESS {
         return None;
     }
-    Some(state.__pc & PAC_MASK_AARCH64)
+    Some(ThreadSample {
+        pc: state.__pc & PAC_MASK_AARCH64,
+        // x16 = syscall number. `as i64` is an intentional bit
+        // reinterpretation: mach traps come back as large u64s that
+        // are negative when read as i64 (e.g. 0xff..dc = -36).
+        syscall: Some(state.__x[16] as i64),
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
-fn read_thread_pc(thread: thread_act_t) -> Option<RawPc> {
+fn read_thread_sample(thread: thread_act_t) -> Option<ThreadSample> {
     use mach2::structs::x86_thread_state64_t;
     use mach2::thread_status::thread_state_t;
     const X86_THREAD_STATE64: u32 = 4;
@@ -363,11 +411,15 @@ fn read_thread_pc(thread: thread_act_t) -> Option<RawPc> {
     if kr != KERN_SUCCESS {
         return None;
     }
-    Some(state.__rip)
+    // x86 syscall ABI differs (rax); not wired for wait classification.
+    Some(ThreadSample {
+        pc: state.__rip,
+        syscall: None,
+    })
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-fn read_thread_pc(_: thread_act_t) -> Option<RawPc> {
+fn read_thread_sample(_: thread_act_t) -> Option<ThreadSample> {
     None
 }
 
@@ -500,6 +552,74 @@ mod tests {
         assert!(
             !drain.samples.is_empty() || drain.failed_snapshots > 0,
             "expected at least one sample or one recorded failure from external sleep task"
+        );
+    }
+}
+
+// Regression: a parked thread's x16 holds the syscall number (the
+// `mov x16,#n; svc #0x80` ABI), and it survives the in-kernel block —
+// this is what the wait-cause classifier relies on. Spawn threads parked
+// on read() and nanosleep and assert we see their syscall numbers.
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod syscall_capture {
+    use super::*;
+
+    #[test]
+    fn parked_thread_x16_is_the_syscall_number() {
+        thread::spawn(|| {
+            let ts = libc::timespec {
+                tv_sec: 100,
+                tv_nsec: 0,
+            };
+            unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
+        });
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let rfd = fds[0];
+        thread::spawn(move || {
+            let mut buf = [0u8; 1];
+            unsafe { libc::read(rfd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+        });
+        thread::sleep(Duration::from_millis(250)); // let them block
+
+        let task = unsafe { mach_task_self() };
+        let own = unsafe { mach_thread_self() };
+        let mut threads: thread_act_array_t = std::ptr::null_mut();
+        let mut count: mach_msg_type_number_t = 0;
+        assert_eq!(
+            unsafe { task_threads(task, &mut threads, &mut count) },
+            KERN_SUCCESS
+        );
+        let mut seen = Vec::new();
+        for i in 0..count as usize {
+            let t = unsafe { *threads.add(i) };
+            if t == own {
+                continue;
+            }
+            if unsafe { thread_suspend(t) } != KERN_SUCCESS {
+                continue;
+            }
+            if let Some(sample) = read_thread_sample(t) {
+                if let Some(x16) = sample.syscall {
+                    seen.push(x16);
+                }
+            }
+            unsafe { thread_resume(t) };
+        }
+        unsafe {
+            mach_vm_deallocate(
+                task,
+                threads as mach_vm_address_t,
+                (count as usize * std::mem::size_of::<thread_act_t>()) as mach_vm_size_t,
+            )
+        };
+        let _ = unsafe { mach_port_deallocate(task, own) };
+
+        // SYS_read = 3, SYS___semwait_signal = 334 (nanosleep routes through it).
+        assert!(seen.contains(&3), "expected read (x16=3) among {seen:?}");
+        assert!(
+            seen.contains(&334),
+            "expected __semwait_signal (x16=334) among {seen:?}"
         );
     }
 }

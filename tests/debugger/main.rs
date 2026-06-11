@@ -11,9 +11,14 @@ mod async_await;
 mod breakpoints;
 mod io;
 mod multithreaded;
+mod panic_location;
 mod signal;
 mod steps;
 mod symbol;
+// Perf-cost ballpark tests — assert per-line instruction/cycle counts via the
+// `proc_pid_rusage` path (bs-perf darwin). macOS-only + `perf`-feature gated.
+#[cfg(all(target_os = "macos", feature = "perf"))]
+mod perf_cost;
 // Tokio runtime introspection on Darwin needs more than the TLS
 // resolver — `darwin_mach::resolve_tlv` lands the per-thread CONTEXT
 // slot correctly, but walking tokio's worker registry from there
@@ -305,6 +310,10 @@ const SIGNALS_APP: &str = "./examples/target/debug/signals";
 const SHARED_LIB_APP: &str = "./examples/target/debug/calc_bin";
 const SLEEPER_APP: &str = "./examples/target/debug/sleeper";
 const FIZZBUZZ_APP: &str = "./examples/target/debug/fizzbuzz";
+// Perf-cost ballpark debuggee — only consumed by `mod perf_cost`,
+// which is macOS + `perf`-feature gated (rusage path is darwin-only).
+#[cfg(all(target_os = "macos", feature = "perf"))]
+const PERF_LINES_APP: &str = "./examples/target/debug/perf_lines";
 #[cfg(target_arch = "x86_64")]
 const CALCULATIONS_APP: &str = "./examples/target/debug/calculations";
 // `mod tokio` is Linux-only on Darwin (worker-registry walk needs
@@ -325,6 +334,9 @@ const TOKIO_JOIN_APP: &str = "./examples/target/debug/tokio_join";
 #[cfg(target_os = "linux")]
 const TOKIO_DYN_FUTURE_APP: &str = "./examples/target/debug/tokio_dyn_future";
 const CALLS_APP: &str = "./examples/target/debug/calls";
+const STEP_INTO_JMC_APP: &str = "./examples/target/debug/step_into_jmc";
+const PANIC_KINDS_APP: &str = "./examples/target/debug/panic_kinds";
+const STEP_INTO_PROBE_APP: &str = "./examples/target/debug/step_into_probe";
 
 #[test]
 #[serial]

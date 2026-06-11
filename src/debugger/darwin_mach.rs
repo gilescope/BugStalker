@@ -140,7 +140,19 @@ impl From<MachError> for Error {
         // a later KERN_FAILURE comes from a different Mach call
         // (e.g. `thread_set_arm_debug_state64` during a step) and
         // would mislead the user if reported as a codesign issue.
-        if e.0 == 5 && !TASK_FOR_PID_EVER_SUCCEEDED.load(std::sync::atomic::Ordering::Relaxed) {
+        // A first-`task_for_pid` KERN_FAILURE *might* be a missing cs.debugger
+        // entitlement — but only attempt the auto-sign + re-exec recovery when
+        // it's SAFE. In DAP mode we already ensured the entitlement at startup
+        // (see `ensure_debugger_entitlement_at_startup`), so a KERN_FAILURE here
+        // is something else (a stale port, a not-yet-suspended thread, the
+        // target un-debuggable …) — and re-execing mid-handshake would orphan
+        // the session ("debugger not initialized" for every later request).
+        // `SUPPRESS_AUTO_REEXEC` is set once the startup check has run, so we
+        // fall through to the descriptive generic Mach error instead.
+        if e.0 == 5
+            && !TASK_FOR_PID_EVER_SUCCEEDED.load(std::sync::atomic::Ordering::Relaxed)
+            && !SUPPRESS_AUTO_REEXEC.load(std::sync::atomic::Ordering::Relaxed)
+        {
             // The binary that needs the entitlement is *us* — the
             // running BugStalker binary, not the inferior — so resolve
             // current_exe() and inline its absolute path into the
@@ -221,6 +233,14 @@ static TASK_FOR_PID_CACHE: std::sync::Mutex<Option<HashMap<i32, task_t>>> =
 // Mach call (e.g. `thread_set_state`, `task_resume`) and shouldn't
 // be misreported as a codesign issue.
 pub(super) static TASK_FOR_PID_EVER_SUCCEEDED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set once the DAP startup entitlement check has run. After that point the
+/// lazy auto-sign + re-exec recovery in `Error::from(MachError)` is suppressed:
+/// in a DAP session a re-exec orphans the protocol handshake, and the startup
+/// check has already handled the entitlement, so a later KERN_FAILURE is some
+/// other Mach problem that must surface as a real error, not a connection drop.
+static SUPPRESS_AUTO_REEXEC: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub fn task_for_pid(pid: Pid) -> Result<task_t, MachError> {
@@ -2078,6 +2098,65 @@ fn stage_entitlements_xml() -> String {
             "failed to stage entitlements at {}: {e}", path.display());
     }
     path.display().to_string()
+}
+
+/// Ensure the running bs binary carries the `cs.debugger` entitlement BEFORE a
+/// debug session starts. Call this at startup in DAP mode.
+///
+/// The lazy recovery in `Error::from(MachError)` re-execs on the first
+/// `task_for_pid` failure — but in a DAP session that failure happens deep in
+/// `start_debugee` (at `configurationDone`), *mid-handshake*. Re-execing then
+/// orphans the session: the fresh process has no initialized debugger, so every
+/// subsequent request fails with "debugger not initialized" and the client drops
+/// the connection. Doing the sign+re-exec here, before we read a single DAP
+/// message, means the re-exec'd process runs the whole session cleanly.
+///
+/// No-op when already entitled, already re-exec'd (`BS_AUTO_SIGN_TRIED`), or
+/// opted out (`BS_NO_AUTO_SIGN`). On a needed re-exec this never returns.
+pub fn ensure_debugger_entitlement_at_startup() {
+    // From here on, a mid-session re-exec is never safe (it orphans the DAP
+    // handshake). The sign+re-exec below is the only place we re-exec; suppress
+    // the lazy recovery for the rest of this process's life.
+    SUPPRESS_AUTO_REEXEC.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    if std::env::var_os("BS_AUTO_SIGN_TRIED").is_some()
+        || std::env::var_os("BS_NO_AUTO_SIGN").is_some()
+    {
+        return;
+    }
+    if self_has_debugger_entitlement() {
+        return;
+    }
+    let entitlements_path = stage_entitlements_xml();
+    if let Err(why) = try_auto_codesign_and_reexec(&entitlements_path) {
+        // Non-fatal: fall through. The lazy path will still produce a
+        // descriptive error if task_for_pid later fails.
+        eprintln!("[bs] startup auto-sign skipped: {why}");
+    }
+}
+
+/// True if the running binary's code signature includes the `cs.debugger`
+/// entitlement. Asks `codesign`; on any failure assumes "not entitled" and lets
+/// the caller try to sign (the `BS_AUTO_SIGN_TRIED` guard prevents a re-exec
+/// loop if the detection is wrong).
+fn self_has_debugger_entitlement() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let Ok(out) = std::process::Command::new("codesign")
+        .arg("-d")
+        .arg("--entitlements")
+        .arg("-")
+        .arg("--xml")
+        .arg(&exe)
+        .output()
+    else {
+        return false;
+    };
+    // The key can land on stdout (modern `--xml`) or stderr (older codesign).
+    const KEY: &str = "com.apple.security.cs.debugger";
+    String::from_utf8_lossy(&out.stdout).contains(KEY)
+        || String::from_utf8_lossy(&out.stderr).contains(KEY)
 }
 
 /// Attempt to codesign the running bs binary with the bundled

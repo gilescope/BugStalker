@@ -50,6 +50,7 @@ impl super::DebugSession {
             "supportsEvaluateForHovers": true,
             "supportsPauseRequest": true,
             "supportsDisassembleRequest": true,
+            "supportsSteppingGranularity": true,
             "supportsSourceRequest": true,
             "supportsFunctionBreakpoints": true,
             "supportsInstructionBreakpoints": true,
@@ -97,6 +98,11 @@ impl super::DebugSession {
             .build(process)
             .context("Build debugger")?;
         self.debugger = Some(dbg);
+        // New process — any cached read-only static values + the names
+        // index belong to the old debuggee (design-principles.md §3).
+        self.ro_statics.clear();
+        self.statics_index = None;
+        self.statics_sizes.clear();
 
         self.start_output_forwarding(stdout_reader, stderr_reader);
         Ok(())
@@ -141,6 +147,11 @@ impl super::DebugSession {
             .context("Attach external process")?;
 
         self.debugger = Some(dbg);
+        // New process — drop the old debuggee's read-only static cache
+        // and names index.
+        self.ro_statics.clear();
+        self.statics_index = None;
+        self.statics_sizes.clear();
         self.start_output_forwarding(stdout_reader, stderr_reader);
         Ok(())
     }
@@ -234,6 +245,7 @@ impl super::DebugSession {
 
         // Source map (remote/WSL/container path mapping).
         self.source_map = SourceMap::from_launch_args(&req.arguments);
+        self.focus_panic_culprit = Self::focus_panic_culprit_arg(&req.arguments);
         // Reset session termination state for a new launch.
         self.terminated = false;
         self.exit_code = None;
@@ -257,6 +269,18 @@ impl super::DebugSession {
         self.send_success(req)?;
         self.drain_events()?;
         Ok(())
+    }
+
+    /// `focusPanicCulprit` launch/attach arg — default `true` when absent or
+    /// non-boolean. The vscode-extension injects this from the user setting
+    /// `bugstalker.focusPanicCulprit` when launch.json doesn't set it, so the
+    /// per-launch value already encodes the user's chosen default by the time
+    /// it reaches the adapter.
+    fn focus_panic_culprit_arg(arguments: &Value) -> bool {
+        arguments
+            .get("focusPanicCulprit")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
     }
 
     fn attach_pid(arguments: &Value) -> anyhow::Result<Pid> {
@@ -287,6 +311,7 @@ impl super::DebugSession {
         let pid = Self::attach_pid(&req.arguments)?;
 
         self.source_map = SourceMap::from_launch_args(&req.arguments);
+        self.focus_panic_culprit = Self::focus_panic_culprit_arg(&req.arguments);
         self.terminated = false;
         self.exit_code = None;
         self.session_mode = Some(SessionMode::Attach);

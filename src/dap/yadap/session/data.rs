@@ -52,15 +52,253 @@ pub struct VarItem {
     pub child: Option<Vec<VarItem>>,
     pub write: Option<WriteMeta>,
     pub source: Option<debugger::variable::value::Value>,
+    /// Variables-view §5.2: serialised as the DAP custom field
+    /// `bugstalker.mutability = "ro" | "rw" | "unknown"`. The
+    /// vscode-extension uses this to pick the row-background hue
+    /// (grey for `ro`, orange for `rw`, none for `unknown`).
+    /// `"ro"` additionally emits `presentationHint.attributes =
+    /// ["readOnly"]` so stock DAP clients (default VSCode pane)
+    /// italicise the row even without our extension.
+    pub mutability: Option<&'static str>,
+    /// Variables-view §5.3: serialised as the DAP custom field
+    /// `bugstalker.storage = "stack" | "register" | "static_ro" |
+    /// "static_rw" | "tls" | "optimized" | "unknown"`. Drives the
+    /// leading storage-class glyph in the vscode-extension.
+    pub storage: Option<&'static str>,
+    /// Variables-view §5.3 heap overlay: when `true`, this
+    /// binding's value points into a heap-ish mapping (the `↗`
+    /// glyph layers on top of the storage class). Serialised as
+    /// `bugstalker.points_to_heap = true` and omitted when false
+    /// to keep DAP JSON tight.
+    pub points_to_heap: bool,
+    /// Variables-view §5.5 — total byte size of this value's type
+    /// from `DW_AT_byte_size`. Drives the trailing size column +
+    /// the amber (>1 KB) / red (>16 KB) tinting. Serialised as
+    /// `bugstalker.byte_size` (u64). `None` is omitted from the JSON.
+    pub byte_size: Option<u64>,
+    /// Variables-view §5.6 — shallow payload / padding breakdown
+    /// (struct types only). Drives the HSL lightness split on the
+    /// row background in the vscode-extension. Serialised as
+    /// `bugstalker.layout = { totalBytes, payloadBytes, paddingBytes }`
+    /// only when padding ≥ 5% of total (the
+    /// `paddingSplit.showThresholdPct` from variables-view §4) —
+    /// below that the split is visual noise.
+    pub layout: Option<debugger::variable::execute::LayoutBreakdown>,
 }
 
 impl super::DebugSession {
+    /// Materialise one level of the lazy Statics namespace tree
+    /// (design-principles.md §2, §4): the immediate sub-namespaces (lazy
+    /// rows whose subtree is read only when opened) plus the leaf statics
+    /// directly at `prefix` (values read now, read-only ones served from
+    /// the cache). `parent_ref` is the reference being expanded — each
+    /// sub-namespace's lazy ref is pre-registered in `child_links` so the
+    /// normal `handle_variables` child path hands it back.
+    fn render_statics_level(
+        &mut self,
+        parent_ref: i64,
+        thread_id: i64,
+        frame_num: u32,
+        prefix: &[String],
+    ) -> Vec<VarItem> {
+        use debugger::variable::execute::FileScopeFilter;
+        let pid = self
+            .thread_cache
+            .get(&thread_id)
+            .copied()
+            .unwrap_or_else(|| Pid::from_raw(thread_id as i32));
+
+        // Build the name index once per process — cheap (names only, no
+        // value reads) — focusing the requested frame so the
+        // current-crate filter resolves.
+        if self.statics_index.is_none()
+            && let Some(dbg) = self.debugger.as_mut()
+        {
+            let _ = dbg.set_thread_into_focus_by_pid(pid);
+            let _ = dbg.set_frame_into_focus(frame_num);
+            // Enumerate *every* crate's statics. The current-crate-only
+            // default predated the namespace tree, when a flat list of
+            // all of std + deps was unusable noise. Now the tree itself
+            // is the anti-flood: the top level is a sorted set of crate
+            // nodes, each collapsed and lazy, so showing everything costs
+            // a names-only walk and the user opens just the crate they
+            // want (their own, or a dependency like `hyper_util`).
+            let name_sizes = dbg
+                .read_static_name_sizes(FileScopeFilter::All)
+                .unwrap_or_default();
+            // Keep only the *large* sizes — that's all the gate and the
+            // lazy-node label ever consult; small statics read inline and
+            // never need their size.
+            self.statics_sizes = name_sizes
+                .iter()
+                .filter_map(|(n, s)| {
+                    s.filter(|&sz| sz > STATIC_LAZY_BYTES)
+                        .map(|sz| (n.clone(), sz))
+                })
+                .collect();
+            self.statics_index = Some(NameTrie::build(name_sizes.into_iter().map(|(n, _)| n)));
+        }
+        let Some((subs, leaf_names)) = self
+            .statics_index
+            .as_ref()
+            .and_then(|t| namespace_level(t, prefix))
+        else {
+            return Vec::new();
+        };
+
+        let mut items = Vec::new();
+
+        // Sub-namespaces: lazy rows. Pre-register each lazy ref against
+        // this parent + index so `handle_variables` returns it without
+        // materialising the placeholder child.
+        for child in subs {
+            let lazy_ref = self.vars.alloc(Vec::new());
+            self.pending_namespaces
+                .insert(lazy_ref, (thread_id, frame_num, child.prefix));
+            let idx = items.len();
+            self.child_links.insert((parent_ref, idx), lazy_ref);
+            items.push(lazy_namespace_node(child.label, child.count));
+        }
+
+        // Leaf statics at this level. Giant ones (precomputed crypto
+        // tables, …) are deferred to a lazy node — reading + rendering a
+        // 512 KB array eagerly is what stalls the pane — and read only
+        // when the user expands them. Everything else is read inline.
+        // `statics_sizes` holds only the over-threshold statics, so its
+        // membership *is* the gate (minus ones already cached read-only).
+        let (lazy_leaf_names, leaf_names): (Vec<String>, Vec<String>) = leaf_names
+            .into_iter()
+            .partition(|n| self.statics_sizes.contains_key(n) && !self.ro_statics.contains_key(n));
+        for name in lazy_leaf_names {
+            let lazy_ref = self.vars.alloc(Vec::new());
+            self.pending_static_values
+                .insert(lazy_ref, (thread_id, frame_num, name.clone()));
+            let idx = items.len();
+            self.child_links.insert((parent_ref, idx), lazy_ref);
+            let label = name.rsplit("::").next().unwrap_or(&name).to_string();
+            items.push(lazy_static_value_node(
+                label,
+                self.statics_sizes.get(&name).copied(),
+            ));
+        }
+        if !leaf_names.is_empty() {
+            let to_read: std::collections::HashSet<String> = leaf_names
+                .iter()
+                .filter(|n| !self.ro_statics.contains_key(*n))
+                .cloned()
+                .collect();
+            let fresh = if to_read.is_empty() {
+                Vec::new()
+            } else if let Some(dbg) = self.debugger.as_mut() {
+                let _ = dbg.set_thread_into_focus_by_pid(pid);
+                let _ = dbg.set_frame_into_focus(frame_num);
+                read_statics_flat_including(dbg, &to_read).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            for vi in &fresh {
+                if vi.storage == Some("static_ro") {
+                    self.ro_statics.insert(vi.name.clone(), vi.clone());
+                }
+            }
+            // Assemble leaves for exactly the wanted names: cached
+            // read-only first, then freshly-read mutable ones.
+            let mut leaves: Vec<VarItem> = Vec::new();
+            for name in &leaf_names {
+                if let Some(cached) = self.ro_statics.get(name) {
+                    leaves.push(cached.clone());
+                }
+            }
+            leaves.extend(
+                fresh
+                    .into_iter()
+                    .filter(|vi| vi.storage != Some("static_ro")),
+            );
+            // Display only the final path segment; sort for stable order.
+            for vi in &mut leaves {
+                if let Some(last) = vi.name.rsplit("::").next() {
+                    vi.name = last.to_string();
+                }
+            }
+            leaves.sort_by(|a, b| a.name.cmp(&b.name));
+            items.extend(leaves);
+        }
+
+        items
+    }
+
     pub(super) fn handle_variables(&mut self, req: &DapRequest) -> anyhow::Result<()> {
         let variables_reference = req
             .arguments
             .get("variablesReference")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow!("variables: missing arguments.variablesReference"))?;
+
+        // Lazy file-scope population (design-principles.md §2). The
+        // Statics scope and each namespace node hand back an empty
+        // placeholder ref; the level is materialised here, on the expand
+        // the user actually asked for — and only that level.
+        if let Some((thread_id, frame_num, kind)) = self.pending_scopes.remove(&variables_reference)
+        {
+            let items = match kind {
+                // Statics: build the namespace skeleton from cheap names;
+                // values are read only for leaves at this (root) level,
+                // sub-namespaces stay lazy.
+                super::frame::ScopeKind::Statics => {
+                    self.render_statics_level(variables_reference, thread_id, frame_num, &[])
+                }
+                // Thread-locals stay eager (few, and per-thread mutable):
+                // read + group the whole set in one go.
+                super::frame::ScopeKind::ThreadLocals => {
+                    let pid = self
+                        .thread_cache
+                        .get(&thread_id)
+                        .copied()
+                        .unwrap_or_else(|| Pid::from_raw(thread_id as i32));
+                    if let Some(dbg) = self.debugger.as_mut() {
+                        let _ = dbg.set_thread_into_focus_by_pid(pid);
+                        let _ = dbg.set_frame_into_focus(frame_num);
+                        read_thread_locals(dbg).unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                }
+                _ => Vec::new(),
+            };
+            self.vars.set(variables_reference, items);
+        } else if let Some((thread_id, frame_num, prefix)) =
+            self.pending_namespaces.remove(&variables_reference)
+        {
+            // Expanding a lazy namespace node — materialise just its level.
+            let items =
+                self.render_statics_level(variables_reference, thread_id, frame_num, &prefix);
+            self.vars.set(variables_reference, items);
+        } else if let Some((thread_id, frame_num, name)) =
+            self.pending_static_values.remove(&variables_reference)
+        {
+            // Expanding a deferred giant static — now read its value (the
+            // expensive bit the open deliberately skipped) and surface the
+            // value's own children (array elements / struct fields).
+            let pid = self
+                .thread_cache
+                .get(&thread_id)
+                .copied()
+                .unwrap_or_else(|| Pid::from_raw(thread_id as i32));
+            let children = if let Some(dbg) = self.debugger.as_mut() {
+                let _ = dbg.set_thread_into_focus_by_pid(pid);
+                let _ = dbg.set_frame_into_focus(frame_num);
+                let one: std::collections::HashSet<String> = std::iter::once(name).collect();
+                read_statics_flat_including(dbg, &one)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .next()
+                    .and_then(|vi| vi.child)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            self.vars.set(variables_reference, children);
+        }
 
         let vars = self
             .vars
@@ -113,12 +351,54 @@ impl super::DebugSession {
                 Some(t) if !t.is_empty() => format!("{} : {t}", v.name),
                 _ => v.name.clone(),
             };
-            out.push(json!({
+            // Variables-view §5.2: emit the mutability hint as
+            // (a) the standard `presentationHint.attributes =
+            // ["readOnly"]` for `ro` rows (so stock DAP clients
+            // italicise without needing our extension), and
+            // (b) a custom `bugstalker.mutability` field carrying
+            // the raw "ro"/"rw" string so the vscode-extension can
+            // paint the row-background hue.
+            let mut entry = json!({
                 "name": name_with_type,
                 "value": v.value,
                 "type": v.type_name,
                 "variablesReference": child_ref,
-            }));
+            });
+            if let Some(m) = v.mutability {
+                entry["bugstalker.mutability"] = json!(m);
+                if m == "ro" {
+                    entry["presentationHint"] = json!({
+                        "attributes": ["readOnly"],
+                    });
+                }
+            }
+            // Variables-view §5.3 — storage class + heap overlay.
+            // Both emitted as custom fields; no stock DAP equivalent.
+            if let Some(s) = v.storage {
+                entry["bugstalker.storage"] = json!(s);
+            }
+            if v.points_to_heap {
+                entry["bugstalker.points_to_heap"] = json!(true);
+            }
+            // Variables-view §5.5 — per-local byte size for the
+            // trailing size column + threshold tinting.
+            if let Some(bytes) = v.byte_size {
+                entry["bugstalker.byte_size"] = json!(bytes);
+            }
+            // Variables-view §5.6 — payload/padding split. Only
+            // emit when padding ≥ 5% of total (the
+            // showThresholdPct from §4) — below that the HSL
+            // split is visual noise.
+            if let Some(layout) = v.layout
+                && layout.padding_pct().is_some_and(|pct| pct >= 5)
+            {
+                entry["bugstalker.layout"] = json!({
+                    "totalBytes": layout.total,
+                    "payloadBytes": layout.payload,
+                    "paddingBytes": layout.padding,
+                });
+            }
+            out.push(entry);
         }
 
         self.send_success_body(req, json!({"variables": out}))
@@ -434,6 +714,32 @@ impl super::DebugSession {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("evaluate: missing arguments.expression"))?;
 
+        // VS Code sends `evaluate` with an empty/whitespace expression for
+        // internal probes (REPL prompt, hover over blank, watch
+        // placeholder). Answer benignly instead of surfacing a parser
+        // "found end of input" error to the user / the log.
+        if expression.trim().is_empty() {
+            return self.send_success_body(req, json!({"result": "", "variablesReference": 0}));
+        }
+
+        // Parse before touching the debugger so a hover over a non-variable
+        // token returns cleanly. VS Code auto-extracts whatever token is under
+        // the cursor for a hover, which is frequently not a DQE (integer
+        // literals like `0` in `0..len`, operators, keywords). For
+        // `context == "hover"` answer empty rather than surfacing a parser
+        // error to the IDE/log; REPL and watch expressions still report it.
+        let dqe = match bs_expr::parser().parse(expression).into_result() {
+            Ok(dqe) => dqe,
+            Err(e) => {
+                let context = req.arguments.get("context").and_then(|v| v.as_str());
+                if context == Some("hover") {
+                    return self
+                        .send_success_body(req, json!({"result": "", "variablesReference": 0}));
+                }
+                return Err(anyhow!("evaluate parse error: {e:?}"));
+            }
+        };
+
         let (body, elapsed) = {
             let dbg = self
                 .debugger
@@ -451,11 +757,6 @@ impl super::DebugSession {
                 let _ = dbg.set_thread_into_focus_by_pid(pid);
                 let _ = dbg.set_frame_into_focus(frame_num);
             }
-
-            let dqe = bs_expr::parser()
-                .parse(expression)
-                .into_result()
-                .map_err(|e| anyhow!("evaluate parse error: {e:?}"))?;
 
             let start = Instant::now();
             let results = dbg.read_variable(dqe).context("evaluate read_variable")?;
@@ -780,6 +1081,20 @@ fn is_tuple_field_set<'a, I: IntoIterator<Item = Option<&'a str>>>(names: I) -> 
     count > 0
 }
 
+/// Wrap a comma-joined tuple body in parens for inline display,
+/// adding the trailing comma Rust uses to disambiguate a 1-tuple
+/// (`(x,)`) from a merely parenthesised value (`(x)`). Only *bare*
+/// tuples get the comma — a single-field tuple struct or enum variant
+/// (`Wrap(x)`, `Ok(x)`) reads without one. `bare_tuple` is true when
+/// the value's own type name is parens-shaped (e.g. `(i32,)`).
+fn wrap_tuple_body(joined: &str, member_count: usize, bare_tuple: bool) -> String {
+    if bare_tuple && member_count == 1 {
+        format!("({joined},)")
+    } else {
+        format!("({joined})")
+    }
+}
+
 /// Phase 4 Tier-A — DAP renderer that consults the
 /// [`debugger::viz::VizRegistry`]. When the value is a struct
 /// whose type has a registered `summary` template, the rendered
@@ -974,7 +1289,8 @@ pub fn render_value_to_string_with_viz(
                 let joined = rendered.join(", ");
                 const MAX_INLINE_LEN: usize = 120;
                 if joined.len() <= MAX_INLINE_LEN {
-                    return format!("({joined})");
+                    let bare_tuple = type_name.starts_with('(');
+                    return wrap_tuple_body(&joined, members.len(), bare_tuple);
                 }
                 return "(…)".to_string();
             }
@@ -1205,6 +1521,16 @@ fn value_children(
                     child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
+                    // Variables-view §5.2 / §5.3: child rows skip
+                    // mutability / storage / heap hints in v0 —
+                    // top-level row already shows them. Per-field
+                    // inheritance from parent is a documented §7
+                    // follow-up.
+                    mutability: None,
+                    storage: None,
+                    points_to_heap: false,
+                    byte_size: None,
+                    layout: None,
                 });
             }
             Some(out)
@@ -1224,6 +1550,11 @@ fn value_children(
                     child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
+                    mutability: None,
+                    storage: None,
+                    points_to_heap: false,
+                    byte_size: None,
+                    layout: None,
                 });
             }
             Some(out)
@@ -1243,6 +1574,11 @@ fn value_children(
                     child: value_children(&qr, type_graph.clone(), viz),
                     write: value_write_meta(qr.value(), type_graph.clone()),
                     source: Some(qr.value().clone()),
+                    mutability: None,
+                    storage: None,
+                    points_to_heap: false,
+                    byte_size: None,
+                    layout: None,
                 });
             }
             Some(out)
@@ -1265,6 +1601,11 @@ fn value_children(
                         .and_then(|qr| value_children(qr, type_graph.clone(), viz)),
                     write: None,
                     source: cell_qr.map(|qr| qr.value().clone()),
+                    mutability: None,
+                    storage: None,
+                    points_to_heap: false,
+                    byte_size: None,
+                    layout: None,
                 });
             }
             Some(out)
@@ -1288,6 +1629,11 @@ fn value_children(
                     child: value_children(&deref_qr, type_graph.clone(), viz),
                     write: value_write_meta(deref_qr.value(), type_graph.clone()),
                     source: Some(deref_qr.value().clone()),
+                    mutability: None,
+                    storage: None,
+                    points_to_heap: false,
+                    byte_size: None,
+                    layout: None,
                 }];
                 Some(out)
             } else {
@@ -1306,6 +1652,11 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     for r in locals {
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
+        let mutability = mutability_hint(&r, dbg);
+        let storage = storage_hint(&r);
+        let points_to_heap = points_to_heap_hint(&r, dbg);
+        let byte_size = r.byte_size();
+        let layout = r.layout();
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1313,9 +1664,46 @@ pub fn read_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             child: value_children(&r, type_graph.clone(), viz),
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
+            mutability,
+            storage,
+            points_to_heap,
+            byte_size,
+            layout,
         });
     }
     Ok(out)
+}
+
+/// Variables-view §5.2: classify the variable's mutability and
+/// stringify it for the DAP custom field. Returns `None` when the
+/// classifier reports `Unknown` so we omit the field rather than
+/// emit an unhelpful `"unknown"` in the JSON.
+fn mutability_hint(
+    qr: &debugger::variable::execute::QueryResult<'_>,
+    dbg: &debugger::Debugger,
+) -> Option<&'static str> {
+    let m = debugger::variable::mutability::classify(qr, dbg);
+    match m {
+        debugger::variable::mutability::Mutability::Unknown => None,
+        other => Some(other.as_dap_str()),
+    }
+}
+
+/// Variables-view §5.3: stringify the storage class from a
+/// QueryResult. Returns the result already cached on the
+/// QueryResult by `DqeExecutor::root_from_die` — we don't redo
+/// the DWARF walk here.
+fn storage_hint(qr: &debugger::variable::execute::QueryResult<'_>) -> Option<&'static str> {
+    qr.storage().map(|s| s.as_dap_str())
+}
+
+/// Variables-view §5.3 heap overlay — `true` when the variable's
+/// value points into a heap-ish mapping (`[heap]` or anon RW).
+fn points_to_heap_hint(
+    qr: &debugger::variable::execute::QueryResult<'_>,
+    dbg: &debugger::Debugger,
+) -> bool {
+    debugger::variable::storage::value_points_to_heap(qr.value(), dbg)
 }
 
 pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
@@ -1327,6 +1715,11 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
     for r in args {
         let type_graph = Rc::new(r.type_graph().clone());
         let name = r.identity().to_string();
+        let mutability = mutability_hint(&r, dbg);
+        let storage = storage_hint(&r);
+        let points_to_heap = points_to_heap_hint(&r, dbg);
+        let byte_size = r.byte_size();
+        let layout = r.layout();
         out.push(VarItem {
             name,
             value: render_value_to_string_with_viz(r.value(), viz),
@@ -1334,9 +1727,476 @@ pub fn read_args(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
             child: value_children(&r, type_graph.clone(), viz),
             write: value_write_meta(r.value(), type_graph.clone()),
             source: Some(r.value().clone()),
+            mutability,
+            storage,
+            points_to_heap,
+            byte_size,
+            layout,
         });
     }
     Ok(out)
+}
+
+/// Variables-view §5.4 — populate the `Thread-locals` DAP scope.
+/// Defaults to the user's crate (filtering out std / dep thread-locals)
+/// so the pane stays useful. Unlike Statics (which is walked lazily per
+/// namespace), thread-locals are read eagerly: there are few of them and
+/// they're per-thread mutable.
+pub fn read_thread_locals(dbg: &debugger::Debugger) -> anyhow::Result<Vec<VarItem>> {
+    file_scope_var_items(
+        dbg,
+        debugger::variable::execute::FileScopeKind::ThreadLocals,
+        debugger::variable::execute::FileScopeFilter::CurrentCrate,
+    )
+}
+
+fn file_scope_var_items(
+    dbg: &debugger::Debugger,
+    kind: debugger::variable::execute::FileScopeKind,
+    filter: debugger::variable::execute::FileScopeFilter,
+) -> anyhow::Result<Vec<VarItem>> {
+    use debugger::variable::execute::FileScopeKind;
+    let entries = match kind {
+        FileScopeKind::Statics => dbg.read_static_variables(filter)?,
+        FileScopeKind::ThreadLocals => dbg.read_thread_local_variables(filter)?,
+    };
+    // Group the flat list into a navigable namespace tree
+    // (design-principles.md §4). The existing child machinery in
+    // `handle_variables` expands the tree level-by-level.
+    Ok(group_by_namespace(varitems_from_query_results(
+        entries, dbg,
+    )))
+}
+
+/// Flat (ungrouped) read of *only* the statics whose full identity path
+/// is in `include` — the immediate leaves of an expanded namespace
+/// (lazy expansion, design-principles.md §2). Statics outside the set
+/// cost no value read.
+pub fn read_statics_flat_including(
+    dbg: &debugger::Debugger,
+    include: &std::collections::HashSet<String>,
+) -> anyhow::Result<Vec<VarItem>> {
+    // `All`, not current-crate: the `include` set is the authoritative
+    // filter (the exact leaf names under the expanded namespace), and a
+    // current-crate filter would wrongly drop dependency leaves.
+    let entries = dbg.read_static_variables_including(
+        debugger::variable::execute::FileScopeFilter::All,
+        include,
+    )?;
+    Ok(varitems_from_query_results(entries, dbg))
+}
+
+/// One-row placeholder child for a lazy namespace node. Never displayed:
+/// `handle_variables` resolves the namespace's pre-registered
+/// `child_links` entry (→ a `pending_namespaces` ref) and ignores this.
+/// It exists only so the node reports a non-empty child, i.e. an expand
+/// arrow.
+fn lazy_child_placeholder() -> VarItem {
+    VarItem {
+        name: String::new(),
+        value: String::new(),
+        type_name: None,
+        child: None,
+        write: None,
+        source: None,
+        mutability: None,
+        storage: None,
+        points_to_heap: false,
+        byte_size: None,
+        layout: None,
+    }
+}
+
+/// A lazy namespace row: shows `label  (N)`, expandable, but its subtree
+/// is materialised only when the user opens it (the real child ref is
+/// pre-registered in `child_links` by `render_statics_level`).
+/// A leaf static at or above this many bytes is shown lazily (read on
+/// expand) rather than materialised when the Statics pane opens. Tuned
+/// above the largest statics that render instantly (a few KB) and well
+/// below the precomputed-table range (hundreds of KB) that stalls.
+pub const STATIC_LAZY_BYTES: u64 = 16 * 1024;
+
+/// Lazy node for a too-big-to-read-eagerly leaf static: shows a cheap
+/// size summary inline and an expand arrow; the value is read on expand
+/// (see `pending_static_values`).
+fn lazy_static_value_node(label: String, byte_size: Option<u64>) -> VarItem {
+    let value = match byte_size {
+        Some(b) => format!("… {} (expand to load)", human_bytes(b)),
+        None => "… (expand to load)".to_string(),
+    };
+    VarItem {
+        name: label,
+        value,
+        type_name: None,
+        child: Some(vec![lazy_child_placeholder()]),
+        write: None,
+        source: None,
+        mutability: None,
+        storage: None,
+        points_to_heap: false,
+        byte_size,
+        layout: None,
+    }
+}
+
+fn human_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 {
+        format!("{:.1} MB", b as f64 / (1024.0 * 1024.0))
+    } else if b >= 1024 {
+        format!("{:.0} KB", b as f64 / 1024.0)
+    } else {
+        format!("{b} B")
+    }
+}
+
+fn lazy_namespace_node(label: String, count: usize) -> VarItem {
+    VarItem {
+        name: label,
+        value: format!("({count})"),
+        type_name: None,
+        child: Some(vec![lazy_child_placeholder()]),
+        write: None,
+        source: None,
+        mutability: None,
+        storage: None,
+        points_to_heap: false,
+        byte_size: None,
+        layout: None,
+    }
+}
+
+/// Render a batch of file-scope query results into flat `VarItem`s with
+/// their full `::` identity-path names (ungrouped). Callers group into
+/// the namespace tree and/or merge with cached read-only entries.
+fn varitems_from_query_results(
+    entries: Vec<debugger::variable::execute::QueryResult<'_>>,
+    dbg: &debugger::Debugger,
+) -> Vec<VarItem> {
+    use debugger::variable::render::RenderValue;
+    let viz = Some(dbg.view_registry());
+    let mut out = Vec::new();
+    for r in entries {
+        let type_graph = Rc::new(r.type_graph().clone());
+        let name = r.identity().to_string();
+        let mutability = mutability_hint(&r, dbg);
+        let storage = storage_hint(&r);
+        let points_to_heap = points_to_heap_hint(&r, dbg);
+        let byte_size = r.byte_size();
+        let layout = r.layout();
+        out.push(VarItem {
+            name,
+            value: render_value_to_string_with_viz(r.value(), viz),
+            type_name: Some(r.value().r#type().to_string()),
+            child: value_children(&r, type_graph.clone(), viz),
+            write: value_write_meta(r.value(), type_graph.clone()),
+            source: Some(r.value().clone()),
+            mutability,
+            storage,
+            points_to_heap,
+            byte_size,
+            layout,
+        });
+    }
+    out
+}
+
+/// Group a flat list of file-scope variables into a namespace tree
+/// keyed by each entry's `::`-separated identity path
+/// (design-principles.md §4). `hyper_util::client::legacy::pool::
+/// __CALLSITE` becomes nested namespace nodes ending in a `__CALLSITE`
+/// leaf, so the pane is navigable instead of a flat unordered dump.
+/// Single-child namespace chains are collapsed (`a::b::c` shown as one
+/// node) so the user isn't forced to click through empty intermediate
+/// levels. Entries at each level are sorted (namespaces before leaves);
+/// each namespace node carries a `(N)` descendant-count summary and
+/// expands via the normal child-reference machinery.
+fn group_by_namespace(items: Vec<VarItem>) -> Vec<VarItem> {
+    let mut root = NsTrie::default();
+    for item in items {
+        // Owned segments so `item` can move into `insert` without the
+        // path borrow outliving it.
+        let segments: Vec<String> = item
+            .name
+            .split("::")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        root.insert(&segments, item);
+    }
+    root.into_varitems()
+}
+
+/// Namespace trie used by [`group_by_namespace`].
+#[derive(Default)]
+struct NsTrie {
+    /// Child namespaces, sorted by segment for stable display order.
+    subs: std::collections::BTreeMap<String, NsTrie>,
+    /// Statics declared at exactly this namespace level (name already
+    /// shortened to the final path segment).
+    leaves: Vec<VarItem>,
+}
+
+impl NsTrie {
+    fn insert(&mut self, segments: &[String], mut item: VarItem) {
+        match segments {
+            [] | [_] => {
+                // Leaf at this level — display only the final segment;
+                // the namespace path is now the row's ancestry.
+                if let Some(leaf) = segments.last() {
+                    item.name = leaf.clone();
+                }
+                self.leaves.push(item);
+            }
+            [head, rest @ ..] => {
+                self.subs
+                    .entry(head.clone())
+                    .or_default()
+                    .insert(rest, item);
+            }
+        }
+    }
+
+    /// Total descendant leaf (static) count, for the namespace summary.
+    fn leaf_count(&self) -> usize {
+        self.leaves.len() + self.subs.values().map(NsTrie::leaf_count).sum::<usize>()
+    }
+
+    fn into_varitems(self) -> Vec<VarItem> {
+        let mut out = Vec::new();
+        for (seg, sub) in self.subs {
+            let (label, sub) = collapse_chain(seg, sub);
+            let count = sub.leaf_count();
+            let children = sub.into_varitems();
+            out.push(namespace_node(label, count, children));
+        }
+        // Leaves after namespaces, sorted for a stable, scannable order.
+        let mut leaves = self.leaves;
+        leaves.sort_by(|a, b| a.name.cmp(&b.name));
+        out.extend(leaves);
+        out
+    }
+}
+
+/// Fold a chain of single-child, leaf-free namespaces into one label so
+/// `a` → `b` → `c` shows as `a::b::c` rather than three empty clicks.
+fn collapse_chain(mut label: String, mut node: NsTrie) -> (String, NsTrie) {
+    while node.leaves.is_empty() && node.subs.len() == 1 {
+        let (seg, sub) = node.subs.into_iter().next().expect("len == 1");
+        label.push_str("::");
+        label.push_str(&seg);
+        node = sub;
+    }
+    (label, node)
+}
+
+/// A synthetic namespace row: collapsible, no value of its own beyond a
+/// `(N)` descendant count, no storage/mutability/size metadata.
+fn namespace_node(name: String, leaf_count: usize, children: Vec<VarItem>) -> VarItem {
+    VarItem {
+        name,
+        value: format!("({leaf_count})"),
+        type_name: None,
+        child: Some(children),
+        write: None,
+        source: None,
+        mutability: None,
+        storage: None,
+        points_to_heap: false,
+        byte_size: None,
+        layout: None,
+    }
+}
+
+/// Namespace trie over static *names only* — no values. Powers the lazy
+/// Statics skeleton: each level is produced on expand without reading
+/// any static's value (design-principles.md §2, §4). Built once per
+/// process from the cheap interned-name enumeration and cached on the
+/// session, so navigating it costs no debugger work.
+#[derive(Default)]
+pub struct NameTrie {
+    subs: std::collections::BTreeMap<String, NameTrie>,
+    /// Full `::` identity paths of statics declared exactly at this level.
+    leaves: Vec<String>,
+}
+
+impl NameTrie {
+    /// Build from full `::` identity paths.
+    pub fn build(names: impl IntoIterator<Item = String>) -> Self {
+        let mut root = NameTrie::default();
+        for full in names {
+            let segs: Vec<&str> = full.split("::").filter(|s| !s.is_empty()).collect();
+            let last = segs.len().saturating_sub(1);
+            let mut node = &mut root;
+            for seg in &segs[..last] {
+                node = node.subs.entry((*seg).to_string()).or_default();
+            }
+            node.leaves.push(full);
+        }
+        root
+    }
+
+    fn total_leaves(&self) -> usize {
+        self.leaves.len()
+            + self
+                .subs
+                .values()
+                .map(NameTrie::total_leaves)
+                .sum::<usize>()
+    }
+
+    fn at(&self, prefix: &[String]) -> Option<&NameTrie> {
+        let mut node = self;
+        for seg in prefix {
+            node = node.subs.get(seg)?;
+        }
+        Some(node)
+    }
+}
+
+/// One immediate child namespace of a level: the display label
+/// (collapsed across single-child chains), the absolute prefix segments
+/// to reach the collapsed node when it is later expanded, and the
+/// descendant static count for the `(N)` summary.
+pub struct NamespaceChild {
+    pub label: String,
+    pub prefix: Vec<String>,
+    pub count: usize,
+}
+
+/// Immediate children of the level at `prefix`: lazy sub-namespace
+/// descriptors and the full names of leaf statics directly at this
+/// level (sorted). `None` when `prefix` isn't present in the trie.
+pub fn namespace_level(
+    trie: &NameTrie,
+    prefix: &[String],
+) -> Option<(Vec<NamespaceChild>, Vec<String>)> {
+    let node = trie.at(prefix)?;
+    let mut subs = Vec::new();
+    for (seg, child) in &node.subs {
+        // Collapse single-child, leaf-free chains (`a::b::c` as one node)
+        // so there are no empty intermediate clicks.
+        let mut label = seg.clone();
+        let mut abs = prefix.to_vec();
+        abs.push(seg.clone());
+        let mut cur = child;
+        while cur.leaves.is_empty() && cur.subs.len() == 1 {
+            let (s, c) = cur.subs.iter().next().expect("len == 1");
+            label.push_str("::");
+            label.push_str(s);
+            abs.push(s.clone());
+            cur = c;
+        }
+        subs.push(NamespaceChild {
+            label,
+            prefix: abs,
+            count: cur.total_leaves(),
+        });
+    }
+    let mut leaves = node.leaves.clone();
+    leaves.sort();
+    Some((subs, leaves))
+}
+
+#[cfg(test)]
+mod name_trie_tests {
+    use super::*;
+
+    fn level(names: &[&str], prefix: &[&str]) -> (Vec<(String, Vec<String>, usize)>, Vec<String>) {
+        let trie = NameTrie::build(names.iter().map(|s| s.to_string()));
+        let pfx: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+        let (subs, leaves) = namespace_level(&trie, &pfx).unwrap();
+        (
+            subs.into_iter()
+                .map(|c| (c.label, c.prefix, c.count))
+                .collect(),
+            leaves,
+        )
+    }
+
+    #[test]
+    fn root_level_collapses_chains_and_counts() {
+        let (subs, leaves) = level(&["a::b::X", "a::b::Y", "c::Z"], &[]);
+        assert_eq!(
+            subs,
+            vec![
+                (
+                    "a::b".to_string(),
+                    vec!["a".to_string(), "b".to_string()],
+                    2
+                ),
+                ("c".to_string(), vec!["c".to_string()], 1),
+            ]
+        );
+        assert!(leaves.is_empty());
+    }
+
+    #[test]
+    fn descend_to_leaves() {
+        let (subs, leaves) = level(&["a::b::X", "a::b::Y", "c::Z"], &["a", "b"]);
+        assert!(subs.is_empty());
+        assert_eq!(leaves, vec!["a::b::X".to_string(), "a::b::Y".to_string()]);
+    }
+
+    #[test]
+    fn root_level_static_is_a_leaf() {
+        let (subs, leaves) = level(&["X"], &[]);
+        assert!(subs.is_empty());
+        assert_eq!(leaves, vec!["X".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod namespace_tree_tests {
+    use super::*;
+
+    fn leaf(name: &str) -> VarItem {
+        VarItem {
+            name: name.into(),
+            value: "v".into(),
+            type_name: None,
+            child: None,
+            write: None,
+            source: None,
+            mutability: None,
+            storage: None,
+            points_to_heap: false,
+            byte_size: None,
+            layout: None,
+        }
+    }
+
+    fn names(items: &[VarItem]) -> Vec<&str> {
+        items.iter().map(|i| i.name.as_str()).collect()
+    }
+
+    #[test]
+    fn single_chain_is_collapsed() {
+        let out = group_by_namespace(vec![leaf("a::b::c::X"), leaf("a::b::c::Y")]);
+        assert_eq!(names(&out), ["a::b::c"]);
+        assert_eq!(out[0].value, "(2)");
+        assert_eq!(names(out[0].child.as_ref().unwrap()), ["X", "Y"]);
+    }
+
+    #[test]
+    fn branches_are_not_collapsed() {
+        let out = group_by_namespace(vec![leaf("a::b::X"), leaf("a::c::Y")]);
+        assert_eq!(names(&out), ["a"]);
+        assert_eq!(names(out[0].child.as_ref().unwrap()), ["b", "c"]);
+    }
+
+    #[test]
+    fn root_level_static_stays_a_leaf() {
+        let out = group_by_namespace(vec![leaf("X")]);
+        assert_eq!(names(&out), ["X"]);
+        assert!(out[0].child.is_none());
+    }
+
+    #[test]
+    fn namespaces_precede_sorted_leaves() {
+        let out = group_by_namespace(vec![leaf("Z"), leaf("m::A"), leaf("B")]);
+        // namespace `m` first, then root leaves sorted B, Z.
+        assert_eq!(names(&out), ["m", "B", "Z"]);
+    }
 }
 
 #[cfg(test)]
@@ -1346,6 +2206,26 @@ mod tuple_rendering_tests {
     #[test]
     fn empty_struct_is_not_a_tuple() {
         assert!(!is_tuple_field_set(std::iter::empty()));
+    }
+
+    #[test]
+    fn bare_one_tuple_gets_trailing_comma() {
+        // A 1-tuple must read as `("a",)`, not `("a")`, so it's
+        // clearly a tuple and not a parenthesised value.
+        assert_eq!(wrap_tuple_body("\"a\"", 1, true), "(\"a\",)");
+    }
+
+    #[test]
+    fn bare_multi_tuple_has_no_trailing_comma() {
+        assert_eq!(wrap_tuple_body("1, \"one\"", 2, true), "(1, \"one\")");
+    }
+
+    #[test]
+    fn one_field_tuple_struct_or_variant_has_no_comma() {
+        // `bare_tuple == false` for tuple structs / enum variants
+        // (`Wrap(x)`, `Ok(x)`) — the prefix is added by the caller and
+        // Rust writes those without a trailing comma.
+        assert_eq!(wrap_tuple_body("7", 1, false), "(7)");
     }
 
     #[test]

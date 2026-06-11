@@ -87,7 +87,25 @@ fuzz:
 clean-all:
 	find . -name Cargo.toml -print0 | xargs -0 -n1 dirname | xargs -n1 -I{} sh -c 'echo ">> cleaning {}"; (cd "{}" && cargo clean)'
 
+# On macOS, `bs` needs the com.apple.security.cs.debugger entitlement for
+# task_for_pid. The canonical install = cargo-install + adhoc-codesign +
+# `bugstalker` symlink lives in one place: the Earthly `+install-darwin`
+# target (see Earthfile). We delegate to it rather than duplicate the
+# codesign incantation here. Linux needs no signing, so it's a plain install.
 install:
-	cargo install --path .
+	@if [ "$$(uname)" = Darwin ]; then \
+		if command -v earthly >/dev/null 2>&1; then \
+			earthly +install-darwin; \
+		else \
+			echo "make install: macOS install routes through 'earthly +install-darwin'"; \
+			echo "(adhoc-signs bs with cs.debugger so task_for_pid works), but earthly"; \
+			echo "is not on PATH. Install earthly, or sign manually:"; \
+			echo "  cargo install --path . --bin bs --force && \\"; \
+			echo "  codesign -s - --force --entitlements tests/darwin.entitlements \"\$$HOME/.cargo/bin/bs\""; \
+			exit 1; \
+		fi; \
+	else \
+		cargo install --path .; \
+	fi
 
 .PHONY: build build-rel build-test build-test-rel build-examples-for-func-test build-examples build-all build-all-rel cargo-test nt nt-int int-test int-test-rel test test-rel lint bench deny fuzz clean-all install

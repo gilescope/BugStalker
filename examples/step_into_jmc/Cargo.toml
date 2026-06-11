@@ -1,0 +1,14 @@
+[package]
+name = "step_into_jmc"
+version = "0.0.0"
+edition = "2024"
+workspace = "./.."
+publish = false
+
+[[bin]]
+name = "step_into_jmc"
+path = "src/main.rs"
+
+[[bin]]
+name = "step_into_probe"
+path = "src/probe.rs"

@@ -107,9 +107,10 @@ bs-replay-driver = { path = "crates/bs-replay-driver" }
 # Live reverse stepping on macOS uses the Mach writable-memory checkpoint
 # primitives directly; trace-file navigation stays in bs-replay-driver.
 bs-replay = { path = "crates/bs-replay" }
-# Phase 6 perf overlay. Optional at the root so default builds keep
-# zero perf collector/linkage overhead; `bs-perf` itself stays pure
-# Rust until its `intel-pt` feature is enabled.
+# Phase 6 perf overlay. Pulled in by the `perf` feature, which is on by
+# default (see [features]); `--no-default-features` drops it for a
+# zero-overhead build. `bs-perf` stays pure Rust until its `intel-pt`
+# feature is enabled.
 bs-perf = { path = "crates/bs-perf", optional = true }
 thiserror = "1.0.69"
 bytes = "1.11.0"
@@ -183,6 +184,11 @@ mach2 = "0.6"
 serial_test = "3.2.0"
 criterion = { workspace = true }
 bs-test-harness = { path = "crates/bs-test-harness" }
+# Perf-cost ballpark tests (`tests/debugger/perf_cost.rs`) snapshot the
+# debuggee's `proc_pid_rusage` counters directly; the darwin module is the
+# same one the perf overlay measures through. Pure Rust, so harmless on Linux
+# (the consuming test module is macOS + `perf`-gated).
+bs-perf = { path = "crates/bs-perf" }
 # PTY-driven integration tests. `expectrl` is a `pexpect` port that
 # spawns the inferior via `posix_spawn` (not `fork`), so the test
 # process can have background threads — HTTP clients, signal
@@ -191,7 +197,10 @@ bs-test-harness = { path = "crates/bs-test-harness" }
 expectrl = "0.7"
 
 [features]
-default = []
+# `perf` is on by default so a plain `cargo install` gives a working perf
+# overlay. Opt out with `--no-default-features` if you want the zero-overhead
+# build (bs-perf is pure Rust, so the linkage cost is small either way).
+default = ["perf"]
 nightly = []
 int_test = ["nightly"]
 perf = ["dep:bs-perf"]
@@ -225,4 +234,14 @@ harness = false
 [[bench]]
 name = "attach_cold"
 path = "benches/attach_cold.rs"
+harness = false
+
+[[bench]]
+name = "statics_enumerate"
+path = "benches/statics_enumerate.rs"
+harness = false
+
+[[bench]]
+name = "stepping"
+path = "benches/stepping.rs"
 harness = false

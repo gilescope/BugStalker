@@ -144,18 +144,64 @@ impl super::DebugSession {
             anchor_index.saturating_sub(back_instructions)
         };
 
-        let instructions = instructions
+        // Interleave source: resolve each instruction's address to (file, line)
+        // and attach a `location`+`line` to the *first* instruction of each
+        // source-line run (DAP carries it forward to the rest) — this is what
+        // makes VS Code show Rust on the left, asm on the right.
+        let dbg = self
+            .debugger
+            .as_ref()
+            .ok_or_else(|| anyhow!("disassemble: debugger not initialized"))?;
+        let mut prev: Option<(String, u64)> = None;
+        let mut instructions = instructions
             .into_iter()
             .skip(start_index)
             .take(instruction_count as usize)
             .map(|ins| {
-                json!({
+                let mut obj = json!({
                     "address": format!("0x{:x}", ins.address),
                     "instructionBytes": ins.bytes_hex,
                     "instruction": ins.text,
-                })
+                });
+                if let Some((file, line, column)) = dbg.source_location_at(ins.address as usize) {
+                    let client = self
+                        .source_map
+                        .map_target_to_client(&file.to_string_lossy());
+                    if prev.as_ref() != Some(&(client.clone(), line)) {
+                        let name = file
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| client.clone());
+                        obj["location"] = json!({ "path": client, "name": name });
+                        obj["line"] = json!(line);
+                        obj["column"] = json!(column);
+                        prev = Some((client, line));
+                    }
+                }
+                obj
             })
             .collect::<Vec<_>>();
+
+        // DAP contract: return EXACTLY instructionCount entries. On x86-64 a
+        // context-before request starts disassembling `back × max_len` bytes
+        // early, and capstone can desync on the variable-length stream and
+        // stop short — arm64's fixed 4-byte instructions always fill the
+        // budget, which is why this only shows up on x86 CI. Pad the tail
+        // with explicit invalid entries (VS Code renders them greyed) rather
+        // than under-deliver, which desyncs the Disassembly View's scrolling.
+        let mut next_addr = instructions
+            .last()
+            .and_then(|i| i["address"].as_str())
+            .and_then(|a| u64::from_str_radix(a.trim_start_matches("0x"), 16).ok())
+            .map_or(anchor_addr as u64, |a| a + 1);
+        while instructions.len() < instruction_count as usize {
+            instructions.push(json!({
+                "address": format!("0x{next_addr:x}"),
+                "instruction": "??",
+                "instructionBytes": "",
+            }));
+            next_addr += 1;
+        }
 
         self.enqueue_progress_update(
             progress_id.clone(),
@@ -165,6 +211,64 @@ impl super::DebugSession {
         self.enqueue_progress_end(progress_id, Some("Disassembly complete".to_string()));
         self.drain_events()?;
         self.send_success_body(req, json!({ "instructions": instructions }))
+    }
+
+    /// `bs/currentFunctionName` — returns the demangled name of the function
+    /// containing the current PC, for display in the Source+ASM view header.
+    pub(super) fn handle_current_function_name(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let Some(dbg) = self.debugger.as_ref() else {
+            return self.send_err(req, "bs/currentFunctionName: no active session");
+        };
+        let name = dbg.current_function_name().unwrap_or_default();
+        self.send_success_body(req, json!({ "name": name }))
+    }
+
+    /// `bs/registers` — GPR values for the focus thread at the current stop,
+    /// as a `{ name: "0x…" }` map. The Source+ASM view uses these to show an
+    /// instruction's operand registers' live values in its hover tooltip.
+    pub(super) fn handle_registers(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let Some(dbg) = self.debugger.as_ref() else {
+            return self.send_err(req, "bs/registers: no active session");
+        };
+        let map: serde_json::Map<String, serde_json::Value> = dbg
+            .current_registers()
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), json!(format!("0x{value:x}"))))
+            .collect();
+        self.send_success_body(req, json!({ "registers": map }))
+    }
+
+    /// `bs/setAsmFocus` — notified by the extension when the Source+ASM webview
+    /// panel gains or loses focus. While focused, `handle_next`/`handle_step_in`
+    /// treat every step as `granularity: "instruction"` so F10/F11 step one
+    /// machine instruction without any keybinding overrides.
+    pub(super) fn handle_set_asm_focus(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let focused = req
+            .arguments
+            .get("focused")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        self.asm_view_focused = focused;
+        self.send_success(req)
+    }
+
+    /// `bs/functionBounds` — returns the relocated start/end addresses of the
+    /// function containing the current PC. The extension uses this to request a
+    /// full-function disassembly rather than a fixed instruction window.
+    pub(super) fn handle_function_bounds(&mut self, req: &DapRequest) -> anyhow::Result<()> {
+        let Some(dbg) = self.debugger.as_ref() else {
+            return self.send_err(req, "bs/functionBounds: no active session");
+        };
+        match dbg.current_function_address_range() {
+            Some((start, end)) => self.send_success_body(
+                req,
+                json!({
+                    "startAddress": format!("0x{start:x}"),
+                    "endAddress":   format!("0x{end:x}"),
+                }),
+            ),
+            None => self.send_success_body(req, json!({ "unavailable": true })),
+        }
     }
 
     pub fn disasm_source_for_address(
@@ -378,7 +482,7 @@ pub fn disassemble_from_address(
     let max_len = 16usize;
     let read_len = instruction_count.saturating_mul(max_len).max(max_len);
     let start = Instant::now();
-    let bytes = dbg
+    let mut bytes = dbg
         .read_memory(addr, read_len)
         .context("disassemble: read_memory")?;
     let elapsed = start.elapsed();
@@ -388,6 +492,9 @@ pub fn disassemble_from_address(
             timeout.as_millis()
         );
     }
+    // Restore original bytes at software-breakpoint addresses so the
+    // disassembler sees the real instructions, not the trap opcodes.
+    dbg.patch_disasm_buf(addr, &mut bytes);
     let insns = cs
         .disasm_all(&bytes, addr as u64)
         .map_err(|err| anyhow!("disassemble: disasm_all: {err}"))?;
@@ -430,7 +537,7 @@ pub fn disassemble_from_range(
     let read_len = len.min(max_len);
     let cs = new_capstone().map_err(|err| anyhow!("disassemble: init capstone: {err}"))?;
     let start = Instant::now();
-    let bytes = dbg
+    let mut bytes = dbg
         .read_memory(start_addr, read_len)
         .context("disassemble: read_memory")?;
     let elapsed = start.elapsed();
@@ -440,6 +547,7 @@ pub fn disassemble_from_range(
             timeout.as_millis()
         );
     }
+    dbg.patch_disasm_buf(start_addr, &mut bytes);
     let insns = cs
         .disasm_all(&bytes, start_addr as u64)
         .map_err(|err| anyhow!("disassemble: disasm_all: {err}"))?;

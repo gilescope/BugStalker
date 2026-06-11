@@ -8,6 +8,7 @@ use crate::debugger::debugee::dwarf::unit::die_ref::{Argument, FatDieRef, Typed,
 use crate::debugger::error::Error;
 use crate::debugger::error::Error::FunctionNotFound;
 use crate::debugger::variable::dqe::{DataCast, Dqe, PointerCast, Selector};
+use crate::debugger::variable::storage::StorageClass;
 use crate::debugger::variable::value::Value;
 use crate::debugger::variable::value::parser::{ParseContext, ValueModifiers, ValueParser};
 use crate::debugger::variable::r#virtual::VirtualVariableDie;
@@ -27,6 +28,81 @@ pub enum QueryResultKind {
     Expression,
 }
 
+/// Variables-view §5.6 — shallow payload / padding breakdown of
+/// a struct type. `total = payload + padding`; the vscode-
+/// extension uses the proportion to paint an HSL lightness split
+/// on the row background (payload at base lightness, padding at
+/// `base ± Δ`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutBreakdown {
+    /// `DW_AT_byte_size` of the struct.
+    pub total: u64,
+    /// Sum of member sizes — the bytes doing real work.
+    pub payload: u64,
+    /// `total - payload` — interior + trailing alignment slack.
+    pub padding: u64,
+}
+
+impl LayoutBreakdown {
+    /// Padding as a percentage of total (0–100). Returns `None`
+    /// when `total` is zero (a zero-sized type can't have
+    /// meaningful padding).
+    pub fn padding_pct(&self) -> Option<u8> {
+        if self.total == 0 {
+            return None;
+        }
+        Some((self.padding.saturating_mul(100) / self.total).min(100) as u8)
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn padding_pct_zero_total_is_none() {
+        let l = LayoutBreakdown {
+            total: 0,
+            payload: 0,
+            padding: 0,
+        };
+        assert_eq!(l.padding_pct(), None);
+    }
+
+    #[test]
+    fn padding_pct_basic_arithmetic() {
+        // 24-byte struct with 14 bytes of padding (58%).
+        let l = LayoutBreakdown {
+            total: 24,
+            payload: 10,
+            padding: 14,
+        };
+        assert_eq!(l.padding_pct(), Some(58));
+    }
+
+    #[test]
+    fn padding_pct_caps_at_100() {
+        // Pathological: padding exceeds total (shouldn't happen
+        // in practice but defensive saturation).
+        let l = LayoutBreakdown {
+            total: 8,
+            payload: 0,
+            padding: 16,
+        };
+        assert_eq!(l.padding_pct(), Some(100));
+    }
+
+    #[test]
+    fn padding_pct_zero_padding() {
+        let l = LayoutBreakdown {
+            total: 16,
+            payload: 16,
+            padding: 0,
+        };
+        assert_eq!(l.padding_pct(), Some(0));
+    }
+}
+
 /// Result of DQE evaluation.
 #[derive(Clone)]
 pub struct QueryResult<'a> {
@@ -37,6 +113,11 @@ pub struct QueryResult<'a> {
     base_type: Rc<ComplexType>,
     identity: Identity,
     evcx_builder: EvaluationContextBuilder<'a>,
+    /// Variables-view §5.3 storage class. Computed at construction
+    /// time from the variable's DW_AT_location expression + the
+    /// segment-kind index. `None` for results derived via DQE
+    /// (DataCast / PointerCast) where there's no source DIE.
+    storage: Option<StorageClass>,
 }
 
 impl QueryResult<'_> {
@@ -88,6 +169,62 @@ impl QueryResult<'_> {
     #[inline(always)]
     pub fn scope(&self) -> &Option<Box<[Range]>> {
         &self.scope
+    }
+
+    /// Variables-view §5.3 storage class. `None` for synthetic
+    /// QueryResults produced by DQE casts (no source DIE to walk).
+    #[inline(always)]
+    pub fn storage(&self) -> Option<StorageClass> {
+        self.storage
+    }
+
+    /// Variables-view §5.5 — total byte size of this value's type,
+    /// resolved from `DW_AT_byte_size` via the existing
+    /// `ComplexType::type_size_in_bytes` path. Returns `None` for
+    /// types whose size depends on dynamic runtime data the
+    /// evaluator can't determine (extremely rare for normal Rust
+    /// types — slices and dyn-trait fat pointers have a known
+    /// header size, the dynamic payload lives behind a pointer).
+    pub fn byte_size(&self) -> Option<u64> {
+        let graph = self.type_graph();
+        self.with_evcx(|evcx| graph.type_size_in_bytes(evcx, graph.root()))
+    }
+
+    /// Variables-view §5.6 — shallow payload-vs-padding breakdown
+    /// of this value's type. `payload` is the sum of the member
+    /// types' sizes; `padding = total - payload`. Computed only
+    /// for `Structure` types (where `Σ(members) < total` indicates
+    /// interior padding for alignment); `None` for primitives,
+    /// arrays, slices, pointers, and any type the evaluator can't
+    /// fully size. The vscode-extension uses this to paint the
+    /// HSL lightness split on the row background.
+    ///
+    /// Shallow only — nested structs' own padding is not summed.
+    /// Deep waste is harder to act on; the design doc defers it
+    /// to a follow-up.
+    pub fn layout(&self) -> Option<LayoutBreakdown> {
+        use crate::debugger::debugee::dwarf::r#type::TypeDeclaration;
+        let graph = self.type_graph();
+        let root = graph.root();
+        let decl = graph.types.get(&root)?;
+        let members: &[_] = match decl {
+            TypeDeclaration::Structure { members, .. } => members.as_slice(),
+            _ => return None,
+        };
+        self.with_evcx(|evcx| {
+            let total = graph.type_size_in_bytes(evcx, root)?;
+            let mut payload: u64 = 0;
+            for m in members {
+                let t = m.type_ref?;
+                payload = payload.saturating_add(graph.type_size_in_bytes(evcx, t)?);
+            }
+            let padding = total.saturating_sub(payload);
+            Some(LayoutBreakdown {
+                total,
+                payload,
+                padding,
+            })
+        })
     }
 
     /// Evaluate any function with evaluation context.
@@ -294,59 +431,71 @@ impl<'dbg> DqeExecutor<'dbg> {
         Ok(params)
     }
 
+    /// Build a [`QueryResult`] for the value referred to by `die_ref`.
+    /// Shared by [`Self::apply_select_die`] and the file-scope
+    /// enumeration path (variables-view §5.4). Returns `None` if any
+    /// of type resolution, value reading, or parsing fail — same
+    /// best-effort semantics as the variable selector path.
+    fn root_from_die<H: Typed>(
+        &self,
+        die_ref: &FatDieRef<'dbg, H>,
+        ranges: Option<Box<[Range]>>,
+    ) -> Option<QueryResult<'dbg>> {
+        // Storage classification (variables-view §5.3) happens at
+        // the call site, after this method returns — the caller
+        // knows whether it's looking at a Variable or Argument
+        // and we don't want to specialise on H here. Default `None`
+        // is then overwritten by `qr.storage = …`.
+        let storage = None;
+        let debugger = self.debugger;
+        let r#type = gcx().with_type_cache(|tc| weak_error!(type_from_cache!(die_ref, tc)))?;
+
+        let evaluator = ref_resolve_unit_call!(
+            die_ref,
+            evaluator,
+            &debugger.debugee,
+            die_ref.debug_info.dwarf()
+        );
+        let context_builder = EvaluationContextBuilder::Ready(debugger, evaluator);
+
+        let value = context_builder.with_evcx(|evcx| {
+            let data = die_ref.read_value(debugger.ecx(), &debugger.debugee, &r#type);
+
+            let parser = ValueParser::new();
+            let pcx = &ParseContext {
+                evcx,
+                type_graph: &r#type,
+                visited_allocations: Default::default(),
+                recursion_depth: Default::default(),
+            };
+            let modifiers = &ValueModifiers::from_identity(pcx, Identity::from_die(die_ref));
+            parser.parse(pcx, data, modifiers)
+        })?;
+
+        Some(QueryResult {
+            value: Some(value),
+            scope: ranges,
+            kind: QueryResultKind::Root,
+            base_type: r#type,
+            identity: Identity::from_die(die_ref),
+            evcx_builder: context_builder,
+            storage,
+        })
+    }
+
     /// Select variables or arguments from debugee state.
     fn apply_select_die(
         &self,
         selector: &Selector,
         on_args: bool,
     ) -> Result<Vec<QueryResult<'dbg>>, Error> {
-        fn root_from_die<'dbg, H: Typed>(
-            debugger: &'dbg Debugger,
-            die_ref: &FatDieRef<'dbg, H>,
-            ranges: Option<Box<[Range]>>,
-        ) -> Option<QueryResult<'dbg>> {
-            let r#type = gcx().with_type_cache(|tc| weak_error!(type_from_cache!(die_ref, tc)))?;
-
-            let evaluator = ref_resolve_unit_call!(
-                die_ref,
-                evaluator,
-                &debugger.debugee,
-                die_ref.debug_info.dwarf()
-            );
-            let context_builder = EvaluationContextBuilder::Ready(debugger, evaluator);
-
-            let value = context_builder.with_evcx(|evcx| {
-                let data = die_ref.read_value(debugger.ecx(), &debugger.debugee, &r#type);
-
-                let parser = ValueParser::new();
-                let pcx = &ParseContext {
-                    evcx,
-                    type_graph: &r#type,
-                    visited_allocations: Default::default(),
-                    recursion_depth: Default::default(),
-                };
-                let modifiers = &ValueModifiers::from_identity(pcx, Identity::from_die(die_ref));
-                parser.parse(pcx, data, modifiers)
-            })?;
-
-            Some(QueryResult {
-                value: Some(value),
-                scope: ranges,
-                kind: QueryResultKind::Root,
-                base_type: r#type,
-                identity: Identity::from_die(die_ref),
-                evcx_builder: context_builder,
-            })
-        }
-
         match on_args {
             true => {
                 let params = self.param_die_by_selector(selector)?;
                 Ok(params
                     .iter()
                     .filter_map(|arg_die| {
-                        root_from_die(
-                            self.debugger,
+                        self.root_from_die(
                             arg_die,
                             arg_die.max_range().map(|r| {
                                 let scope: Box<[Range]> = Box::new([r]);
@@ -358,10 +507,42 @@ impl<'dbg> DqeExecutor<'dbg> {
             }
             false => {
                 let vars = self.variable_die_by_selector(selector)?;
-                Ok(vars
+                let results: Vec<QueryResult<'dbg>> = vars
                     .iter()
-                    .filter_map(|var_die| root_from_die(self.debugger, var_die, var_die.ranges()))
-                    .collect())
+                    .filter_map(|var_die| {
+                        let mut qr = self.root_from_die(var_die, var_die.ranges())?;
+                        // Variables-view §5.3: now that root_from_die
+                        // has populated `qr.value` (and therefore
+                        // `value.in_memory_location()`), compute the
+                        // storage class by walking the DW_AT_location
+                        // expression + the segment-kind index.
+                        let addr = qr.value().in_memory_location();
+                        qr.storage = compute_storage_for_variable(var_die, addr, self.debugger);
+                        Some(qr)
+                    })
+                    .collect();
+
+                // Arguments (DW_TAG_formal_parameter) live in neither the
+                // variable index nor `local_variable` (both only match
+                // DW_TAG_variable), so a by-name lookup — used by DAP
+                // `evaluate`/hover, breakpoint conditions and log points —
+                // misses function parameters even though they're in scope
+                // and visible in the Arguments pane. Fall back to the
+                // parameter search for *name* selectors only; `Selector::Any`
+                // must stay locals-only so the Locals scope doesn't absorb
+                // the Arguments scope.
+                if results.is_empty()
+                    && matches!(
+                        selector,
+                        Selector::Name {
+                            local_only: false,
+                            ..
+                        }
+                    )
+                {
+                    return self.apply_select_die(selector, true);
+                }
+                Ok(results)
             }
         }
     }
@@ -404,6 +585,9 @@ impl<'dbg> DqeExecutor<'dbg> {
             base_type: r#type,
             identity: Identity::default(),
             evcx_builder: context_builder,
+            // Synthetic QueryResult — no source DIE to walk for
+            // storage classification (variables-view §5.3).
+            storage: None,
         })
     }
 
@@ -461,6 +645,9 @@ impl<'dbg> DqeExecutor<'dbg> {
             base_type: r#type,
             identity: Identity::default(),
             evcx_builder: context_builder,
+            // Synthetic QueryResult — no source DIE to walk for
+            // storage classification (variables-view §5.3).
+            storage: None,
         })
     }
 
@@ -556,5 +743,310 @@ impl<'dbg> DqeExecutor<'dbg> {
             }
             _ => unreachable!("unexpected expression variant"),
         }
+    }
+
+    /// Enumerate every file-scope `DW_TAG_variable` in the debugee
+    /// (statics + thread-locals), filtered by `kind` and `filter`.
+    /// Backs the variables-pane `Statics` / `Thread-locals` scopes
+    /// (variables-view §5.4).
+    ///
+    /// `kind` selects statics vs thread-locals. TLS classification
+    /// is by the rustc `thread_local!` lowering: a `DW_TAG_variable`
+    /// named `__KEY`, `VAL`, or `__RUST_STD_INTERNAL_VAL` is a TLS
+    /// internal; everything else is a static.
+    ///
+    /// `filter` controls breadth — see [`FileScopeFilter`].
+    pub fn query_file_scope(
+        &self,
+        kind: FileScopeKind,
+        filter: FileScopeFilter,
+        exclude: &std::collections::HashSet<String>,
+        include: Option<&std::collections::HashSet<String>>,
+    ) -> Result<Vec<QueryResult<'dbg>>, Error> {
+        let tls_names = TlsInternalNames::resolve();
+        let current_crate = match filter {
+            FileScopeFilter::CurrentCrate => self.current_crate_namespace_root(),
+            _ => None,
+        };
+        let current_unit_id = match filter {
+            FileScopeFilter::CurrentUnit => self.current_unit_id(),
+            _ => None,
+        };
+
+        let mut out = Vec::new();
+        for debug_info in self.debugger.debugee.debug_info_all() {
+            let Ok(entries) = debug_info.enumerate_file_scope_variables() else {
+                continue;
+            };
+            for (meta, die_ref) in entries {
+                let is_tls = tls_names.is_tls_internal(meta.name_sym);
+                match kind {
+                    FileScopeKind::Statics if is_tls => continue,
+                    FileScopeKind::ThreadLocals if !is_tls => continue,
+                    _ => {}
+                }
+                if let Some(crate_root) = current_crate.as_ref()
+                    && meta.namespace.as_parts().first() != Some(crate_root)
+                {
+                    continue;
+                }
+                if let Some(uid) = current_unit_id
+                    && die_ref.unit().id != uid
+                {
+                    continue;
+                }
+                // Name-based include/exclude (variables-view, design-
+                // principles.md §2, §3). `exclude` carries read-only
+                // statics already cached from an earlier stop (skip the
+                // read — value can't change); `include`, when present,
+                // restricts the read to a specific set (the immediate
+                // leaves of an expanded namespace). The identity is built
+                // from the cached interned metadata (`name_sym` +
+                // `namespace`), NOT `Identity::from_die`, which would
+                // deref the DIE — both were interned from the same DIE at
+                // parse time, so the `to_string()` matches the result
+                // identity below while reading no DIE attributes.
+                if !exclude.is_empty() || include.is_some() {
+                    let name =
+                        gcx().with_interner(|i| i.resolve(meta.name_sym).map(str::to_string));
+                    let key = Identity::new(meta.namespace.clone(), name).to_string();
+                    if exclude.contains(&key) {
+                        continue;
+                    }
+                    if include.is_some_and(|inc| !inc.contains(&key)) {
+                        continue;
+                    }
+                }
+                // `root_from_die` may return None for TLS internals
+                // whose runtime slot hasn't been initialised on the
+                // current thread (variables-view §5.4 known limit) —
+                // silently drop those entries for v0. A future
+                // refactor could surface them with an "<unavailable>"
+                // placeholder so the user still sees the name.
+                if let Some(mut qr) = self.root_from_die(&die_ref, None) {
+                    // Variables-view §5.3 storage class for the
+                    // file-scope enumeration path (statics + TLS).
+                    let addr = qr.value().in_memory_location();
+                    qr.storage = compute_storage_for_variable(&die_ref, addr, self.debugger);
+                    out.push(qr);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Cheap names-only enumeration of file-scope variables (the same
+    /// `kind`/`filter` rules as [`Self::query_file_scope`]) — returns the
+    /// full `::` identity path of each matching static **without** any
+    /// value read or DIE deref (names come from the interned metadata).
+    /// Powers the lazy Statics skeleton (design-principles.md §2): build
+    /// the namespace tree from names, read values only for the subtree
+    /// the user expands.
+    pub fn query_file_scope_names(
+        &self,
+        kind: FileScopeKind,
+        filter: FileScopeFilter,
+    ) -> Result<Vec<String>, Error> {
+        let tls_names = TlsInternalNames::resolve();
+        let current_crate = match filter {
+            FileScopeFilter::CurrentCrate => self.current_crate_namespace_root(),
+            _ => None,
+        };
+        let current_unit_id = match filter {
+            FileScopeFilter::CurrentUnit => self.current_unit_id(),
+            _ => None,
+        };
+
+        let mut out = Vec::new();
+        for debug_info in self.debugger.debugee.debug_info_all() {
+            let Ok(entries) = debug_info.enumerate_file_scope_variables() else {
+                continue;
+            };
+            for (meta, die_ref) in entries {
+                let is_tls = tls_names.is_tls_internal(meta.name_sym);
+                match kind {
+                    FileScopeKind::Statics if is_tls => continue,
+                    FileScopeKind::ThreadLocals if !is_tls => continue,
+                    _ => {}
+                }
+                if let Some(crate_root) = current_crate.as_ref()
+                    && meta.namespace.as_parts().first() != Some(crate_root)
+                {
+                    continue;
+                }
+                if let Some(uid) = current_unit_id
+                    && die_ref.unit().id != uid
+                {
+                    continue;
+                }
+                let name = gcx().with_interner(|i| i.resolve(meta.name_sym).map(str::to_string));
+                out.push(Identity::new(meta.namespace.clone(), name).to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Like [`Self::query_file_scope_names`] but pairs each name with a
+    /// cheap, no-value byte-size from `DW_AT_byte_size` (see
+    /// [`ComplexType::static_byte_size`]). Used to gate eager value reads
+    /// so a giant static (a precomputed crypto table, …) is shown lazily
+    /// instead of materialised on open. `None` size means "unknown" —
+    /// the caller should read it normally.
+    pub fn query_file_scope_name_sizes(
+        &self,
+        kind: FileScopeKind,
+        filter: FileScopeFilter,
+    ) -> Result<Vec<(String, Option<u64>)>, Error> {
+        let tls_names = TlsInternalNames::resolve();
+        let current_crate = match filter {
+            FileScopeFilter::CurrentCrate => self.current_crate_namespace_root(),
+            _ => None,
+        };
+        let current_unit_id = match filter {
+            FileScopeFilter::CurrentUnit => self.current_unit_id(),
+            _ => None,
+        };
+
+        let mut out = Vec::new();
+        for debug_info in self.debugger.debugee.debug_info_all() {
+            let Ok(entries) = debug_info.enumerate_file_scope_variables() else {
+                continue;
+            };
+            for (meta, die_ref) in entries {
+                let is_tls = tls_names.is_tls_internal(meta.name_sym);
+                match kind {
+                    FileScopeKind::Statics if is_tls => continue,
+                    FileScopeKind::ThreadLocals if !is_tls => continue,
+                    _ => {}
+                }
+                if let Some(crate_root) = current_crate.as_ref()
+                    && meta.namespace.as_parts().first() != Some(crate_root)
+                {
+                    continue;
+                }
+                if let Some(uid) = current_unit_id
+                    && die_ref.unit().id != uid
+                {
+                    continue;
+                }
+                let name = gcx().with_interner(|i| i.resolve(meta.name_sym).map(str::to_string));
+                let size = die_ref.r#type().and_then(|t| t.static_byte_size());
+                out.push((
+                    Identity::new(meta.namespace.clone(), name).to_string(),
+                    size,
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Namespace root component (the user's crate name) for the
+    /// current function. Returns `None` if the PC isn't in a known
+    /// compilation unit / function — falls back to "no crate
+    /// filter" so the user still sees *something*.
+    fn current_crate_namespace_root(&self) -> Option<String> {
+        let ecx = self.debugger.ecx();
+        let debugee = &self.debugger.debugee;
+        let di = debugee.debug_info(ecx.location().pc).ok()?;
+        let (func, _) = di.find_function_by_pc(ecx.location().global_pc).ok()??;
+        let ns = func.namespace();
+        ns.as_parts().first().cloned()
+    }
+
+    /// Compilation-unit id for the current PC's function. Returns
+    /// `None` if the PC isn't in a known compilation unit.
+    fn current_unit_id(&self) -> Option<uuid::Uuid> {
+        let ecx = self.debugger.ecx();
+        let debugee = &self.debugger.debugee;
+        let di = debugee.debug_info(ecx.location().pc).ok()?;
+        let (func, _) = di.find_function_by_pc(ecx.location().global_pc).ok()??;
+        Some(func.unit().id)
+    }
+}
+
+/// Breadth filter for [`DqeExecutor::query_file_scope`]. See
+/// variables-view.md §4 for the user-facing setting key
+/// (`variablesView.statics.scope`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileScopeFilter {
+    /// Only variables whose namespace root matches the current
+    /// frame's crate. **Default.** Avoids flooding the pane with
+    /// std / dependency statics.
+    CurrentCrate,
+    /// Only variables in the current PC's compilation unit.
+    CurrentUnit,
+    /// All file-scope variables across all loaded debug-info.
+    All,
+}
+
+/// Which slice of the file-scope variable space to surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileScopeKind {
+    /// `static`s (any segment).
+    Statics,
+    /// `thread_local!`s.
+    ThreadLocals,
+}
+
+/// Walk a Variable DIE's `DW_AT_location` and classify the storage
+/// class (variables-view §5.3). Cross-references the evaluated
+/// address (passed in via `addr` from the parsed Value, no need to
+/// re-evaluate) with the segment-kind index to split Static into
+/// RO / RW.
+fn compute_storage_for_variable(
+    die_ref: &FatDieRef<'_, Variable>,
+    addr: Option<usize>,
+    dbg: &Debugger,
+) -> Option<StorageClass> {
+    use crate::debugger::variable::storage;
+    let pc = dbg.ecx().location().global_pc;
+    let expr = die_ref.location_expression(pc);
+    let encoding = die_ref.unit_encoding();
+    Some(storage::classify(expr.as_ref(), addr, encoding, dbg))
+}
+
+/// Interned name symbols for the three names rustc gives to
+/// `thread_local!` internals. Cached for fast `is_tls_internal`
+/// checks across many variables in one enumeration pass.
+struct TlsInternalNames {
+    key: Option<string_interner::DefaultSymbol>,
+    val: Option<string_interner::DefaultSymbol>,
+    rust_std_internal: Option<string_interner::DefaultSymbol>,
+}
+
+impl TlsInternalNames {
+    fn resolve() -> Self {
+        let lookup = |name: &str| gcx().with_interner(|i| i.get(name));
+        Self {
+            key: lookup("__KEY"),
+            val: lookup("VAL"),
+            rust_std_internal: lookup("__RUST_STD_INTERNAL_VAL"),
+        }
+    }
+
+    fn is_tls_internal(&self, sym: string_interner::DefaultSymbol) -> bool {
+        Some(sym) == self.key || Some(sym) == self.val || Some(sym) == self.rust_std_internal
+    }
+}
+
+#[cfg(test)]
+mod tls_classification_tests {
+    use super::*;
+
+    /// Intern the three known TLS internal names + a control, then
+    /// check the classifier picks them correctly. Uses the real
+    /// global interner so the prod path is exercised.
+    #[test]
+    fn classifies_only_rustc_tls_internals() {
+        let key = gcx().with_interner(|i| i.get_or_intern("__KEY"));
+        let val = gcx().with_interner(|i| i.get_or_intern("VAL"));
+        let rsi = gcx().with_interner(|i| i.get_or_intern("__RUST_STD_INTERNAL_VAL"));
+        let other = gcx().with_interner(|i| i.get_or_intern("MY_STATIC"));
+
+        let names = TlsInternalNames::resolve();
+        assert!(names.is_tls_internal(key));
+        assert!(names.is_tls_internal(val));
+        assert!(names.is_tls_internal(rsi));
+        assert!(!names.is_tls_internal(other));
     }
 }

@@ -5,7 +5,7 @@ use crate::debugger::debugee::dwarf::{DebugInformation, EndianArcSlice};
 use crate::weak_error;
 use gimli::{Attribute, AttributeValue, Expression};
 
-pub(super) struct Location<'a>(pub(super) &'a Attribute<EndianArcSlice>);
+pub struct Location<'a>(pub &'a Attribute<EndianArcSlice>);
 
 impl Location<'_> {
     /// Converts location attribute to a dwarf expression.
@@ -17,7 +17,7 @@ impl Location<'_> {
     /// - DW_FORM_loclistx
     ///
     ///  Return `None` otherwise.
-    pub(super) fn try_as_expression(
+    pub fn try_as_expression(
         &self,
         di: &DebugInformation<EndianArcSlice>,
         unit: &BsUnit,

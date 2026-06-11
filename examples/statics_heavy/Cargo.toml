@@ -1,0 +1,11 @@
+[package]
+name = "statics_heavy"
+version = "0.0.0"
+edition = "2024"
+workspace = "./.."
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "statics_heavy"
+path = "src/main.rs"
