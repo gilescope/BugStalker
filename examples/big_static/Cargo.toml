@@ -1,0 +1,10 @@
+[package]
+name = "big_static"
+version = "0.0.0"
+edition = "2024"
+workspace = "./.."
+publish = false
+
+[[bin]]
+name = "big_static"
+path = "src/main.rs"

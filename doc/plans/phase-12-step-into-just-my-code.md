@@ -133,9 +133,16 @@ abusing the `granularity` field — not ours to repurpose.
 
 ## Settings
 
-- `bugstalker.stepInto.skipLibraries` (bool, default **true**) — the
-  default for plain DAP `stepIn` (toolbar / non-keybinding). The
-  keybindings always pick a mode explicitly and ignore this.
+**Not yet wired (v0 ships none of these).** The classifier uses a
+hard-coded path heuristic (`LIBRARY_PATH_FRAGMENTS` in
+`src/debugger/step.rs`) and the toolbar button stays `AnyFrame`. These
+were intentionally *not* declared in `package.json` rather than ship
+dead config keys; add them when the adapter actually consumes them.
+
+- `bugstalker.stepInto.skipLibraries` (bool, default **true**) — would
+  be the default for plain DAP `stepIn` (toolbar / non-keybinding); the
+  keybindings always pick a mode explicitly and ignore it. (Toolbar
+  default is still an open question below.)
 - `bugstalker.stepInto.libraryPaths` / `...alsoMine` (string[],
   optional) — extra path fragments to force library / force-user.
 
@@ -177,14 +184,84 @@ user closure (`[1,2,3].iter().map(user_fn).sum()`).
 
 ## Phasing
 
-1. `step_into_with(SkipLibraries)` MVP (step-over-the-lib) + user/lib
-   path classifier + unit tests on the classifier.
-2. `bs/stepIn` custom request + `step_into_with` dispatch + DAP
-   integration test.
-3. Extension: two commands + keybindings (`alt+right` /
-   `shift+alt+right`), `lldb` alias, settings.
-4. Upgrade the engine to the full callback-aware walk; flip the (b)
-   test from known-gap to passing.
+1. ✅ **Done.** `step_into_with(SkipLibraries)` MVP + `FrameKind` /
+   `classify_source_path` path classifier (`src/debugger/step.rs`) +
+   classifier unit tests + doctest. The engine is a **single walk**:
+   `step_in`; if the landing frame is library, climb out with
+   `step_out_frame`; then stop *iff* the displayed source line is user
+   code **and** differs from the start line — otherwise keep walking.
+   This one loop steps **over** library calls but **into** user calls in
+   execution order, and never strands you on the start line. Three
+   subtleties, each found by stepping real programs to the end (see the
+   sweep test `test_skip_libs_never_stops_in_library`):
+   - **Frame vs. line classification.** The climb/skip decision uses the
+     **real frame function's** own file (its first range's place), not
+     `find_place_from_pc` — so an *inlined* library call (`iter().map`)
+     inside a user line doesn't look like a library frame. But the *stop*
+     decision uses the displayed **place** file: we won't stop on an
+     inlined library line (`boxed.rs` spliced into a user fn) even though
+     its frame is user — we'd be showing the user `boxed.rs`.
+   - **Library-then-user on one line.** `helper(&v)` does a `Vec`→`&[T]`
+     deref (library) *then* calls the user `helper`. After skipping the
+     deref we're mid-line, so we keep walking rather than step-over the
+     line — and step *into* `helper`. (Stepping over here was the first
+     bug the sweep caught.)
+   - **Off the end of `main`.** When the climb finds no user frame to
+     return to (stepped past all user code into the C runtime), the step
+     degrades to run-to-completion (`continue_to_stop`) — exit or next
+     breakpoint — instead of erroring on no-debug-info runtime.
+2. ✅ **Done.** `bs/stepIn` custom request (`skipLibraries` bool) →
+   `step_into_with` dispatch (`src/dap/yadap/session/control.rs`,
+   `…/session/mod.rs`) + DAP integration tests
+   (`tests/dap/dap_integration.rs`) + direct-debugger test
+   (`tests/debugger/steps.rs::test_step_into_skip_libraries`) over the
+   `examples/step_into_jmc` fixture. Plain DAP `stepIn` (toolbar) stays
+   `AnyFrame`.
+3. ✅ **Done.** Extension: `…stepIntoSkipLibs` / `…stepIntoAnyFrame`
+   commands (`extension/stepInto.ts`) sending the custom request,
+   keybindings `alt+right` (skip libs) / `shift+alt+right` (any frame)
+   scoped per `debugType`, `lldb` alias. Settings deferred — v0 is the
+   hard-coded path heuristic (see Settings note below).
+4. ⏸️ **Deferred (2026-05-30).** The full callback-aware walk. The
+   blind-but-fast `step_out`/`continue` the MVP uses can't pause in a
+   user closure the library invokes (`iter().map(user_fn)`) — catching
+   it costs either speed (single-step the whole library, regressing the
+   headline `println!` case) or machinery (breakpoint every user fn +
+   return addr, then one `continue`, plus inlining/async/recursion
+   corners). Decision: ship the MVP; the callback case has adequate
+   workarounds — `shift+alt+right` (any-frame) and step through, or set
+   a breakpoint in your own code. The MVP behaviour is **pinned by
+   tests** (`…callback_is_stepped_over_mvp`, and line `28` in the direct
+   test) so the future engine upgrade is a deliberate, visible flip.
+
+## Unwinder fix (found while stepping real binaries)
+
+Stepping a real wild-linked binary (whisky-csl tests) erupted in
+`dwarf file parsing error: no unwind info for address` the moment a step
+descended into a trivial library function (`Vec::new`). Root cause, found
+by instrumenting `get_cfa`:
+
+- **macOS compact unwind was silently dead.** `compact_cfa_at` /
+  `compact_function_range_at` looked the PC up in the `__unwind_info`
+  table with `u32::try_from(global_pc)`. On macOS arm64 every PC is
+  `image_base + offset` with `image_base ≈ 0x1_0000_0000`, so the cast
+  **always overflowed** → every lookup returned `None`. It only ever
+  "worked" because `__eh_frame` happened to cover the functions tested;
+  the first function with *only* compact unwind (no FDE) exposed it.
+  Fix: subtract the image base (the `__TEXT` segment vmaddr —
+  `object`'s `relative_address_base()` returns 0 for Mach-O, so read the
+  segment) before the u32 lookup. `src/debugger/debugee/dwarf/mod.rs`.
+- **The full unwinder (`unwind.rs`) had no compact fallback at all.**
+  `return_address` / backtraces used only `__eh_frame` / `.debug_frame`,
+  so `step_out_frame` couldn't climb out of a frameless library leaf.
+  Added a compact-unwind return-address fallback: frameless → RA in `lr`;
+  frame-based → RA at `[fp+8]` (`CompactUnwind` enum + `compact_unwind_at`).
+
+With both, skip-libs steps cleanly through real user code on macOS arm64
+instead of erroring. Note the underlying `step_in` fragility (it can't
+introspect stripped system dylibs at all) is handled in the engine by
+treating a recoverable step error as "entered foreign code → climb out"
+(`is_recoverable_step_error`).
 
 ## Open questions
 

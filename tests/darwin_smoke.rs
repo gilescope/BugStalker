@@ -702,10 +702,18 @@ fn dap_startup_resigns_when_entitlement_missing() {
     // Adhoc-sign WITHOUT the entitlement (arm64 refuses to exec a fully
     // unsigned binary, so this models the real "signed but unentitled" case).
     assert!(
-        Command::new("codesign").args(["-s", "-", "--force"]).arg(&copy).status().unwrap().success(),
+        Command::new("codesign")
+            .args(["-s", "-", "--force"])
+            .arg(&copy)
+            .status()
+            .unwrap()
+            .success(),
         "adhoc sign failed",
     );
-    assert!(!has_entitlement(&copy), "copy must start without the entitlement");
+    assert!(
+        !has_entitlement(&copy),
+        "copy must start without the entitlement"
+    );
 
     // Empty stdin → the DAP loop hits EOF and exits right after the startup
     // check. Must not inherit BS_AUTO_SIGN_TRIED (would skip the re-sign).

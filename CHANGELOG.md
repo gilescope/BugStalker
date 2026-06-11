@@ -7,6 +7,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- macOS step-cost correction (`debug-step-costs.md` #3):
+  - New `bs_perf::TrapFloor` (`crates/bs-perf/src/trap_floor.rs`) —
+    `proc_pid_rusage` charges each debugger trap's Mach-exception +
+    ptrace round-trip (~35k instructions) to the debuggee, swamping a
+    stepped line's real cost. `TrapFloor` passively learns that fixed
+    per-trap floor as a rolling-min over observed steps and subtracts
+    `traps × floor` from each step's instruction/cycle delta — no extra
+    traps, no debuggee perturbation. Trivial stepped lines drop from
+    ~73k to single-digit-k.
+  - `Debugee` / `Debugger` gained `trap_count()` / `reset_trap_count()`;
+    the macOS perf session brackets the trap count per window and emits
+    the corrected `runInstructions` / `runCycles`.
+
 - segment-index refresh-on-stop (variables-view §5.3 follow-up):
   - New `DwarfRegistry::refresh_segment_index()` re-reads
     `proc_maps` and rebuilds just the segment-writability +

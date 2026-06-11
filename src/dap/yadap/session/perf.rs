@@ -76,6 +76,19 @@ pub(super) struct PerfOverlaySession {
     /// would otherwise hang). Thawed in `finish_perf_stop` / on drop.
     #[cfg(target_os = "macos")]
     freeze_guard: Option<ThreadFreezeGuard>,
+    /// Passive per-trap overhead floor, learned from the user's own steps. Used
+    /// to subtract the fixed Mach-exception/ptrace round-trip cost (~35k instr
+    /// per trap) the rusage counters charge to the debuggee out of each step's
+    /// instruction/cycle delta. Persists across runs — only the debugger's trap
+    /// *count* resets per window. See `bs_perf::TrapFloor`.
+    #[cfg(target_os = "macos")]
+    trap_floor: bs_perf::TrapFloor,
+    /// Exact per-line instruction count for the step just taken, when the step
+    /// path obtained one (`Debugger::step_over_or_count` on a no-call line).
+    /// `Some` overrides the rusage-derived `runInstructions` with the true count
+    /// (see `debug-step-costs.md` #3); `None` falls back to rusage − `TrapFloor`.
+    /// Reset at the start of each step window.
+    last_exact_instructions: Option<u64>,
 }
 
 /// macOS in-flight run state. Owns the rusage start snapshot, the
@@ -272,6 +285,11 @@ impl super::DebugSession {
         self.perf_overlay.unavailable = None;
         self.perf_overlay.darwin_run = None;
         self.perf_overlay.last_wait_syscall = None;
+        // Start the trap count for this window; finish_perf_stop reads it to
+        // subtract the per-trap rusage overhead.
+        if let Some(dbg) = self.debugger.as_mut() {
+            dbg.reset_trap_count();
+        }
 
         let Some((proc_pid, program)) = self
             .debugger
@@ -574,8 +592,14 @@ impl super::DebugSession {
             self.perf_overlay.last_wait_syscall = dominant_wait_syscall(&drain.syscalls);
         }
 
-        // 2) Take the rusage end snapshot and close the window.
-        let Some(proc_pid) = self.debugger.as_ref().map(|dbg| dbg.process().pid()) else {
+        // 2) Take the rusage end snapshot and close the window. Grab the trap
+        // count for the window in the same borrow — it drives the per-trap
+        // overhead subtraction below.
+        let Some((proc_pid, traps)) = self
+            .debugger
+            .as_ref()
+            .map(|dbg| (dbg.process().pid(), dbg.trap_count()))
+        else {
             // Debugger gone — finalise with what we have.
             let wall_ns = run
                 .rusage_start
@@ -592,13 +616,32 @@ impl super::DebugSession {
         match bs_perf::darwin::ProcessSnapshot::capture(proc_pid.as_raw()) {
             Ok(end) => {
                 let delta = end.delta_since(run.rusage_start);
-                let instructions = if delta.instructions != 0 {
-                    Some(delta.instructions)
-                } else {
-                    None
-                };
+                // Subtract the fixed per-trap kernel/exception overhead the
+                // rusage counters charge to the debuggee for each debugger trap
+                // (see `bs_perf::TrapFloor`). Correct using the floor learned
+                // from *prior* steps, then fold this step in — so a step can't
+                // cancel itself to zero.
+                let cycles = self
+                    .perf_overlay
+                    .trap_floor
+                    .corrected_cycles(delta.cycles, traps);
+                let corrected_instructions = self
+                    .perf_overlay
+                    .trap_floor
+                    .corrected_instructions(delta.instructions, traps);
+                self.perf_overlay
+                    .trap_floor
+                    .observe(delta.instructions, delta.cycles, traps);
+                // Prefer the exact step-count when the step path obtained one
+                // (no-call line) — that's the true instruction count, not the
+                // rusage estimate. Otherwise: `Some(0)` = "measured, negligible";
+                // `None` = host doesn't populate `ri_instructions` (raw was 0).
+                let instructions = self
+                    .perf_overlay
+                    .last_exact_instructions
+                    .or_else(|| (delta.instructions != 0).then_some(corrected_instructions));
                 self.perf_overlay.data.finish_stop_full(
-                    delta.cycles,
+                    cycles,
                     delta.wall_ns,
                     Some(delta.cpu_time_ns),
                     instructions,
@@ -634,6 +677,27 @@ impl super::DebugSession {
 
     #[cfg(not(feature = "perf"))]
     pub(super) fn finish_perf_stop(&mut self) {}
+
+    /// Whether the perf overlay is enabled — gates the exact-instruction-count
+    /// step path in `handle_next`.
+    #[cfg(feature = "perf")]
+    pub(super) fn perf_overlay_enabled(&self) -> bool {
+        self.perf_overlay.enabled
+    }
+    #[cfg(not(feature = "perf"))]
+    pub(super) fn perf_overlay_enabled(&self) -> bool {
+        false
+    }
+
+    /// Stash the exact per-line instruction count from the step just taken (or
+    /// `None` to fall back to the rusage estimate). `finish_perf_stop` prefers it
+    /// for `runInstructions`. Reset at the start of each step window.
+    #[cfg(feature = "perf")]
+    pub(super) fn set_perf_exact_instructions(&mut self, n: Option<u64>) {
+        self.perf_overlay.last_exact_instructions = n;
+    }
+    #[cfg(not(feature = "perf"))]
+    pub(super) fn set_perf_exact_instructions(&mut self, _n: Option<u64>) {}
 
     #[cfg(feature = "perf")]
     pub(super) fn handle_perf_overlay(&mut self, req: &DapRequest) -> anyhow::Result<()> {
@@ -792,7 +856,8 @@ impl super::DebugSession {
         // Memory-footprint delta for the window (bytes, signed). macOS
         // only — Linux has no equivalent in the rusage path yet, so null.
         #[cfg(target_os = "macos")]
-        let phys_footprint_delta: Option<i64> = Some(self.perf_overlay.darwin_last_delta.phys_footprint_delta);
+        let phys_footprint_delta: Option<i64> =
+            Some(self.perf_overlay.darwin_last_delta.phys_footprint_delta);
         #[cfg(not(target_os = "macos"))]
         let phys_footprint_delta: Option<i64> = None;
         Some(json!({
@@ -1429,13 +1494,17 @@ impl Drop for ThreadFreezeGuard {
 /// [`FREEZE_WATCHDOG`] in case the step blocks on a frozen thread. Returns
 /// `None` when single-threaded or the focus thread can't be identified.
 #[cfg(all(feature = "perf", target_os = "macos"))]
-fn install_thread_freeze(task: mach2::mach_types::task_t, focus_pid: nix::unistd::Pid) -> Option<ThreadFreezeGuard> {
+fn install_thread_freeze(
+    task: mach2::mach_types::task_t,
+    focus_pid: nix::unistd::Pid,
+) -> Option<ThreadFreezeGuard> {
     use crate::debugger::darwin_mach;
-    use std::sync::{atomic::AtomicBool, Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     let dealloc = |t: mach2::mach_types::thread_act_t| {
         // SAFETY: `t` is a send right we own from task_threads.
-        let _ = unsafe { mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), t) };
+        let _ =
+            unsafe { mach2::mach_port::mach_port_deallocate(mach2::traps::mach_task_self(), t) };
     };
 
     let focus_port = darwin_mach::thread_port_for_pid_or_first(focus_pid).ok()?;
@@ -1733,7 +1802,10 @@ mod tests {
     fn dominant_wait_prefers_positive_blocking_over_idle_mach() {
         // idle threads parked in mach_msg (-31), one stepped thread in read(3):
         // the real wait wins over the mach-trap noise.
-        assert_eq!(dominant_wait_syscall(&[-31, -31, -31, -31, -31, 3]), Some(3));
+        assert_eq!(
+            dominant_wait_syscall(&[-31, -31, -31, -31, -31, 3]),
+            Some(3)
+        );
         // only mach traps → fall back to the mach trap.
         assert_eq!(dominant_wait_syscall(&[-31, -31]), Some(-31));
         // unrecognised positive syscalls don't win; mach fallback applies.

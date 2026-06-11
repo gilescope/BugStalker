@@ -1845,9 +1845,11 @@ fn test_next_instruction_granularity() -> anyhow::Result<()> {
             .client
             .send_request("stackTrace", json!({ "threadId": thread_id }))?;
         let resp = session.client.read_response(seq)?;
-        Ok(resp["body"]["stackFrames"][0]["instructionPointerReference"]
-            .as_str()
-            .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()))
+        Ok(
+            resp["body"]["stackFrames"][0]["instructionPointerReference"]
+                .as_str()
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()),
+        )
     };
     let before = pc_of(&mut session)?;
 
@@ -1900,9 +1902,14 @@ fn test_registers_request() -> anyhow::Result<()> {
 
     if cfg!(target_arch = "aarch64") {
         let pc = regs["pc"].as_str().expect("pc register present");
-        assert!(pc.starts_with("0x"), "register values are hex strings, got {pc}");
+        assert!(
+            pc.starts_with("0x"),
+            "register values are hex strings, got {pc}"
+        );
         // pc must match the top frame's instruction pointer.
-        let seq = session.client.send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let seq = session
+            .client
+            .send_request("stackTrace", json!({ "threadId": thread_id }))?;
         let st = session.client.read_response(seq)?;
         let ip = st["body"]["stackFrames"][0]["instructionPointerReference"]
             .as_str()
@@ -1934,18 +1941,27 @@ fn test_asm_focus_next_steps_instruction() -> anyhow::Result<()> {
         .client
         .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
     let resp = session.client.read_response(seq)?;
-    assert!(resp["success"].as_bool().unwrap_or(false), "bs/setAsmFocus failed");
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/setAsmFocus failed"
+    );
 
     let pc_of = |s: &mut DapSession| -> anyhow::Result<Option<u64>> {
-        let seq = s.client.send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let seq = s
+            .client
+            .send_request("stackTrace", json!({ "threadId": thread_id }))?;
         let resp = s.client.read_response(seq)?;
-        Ok(resp["body"]["stackFrames"][0]["instructionPointerReference"]
-            .as_str()
-            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+        Ok(
+            resp["body"]["stackFrames"][0]["instructionPointerReference"]
+                .as_str()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+        )
     };
     let before = pc_of(&mut session)?;
 
-    let seq = session.client.send_request("next", json!({ "threadId": thread_id }))?;
+    let seq = session
+        .client
+        .send_request("next", json!({ "threadId": thread_id }))?;
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "next", seq, true);
 
@@ -1984,17 +2000,27 @@ fn test_asm_focus_step_reports_one_instruction() -> anyhow::Result<()> {
         HELLO_LINE
     );
 
-    let seq = session.client.send_request("bs/perfOverlayEnable", json!({}))?;
+    let seq = session
+        .client
+        .send_request("bs/perfOverlayEnable", json!({}))?;
     let resp = session.client.read_response(seq)?;
-    assert!(resp["success"].as_bool().unwrap_or(false), "bs/perfOverlayEnable failed");
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/perfOverlayEnable failed"
+    );
 
     let seq = session
         .client
         .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
     let resp = session.client.read_response(seq)?;
-    assert!(resp["success"].as_bool().unwrap_or(false), "bs/setAsmFocus failed");
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/setAsmFocus failed"
+    );
 
-    let seq = session.client.send_request("next", json!({ "threadId": thread_id }))?;
+    let seq = session
+        .client
+        .send_request("next", json!({ "threadId": thread_id }))?;
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "next", seq, true);
 
@@ -2028,18 +2054,27 @@ fn test_asm_focus_step_in_steps_instruction() -> anyhow::Result<()> {
         .client
         .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
     let resp = session.client.read_response(seq)?;
-    assert!(resp["success"].as_bool().unwrap_or(false), "bs/setAsmFocus failed");
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/setAsmFocus failed"
+    );
 
     let pc_of = |s: &mut DapSession| -> anyhow::Result<Option<u64>> {
-        let seq = s.client.send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let seq = s
+            .client
+            .send_request("stackTrace", json!({ "threadId": thread_id }))?;
         let resp = s.client.read_response(seq)?;
-        Ok(resp["body"]["stackFrames"][0]["instructionPointerReference"]
-            .as_str()
-            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+        Ok(
+            resp["body"]["stackFrames"][0]["instructionPointerReference"]
+                .as_str()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+        )
     };
     let before = pc_of(&mut session)?;
 
-    let seq = session.client.send_request("stepIn", json!({ "threadId": thread_id }))?;
+    let seq = session
+        .client
+        .send_request("stepIn", json!({ "threadId": thread_id }))?;
     let response = session.client.read_response(seq)?;
     ensure_response!(session, &response, "stepIn", seq, true);
     let _ = session.client.wait_for_event("stopped")?;
@@ -2075,14 +2110,21 @@ fn test_asm_focus_bs_step_in_steps_instruction() -> anyhow::Result<()> {
         .client
         .send_request("bs/setAsmFocus", json!({ "focused": true }))?;
     let resp = session.client.read_response(seq)?;
-    assert!(resp["success"].as_bool().unwrap_or(false), "bs/setAsmFocus failed");
+    assert!(
+        resp["success"].as_bool().unwrap_or(false),
+        "bs/setAsmFocus failed"
+    );
 
     let pc_of = |s: &mut DapSession| -> anyhow::Result<Option<u64>> {
-        let seq = s.client.send_request("stackTrace", json!({ "threadId": thread_id }))?;
+        let seq = s
+            .client
+            .send_request("stackTrace", json!({ "threadId": thread_id }))?;
         let resp = s.client.read_response(seq)?;
-        Ok(resp["body"]["stackFrames"][0]["instructionPointerReference"]
-            .as_str()
-            .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()))
+        Ok(
+            resp["body"]["stackFrames"][0]["instructionPointerReference"]
+                .as_str()
+                .and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok()),
+        )
     };
     let before = pc_of(&mut session)?;
 
@@ -2457,7 +2499,13 @@ fn test_break_on_panic_focus_opt_out() -> anyhow::Result<()> {
         .client
         .send_request("configurationDone", json!({}))?;
     let config_response = session.client.read_response(config_seq)?;
-    ensure_response!(session, &config_response, "configurationDone", config_seq, true);
+    ensure_response!(
+        session,
+        &config_response,
+        "configurationDone",
+        config_seq,
+        true
+    );
 
     let Some(stopped) =
         wait_for_event_or_terminated(&mut session, "stopped", OPTIONAL_EVENT_TIMEOUT)?
@@ -2903,7 +2951,10 @@ fn test_disassemble_request() -> anyhow::Result<()> {
     let instructions = response["body"]["instructions"]
         .as_array()
         .expect("disassemble: instructions must be an array");
-    assert!(!instructions.is_empty(), "disassemble returned no instructions");
+    assert!(
+        !instructions.is_empty(),
+        "disassemble returned no instructions"
+    );
     // Source interleaving: at least one instruction carries a `location`+`line`
     // so VS Code can show Rust on the left, asm on the right.
     let interleaved = instructions.iter().any(|ins| {
@@ -2911,7 +2962,10 @@ fn test_disassemble_request() -> anyhow::Result<()> {
             .and_then(|loc| loc.get("path"))
             .and_then(serde_json::Value::as_str)
             .is_some()
-            && ins.get("line").and_then(serde_json::Value::as_u64).is_some()
+            && ins
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
     });
     assert!(
         interleaved,
@@ -2972,7 +3026,10 @@ fn test_disassemble_view_context_before() -> anyhow::Result<()> {
             .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
             == Some(anchor)
     });
-    assert!(has_anchor, "the anchor (current PC) must appear in the disassembled window");
+    assert!(
+        has_anchor,
+        "the anchor (current PC) must appear in the disassembled window"
+    );
     session.shutdown();
     Ok(())
 }
@@ -3017,9 +3074,7 @@ fn test_disassemble_no_brk_at_breakpoint() -> anyhow::Result<()> {
     let bp_ins = instructions
         .iter()
         .find(|ins| ins["address"].as_str() == Some(ip.as_str()));
-    let ins_text = bp_ins
-        .and_then(|i| i["instruction"].as_str())
-        .unwrap_or("");
+    let ins_text = bp_ins.and_then(|i| i["instruction"].as_str()).unwrap_or("");
     let first_word = ins_text.split_whitespace().next().unwrap_or("");
     assert!(
         !trap_mnemonics.contains(&first_word),

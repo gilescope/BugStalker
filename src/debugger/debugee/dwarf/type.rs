@@ -270,6 +270,28 @@ impl ArrayType {
         self.byte_size
     }
 
+    /// Byte size from constant subrange bounds, no eval context (mirrors
+    /// [`Self::size_in_bytes`] for the const case). `None` when a bound
+    /// is a runtime expression — those need a live evaluator. This is the
+    /// path that sizes a `[T; N]` C/Rust static array whose DWARF carries
+    /// only a constant `DW_AT_upper_bound`/`DW_AT_count`, not a
+    /// `DW_AT_byte_size` (e.g. the secp256k1 precomputed tables).
+    pub fn static_byte_size(&self, type_graph: &ComplexType) -> Option<u64> {
+        if let Some(bs) = self.byte_size {
+            return Some(bs);
+        }
+        let ArrayBoundValue::Const(lb) = self.lower_bound else {
+            return None;
+        };
+        let span = match self.upper_bound.as_ref()? {
+            UpperBound::UpperBound(ArrayBoundValue::Const(ub)) => ub - lb,
+            UpperBound::Count(ArrayBoundValue::Const(c)) => *c,
+            _ => return None,
+        };
+        let element_size = type_graph.static_byte_size_of(self.element_type?)?;
+        array_byte_size(lb, span, element_size)
+    }
+
     fn lower_bound(&self, evcx: &EvaluationContext) -> i64 {
         self.lower_bound.value(evcx).unwrap_or(0)
     }
@@ -554,6 +576,34 @@ impl ComplexType {
             TypeDeclaration::Subroutine { .. } => Some(mem::size_of::<usize>() as u64),
             TypeDeclaration::ModifiedType { inner, .. } => {
                 inner.and_then(|inner_id| self.type_size_in_bytes(evcx, inner_id))
+            }
+        }
+    }
+
+    /// Best-effort byte size of the root type **without** an evaluation
+    /// context — straight from `DW_AT_byte_size`, or for arrays from
+    /// constant subrange bounds × element size (no live memory / dynamic
+    /// bound eval). Used as a cheap size gate (e.g. "is this static a
+    /// giant array we shouldn't eagerly read?"). `None` for types whose
+    /// size the DWARF doesn't state statically (truly dynamic arrays);
+    /// callers should treat `None` as "small / unknown" and read normally.
+    pub fn static_byte_size(&self) -> Option<u64> {
+        self.static_byte_size_of(self.root())
+    }
+
+    fn static_byte_size_of(&self, typ: TypeId) -> Option<u64> {
+        match self.types.get(&typ)? {
+            TypeDeclaration::Scalar(s) => s.byte_size,
+            TypeDeclaration::Structure { byte_size, .. } => *byte_size,
+            TypeDeclaration::Array(arr) => arr.static_byte_size(self),
+            TypeDeclaration::CStyleEnum { byte_size, .. } => *byte_size,
+            TypeDeclaration::RustEnum { byte_size, .. } => *byte_size,
+            TypeDeclaration::Union { byte_size, .. } => *byte_size,
+            TypeDeclaration::Pointer { .. } | TypeDeclaration::Subroutine { .. } => {
+                Some(mem::size_of::<usize>() as u64)
+            }
+            TypeDeclaration::ModifiedType { inner, .. } => {
+                inner.and_then(|inner_id| self.static_byte_size_of(inner_id))
             }
         }
     }

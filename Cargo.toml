@@ -184,6 +184,11 @@ mach2 = "0.6"
 serial_test = "3.2.0"
 criterion = { workspace = true }
 bs-test-harness = { path = "crates/bs-test-harness" }
+# Perf-cost ballpark tests (`tests/debugger/perf_cost.rs`) snapshot the
+# debuggee's `proc_pid_rusage` counters directly; the darwin module is the
+# same one the perf overlay measures through. Pure Rust, so harmless on Linux
+# (the consuming test module is macOS + `perf`-gated).
+bs-perf = { path = "crates/bs-perf" }
 # PTY-driven integration tests. `expectrl` is a `pexpect` port that
 # spawns the inferior via `posix_spawn` (not `fork`), so the test
 # process can have background threads — HTTP clients, signal

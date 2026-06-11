@@ -142,7 +142,9 @@ impl PollSampler {
         let failed_snapshots = self.failed_snapshots.clone();
         let handle = thread::Builder::new()
             .name("bs-perf-poll-darwin".to_owned())
-            .spawn(move || sampler_loop(task, period, samples, syscalls, stop_flag, failed_snapshots))
+            .spawn(move || {
+                sampler_loop(task, period, samples, syscalls, stop_flag, failed_snapshots)
+            })
             .map_err(|err| {
                 PerfError::Open(std::io::Error::other(format!(
                     "spawn bs-perf-poll-darwin: {err}"
@@ -159,7 +161,13 @@ impl PollSampler {
     pub fn sample_once(&self) -> usize {
         // SAFETY: mach_thread_self always returns a valid send right.
         let own_thread = unsafe { mach_thread_self() };
-        let pushed = sample_pass(self.task, own_thread, &self.samples, &self.syscalls, &self.failed_snapshots);
+        let pushed = sample_pass(
+            self.task,
+            own_thread,
+            &self.samples,
+            &self.syscalls,
+            &self.failed_snapshots,
+        );
         // SAFETY: own_thread came from mach_thread_self; balance.
         let _ = unsafe { mach_port_deallocate(mach_task_self(), own_thread) };
         pushed
@@ -404,7 +412,10 @@ fn read_thread_sample(thread: thread_act_t) -> Option<ThreadSample> {
         return None;
     }
     // x86 syscall ABI differs (rax); not wired for wait classification.
-    Some(ThreadSample { pc: state.__rip, syscall: None })
+    Some(ThreadSample {
+        pc: state.__rip,
+        syscall: None,
+    })
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -556,7 +567,10 @@ mod syscall_capture {
     #[test]
     fn parked_thread_x16_is_the_syscall_number() {
         thread::spawn(|| {
-            let ts = libc::timespec { tv_sec: 100, tv_nsec: 0 };
+            let ts = libc::timespec {
+                tv_sec: 100,
+                tv_nsec: 0,
+            };
             unsafe { libc::nanosleep(&ts, std::ptr::null_mut()) };
         });
         let mut fds = [0i32; 2];
@@ -572,7 +586,10 @@ mod syscall_capture {
         let own = unsafe { mach_thread_self() };
         let mut threads: thread_act_array_t = std::ptr::null_mut();
         let mut count: mach_msg_type_number_t = 0;
-        assert_eq!(unsafe { task_threads(task, &mut threads, &mut count) }, KERN_SUCCESS);
+        assert_eq!(
+            unsafe { task_threads(task, &mut threads, &mut count) },
+            KERN_SUCCESS
+        );
         let mut seen = Vec::new();
         for i in 0..count as usize {
             let t = unsafe { *threads.add(i) };
@@ -600,6 +617,9 @@ mod syscall_capture {
 
         // SYS_read = 3, SYS___semwait_signal = 334 (nanosleep routes through it).
         assert!(seen.contains(&3), "expected read (x16=3) among {seen:?}");
-        assert!(seen.contains(&334), "expected __semwait_signal (x16=334) among {seen:?}");
+        assert!(
+            seen.contains(&334),
+            "expected __semwait_signal (x16=334) among {seen:?}"
+        );
     }
 }

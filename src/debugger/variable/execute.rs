@@ -532,7 +532,13 @@ impl<'dbg> DqeExecutor<'dbg> {
                 // must stay locals-only so the Locals scope doesn't absorb
                 // the Arguments scope.
                 if results.is_empty()
-                    && matches!(selector, Selector::Name { local_only: false, .. })
+                    && matches!(
+                        selector,
+                        Selector::Name {
+                            local_only: false,
+                            ..
+                        }
+                    )
                 {
                     return self.apply_select_die(selector, true);
                 }

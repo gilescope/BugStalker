@@ -61,7 +61,12 @@ fn stopped_at(line: u64) -> (Debugger, TestInfo, i32) {
 /// until the reported line changes — robust to #1's multi-row lines),
 /// measuring the summed rusage delta and the trap count for the line.
 /// Returns `(raw_instructions, raw_cycles, traps, landed_line)`.
-fn step_one_line(dbg: &mut Debugger, info: &TestInfo, raw_pid: i32, cur: u64) -> (u64, u64, u64, u64) {
+fn step_one_line(
+    dbg: &mut Debugger,
+    info: &TestInfo,
+    raw_pid: i32,
+    cur: u64,
+) -> (u64, u64, u64, u64) {
     dbg.reset_trap_count();
     let before = ProcessSnapshot::capture(raw_pid).expect("rusage before");
     let mut substeps = 0u32;
@@ -201,7 +206,11 @@ fn step_over_or_count_exact_then_fallback() {
         ),
         LineInstrCount::Capped(n) => panic!("no-call line should be Exact, got Capped({n})"),
     }
-    assert_eq!(info.line.get(), Some(18), "exact step must land on the next line");
+    assert_eq!(
+        info.line.get(),
+        Some(18),
+        "exact step must land on the next line"
+    );
     dbg.continue_debugee().unwrap();
 
     // Call line (L40 `busy_loop(..)`) → falls back to step-over, lands on L41.
@@ -237,7 +246,11 @@ fn step_into_or_count_exact_and_descends() {
         ),
         LineInstrCount::Capped(n) => panic!("no-call line should be Exact, got Capped({n})"),
     }
-    assert_eq!(info.line.get(), Some(19), "exact step-in must land on the next line");
+    assert_eq!(
+        info.line.get(),
+        Some(19),
+        "exact step-in must land on the next line"
+    );
     dbg.continue_debugee().unwrap();
 
     // Call line L40 `busy_loop(black_box(..))` → step-in DESCENDS into the first
@@ -247,7 +260,11 @@ fn step_into_or_count_exact_and_descends() {
     let (mut dbg, info, _pid) = stopped_at(40);
     let _ = dbg.step_into_or_count(4_096).unwrap();
     let landed = info.line.get();
-    assert_ne!(landed, Some(41), "step-in must not step OVER the call to L41");
+    assert_ne!(
+        landed,
+        Some(41),
+        "step-in must not step OVER the call to L41"
+    );
     assert_ne!(landed, Some(40), "step-in must leave the call line");
     dbg.continue_debugee().unwrap();
 }
@@ -294,14 +311,22 @@ fn investigate_step_cost_decomposition() {
     let b = ProcessSnapshot::capture(raw_pid).unwrap();
     dbg.stepi().unwrap();
     let d = ProcessSnapshot::capture(raw_pid).unwrap().delta_since(b);
-    println!("{:<28} {:>12} {:>12}", "1x stepi @L17", d.instructions, d.cycles);
+    println!(
+        "{:<28} {:>12} {:>12}",
+        "1x stepi @L17", d.instructions, d.cycles
+    );
 
     // --- 5 consecutive stepi (linearity: does cost scale with traps?) ---
     for n in 1..=5 {
         let b = ProcessSnapshot::capture(raw_pid).unwrap();
         dbg.stepi().unwrap();
         let d = ProcessSnapshot::capture(raw_pid).unwrap().delta_since(b);
-        println!("{:<28} {:>12} {:>12}", format!("  stepi #{n}"), d.instructions, d.cycles);
+        println!(
+            "{:<28} {:>12} {:>12}",
+            format!("  stepi #{n}"),
+            d.instructions,
+            d.cycles
+        );
     }
     dbg.continue_debugee().unwrap();
 
@@ -321,7 +346,10 @@ fn investigate_step_cost_decomposition() {
     let b = ProcessSnapshot::capture(raw_pid).unwrap();
     dbg.continue_debugee().unwrap(); // 1 trap, full-speed
     let d = ProcessSnapshot::capture(raw_pid).unwrap().delta_since(b);
-    println!("{:<28} {:>12} {:>12}", "1x continue L16->L17", d.instructions, d.cycles);
+    println!(
+        "{:<28} {:>12} {:>12}",
+        "1x continue L16->L17", d.instructions, d.cycles
+    );
     dbg.continue_debugee().unwrap();
 
     // --- one continue across a 1,000,000-iteration hot loop (L28 -> L35) ---
@@ -343,7 +371,10 @@ fn investigate_step_cost_decomposition() {
     dbg.continue_debugee().unwrap();
     let d = ProcessSnapshot::capture(raw_pid).unwrap().delta_since(b);
     assert_eq!(info.line.get(), Some(35));
-    println!("{:<28} {:>12} {:>12}", "1x continue 1e6-loop", d.instructions, d.cycles);
+    println!(
+        "{:<28} {:>12} {:>12}",
+        "1x continue 1e6-loop", d.instructions, d.cycles
+    );
     println!("(line steps: ~5-8 user instr buried under ~35k/trap; loop: user work dominates)\n");
     dbg.continue_debugee().unwrap();
 }
@@ -365,18 +396,27 @@ fn investigate_floor_subtraction() {
         let (mut dbg, _i, pid) = stopped_at(line);
         let b = ProcessSnapshot::capture(pid).unwrap();
         dbg.step_over().unwrap();
-        let raw = ProcessSnapshot::capture(pid).unwrap().delta_since(b).instructions;
+        let raw = ProcessSnapshot::capture(pid)
+            .unwrap()
+            .delta_since(b)
+            .instructions;
         // adjacent floor — 2 traps' worth, same warm process
         let b2 = ProcessSnapshot::capture(pid).unwrap();
         dbg.stepi().unwrap();
         dbg.stepi().unwrap();
-        let floor = ProcessSnapshot::capture(pid).unwrap().delta_since(b2).instructions;
+        let floor = ProcessSnapshot::capture(pid)
+            .unwrap()
+            .delta_since(b2)
+            .instructions;
         dbg.continue_debugee().unwrap();
         (raw, floor)
     };
 
     println!("\n=== double-trap (adjacent, same-process floor) validation ===");
-    println!("{:<22} {:>12} {:>12} {:>12}", "line", "raw", "floor(2trap)", "corrected");
+    println!(
+        "{:<22} {:>12} {:>12} {:>12}",
+        "line", "raw", "floor(2trap)", "corrected"
+    );
     for (label, line, real) in [
         ("i = i * 2 (L17)", 17u64, "~8"),
         ("busy_loop 2e3 (L41)", 41, "~38k"),

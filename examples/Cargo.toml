@@ -22,6 +22,7 @@ members = [
     "shlib/printer_lib",
     "panic",
     "calculations",
+    "perf_lines",
     "calls",
     "dap_cache_vars",
     "statics_heavy",
@@ -35,6 +36,9 @@ members = [
     "dap_set_variable",
     "dap_data_breakpoints",
     "dap_source_map",
+    "step_into_jmc",
+    "panic_kinds",
+    "big_static",
     "viz_demo",
 ]
 

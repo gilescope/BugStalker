@@ -8,6 +8,92 @@ use crate::debugger::error::Error::{NoFunctionRanges, ProcessExit};
 use crate::debugger::{Debugger, ExplorationContext};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use std::path::Path;
+
+/// Whether a stopped frame is the user's own code or library/runtime
+/// code. Drives "Step-In, skip libraries" (just-my-code stepping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameKind {
+    /// Source file resolves to the user's own crate(s).
+    UserCode,
+    /// Cargo dep, std/core, the toolchain, or a frame with no line info.
+    Library,
+}
+
+/// Path fragments that mark a DWARF source/decl path as library or
+/// toolchain code rather than the user's own crate. Matched as
+/// substrings. Covers cargo deps (`/registry/`), the cargo home
+/// (`/.cargo/`), rustup toolchains (`/.rustup/`, `/toolchains/`), and
+/// the rust std/compiler sources (`/rustc/`). The rustup layout already
+/// nests the sysroot under `/.rustup/toolchains/<tc>/…`, so the
+/// `rustc --print sysroot` prefix mentioned in the design is subsumed
+/// here; v0 deliberately avoids shelling out, for determinism.
+const LIBRARY_PATH_FRAGMENTS: &[&str] = &[
+    "/registry/",
+    "/.cargo/",
+    "/.rustup/",
+    "/toolchains/",
+    "/rustc/",
+];
+
+/// Classify a DWARF source path as user code or library code. A `None`
+/// path — a frame with no line info (PLT stub, stripped/FFI frame) — is
+/// `Library`: there's nothing there for the user to read.
+///
+/// ```
+/// use std::path::Path;
+/// use bugstalker::debugger::{classify_source_path, FrameKind};
+///
+/// assert_eq!(
+///     classify_source_path(Some(Path::new("/home/me/proj/src/main.rs"))),
+///     FrameKind::UserCode,
+/// );
+/// assert_eq!(
+///     classify_source_path(Some(Path::new(
+///         "/home/me/.cargo/registry/src/index.crates.io-x/serde-1/src/lib.rs"
+///     ))),
+///     FrameKind::Library,
+/// );
+/// assert_eq!(classify_source_path(None), FrameKind::Library);
+/// ```
+pub fn classify_source_path(path: Option<&Path>) -> FrameKind {
+    let Some(path) = path else {
+        return FrameKind::Library;
+    };
+    let s = path.to_string_lossy();
+    if LIBRARY_PATH_FRAGMENTS.iter().any(|frag| s.contains(frag)) {
+        FrameKind::Library
+    } else {
+        FrameKind::UserCode
+    }
+}
+
+/// Which frames a Step-In is allowed to stop in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepIntoMode {
+    /// Descend into whatever the current line calls, library or not
+    /// (classic Step-In).
+    AnyFrame,
+    /// Step transparently through library/runtime frames and stop at
+    /// the next line of user code ("just my code").
+    SkipLibraries,
+}
+
+/// Whether a stepping error is recoverable during a "skip libraries"
+/// walk — i.e. it means "stepped into code we can't introspect" (a
+/// stripped dylib with no DWARF, or a frame the unwinder can't read)
+/// rather than a genuine fault. Such a step should degrade to climbing
+/// back out to user code, not abort the whole step.
+fn is_recoverable_step_error(e: &Error) -> bool {
+    matches!(e, Error::NoDebugInformation(_) | Error::DwarfParsing(_))
+}
+
+/// Backstop on the number of line-steps the [`StepIntoMode::SkipLibraries`]
+/// walk will take before giving up and stopping wherever it landed. A
+/// normal library call resolves in a handful of steps; this only fires
+/// on pathological runaways (and is logged when it does), so the
+/// debugger never hangs.
+const SKIP_LIB_STEP_BUDGET: usize = 4096;
 
 /// Result of a step, if [`SignalInterrupt`] or [`WatchpointInterrupt`] then
 /// a step process interrupted and the user should know about it.
@@ -191,6 +277,7 @@ impl Debugger {
         let mb_reason = if self.breakpoints.get_enabled(loc.pc).is_some() {
             self.step_over_breakpoint()?
         } else {
+            self.debugee.bump_single_step_trap();
             let maybe_reason = self.debugee.tracer_mut().single_step(
                 TraceContext::new(&self.breakpoints.active_breakpoints(), &self.watchpoints),
                 loc.pid,
@@ -216,6 +303,7 @@ impl Debugger {
             && brkpt.is_enabled()
         {
             brkpt.disable()?;
+            self.debugee.bump_single_step_trap();
             let maybe_reason = self.debugee.tracer_mut().single_step(
                 TraceContext::new(&self.breakpoints.active_breakpoints(), &self.watchpoints),
                 tracee_pid,
@@ -436,5 +524,239 @@ impl Debugger {
 
         self.ecx_update_location()?;
         Ok(StepResult::Done)
+    }
+
+    /// Classify the frame the focus thread is currently stopped in as
+    /// user code or library code, by resolving the PC to a source path.
+    /// A PC with no debug info / no function is [`FrameKind::Library`]
+    /// (nothing to show there).
+    ///
+    /// Classification uses the *real* frame function's own defining file
+    /// (its first range's place), **not** `find_place_from_pc` — the PC
+    /// may sit on an inlined library call (`iter().map(…)`,
+    /// `BTreeMap::insert`, …) whose innermost attribution is core/alloc
+    /// even though the executing frame is the user's function. We want to
+    /// classify the frame, so that stepping over an inlined library call
+    /// inside a user line still stops on that user line.
+    ///
+    /// **! does not change exploration context**
+    pub(super) fn current_frame_kind(&self) -> FrameKind {
+        let loc = self.ecx().location();
+        let Ok(dwarf) = self.debugee.debug_info(loc.pc) else {
+            return FrameKind::Library;
+        };
+        if let Ok(Some((func, _))) = dwarf.find_function_by_pc(loc.global_pc)
+            && let Some(range) = func.ranges().first()
+            && let Some(place) = func
+                .unit()
+                .find_place_by_pc(GlobalAddress::from(range.begin))
+        {
+            return classify_source_path(Some(place.file));
+        }
+        // No function / no place — a PLT stub, stripped or FFI frame.
+        FrameKind::Library
+    }
+
+    /// Step-In that steps *through* library frames and stops at the next
+    /// line of user code ("just my code").
+    ///
+    /// Walk: repeatedly [`Self::step_in`]; classify where we land.
+    /// - **User code at a new source position** → stop. Covers both
+    ///   stepping *into* a user function the line called (`helper(x)`)
+    ///   and *advancing* to the next user line (an all-library line).
+    /// - **Library frame** → skip it: climb back out with
+    ///   [`Self::step_out_frame`] to the user caller. Then, crucially,
+    ///   only stop if that returned us to a *new* source line; if we're
+    ///   still on the *same* line we keep walking, because the rest of
+    ///   the line may hold another call — and the next one might be
+    ///   **your** code (e.g. `helper(&v)` does a `Vec`→`&[T]` deref, a
+    ///   library call, *then* calls the user `helper`). Stepping over the
+    ///   whole line here would wrongly skip `helper`.
+    ///
+    /// So the engine steps *over* library calls but *into* user calls, in
+    /// execution order, and never strands you on the start line doing
+    /// nothing.
+    ///
+    /// MVP gap: a library that invokes a *user closure* (e.g.
+    /// `iter().map(user_fn)`) is stepped over, not stopped in — the
+    /// callback runs to completion inside the `step_out_frame` that skips
+    /// the iterator. The phase-4 engine closes this; see
+    /// `doc/plans/phase-12-step-into-just-my-code.md`.
+    ///
+    /// **! change exploration context**
+    pub(super) fn step_in_skip_libraries(&mut self) -> Result<StepResult, Error> {
+        // The source line we started on. A step has made user-visible
+        // progress once we're in user code at a *different* `(file, line)`.
+        let start_place = self.current_source_place();
+
+        for _ in 0..SKIP_LIB_STEP_BUDGET {
+            // A `step_in` can fail *inside* foreign code we can't
+            // introspect — a stripped system dylib (no DWARF →
+            // `NoDebugInformation`) or a frame the unwinder can't read
+            // (`DwarfParsing`). That's not a real failure: treat it like
+            // landing in library and climb back out to the user frame.
+            let entered_foreign = match self.step_in() {
+                Ok(StepResult::Done) => false,
+                Ok(other) => return Ok(other),
+                Err(e) if is_recoverable_step_error(&e) => {
+                    // Resync the exploration context to the real PC the
+                    // failed step left us at before we try to climb.
+                    let _ = self.ecx_update_location();
+                    true
+                }
+                Err(e) => return Err(e),
+            };
+            if self.debugee.is_exited() {
+                return Err(ProcessExit(0));
+            }
+
+            if entered_foreign || self.current_frame_kind() == FrameKind::Library {
+                // Skip this library call: climb back out to user code.
+                let mut reached_user = false;
+                for _ in 0..SKIP_LIB_STEP_BUDGET {
+                    let before = self.ecx().location().pc;
+                    // `step_out_frame` can itself hit an un-unwindable
+                    // frame; tolerate that and stop climbing.
+                    if self.step_out_frame().is_err() {
+                        break;
+                    }
+                    if self.debugee.is_exited() {
+                        return Err(ProcessExit(0));
+                    }
+                    if self.current_frame_kind() == FrameKind::UserCode {
+                        reached_user = true;
+                        break;
+                    }
+                    // No return address to unwind to (top of stack): we've
+                    // run out of frames to climb. Stop trying.
+                    if self.ecx().location().pc == before {
+                        break;
+                    }
+                }
+                if !reached_user {
+                    // No user frame left to return to — we've stepped past
+                    // the end of all user code (typically off the end of
+                    // `main` into the C runtime). A step here should behave
+                    // like run-to-completion: continue to the next
+                    // breakpoint or program exit, rather than stranding the
+                    // user in unreadable runtime or erroring on it.
+                    return self.continue_to_stop();
+                }
+            }
+
+            // Now in a user *frame*. Stop only when the displayed source
+            // line is itself user code (not an inlined library line such
+            // as a `Box`/`Vec` method spliced into a user function — the
+            // frame is the user's, but the editor would show `boxed.rs`)
+            // *and* it differs from where we began. Otherwise — inlined
+            // library line, or still on the start line — keep walking.
+            let place = self.current_source_place();
+            let place_is_user = matches!(
+                classify_source_path(place.as_ref().map(|(f, _)| f.as_path())),
+                FrameKind::UserCode
+            );
+            if place_is_user && place != start_place {
+                return Ok(StepResult::Done);
+            }
+        }
+
+        log::warn!(
+            "step-into (skip libraries): step budget ({SKIP_LIB_STEP_BUDGET}) \
+             exhausted, stopping in place"
+        );
+        Ok(StepResult::Done)
+    }
+
+    /// Run the debuggee until the next stop (breakpoint / watchpoint /
+    /// signal) or exit, mapping the outcome to a [`StepResult`]. Used as
+    /// the graceful fallback when a "skip libraries" step runs off the
+    /// end of user code: there is nothing left to step *to*, so the step
+    /// degrades into a continue (this is what GDB/LLDB do when you step
+    /// off the end of `main`). Hooks already fire inside
+    /// `continue_execution`, so the signal/watchpoint variants are quiet.
+    fn continue_to_stop(&mut self) -> Result<StepResult, Error> {
+        let stop = self.continue_execution()?;
+        if self.debugee.is_exited() {
+            return Err(ProcessExit(0));
+        }
+        match stop {
+            StopReason::DebugeeExit(code) => Err(ProcessExit(code)),
+            StopReason::SignalStop(_, sign) => Ok(StepResult::signal_interrupt_quiet(sign)),
+            StopReason::Watchpoint(pid, addr, ty) => {
+                Ok(StepResult::wp_interrupt_quite(pid, addr, ty))
+            }
+            _ => Ok(StepResult::Done),
+        }
+    }
+
+    /// `(file, line)` of the source place the focus thread is currently
+    /// stopped at, or `None` if the PC has no place. Used to detect a
+    /// source-line change across a step.
+    pub(super) fn current_source_place(&self) -> Option<(std::path::PathBuf, u64)> {
+        let loc = self.ecx().location();
+        let dwarf = self.debugee.debug_info(loc.pc).ok()?;
+        let place = dwarf.find_place_from_pc(loc.global_pc).ok().flatten()?;
+        Some((place.file.to_path_buf(), place.line_number))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameKind, classify_source_path};
+    use std::path::Path;
+
+    fn classify(p: &str) -> FrameKind {
+        classify_source_path(Some(Path::new(p)))
+    }
+
+    #[test]
+    fn user_crate_paths_are_user_code() {
+        assert_eq!(classify("/home/me/proj/src/main.rs"), FrameKind::UserCode);
+        assert_eq!(
+            classify("/Users/me/git/app/crates/core/src/lib.rs"),
+            FrameKind::UserCode
+        );
+        // A workspace member literally named "registry" must not be
+        // mistaken for the cargo registry — the fragment is `/registry/`
+        // mid-path, not a bare component the user might choose.
+        assert_eq!(
+            classify("/home/me/registry-cli/src/main.rs"),
+            FrameKind::UserCode
+        );
+    }
+
+    #[test]
+    fn cargo_dep_paths_are_library() {
+        assert_eq!(
+            classify("/home/me/.cargo/registry/src/index.crates.io-abc/serde-1.0/src/lib.rs"),
+            FrameKind::Library
+        );
+        // `/registry/` alone (e.g. a vendored deps dir) is enough.
+        assert_eq!(
+            classify("/opt/vendor/registry/foo-2.0/src/lib.rs"),
+            FrameKind::Library
+        );
+    }
+
+    #[test]
+    fn toolchain_and_std_paths_are_library() {
+        assert_eq!(
+            classify(
+                "/home/me/.rustup/toolchains/stable-aarch64/lib/rustlib/src/rust/library/core/src/iter/mod.rs"
+            ),
+            FrameKind::Library
+        );
+        // rustc-embedded std source prefix (`/rustc/<hash>/library/...`).
+        assert_eq!(
+            classify("/rustc/abc123/library/alloc/src/vec/mod.rs"),
+            FrameKind::Library
+        );
+    }
+
+    #[test]
+    fn no_line_info_is_library() {
+        // PLT stubs / stripped / FFI frames carry no place — nothing to
+        // show, so treat as library and step through.
+        assert_eq!(classify_source_path(None), FrameKind::Library);
     }
 }

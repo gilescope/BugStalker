@@ -164,7 +164,9 @@ impl super::DebugSession {
                     "instruction": ins.text,
                 });
                 if let Some((file, line, column)) = dbg.source_location_at(ins.address as usize) {
-                    let client = self.source_map.map_target_to_client(&file.to_string_lossy());
+                    let client = self
+                        .source_map
+                        .map_target_to_client(&file.to_string_lossy());
                     if prev.as_ref() != Some(&(client.clone(), line)) {
                         let name = file
                             .file_name()
@@ -192,10 +194,7 @@ impl super::DebugSession {
 
     /// `bs/currentFunctionName` — returns the demangled name of the function
     /// containing the current PC, for display in the Source+ASM view header.
-    pub(super) fn handle_current_function_name(
-        &mut self,
-        req: &DapRequest,
-    ) -> anyhow::Result<()> {
+    pub(super) fn handle_current_function_name(&mut self, req: &DapRequest) -> anyhow::Result<()> {
         let Some(dbg) = self.debugger.as_ref() else {
             return self.send_err(req, "bs/currentFunctionName: no active session");
         };

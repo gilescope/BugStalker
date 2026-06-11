@@ -2431,19 +2431,43 @@ impl Debugger {
             return Vec::new();
         };
         const GPRS: [(&str, Register); 33] = [
-            ("x0", Register::X0), ("x1", Register::X1), ("x2", Register::X2),
-            ("x3", Register::X3), ("x4", Register::X4), ("x5", Register::X5),
-            ("x6", Register::X6), ("x7", Register::X7), ("x8", Register::X8),
-            ("x9", Register::X9), ("x10", Register::X10), ("x11", Register::X11),
-            ("x12", Register::X12), ("x13", Register::X13), ("x14", Register::X14),
-            ("x15", Register::X15), ("x16", Register::X16), ("x17", Register::X17),
-            ("x18", Register::X18), ("x19", Register::X19), ("x20", Register::X20),
-            ("x21", Register::X21), ("x22", Register::X22), ("x23", Register::X23),
-            ("x24", Register::X24), ("x25", Register::X25), ("x26", Register::X26),
-            ("x27", Register::X27), ("x28", Register::X28), ("x29", Register::X29),
-            ("x30", Register::X30), ("sp", Register::Sp), ("pc", Register::Pc),
+            ("x0", Register::X0),
+            ("x1", Register::X1),
+            ("x2", Register::X2),
+            ("x3", Register::X3),
+            ("x4", Register::X4),
+            ("x5", Register::X5),
+            ("x6", Register::X6),
+            ("x7", Register::X7),
+            ("x8", Register::X8),
+            ("x9", Register::X9),
+            ("x10", Register::X10),
+            ("x11", Register::X11),
+            ("x12", Register::X12),
+            ("x13", Register::X13),
+            ("x14", Register::X14),
+            ("x15", Register::X15),
+            ("x16", Register::X16),
+            ("x17", Register::X17),
+            ("x18", Register::X18),
+            ("x19", Register::X19),
+            ("x20", Register::X20),
+            ("x21", Register::X21),
+            ("x22", Register::X22),
+            ("x23", Register::X23),
+            ("x24", Register::X24),
+            ("x25", Register::X25),
+            ("x26", Register::X26),
+            ("x27", Register::X27),
+            ("x28", Register::X28),
+            ("x29", Register::X29),
+            ("x30", Register::X30),
+            ("sp", Register::Sp),
+            ("pc", Register::Pc),
         ];
-        GPRS.iter().map(|(name, reg)| (*name, map.value(*reg))).collect()
+        GPRS.iter()
+            .map(|(name, reg)| (*name, map.value(*reg)))
+            .collect()
     }
 
     #[cfg(not(target_arch = "aarch64"))]
