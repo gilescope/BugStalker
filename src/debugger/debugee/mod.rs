@@ -475,7 +475,12 @@ impl Debugee {
             .enumerate()
             .find(|(_, frame)| frame.ip == ecx.location().pc)
             .expect("frame must exists");
-        let return_addr = backtrace.get(bt_frame_num + 1).map(|f| f.ip);
+        // Caller frames' `ip` is the *call site* (raw return address − 1, see
+        // the unwind loop) so symbolization doesn't mislabel noreturn tail
+        // calls. `return_addr` is the contract "where execution resumes" and
+        // must equal the CIE's return-address register — undo the lookup
+        // adjustment.
+        let return_addr = backtrace.get(bt_frame_num + 1).map(|f| f.ip.offset(1));
         Ok(FrameInfo {
             frame: frame.clone(),
             num: bt_frame_num as u32,
